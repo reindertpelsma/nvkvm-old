@@ -3,6 +3,7 @@
  * tested by test_dispatch.c. Allows linking the dispatch layer in isolation.
  */
 
+#include <errno.h>
 #include "../../src/qemu/virtio_nvgpu.h"
 
 int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx)        { (void)ctx; return -ENOSYS; }
