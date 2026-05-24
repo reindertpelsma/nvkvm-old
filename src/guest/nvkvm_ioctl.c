@@ -21,6 +21,7 @@
 
 #include <linux/errno.h>
 #include <linux/fdtable.h>
+#include <linux/file.h>
 #include <linux/ioctl.h>
 #include "nvkvm.h"
 #include "abi/uvm.h"
