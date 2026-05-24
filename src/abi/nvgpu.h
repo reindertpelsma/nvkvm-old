@@ -89,6 +89,7 @@ struct nvos21_parameters {
 	nvclassid_t h_class;
 	nvp64_t    p_alloc_parms;   /* pointer to class-specific alloc struct */
 	__u32      status;
+	__u32      _pad;            /* trailing alignment pad — sizeof == 32 on x86-64 */
 };
 
 /*

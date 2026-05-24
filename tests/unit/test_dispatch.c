@@ -349,7 +349,8 @@ TEST(test_proto_shm_ctrl_size) {
  * Values taken from open-gpu-kernel-modules headers.
  */
 TEST(test_nvos21_size) {
-	ASSERT_EQ(sizeof(struct nvos21_parameters), 28U);
+	/* 4x u32 (16) + u64 (8) + u32 (4) + 4 trailing pad = 32 on x86-64 */
+	ASSERT_EQ(sizeof(struct nvos21_parameters), 32U);
 }
 
 TEST(test_nvos64_size) {
