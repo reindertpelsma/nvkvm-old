@@ -7,7 +7,8 @@ LDFLAGS = -lpthread
 
 SRCS = test_dispatch.c \
        ../../src/qemu/nvkvm_objects.c \
-       ../../src/qemu/nvkvm_dispatch.c
+       ../../src/qemu/nvkvm_dispatch.c \
+       frontend_stubs.c
 
 .PHONY: all clean run
 
