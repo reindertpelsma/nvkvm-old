@@ -20,8 +20,10 @@
  */
 
 #include <linux/errno.h>
+#include <linux/fdtable.h>
 #include <linux/ioctl.h>
 #include "nvkvm.h"
+#include "abi/uvm.h"
 
 /* ── Ioctl number extraction ─────────────────────────────────────────────── */
 
