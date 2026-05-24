@@ -21,24 +21,12 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
 
-/* Pull in the ABI headers */
-#include "../../src/abi/nvgpu.h"
-#include "../../src/abi/uvm.h"
-#include "../../src/common/nvkvm_proto.h"
-
-/* Minimal stub for QEMU types used by virtio_nvgpu.h */
-typedef struct VirtIODevice { int _dummy; } VirtIODevice;
-typedef struct VirtQueue     { int _dummy; } VirtQueue;
-typedef struct VirtQueueElement { int _dummy; } VirtQueueElement;
-#define OBJECT_CHECK(t, o, n) ((t*)(o))
-#define TYPE_VIRTIO_NVGPU "virtio-nvgpu-device"
-#define VIRTIO_NVGPU(o)   ((VirtIONvgpu*)(o))
-#define g_new0(T, n)      ((T*)calloc((n), sizeof(T)))
-#define g_free(p)         free(p)
-#define g_realloc(p, s)   realloc((p), (s))
-
+/* QEMU type stubs (provided by stubs/hw/virtio/virtio.h, included transitively) */
 #include "../../src/qemu/virtio_nvgpu.h"
+
+/* Pull in the ABI headers (already included via virtio_nvgpu.h) */
 
 /* ── Tiny test framework ──────────────────────────────────────────────────── */
 
