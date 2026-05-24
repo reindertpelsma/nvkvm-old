@@ -217,7 +217,6 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 int nvkvm_virtio_open(int dev_id, unsigned int flags,
 		      struct nvkvm_resp_open *resp_out)
 {
-	extern struct nvkvm_state nvkvm;
 	struct {
 		struct nvkvm_hdr      hdr;
 		struct nvkvm_req_open req;
@@ -252,7 +251,6 @@ int nvkvm_virtio_open(int dev_id, unsigned int flags,
 
 int nvkvm_virtio_close(__u32 fd_token, struct nvkvm_resp_close *resp_out)
 {
-	extern struct nvkvm_state nvkvm;
 	struct {
 		struct nvkvm_hdr       hdr;
 		struct nvkvm_req_close req;
@@ -286,7 +284,6 @@ long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx,
 			unsigned int cmd,
 			void *params_buf, size_t param_size)
 {
-	extern struct nvkvm_state nvkvm;
 	struct {
 		struct nvkvm_hdr       hdr;
 		struct nvkvm_req_ioctl req;

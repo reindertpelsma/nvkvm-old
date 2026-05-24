@@ -22,8 +22,6 @@
 
 #include "nvkvm.h"
 
-extern struct nvkvm_state nvkvm;
-
 struct nvkvm_session *nvkvm_session_get_or_create(pid_t tgid)
 {
 	struct nvkvm_session *session = NULL;

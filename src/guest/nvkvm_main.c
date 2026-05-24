@@ -55,7 +55,7 @@ MODULE_VERSION("0.1.0");
 
 /* ── Global state ─────────────────────────────────────────────────────────── */
 
-static struct nvkvm_state nvkvm;
+struct nvkvm_state nvkvm;
 
 /* ── Module parameters ────────────────────────────────────────────────────── */
 

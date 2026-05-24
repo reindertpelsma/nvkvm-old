@@ -59,7 +59,6 @@ static void nvkvm_vma_close(struct vm_area_struct *vma)
 
 int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 {
-	extern struct nvkvm_state nvkvm;
 	struct {
 		struct nvkvm_hdr      hdr;
 		struct nvkvm_req_mmap req;
@@ -182,7 +181,6 @@ out_msg:
 
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 {
-	extern struct nvkvm_state nvkvm;
 	struct nvkvm_mmap_region *region, *tmp;
 	LIST_HEAD(to_free);
 
@@ -218,7 +216,6 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
  */
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len)
 {
-	extern struct nvkvm_state nvkvm;
 	/* The mmap window is exposed as a second memory region by the host;
 	 * its start GPA and size are stored in nvkvm.mmap_window_* at init. */
 	if (!nvkvm.mmap_window_gpa_base || !nvkvm.mmap_window_len)

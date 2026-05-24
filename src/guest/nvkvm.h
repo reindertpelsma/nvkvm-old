@@ -123,6 +123,10 @@ struct nvkvm_state {
 	unsigned long           mmap_window_len;
 };
 
+/* ── Global module state (defined in nvkvm_main.c) ────────────────────────── */
+
+extern struct nvkvm_state nvkvm;
+
 /* ── Function declarations ─────────────────────────────────────────────────── */
 
 /* nvkvm_virtio.c */
