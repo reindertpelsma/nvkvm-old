@@ -154,4 +154,9 @@ int   nvkvm_slot_alloc(struct nvkvm_state *state);
 void  nvkvm_slot_free(struct nvkvm_state *state, int slot);
 void *nvkvm_slot_addr(struct nvkvm_state *state, int slot);
 
+/* Internal transport send (nvkvm_virtio.c) */
+int   nvkvm_send_sync(struct nvkvm_state *state,
+		      void *req_buf, size_t req_len,
+		      struct nvkvm_inflight *inf);
+
 #endif /* NVKVM_H */

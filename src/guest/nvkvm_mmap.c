@@ -21,6 +21,8 @@
  */
 
 #include <linux/mm.h>
+#include <linux/mman.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
@@ -28,8 +30,10 @@
 
 #include "nvkvm.h"
 
+/* Forward declarations for module-internal functions */
 static void nvkvm_vma_open(struct vm_area_struct *vma);
 static void nvkvm_vma_close(struct vm_area_struct *vma);
+bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
 
 static const struct vm_operations_struct nvkvm_vm_ops = {
 	.open  = nvkvm_vma_open,
@@ -88,9 +92,10 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	msg->hdr.type    = cpu_to_le32(NVKVM_REQ_MMAP);
 	msg->hdr.req_id  = cpu_to_le32(req_id);
 	msg->req.fd_token = cpu_to_le32(ctx->fd_token);
-	msg->req.prot     = cpu_to_le32(vma->vm_page_prot.pgprot &
-					(PROT_READ | PROT_WRITE | PROT_EXEC));
-	msg->req.flags    = cpu_to_le32(vma->vm_flags);
+	/* Translate kernel VM_* flags to userspace PROT_* for the host mmap.
+	 * VM_READ/WRITE/EXEC == PROT_READ/WRITE/EXEC numerically on x86. */
+	msg->req.prot     = cpu_to_le32(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC));
+	msg->req.flags    = cpu_to_le32(vma->vm_flags & (VM_SHARED | VM_MAYSHARE));
 	msg->req.offset   = cpu_to_le64((u64)vma->vm_pgoff << PAGE_SHIFT);
 	msg->req.length   = cpu_to_le64(vma_len);
 
@@ -123,7 +128,7 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 
 	/* Set caching attributes: write-combine for framebuffer/BAR pages */
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 
 	ret = remap_pfn_range(vma, vma->vm_start, gpa_base >> PAGE_SHIFT,
 			      vma_len, vma->vm_page_prot);
