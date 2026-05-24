@@ -1,5 +1,7 @@
 # nvkvm — NVIDIA GPU Passthrough for KVM Guests
 
+**Author**: Reindert Pelsma
+
 WSL2-style NVIDIA GPU ioctl forwarding for KVM/QEMU VMs on commodity hardware,
 without vGPU licensing or full PCI passthrough.
 
