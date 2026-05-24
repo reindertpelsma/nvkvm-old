@@ -36,6 +36,19 @@
 
 #include <linux/types.h>
 
+/* ── Virtio device configuration space ──────────────────────────────────── */
+
+/*
+ * Exposed by QEMU in PCI BAR 0 (virtio config space). The guest reads these
+ * fields to locate the shared memory region and the mmap window.
+ */
+struct nvkvm_virtio_config {
+	__le64 shm_base;        /* host-physical base of shared memory      */
+	__le64 shm_len;         /* size of shared memory region in bytes    */
+	__le64 mmap_win_gpa;    /* guest-physical base of mmap window       */
+	__le64 mmap_win_len;    /* size of mmap window in bytes             */
+};
+
 /* ── Protocol version ────────────────────────────────────────────────────── */
 
 #define NVKVM_PROTO_VERSION     1

@@ -171,15 +171,12 @@ static void nvkvm_rx_callback(struct virtqueue *vq)
 
 static void nvkvm_evt_callback(struct virtqueue *vq)
 {
-	struct nvkvm_state *state = vq->vdev->priv;
 	struct nvkvm_evt_poll *evt;
 	unsigned int len;
 
-	while ((evt = virtqueue_get_buf(vq, &len)) != NULL) {
-		/* TODO: look up fd_token in session table, wake poll queue */
-		(void)evt;
+	/* TODO: look up fd_token in session table, wake poll queue */
+	while ((evt = virtqueue_get_buf(vq, &len)) != NULL)
 		kfree(evt);
-	}
 }
 
 /* ── Generic synchronous send ─────────────────────────────────────────────── */
@@ -436,9 +433,9 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	state->vq_evt = vqs[NVKVM_VQ_EVT];
 
 	/* Map shared memory BAR 0 */
-	shm_addr = virtio_cread64(vdev, offsetof(struct virtio_device_config,
+	shm_addr = virtio_cread64(vdev, offsetof(struct nvkvm_virtio_config,
 						 shm_base));
-	shm_len  = virtio_cread64(vdev, offsetof(struct virtio_device_config,
+	shm_len  = virtio_cread64(vdev, offsetof(struct nvkvm_virtio_config,
 						  shm_len));
 
 	if (shm_len < NVKVM_SHM_SLOT_MIN_SIZE) {
@@ -457,6 +454,11 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	}
 	state->shm_size  = shm_len;
 	state->slot_size = NVKVM_SHM_SLOT_DEFAULT_SIZE; /* overridden by negotiate */
+
+	state->mmap_window_gpa_base = virtio_cread64(vdev,
+		offsetof(struct nvkvm_virtio_config, mmap_win_gpa));
+	state->mmap_window_len = virtio_cread64(vdev,
+		offsetof(struct nvkvm_virtio_config, mmap_win_len));
 
 	virtio_device_ready(vdev);
 	return 0;
