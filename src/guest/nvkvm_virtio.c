@@ -190,9 +190,9 @@ static void nvkvm_evt_callback(struct virtqueue *vq)
  *
  * Returns 0 on transport success (inf->status holds the operation result).
  */
-static int nvkvm_send_sync(struct nvkvm_state *state,
-			   void *req_buf, size_t req_len,
-			   struct nvkvm_inflight *inf)
+int nvkvm_send_sync(struct nvkvm_state *state,
+		    void *req_buf, size_t req_len,
+		    struct nvkvm_inflight *inf)
 {
 	struct scatterlist sg;
 	int ret;
