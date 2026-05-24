@@ -18,7 +18,7 @@ echo "Searching for GPU instances with KVM support in $REGION..."
 #   - Reasonable disk space
 #   - Low latency from EU
 vastai search offers \
-    'rentable=true kvm=true disk_space>='"$DISK_GB"' inet_up>'"$MIN_INET_UP"' cuda_max_good>=12.0' \
+    'rentable=true vms_enabled=true disk_space>='"$DISK_GB"' inet_up>'"$MIN_INET_UP"' cuda_max_good>=12.0' \
     --type on-demand \
     --order 'dph_total+' \
     2>/dev/null | head -20

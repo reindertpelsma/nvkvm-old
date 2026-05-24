@@ -228,9 +228,7 @@ struct nvos46_parameters {
 	__u64      offset;
 	__u64      length;
 	__u32      flags;
-	__u32      dma_offset;
 	__u32      status;
-	__u32      reserved;
 };
 
 /* ── NV_ESC_RM_UNMAP_MEMORY_DMA ──────────────────────────────────────────── */
@@ -285,8 +283,9 @@ struct nv_ioctl_card_info {
 	__u64           fb_address;
 	__u64           fb_size;
 	__u32           minor_number;
-	__u8            dev_name[10];
+	__u8            dev_name[14];  /* gVisor NvIoctlCardInfo.DevName is 14 bytes */
 	__u8            reserved3[2];
+	/* 4 bytes implicit trailing padding → sizeof == 80 on x86-64 */
 };
 
 /* ── NV_ESC_CHECK_VERSION_STR ────────────────────────────────────────────── */
