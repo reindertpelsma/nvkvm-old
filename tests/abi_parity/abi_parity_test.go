@@ -13,7 +13,7 @@
 //   cd tests/abi_parity
 //   go test -v ./...
 
-package abi_parity_test
+package abi_parity
 
 // #cgo CFLAGS: -I../../src
 //
