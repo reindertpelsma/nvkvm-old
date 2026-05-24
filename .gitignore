@@ -1,0 +1,39 @@
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.tmp_versions/
+Module.symvers
+modules.builtin
+modules.order
+
+# Go test artifacts
+tests/abi_parity/vendor/
+
+# QEMU build artifacts
+*.so
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# gVisor reference (large, fetched separately)
+gvisor/
+
+# VM images
+*.qcow2
+*.iso
+*.img

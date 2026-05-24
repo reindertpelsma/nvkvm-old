@@ -1,0 +1,9 @@
+obj-m := nvkvm-guest.o
+
+nvkvm-guest-objs := nvkvm_main.o \
+                    nvkvm_ioctl.o \
+                    nvkvm_virtio.o \
+                    nvkvm_mmap.o \
+                    nvkvm_session.o
+
+ccflags-y := -I$(src)/../../src
