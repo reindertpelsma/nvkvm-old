@@ -123,8 +123,11 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return sizeof(struct nv_ioctl_rm_api_version);
 	case NV_ESC_SYS_PARAMS:
 		return sizeof(struct nv_ioctl_sys_params);
-	case NV_ESC_NUMA_INFO:
-		return sizeof(struct nv_ioctl_numa_info);
+	case NV_ESC_NUMA_INFO: {
+		/* Struct grew in newer drivers — accept whatever size the ioctl encodes */
+		size_t sz = _IOC_SIZE(cmd);
+		return sz ? sz : (size_t)-1;
+	}
 	case NV_ESC_WAIT_OPEN_COMPLETE:
 		return sizeof(struct nv_ioctl_wait_open_complete);
 	case NV_ESC_RM_ALLOC_MEMORY:

@@ -8,6 +8,7 @@
  * return -ENOTTY. Ioctls with wrong sizes return -EINVAL.
  */
 
+#include "qemu/osdep.h"
 #include <errno.h>
 #include <sys/ioctl.h>
 
@@ -92,8 +93,11 @@ size_t nvkvm_ioctl_expected_param_size(unsigned int cmd)
 		return sizeof(struct nv_ioctl_rm_api_version);
 	case NV_ESC_SYS_PARAMS:
 		return sizeof(struct nv_ioctl_sys_params);
-	case NV_ESC_NUMA_INFO:
-		return sizeof(struct nv_ioctl_numa_info);
+	case NV_ESC_NUMA_INFO: {
+		/* Struct grew in newer drivers — accept whatever size the ioctl encodes */
+		size_t sz = _IOC_SIZE(cmd);
+		return sz ? sz : (size_t)-1;
+	}
 	case NV_ESC_WAIT_OPEN_COMPLETE:
 		return sizeof(struct nv_ioctl_wait_open_complete);
 	case NV_ESC_RM_ALLOC_MEMORY:
@@ -164,16 +168,45 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		return nvkvm_handle_simple_ioctl(ctx, cmd);
 
 	/*
-	 * UVM channel/vaspace registration: contain fd fields that were
-	 * translated to fd_tokens by the guest; we need to convert back.
-	 * For now, forward as simple (TODO: add fd fixup).
+	 * UVM channel/vaspace registration: rm_ctrl_fd contains an fd_token
+	 * (assigned by QEMU to the guest) that must be translated to the real
+	 * host fd before the UVM driver sees it.  We zero the field on return
+	 * so the guest cannot read back real host fd numbers from shared memory.
 	 */
-	case UVM_REGISTER_GPU_VASPACE:
+	case UVM_REGISTER_GPU_VASPACE: {
+		struct uvm_register_gpu_vaspace_params *p = ctx->params_buf;
+		struct nvkvm_host_fd *ctrl_hfd =
+			nvkvm_fd_lookup(ctx->session, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_hfd) return -EBADF;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_hfd->fd;
+		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		p->rm_ctrl_fd = 0;
+		return ret;
+	}
 	case UVM_UNREGISTER_GPU_VASPACE:
-	case UVM_REGISTER_CHANNEL:
-	case UVM_UNREGISTER_CHANNEL:
-		/* TODO: translate rm_ctrl_fd field from token to host fd */
+		/* no rm_ctrl_fd in this struct — plain passthrough */
 		return nvkvm_handle_simple_ioctl(ctx, cmd);
+
+	case UVM_REGISTER_CHANNEL: {
+		struct uvm_register_channel_params *p = ctx->params_buf;
+		struct nvkvm_host_fd *ctrl_hfd =
+			nvkvm_fd_lookup(ctx->session, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_hfd) return -EBADF;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_hfd->fd;
+		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		p->rm_ctrl_fd = 0;
+		return ret;
+	}
+	case UVM_UNREGISTER_CHANNEL: {
+		struct uvm_unregister_channel_params *p = ctx->params_buf;
+		struct nvkvm_host_fd *ctrl_hfd =
+			nvkvm_fd_lookup(ctx->session, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_hfd) return -EBADF;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_hfd->fd;
+		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		p->rm_ctrl_fd = 0;
+		return ret;
+	}
 
 	case UVM_REGISTER_GPU:
 	case UVM_UNREGISTER_GPU:

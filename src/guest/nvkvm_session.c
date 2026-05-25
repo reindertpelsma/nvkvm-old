@@ -44,8 +44,10 @@ struct nvkvm_session *nvkvm_session_get_or_create(pid_t tgid)
 		mutex_unlock(&nvkvm.sessions_lock);
 		return ERR_PTR(-ENOMEM);
 	}
-	session->tgid     = tgid;
-	session->refcount = 1;
+	session->tgid       = tgid;
+	session->refcount   = 1;
+	session->isolate_id = 0;
+	mutex_init(&session->isolate_lock);
 
 	id = idr_alloc(&nvkvm.sessions_idr, session, 1, 0, GFP_KERNEL);
 	if (id < 0) {
@@ -62,13 +64,22 @@ struct nvkvm_session *nvkvm_session_get_or_create(pid_t tgid)
 void nvkvm_session_put(struct nvkvm_session *session)
 {
 	bool last;
+	__u32 isolate_id = 0;
 
 	mutex_lock(&nvkvm.sessions_lock);
 	last = --session->refcount == 0;
-	if (last)
+	if (last) {
 		idr_remove(&nvkvm.sessions_idr, session->id);
+		isolate_id = session->isolate_id;
+		session->isolate_id = 0;
+	}
 	mutex_unlock(&nvkvm.sessions_lock);
 
-	if (last)
+	if (last) {
+		/* Kill the isolate process before freeing the session struct. */
+		if (isolate_id)
+			nvkvm_virtio_kill_isolate(isolate_id);
+		mutex_destroy(&session->isolate_lock);
 		kfree(session);
+	}
 }

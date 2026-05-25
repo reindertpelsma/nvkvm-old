@@ -2,23 +2,50 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -g \
           -Istubs \
           -I../../src \
-          -I../../src/qemu
+          -I../../src/qemu \
+          -I../../src/common
 LDFLAGS = -lpthread
 
-SRCS = test_dispatch.c \
-       ../../src/qemu/nvkvm_objects.c \
-       ../../src/qemu/nvkvm_dispatch.c \
-       frontend_stubs.c
+DISPATCH_SRCS = test_dispatch.c \
+                ../../src/qemu/nvkvm_objects.c \
+                ../../src/qemu/nvkvm_dispatch.c \
+                frontend_stubs.c
+
+FRONTEND_SRCS = test_frontend.c \
+                ../../src/qemu/nvkvm_frontend.c \
+                ../../src/qemu/nvkvm_objects.c
+
+HANDLE_SRCS   = test_handle.c \
+                ../../src/qemu/nvkvm_handle.c
+
+ISOLATE_SRCS  = test_isolate.c \
+                ../../src/qemu/nvkvm_isolate.c \
+                ../../src/qemu/nvkvm_handle.c
 
 .PHONY: all clean run
 
-all: test_dispatch
+all: test_dispatch test_frontend test_handle mock_stub test_isolate
 
-test_dispatch: $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
+test_dispatch: $(DISPATCH_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
 
-run: test_dispatch
+test_frontend: $(FRONTEND_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(FRONTEND_SRCS) $(LDFLAGS)
+
+test_handle: $(HANDLE_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(HANDLE_SRCS) $(LDFLAGS)
+
+mock_stub: mock_stub.c
+	$(CC) $(CFLAGS) -o $@ mock_stub.c
+
+test_isolate: $(ISOLATE_SRCS) mock_stub
+	$(CC) $(CFLAGS) -o $@ $(ISOLATE_SRCS) $(LDFLAGS)
+
+run: test_dispatch test_frontend test_handle test_isolate
 	./test_dispatch
+	./test_frontend
+	./test_handle
+	./test_isolate
 
 clean:
-	rm -f test_dispatch
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate

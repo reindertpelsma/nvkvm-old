@@ -368,3 +368,108 @@ TEST(test_nvos00_size) {
 TEST(test_uvm_initialize_size) {
 	ASSERT_EQ(sizeof(struct uvm_initialize_params), 16U);
 }
+
+/*
+ * Bug: NV_ESC_NUMA_INFO param size was hard-coded to sizeof(struct
+ * nv_ioctl_numa_info) = 32 bytes, but the driver 575.x struct grew to 560
+ * bytes. The fix was to use _IOC_SIZE(cmd) instead.
+ *
+ * These tests verify the fixed behavior: the dispatch table accepts whatever
+ * size the ioctl command encodes, not a hard-coded struct size.
+ */
+
+/* Helper: build a NUMA_INFO ioctl command encoding a specific byte count */
+static unsigned int make_numa_info_cmd(unsigned int size_bytes)
+{
+	return _IOC(_IOC_READ | _IOC_WRITE, 'F', NV_ESC_NUMA_INFO, size_bytes);
+}
+
+TEST(test_numa_info_size_from_ioc_size_32) {
+	/*
+	 * Old (broken): sizeof(struct nv_ioctl_numa_info) == 32.
+	 * Old behavior: only cmd with IOC_SIZE==32 was accepted.
+	 * New behavior: IOC_SIZE is authoritative; 32 is valid.
+	 */
+	unsigned int cmd = make_numa_info_cmd(32);
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	/* Must return exactly 32, not (size_t)-1 */
+	ASSERT_EQ(sz, 32U);
+}
+
+TEST(test_numa_info_size_from_ioc_size_560) {
+	/*
+	 * Driver 575.x sends a 560-byte NUMA_INFO struct.
+	 * Before the fix, this returned (size_t)-1 (unknown size),
+	 * causing QEMU to reject the ioctl with EINVAL before forwarding.
+	 */
+	unsigned int cmd = make_numa_info_cmd(560);
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	ASSERT_EQ(sz, 560U);
+}
+
+TEST(test_numa_info_size_zero_rejected) {
+	/* IOC_SIZE == 0 is invalid and must be rejected */
+	unsigned int cmd = _IOC(_IOC_READ | _IOC_WRITE, 'F', NV_ESC_NUMA_INFO, 0);
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	ASSERT_EQ(sz, (size_t)-1);
+}
+
+TEST(test_numa_info_size_arbitrary_nonzero) {
+	/* Any non-zero IOC_SIZE is accepted (driver versioning) */
+	unsigned int cmd = make_numa_info_cmd(128);
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	ASSERT_EQ(sz, 128U);
+}
+
+TEST(test_numa_info_old_sizeof_would_fail_560) {
+	/*
+	 * Regression guard: if someone restores the old sizeof()-based check,
+	 * this test would catch it.  The fix must NOT hardcode any specific size.
+	 *
+	 * Verify: expected size for cmd encoding 560 bytes != old sizeof (32).
+	 */
+	unsigned int cmd = make_numa_info_cmd(560);
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	/* If this fails, it means the old bug was re-introduced */
+	ASSERT_NE(sz, 32U);
+	ASSERT_EQ(sz, 560U);
+}
+
+/*
+ * CARD_INFO size handling also uses IOC_SIZE (correct pattern).
+ * Test edge cases in CARD_INFO to ensure the pattern is consistent.
+ */
+
+TEST(test_card_info_max_entries_exactly) {
+	/* Exactly the maximum allowed array size */
+	size_t max_sz = sizeof(struct nv_ioctl_card_info) *
+			NV_IOCTL_CARD_INFO_MAX_ENTRIES;
+	unsigned int cmd = _IOC(_IOC_READ | _IOC_WRITE, 'F',
+				NV_ESC_CARD_INFO, max_sz);
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	ASSERT_EQ(sz, max_sz);
+}
+
+TEST(test_card_info_single_entry) {
+	unsigned int cmd = _IOC(_IOC_READ | _IOC_WRITE, 'F',
+				NV_ESC_CARD_INFO,
+				sizeof(struct nv_ioctl_card_info));
+	size_t sz = nvkvm_ioctl_expected_param_size(cmd);
+	ASSERT_EQ(sz, sizeof(struct nv_ioctl_card_info));
+}
+
+/*
+ * Slot-size guard: the SHM slot must be large enough to hold the largest
+ * known ioctl parameter struct. If NVKVM_SHM_SLOT_MIN_SIZE < the largest
+ * struct, something would silently get truncated.
+ */
+
+TEST(test_shm_slot_fits_largest_param) {
+	/* nvos32_parameters is currently the largest frontend struct */
+	ASSERT_TRUE(NVKVM_SHM_SLOT_MIN_SIZE >= sizeof(struct nvos32_parameters));
+}
+
+TEST(test_shm_slot_fits_numa_info_560) {
+	/* 560-byte NUMA_INFO must fit in the minimum slot size */
+	ASSERT_TRUE(NVKVM_SHM_SLOT_MIN_SIZE >= 560U);
+}

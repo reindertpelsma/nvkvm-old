@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
 /*
- * nvkvm_proto.h — virtio-nvgpu wire protocol
+ * nvkvm_proto.h — virtio-nvgpu wire protocol (isolate architecture)
  *
  * Shared between the guest kernel module (nvkvm-guest.ko) and the QEMU virtio
  * device backend. Both sides must be compiled with the same version of this
@@ -9,26 +9,33 @@
  * Transport: a single virtio device with three virtqueues:
  *   VQ 0 (TX): guest → host requests
  *   VQ 1 (RX): host → guest responses
- *   VQ 2 (EVT): host → guest async events (poll/epoll notifications)
- *
- * Shared memory region (BAR 0): used for ioctl parameter blobs and for
- * GPU mmap regions that need zero-copy guest access. The region is divided
- * into fixed-size slots allocated by the guest and confirmed by the host.
+ *   VQ 2 (EVT): host → guest async events (poll notifications)
  *
  * Security model
  * ==============
- * QEMU validates every field in every request. The guest kernel module
- * validates every field from guest userspace before forwarding. Neither side
- * trusts the other beyond what is proven by the protocol invariants below.
+ * QEMU validates every field in every request. Unknown handle IDs or isolate IDs
+ * cause QEMU to immediately panic the VM — the guest kernel should never send
+ * invalid values; if it does, it is compromised.
  *
- * Notable invariants:
- *  - param_size is validated against the known size for the ioctl command
- *    before any pointer dereference on the host side.
- *  - shm_offset + param_size must fit within the negotiated shared region.
- *  - fd_token values are checked against the per-session open-FD table on the
- *    host side; unknown tokens are rejected with EBADF.
- *  - All handles in RM alloc/control/free requests are validated against the
- *    per-client object graph before the real ioctl is issued.
+ * The guest kernel module validates every field from guest userspace before
+ * forwarding over virtio. Neither side trusts the other beyond what is proven
+ * by the protocol invariants below.
+ *
+ * Isolate architecture
+ * ====================
+ * Each guest userspace process (identified by mm_struct) has exactly one
+ * "isolate" host process that mirrors its virtual address space. The isolate
+ * has GPU device fds dup'd in via SCM_RIGHTS and replays every mmap at the
+ * same GVA (MAP_FIXED), so the NVIDIA driver sees valid mappings in current->mm
+ * when processing ioctls. QEMU routes all ioctls through the correct isolate.
+ *
+ * Handle IDs
+ * ==========
+ * Two types, both 32-bit opaque integers, globally unique across all sessions:
+ *   nvidia handle: wraps an open /dev/nvidia* fd kept in QEMU
+ *   memory handle: wraps a memfd kept in QEMU
+ * Handles may be distributed to isolates via SCM_RIGHTS. QEMU tracks which
+ * isolates hold each handle. close_handle requires no isolates to hold the handle.
  */
 
 #ifndef NVKVM_PROTO_H
@@ -38,10 +45,6 @@
 
 /* ── Virtio device configuration space ──────────────────────────────────── */
 
-/*
- * Exposed by QEMU in PCI BAR 0 (virtio config space). The guest reads these
- * fields to locate the shared memory region and the mmap window.
- */
 struct nvkvm_virtio_config {
 	__le64 shm_base;        /* host-physical base of shared memory      */
 	__le64 shm_len;         /* size of shared memory region in bytes    */
@@ -51,46 +54,29 @@ struct nvkvm_virtio_config {
 
 /* ── Protocol version ────────────────────────────────────────────────────── */
 
-#define NVKVM_PROTO_VERSION     1
+#define NVKVM_PROTO_VERSION     2
 
 /* ── Virtqueue indices ───────────────────────────────────────────────────── */
 
 #define NVKVM_VQ_TX     0  /* guest → host requests        */
-#define NVKVM_VQ_RX     1  /* host → guest responses        */
-#define NVKVM_VQ_EVT    2  /* host → guest async events     */
+#define NVKVM_VQ_RX     1  /* host → guest responses       */
+#define NVKVM_VQ_EVT    2  /* host → guest async events    */
 #define NVKVM_NUM_VQS   3
 
 /* ── Shared memory layout ────────────────────────────────────────────────── */
 
-/*
- * The shared memory BAR is divided into NVKVM_SHM_NSLOTS fixed-size slots.
- * Slot 0 is reserved for control (feature negotiation, etc.).
- * Slots 1..N-1 are used for ioctl parameter blobs and mmap regions.
- *
- * Slot size is negotiated during feature exchange and must be a power of two
- * >= NVKVM_SHM_SLOT_MIN_SIZE.
- */
-#define NVKVM_SHM_SLOT_MIN_SIZE     (4096)          /* 4 KiB minimum        */
-#define NVKVM_SHM_SLOT_DEFAULT_SIZE (64 * 1024)     /* 64 KiB default       */
-#define NVKVM_SHM_NSLOTS            256             /* 256 slots = 16 MiB   */
+#define NVKVM_SHM_SLOT_MIN_SIZE     (4096)
+#define NVKVM_SHM_SLOT_DEFAULT_SIZE (64 * 1024)
+#define NVKVM_SHM_NSLOTS            256
 #define NVKVM_SHM_CTRL_SLOT         0
 
-/* Shared memory control block (slot 0) */
 struct nvkvm_shm_ctrl {
-	__le32 proto_version;       /* NVKVM_PROTO_VERSION              */
-	__le32 slot_size;           /* negotiated slot size in bytes     */
-	__le32 nslots;              /* total number of slots             */
+	__le32 proto_version;
+	__le32 slot_size;
+	__le32 nslots;
 	__le32 reserved;
-	__u8   driver_version[64];  /* host NVIDIA driver version string */
+	__u8   driver_version[64];
 };
-
-/* ── Request types ───────────────────────────────────────────────────────── */
-
-#define NVKVM_REQ_OPEN       1  /* open /dev/nvidia* device           */
-#define NVKVM_REQ_CLOSE      2  /* close a previously opened device   */
-#define NVKVM_REQ_IOCTL      3  /* forward an ioctl                   */
-#define NVKVM_REQ_MMAP       4  /* create a GPU memory mapping        */
-#define NVKVM_REQ_MUNMAP     5  /* tear down a GPU memory mapping     */
 
 /* ── Device identifiers ──────────────────────────────────────────────────── */
 
@@ -98,19 +84,109 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_DEV_UVM        1          /* /dev/nvidia-uvm               */
 #define NVKVM_DEV_GPU(n)     (16 + (n)) /* /dev/nvidia0 → /dev/nvidia15  */
 
-/* ── Open request ────────────────────────────────────────────────────────── */
+/* ── Request types ───────────────────────────────────────────────────────── */
 
+/* Legacy (compat, will be removed) */
+#define NVKVM_REQ_OPEN                   1
+#define NVKVM_REQ_CLOSE                  2
+
+/* Isolate/handle architecture */
+#define NVKVM_REQ_LIST_NVIDIA_DEVICES    10  /* enumerate host GPU devices     */
+#define NVKVM_REQ_OPEN_NVIDIA_HANDLE     11  /* open /dev/nvidia* in QEMU      */
+#define NVKVM_REQ_OPEN_MEMORY_HANDLE     12  /* memfd_create in QEMU           */
+#define NVKVM_REQ_CLOSE_HANDLE           13  /* close when no isolate holds it */
+#define NVKVM_REQ_CREATE_ISOLATE         14  /* spawn isolate process          */
+#define NVKVM_REQ_KILL_ISOLATE           15  /* exit isolate process           */
+#define NVKVM_REQ_COPY_HANDLE_TO_ISOLATE 16  /* SCM_RIGHTS send                */
+#define NVKVM_REQ_CLOSE_HANDLE_ON_ISOLATE 17 /* CLOSE_FD cmd to isolate        */
+#define NVKVM_REQ_IOCTL_ON_ISOLATE       18  /* IOCTL cmd via isolate          */
+#define NVKVM_REQ_MMAP_ON_ISOLATE        19  /* MMAP cmd via isolate           */
+#define NVKVM_REQ_MUNMAP_ON_ISOLATE      20  /* MUNMAP cmd via isolate         */
+#define NVKVM_REQ_POLL_ON_ISOLATE        21  /* start polling fd in isolate    */
+#define NVKVM_REQ_UNPOLL_ON_ISOLATE      22  /* stop polling fd in isolate     */
+#define NVKVM_REQ_WRITE_MEMORY_HANDLE    23  /* shm_slot → memfd (page upload) */
+#define NVKVM_REQ_READ_MEMORY_HANDLE     24  /* memfd → shm_slot (writeback)   */
+
+/* ── Generic header ──────────────────────────────────────────────────────── */
+
+struct nvkvm_hdr {
+	__le32 type;        /* NVKVM_REQ_*                            */
+	__le32 req_id;      /* guest-assigned, echoed in response     */
+};
+
+/* ── LIST_NVIDIA_DEVICES ─────────────────────────────────────────────────── */
+
+struct nvkvm_req_list_nvidia_devices {
+	/* no payload */
+};
+
+#define NVKVM_MAX_DEVICES  32
+
+struct nvkvm_device_info {
+	__le32 dev_id;       /* NVKVM_DEV_* */
+	__le32 flags;        /* reserved    */
+	__le64 reserved;
+};
+
+struct nvkvm_resp_list_nvidia_devices {
+	__le32 ndevices;
+	__le32 status;
+	struct nvkvm_device_info devices[NVKVM_MAX_DEVICES];
+};
+
+/* ── OPEN_NVIDIA_HANDLE ──────────────────────────────────────────────────── */
+
+struct nvkvm_req_open_nvidia_handle {
+	__le32 dev_id;       /* NVKVM_DEV_*                          */
+	__le32 flags;        /* O_RDWR etc.                          */
+	__le32 session_id;   /* guest session                        */
+	__le32 reserved;
+};
+
+struct nvkvm_resp_open_nvidia_handle {
+	__le32 handle_id;    /* globally unique handle               */
+	__le32 status;       /* 0 = success, errno otherwise         */
+};
+
+/* Kept for compat with existing open path */
 struct nvkvm_req_open {
-	__le32 dev_id;      /* NVKVM_DEV_* identifying which device to open */
-	__le32 flags;       /* O_RDWR, O_RDONLY, etc.                       */
+	__le32 dev_id;
+	__le32 flags;
+	__le32 session_id;
+	__le32 reserved;
 };
 
 struct nvkvm_resp_open {
-	__le32 fd_token;    /* opaque handle used in subsequent requests    */
-	__le32 status;      /* 0 = success, errno otherwise                 */
+	__le32 fd_token;
+	__le32 status;
 };
 
-/* ── Close request ───────────────────────────────────────────────────────── */
+/* ── OPEN_MEMORY_HANDLE ──────────────────────────────────────────────────── */
+
+struct nvkvm_req_open_memory_handle {
+	__le64 size;         /* initial size (may be 0 for grow-on-demand) */
+	__le32 session_id;
+	__le32 flags;        /* reserved                               */
+};
+
+struct nvkvm_resp_open_memory_handle {
+	__le32 handle_id;
+	__le32 status;
+};
+
+/* ── CLOSE_HANDLE ────────────────────────────────────────────────────────── */
+
+struct nvkvm_req_close_handle {
+	__le32 handle_id;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_close_handle {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── CLOSE (legacy) ──────────────────────────────────────────────────────── */
 
 struct nvkvm_req_close {
 	__le32 fd_token;
@@ -122,74 +198,239 @@ struct nvkvm_resp_close {
 	__le32 reserved;
 };
 
-/* ── Ioctl request ───────────────────────────────────────────────────────── */
+/* ── CREATE_ISOLATE ──────────────────────────────────────────────────────── */
+
+struct nvkvm_req_create_isolate {
+	__le32 session_id;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_create_isolate {
+	__le32 isolate_id;   /* opaque isolate identifier            */
+	__le32 status;
+};
+
+/* ── KILL_ISOLATE ────────────────────────────────────────────────────────── */
+
+struct nvkvm_req_kill_isolate {
+	__le32 isolate_id;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_kill_isolate {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── COPY_HANDLE_TO_ISOLATE ──────────────────────────────────────────────── */
+
+struct nvkvm_req_copy_handle_to_isolate {
+	__le32 handle_id;
+	__le32 isolate_id;
+};
+
+struct nvkvm_resp_copy_handle_to_isolate {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── CLOSE_HANDLE_ON_ISOLATE ─────────────────────────────────────────────── */
+
+struct nvkvm_req_close_handle_on_isolate {
+	__le32 handle_id;
+	__le32 isolate_id;
+};
+
+struct nvkvm_resp_close_handle_on_isolate {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── IOCTL_ON_ISOLATE ────────────────────────────────────────────────────── */
 
 /*
- * The parameter blob for the ioctl is written by the guest into the shared
- * memory slot identified by shm_slot before submitting this request.
- * The host reads the blob, translates any embedded pointers, calls the real
- * ioctl, writes the updated blob back into the same slot, then posts the
- * response.
+ * The parameter blob and aux buffer are placed in shared memory slots.
+ * vma_whitelist_slot holds an array of nvkvm_vma_entry structs (see below)
+ * used for demand-fault resolution. Set vma_whitelist_nentries = 0 to skip.
  *
- * param_size must equal the known fixed size for cmd; the host rejects any
- * request where param_size doesn't match.
- *
- * For ioctls that contain embedded pointers to secondary buffers (e.g.
- * NV_ESC_RM_CONTROL with a param buffer, or NV_ESC_CARD_INFO with an array),
- * the guest places the secondary buffer in shm_aux_slot and sets aux_size.
- * The host's handler is responsible for knowing which ioctls require this.
+ * flags:
+ *   NVKVM_IOCTL_FL_RETRY_EFAULT — this is a retry after demand-fault mapping
  */
+#define NVKVM_IOCTL_FL_RETRY_EFAULT  (1 << 0)
+
+struct nvkvm_req_ioctl_on_isolate {
+	__le32 isolate_id;
+	__le32 handle_id;            /* which nvidia handle (fd)              */
+	__le32 cmd;                  /* full ioctl command                    */
+	__le32 param_size;           /* size of param blob in shm_slot        */
+	__le32 shm_slot;             /* slot index for param blob             */
+	__le32 aux_size;             /* aux buffer size (0 if none)           */
+	__le32 shm_aux_slot;         /* slot index for aux buffer             */
+	__le32 vma_whitelist_nentries; /* # of VMA whitelist entries          */
+	__le32 vma_whitelist_slot;   /* slot for nvkvm_vma_entry array        */
+	__le32 flags;                /* NVKVM_IOCTL_FL_*                      */
+	__le32 session_id;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_ioctl_on_isolate {
+	__le64 retval;               /* raw ioctl return value                */
+	__le32 status;               /* 0 = ok, errno on transport error      */
+	__le32 nvstatus;             /* NvStatus from params.status field     */
+	__le64 fault_addr;           /* GVA that caused SIGSEGV (0 if none)  */
+};
+
+/* VMA entry for demand-fault whitelist */
+struct nvkvm_vma_entry {
+	__le64 start;   /* inclusive */
+	__le64 end;     /* exclusive */
+	__le32 prot;    /* PROT_READ | PROT_WRITE | PROT_EXEC */
+	__le32 reserved;
+};
+
+/* Maximum whitelist entries per ioctl */
+#define NVKVM_MAX_VMA_ENTRIES  1024
+
+/* ── MMAP_ON_ISOLATE ─────────────────────────────────────────────────────── */
+
+/*
+ * Asks QEMU to:
+ *   1. mmap the handle fd at any host VA (QVA), register GPA→QVA in KVM slot.
+ *   2. Send MMAP command to isolate: map same fd at gva (MAP_FIXED).
+ * Returns the GPA allocated for the guest to use in remap_pfn_range.
+ */
+struct nvkvm_req_mmap_on_isolate {
+	__le32 isolate_id;
+	__le32 handle_id;
+	__le64 gva;              /* exact guest VA to map in the isolate   */
+	__le64 offset;           /* fd offset                              */
+	__le64 length;           /* mapping length                         */
+	__le32 prot;             /* PROT_READ | PROT_WRITE | ...           */
+	__le32 map_flags;        /* MAP_SHARED etc. (MAP_FIXED added by QEMU) */
+	__le32 session_id;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_mmap_on_isolate {
+	__le64 gpa_base;         /* GPA for remap_pfn_range                */
+	__le64 length;           /* actual mapped length (page-aligned)    */
+	__le32 mmap_token;       /* opaque handle for munmap               */
+	__le32 status;
+};
+
+/* ── MUNMAP_ON_ISOLATE ───────────────────────────────────────────────────── */
+
+struct nvkvm_req_munmap_on_isolate {
+	__le32 isolate_id;
+	__le32 mmap_token;
+};
+
+struct nvkvm_resp_munmap_on_isolate {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── POLL_ON_ISOLATE ─────────────────────────────────────────────────────── */
+
+struct nvkvm_req_poll_on_isolate {
+	__le32 isolate_id;
+	__le32 handle_id;
+	__le32 events;           /* POLLIN | POLLOUT | ...                 */
+	__le32 reserved;
+};
+
+struct nvkvm_resp_poll_on_isolate {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── UNPOLL_ON_ISOLATE ───────────────────────────────────────────────────── */
+
+struct nvkvm_req_unpoll_on_isolate {
+	__le32 isolate_id;
+	__le32 handle_id;
+};
+
+struct nvkvm_resp_unpoll_on_isolate {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── Async poll event (VQ_EVT) ───────────────────────────────────────────── */
+
+struct nvkvm_evt_poll {
+	__le32 isolate_id;
+	__le32 handle_id;
+	__le32 events;
+	__le32 reserved;
+};
+
+/* ── WRITE_MEMORY_HANDLE ─────────────────────────────────────────────────── */
+/* Copy shm_slot[0..size) into memfd at offset (CPU page upload). */
+
+struct nvkvm_req_write_memory_handle {
+	__le32 handle_id;
+	__le32 shm_slot;
+	__le64 offset;
+	__le32 size;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_write_memory_handle {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* ── READ_MEMORY_HANDLE ──────────────────────────────────────────────────── */
+/* Copy memfd at offset into shm_slot[0..size) (CPU page writeback). */
+
+struct nvkvm_req_read_memory_handle {
+	__le32 handle_id;
+	__le32 shm_slot;
+	__le64 offset;
+	__le32 size;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_read_memory_handle {
+	__le32 status;
+	__le32 reserved;
+};
+
+/* Legacy ioctl request (retained for dispatch.c compat) */
 struct nvkvm_req_ioctl {
-	__le32 fd_token;        /* which open device FD                  */
-	__le32 cmd;             /* full ioctl command (including type/nr) */
-	__le32 param_size;      /* size of parameter blob in shm_slot    */
-	__le32 shm_slot;        /* slot index for parameter blob         */
-	__le32 aux_size;        /* size of auxiliary buffer (0 if none)  */
-	__le32 shm_aux_slot;    /* slot index for auxiliary buffer       */
-	__le32 session_id;      /* per-guest-process session identifier  */
+	__le32 fd_token;
+	__le32 cmd;
+	__le32 param_size;
+	__le32 shm_slot;
+	__le32 aux_size;
+	__le32 shm_aux_slot;
+	__le32 session_id;
 	__le32 reserved;
 };
 
 struct nvkvm_resp_ioctl {
-	__le64 retval;          /* raw ioctl return value (typically 0)  */
-	__le32 status;          /* 0 = success, errno otherwise          */
+	__le64 retval;
+	__le32 status;
 	__le32 reserved;
-	/* updated parameter blob is already in shm_slot */
 };
 
-/* ── Mmap request ────────────────────────────────────────────────────────── */
-
-/*
- * The guest kernel module calls mmap on a nvidia device fd. Instead of
- * directly mapping hardware pages, it asks the host to:
- *   1. Call mmap on the real host fd.
- *   2. Map the resulting host pages into a contiguous GPA range (via
- *      KVM_SET_USER_MEMORY_REGION or equivalent).
- *   3. Return the GPA base to the guest so it can establish process mappings.
- *
- * The host allocates a GPA range from the device's mmio window (BAR 1) and
- * returns gpa_base. The guest kernel module then maps [gpa_base, gpa_base+len)
- * into the requesting process's VMA.
- *
- * prot and flags mirror the mmap(2) arguments as seen from guest userspace.
- */
+/* Legacy mmap request */
 struct nvkvm_req_mmap {
 	__le32 fd_token;
-	__le32 prot;        /* PROT_READ | PROT_WRITE | ...           */
-	__le32 flags;       /* MAP_SHARED, etc.                       */
+	__le32 prot;
+	__le32 flags;
 	__le32 reserved;
-	__le64 offset;      /* file offset passed to mmap             */
-	__le64 length;      /* mapping length in bytes                */
+	__le64 offset;
+	__le64 length;
 };
 
 struct nvkvm_resp_mmap {
-	__le64 gpa_base;    /* guest physical address of mapping      */
-	__le64 length;      /* actual mapped length (page-aligned)    */
-	__le32 mmap_token;  /* opaque handle for munmap               */
-	__le32 status;      /* 0 = success, errno otherwise           */
+	__le64 gpa_base;
+	__le64 length;
+	__le32 mmap_token;
+	__le32 status;
 };
-
-/* ── Munmap request ──────────────────────────────────────────────────────── */
 
 struct nvkvm_req_munmap {
 	__le32 mmap_token;
@@ -201,32 +442,6 @@ struct nvkvm_resp_munmap {
 	__le32 reserved;
 };
 
-/* ── Async event notification (VQ_EVT) ──────────────────────────────────── */
-
-/*
- * When a guest process is polling on a /dev/nvidia* fd and the host fd
- * becomes readable/writable/exceptional, the host posts an event notification
- * on VQ_EVT so the guest kernel module can wake up waiting processes.
- */
-struct nvkvm_evt_poll {
-	__le32 fd_token;
-	__le32 events;      /* POLLIN | POLLOUT | POLLERR | ...       */
-};
-
-/* ── Generic virtio descriptor header ───────────────────────────────────── */
-
-/*
- * Every descriptor placed on VQ_TX starts with this header so the host can
- * dispatch to the right handler before reading the type-specific payload.
- * Every descriptor on VQ_RX and VQ_EVT also starts with a matching header
- * (with the same req_id echoed back) for correlation.
- */
-struct nvkvm_hdr {
-	__le32 type;        /* NVKVM_REQ_*                            */
-	__le32 req_id;      /* guest-assigned, echoed in response     */
-};
-
-/* Maximum size of the type-specific payload following nvkvm_hdr on VQ_TX */
-#define NVKVM_MAX_REQ_PAYLOAD  sizeof(struct nvkvm_req_ioctl)
+#define NVKVM_MAX_REQ_PAYLOAD  sizeof(struct nvkvm_req_ioctl_on_isolate)
 
 #endif /* NVKVM_PROTO_H */

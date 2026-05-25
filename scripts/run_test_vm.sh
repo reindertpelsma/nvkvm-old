@@ -2,33 +2,64 @@
 # run_test_vm.sh — launch a KVM guest VM with virtio-nvgpu device
 #
 # This starts a QEMU VM with:
-#   - The virtio-nvgpu device patched into QEMU
-#   - nvkvm-guest.ko available to load in the guest
-#   - A shared directory with the test suite
+#   - The virtio-nvgpu device patched into QEMU (built by scripts/build_qemu.sh)
+#   - nvkvm-guest.ko available to build/load in the guest via 9p virtfs
+#   - Ubuntu 24.04 cloud image prepared by scripts/setup_guest.sh
 #
 # Prerequisites:
-#   - QEMU patched with the virtio-nvgpu device (hw/misc/virtio-nvgpu.c)
-#   - nvkvm-guest.ko built in src/guest/
-#   - Ubuntu cloud image at /var/lib/libvirt/images/ubuntu-22.04-nvkvm.qcow2
+#   - scripts/build_qemu.sh has been run  (or system QEMU has virtio-nvgpu)
+#   - scripts/setup_guest.sh has been run
+#
+# Environment overrides:
+#   QEMU_BIN — path to qemu-system-x86_64 binary
 
 set -euo pipefail
 
-QEMU=${QEMU_BIN:-qemu-system-x86_64}
-IMG=/var/lib/libvirt/images/ubuntu-22.04-nvkvm.qcow2
-SEED=/tmp/nvkvm-cloud-init/seed.iso
-MODULE_DIR=$(realpath "$(dirname "$0")/../src/guest")
-TEST_DIR=$(realpath "$(dirname "$0")/../tests")
+REPO_ROOT="$(realpath "$(dirname "$0")/..")"
+
+# ── QEMU binary: prefer our patched build, fall back to system QEMU ───────
+NVKVM_QEMU="/opt/qemu-nvkvm/bin/qemu-system-x86_64"
+if [ -n "${QEMU_BIN:-}" ]; then
+    QEMU="$QEMU_BIN"
+elif [ -x "$NVKVM_QEMU" ]; then
+    QEMU="$NVKVM_QEMU"
+    echo "INFO: Using patched QEMU at $NVKVM_QEMU"
+else
+    QEMU="qemu-system-x86_64"
+    echo "WARN: $NVKVM_QEMU not found — falling back to system QEMU."
+    echo "      Run scripts/build_qemu.sh to build the patched binary."
+fi
+
+# ── Paths ─────────────────────────────────────────────────────────────────
+IMG="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+SEED="/opt/nvkvm-guest/seed.iso"
 SSH_PORT=2222
 
+# Validate required files.
+if [ ! -f "$IMG" ]; then
+    echo "ERROR: disk image not found at $IMG"
+    echo "       Run scripts/setup_guest.sh first."
+    exit 1
+fi
+if [ ! -f "$SEED" ]; then
+    echo "ERROR: cloud-init seed ISO not found at $SEED"
+    echo "       Run scripts/setup_guest.sh first."
+    exit 1
+fi
+
 echo "Starting nvkvm test VM..."
-echo "SSH will be available at: ssh nvkvm@localhost -p $SSH_PORT"
+echo "QEMU         : $QEMU"
+echo "Disk image   : $IMG"
+echo "Seed ISO     : $SEED"
+echo "Repo (9p)    : $REPO_ROOT  →  guest:/mnt/nvkvm  (tag: nvkvm_src)"
+echo "SSH          : ssh ubuntu@localhost -p $SSH_PORT"
 echo ""
 
 exec "$QEMU" \
     -enable-kvm \
     -m 4G \
     -smp 4 \
-    -cpu host \
+    -cpu host,hypervisor=off \
     \
     -drive file="$IMG",format=qcow2,if=virtio \
     -drive file="$SEED",format=raw,if=virtio,readonly=on \
@@ -36,10 +67,9 @@ exec "$QEMU" \
     -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=net0 \
     \
-    -device virtio-nvgpu-pci \
+    -device virtio-nvgpu-pci-non-transitional \
     \
-    -virtfs local,path="$MODULE_DIR",mount_tag=nvkvm_module,security_model=mapped \
-    -virtfs local,path="$TEST_DIR",mount_tag=nvkvm_tests,security_model=mapped \
+    -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped \
     \
     -serial stdio \
     -display none \

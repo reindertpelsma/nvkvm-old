@@ -36,23 +36,54 @@
  * guest-owned memory), VFIO integration is a future extension point.
  */
 
+#include "qemu/osdep.h"
 #include <sys/mman.h>
-#include <linux/kvm.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "virtio_nvgpu.h"
 
+/*
+ * Inline KVM memory region API — avoids including <linux/kvm.h> which
+ * conflicts with QEMU's internal header chain (resettable.h typedef issue).
+ * Values are stable ABI constants on Linux x86-64.
+ */
+#ifndef KVM_SET_USER_MEMORY_REGION
+#define NVKVM_KVMIO                     0xAE
+#define KVM_MEM_READONLY                (1UL << 1)
+#define KVM_SET_USER_MEMORY_REGION      _IOW(NVKVM_KVMIO, 0x46, \
+					     struct nvkvm_kvm_mem_region)
+struct nvkvm_kvm_mem_region {
+	uint32_t slot;
+	uint32_t flags;
+	uint64_t guest_phys_addr;
+	uint64_t memory_size;
+	uint64_t userspace_addr;
+};
+#else
+typedef struct kvm_userspace_memory_region nvkvm_kvm_mem_region;
+#endif
+
 /* KVM VM fd opened at device init */
 static int kvm_vm_fd = -1;
+/* Exposed for nvkvm_isolate_handlers.c */
+int nvkvm_kvm_vm_fd = -1;
 
 void nvkvm_set_kvm_vm_fd(int fd)
 {
-	kvm_vm_fd = fd;
+	kvm_vm_fd     = fd;
+	nvkvm_kvm_vm_fd = fd;
+}
+
+/* Thin wrapper used by nvkvm_isolate_handlers.c for double-mmap GPA allocation */
+void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out)
+{
+	*gpa_out = alloc_gpa(nv, length);
 }
 
 /* ── GPA allocator ────────────────────────────────────────────────────────── */
@@ -99,9 +130,9 @@ static int next_kvm_slot = NVKVM_KVM_SLOT_BASE;
 static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 				 bool readonly, int *slot_out)
 {
-	struct kvm_userspace_memory_region region = {
+	struct nvkvm_kvm_mem_region region = {
 		.slot            = next_kvm_slot++,
-		.flags           = readonly ? KVM_MEM_READONLY : 0,
+		.flags           = readonly ? (uint32_t)KVM_MEM_READONLY : 0,
 		.guest_phys_addr = gpa,
 		.memory_size     = length,
 		.userspace_addr  = (uint64_t)(uintptr_t)hva,
@@ -125,7 +156,7 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 
 static void kvm_remove_memory_region(int slot)
 {
-	struct kvm_userspace_memory_region region = {
+	struct nvkvm_kvm_mem_region region = {
 		.slot         = (uint32_t)slot,
 		.memory_size  = 0,  /* size=0 removes the slot */
 	};

@@ -20,8 +20,12 @@
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/abi/nvgpu.h"
 
-/* virtio-nvgpu device ID — allocated from the vendor-specific range */
-#define VIRTIO_ID_NVGPU   0x105d
+/* virtio-nvgpu device ID.
+ * Must be in the range 0–63 so the PCI device ID (0x1040 + type) falls in
+ * the valid modern virtio PCI range 0x1040–0x107f.  50 is unassigned by the
+ * virtio spec; PCI device ID = 0x1072.
+ * Must match VIRTIO_ID_NVGPU in src/qemu/virtio_nvgpu.h. */
+#define VIRTIO_ID_NVGPU   50
 
 /* ── Per-session state (one per guest process that has opened a device) ───── */
 
@@ -35,8 +39,10 @@
  */
 struct nvkvm_session {
 	pid_t   tgid;
-	int     id;             /* IDR key                             */
+	int     id;             /* IDR key                                */
 	int     refcount;       /* protected by nvkvm_state.sessions_lock */
+	__u32   isolate_id;     /* QEMU isolate process ID (0 = not yet created) */
+	struct mutex isolate_lock; /* protects isolate_id creation       */
 };
 
 /* ── Per-FD context (one per open(/dev/nvidia*)) ──────────────────────────── */
@@ -44,13 +50,29 @@ struct nvkvm_session {
 struct nvkvm_mmap_region {
 	struct list_head list;
 	__u32    mmap_token;       /* opaque token from host                */
+	__u32    handle_id;        /* QEMU-side handle (for isolate re-map) */
 	unsigned long gpa_base;    /* guest physical address                */
 	unsigned long length;
-	struct vm_area_struct *vma; /* NULL after munmap                    */
+	__u64    offset;           /* fd offset at which we were mapped     */
+	struct vm_area_struct *vma; /* NULL after munmap                   */
+};
+
+/*
+ * CPU page migration tracking — one entry per page pinned and uploaded to a
+ * memfd for the isolate's CPU-userptr access.
+ */
+struct nvkvm_cpu_page {
+	struct page    *page;      /* pinned guest physical page                */
+	unsigned long   gva;       /* page-aligned GVA mapped in the isolate    */
+	__u32           handle_id; /* QEMU memory handle wrapping the memfd     */
+	__u32           mmap_token;/* token for MUNMAP_ON_ISOLATE cleanup       */
+	__u32           prot;      /* PROT_* flags (read/write)                 */
+	struct list_head list;
 };
 
 struct nvkvm_fd_ctx {
-	__u32                  fd_token;    /* opaque host-side FD reference       */
+	__u32                  fd_token;    /* opaque host-side FD reference (legacy) */
+	__u32                  handle_id;   /* QEMU-side nvidia handle ID (new)    */
 	int                    dev_id;      /* NVKVM_DEV_*                         */
 	struct nvkvm_session  *session;
 
@@ -61,6 +83,10 @@ struct nvkvm_fd_ctx {
 	/* mmap regions owned by this FD */
 	spinlock_t             mmap_lock;
 	struct list_head       mmap_regions;
+
+	/* CPU pages migrated to the isolate for userptr access */
+	struct mutex           cpu_pages_lock;
+	struct list_head       cpu_pages;
 };
 
 /* ── In-flight request tracking ───────────────────────────────────────────── */
@@ -69,9 +95,13 @@ struct nvkvm_inflight {
 	struct list_head    list;
 	__u32               req_id;
 	struct completion   done;
-	/* response fields filled by virtio RX callback */
+	/* response fields filled by virtio TX completion callback */
 	__u64               retval;
 	int                 status;   /* 0 = success, errno otherwise          */
+	void               *resp_buf; /* IN-sg buffer holding the host response */
+	/* extended fields for isolate-path responses */
+	__u64               fault_addr; /* GVA of SIGSEGV in isolate (IOCTL_ON_ISOLATE) */
+	__u32               nvstatus;   /* NvStatus from NVIDIA params              */
 };
 
 /* ── Global module state ──────────────────────────────────────────────────── */
@@ -129,15 +159,48 @@ extern struct nvkvm_state nvkvm;
 
 /* ── Function declarations ─────────────────────────────────────────────────── */
 
-/* nvkvm_virtio.c */
+/* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
 void nvkvm_virtio_fini(struct nvkvm_state *state);
 int  nvkvm_negotiate_version(struct nvkvm_state *state);
-int  nvkvm_virtio_open(int dev_id, unsigned int flags,
+
+/* Legacy (kept for compat; will be removed) */
+int  nvkvm_virtio_open(int dev_id, unsigned int flags, unsigned int session_id,
 		       struct nvkvm_resp_open *resp_out);
 int  nvkvm_virtio_close(__u32 fd_token, struct nvkvm_resp_close *resp_out);
 long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
-			void *params_buf, size_t param_size);
+			void *params_buf, size_t param_size,
+			void *aux_buf, size_t aux_size);
+
+/* New isolate-aware API */
+int  nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
+				     unsigned int session_id,
+				     __u32 *handle_id_out);
+int  nvkvm_virtio_create_isolate(unsigned int session_id,
+				 __u32 *isolate_id_out);
+int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
+int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);
+int  nvkvm_virtio_close_handle(__u32 handle_id);
+int  nvkvm_virtio_kill_isolate(__u32 isolate_id);
+long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
+				   unsigned int cmd,
+				   void *params_buf, size_t param_size,
+				   void *aux_buf, size_t aux_size,
+				   __u32 flags,
+				   __u64 *fault_addr_out);
+int  nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
+				  __u64 gva, __u64 offset, __u64 length,
+				  __u32 prot, __u32 map_flags,
+				  unsigned int session_id,
+				  __u64 *gpa_base_out,
+				  __u32 *mmap_token_out);
+int  nvkvm_virtio_munmap_on_isolate(__u32 isolate_id, __u32 mmap_token);
+int  nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
+				     __u32 *handle_id_out);
+int  nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
+				      int shm_slot, __u32 size);
+int  nvkvm_virtio_read_memory_handle(__u32 handle_id, __u64 offset,
+				     int shm_slot, __u32 size);
 
 /* nvkvm_ioctl.c */
 size_t nvkvm_ioctl_param_size(unsigned int cmd);
@@ -146,8 +209,12 @@ int    nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				   void *params_buf, size_t param_size);
 
 /* nvkvm_mmap.c */
+extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx);
+int  nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr);
+void nvkvm_cpu_pages_writeback(struct nvkvm_fd_ctx *ctx);
+void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
 
 /* nvkvm_session.c */
 struct nvkvm_session *nvkvm_session_get_or_create(pid_t tgid);

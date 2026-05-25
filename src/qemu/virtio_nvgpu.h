@@ -39,10 +39,32 @@
 #include "hw/virtio/virtio.h"
 #include "hw/pci/pci.h"
 #include "qemu/iov.h"
+/* exec/memory.h (for MemoryRegion) is transitively included via virtio.h */
 
 #include "../../src/common/nvkvm_proto.h"
+#include "../../src/common/nvkvm_isolate_proto.h"
 #include "../../src/abi/nvgpu.h"
 #include "../../src/abi/uvm.h"
+#include "nvkvm_handle.h"
+#include "nvkvm_isolate.h"
+
+/* ── Device constants ────────────────────────────────────────────────────── */
+
+/* Virtio device type for NVIDIA GPU ioctl passthrough.
+ * 50 is unassigned by the virtio spec; PCI device ID = 0x1040 + 50 = 0x1072.
+ * Must be in range 0–63 so the PCI ID stays within 0x1040–0x107f (the valid
+ * range the Linux virtio-pci driver recognizes).
+ * Must match VIRTIO_ID_NVGPU in src/guest/nvkvm.h. */
+#define VIRTIO_ID_NVGPU             50
+
+/*
+ * Guest-physical address layout for shared memory and mmap window.
+ * These live above any realistic guest RAM ceiling (1 TB and 1.5 TB),
+ * so they never alias guest RAM regardless of VM size.
+ */
+#define NVKVM_SHM_GPA_BASE          0x10000000000ULL  /* 1 TB  */
+#define NVKVM_MMAP_WIN_GPA_BASE     0x18000000000ULL  /* 1.5 TB */
+#define NVKVM_MMAP_WIN_SIZE         (16ULL << 30)     /* 16 GB window */
 
 /* ── Object graph (mirrors gVisor nvproxy object.go) ────────────────────── */
 
@@ -122,7 +144,7 @@ struct nvkvm_session {
 
 	pthread_mutex_t lock;
 
-	/* fd table: fd_token → nvkvm_host_fd */
+	/* fd table: fd_token → nvkvm_host_fd (legacy path) */
 	TAILQ_HEAD(, nvkvm_host_fd)    fds;
 	uint32_t                        next_fd_token;
 
@@ -130,10 +152,14 @@ struct nvkvm_session {
 	TAILQ_HEAD(, nvkvm_mmap_region) mmaps;
 	uint32_t                         next_mmap_token;
 
-	/* global client map: handle → nvkvm_client */
+	/* global client map: handle → nvkvm_client (RM object graph) */
 	struct nvkvm_client   *clients[NVKVM_MAX_OBJECTS_PER_CLIENT];
 	int                    nclients;
 	pthread_mutex_t        clients_lock;
+
+	/* isolate IDs active in this session (one per guest mm) */
+	uint32_t isolate_ids[256];
+	int      nisolates;
 
 	TAILQ_ENTRY(nvkvm_session) link;
 };
@@ -153,6 +179,11 @@ typedef struct VirtIONvgpu {
 	size_t              shm_size;
 	size_t              slot_size;
 	uint64_t            shm_gpa;    /* GPA where guest sees shared mem  */
+	MemoryRegion        shm_mr;     /* QEMU memory region for shm_base  */
+	bool                shm_mr_registered;
+
+	/* Virtio config space (little-endian, copied out by get_config) */
+	struct nvkvm_virtio_config config_space;
 
 	/* Mmap window: GPA range for GPU memory mappings */
 	uint64_t            mmap_win_gpa;
@@ -164,6 +195,10 @@ typedef struct VirtIONvgpu {
 	TAILQ_HEAD(, nvkvm_session) sessions;
 	pthread_mutex_t             sessions_lock;
 	uint32_t                    next_session_id;
+
+	/* Handle and isolate managers (isolate architecture) */
+	struct nvkvm_handle_table   handles;
+	struct nvkvm_isolate_table  isolates;
 
 	/* Host NVIDIA driver version (read at init) */
 	char                driver_version[64];
@@ -213,6 +248,56 @@ int nvkvm_handle_alloc_os_event(struct nvkvm_req_ctx *ctx);
 int nvkvm_handle_free_os_event(struct nvkvm_req_ctx *ctx);
 int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd);
 
+/* nvkvm_isolate_handlers.c — new isolate/handle virtio request handlers */
+int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
+				   struct nvkvm_req_list_nvidia_devices *req,
+				   struct nvkvm_resp_list_nvidia_devices *resp);
+int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
+				  struct nvkvm_req_open_nvidia_handle *req,
+				  struct nvkvm_resp_open_nvidia_handle *resp);
+int nvkvm_req_open_memory_handle(VirtIONvgpu *nv,
+				  struct nvkvm_req_open_memory_handle *req,
+				  struct nvkvm_resp_open_memory_handle *resp);
+int nvkvm_req_close_handle(VirtIONvgpu *nv,
+			    struct nvkvm_req_close_handle *req,
+			    struct nvkvm_resp_close_handle *resp);
+int nvkvm_req_create_isolate(VirtIONvgpu *nv,
+			      struct nvkvm_req_create_isolate *req,
+			      struct nvkvm_resp_create_isolate *resp);
+int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
+			    struct nvkvm_req_kill_isolate *req,
+			    struct nvkvm_resp_kill_isolate *resp);
+int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,
+				      struct nvkvm_req_copy_handle_to_isolate *req,
+				      struct nvkvm_resp_copy_handle_to_isolate *resp);
+int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
+				       struct nvkvm_req_close_handle_on_isolate *req,
+				       struct nvkvm_resp_close_handle_on_isolate *resp);
+int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
+				struct nvkvm_req_ioctl_on_isolate *req,
+				struct nvkvm_resp_ioctl_on_isolate *resp,
+				void *param_buf, void *aux_buf);
+int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
+			       struct nvkvm_req_mmap_on_isolate *req,
+			       struct nvkvm_resp_mmap_on_isolate *resp);
+int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
+				 struct nvkvm_req_munmap_on_isolate *req,
+				 struct nvkvm_resp_munmap_on_isolate *resp);
+int nvkvm_req_poll_on_isolate(VirtIONvgpu *nv,
+			       struct nvkvm_req_poll_on_isolate *req,
+			       struct nvkvm_resp_poll_on_isolate *resp);
+int nvkvm_req_unpoll_on_isolate(VirtIONvgpu *nv,
+				 struct nvkvm_req_unpoll_on_isolate *req,
+				 struct nvkvm_resp_unpoll_on_isolate *resp);
+int nvkvm_req_write_memory_handle(VirtIONvgpu *nv,
+				   struct nvkvm_req_write_memory_handle *req,
+				   struct nvkvm_resp_write_memory_handle *resp,
+				   void *data_buf);
+int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
+				  struct nvkvm_req_read_memory_handle *req,
+				  struct nvkvm_resp_read_memory_handle *resp,
+				  void *data_buf);
+
 /* nvkvm_objects.c */
 struct nvkvm_client *nvkvm_client_alloc(uint32_t handle);
 void                 nvkvm_client_free(struct nvkvm_session *session,
@@ -227,6 +312,7 @@ void nvkvm_obj_add_dep(struct nvkvm_client *client,
 		       uint32_t h1, uint32_t h2);
 
 /* nvkvm_mmap_host.c */
+void nvkvm_set_kvm_vm_fd(int fd);
 int  nvkvm_mmap_create(VirtIONvgpu *nv, struct nvkvm_host_fd *hfd,
 		       uint64_t offset, size_t length,
 		       int prot, int flags,

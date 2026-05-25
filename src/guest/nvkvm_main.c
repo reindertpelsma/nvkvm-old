@@ -83,6 +83,15 @@ static const struct file_operations nvkvm_fops = {
 
 /* ── Device registration ──────────────────────────────────────────────────── */
 
+/*
+ * libnvidia-ml and nvidia-smi call mknodat(195, 255) before opening nvidiactl
+ * (the major is hardcoded in the library).  We must register at that exact
+ * major so the device can be opened after the library recreates the node.
+ * Similarly, nvidia0 lives at major 195 minor 0 in the real NVIDIA driver.
+ * Fall back to dynamic allocation if 195 is already taken.
+ */
+#define NV_NVIDIA_MAJOR 195
+
 static int __init register_devices(void)
 {
 	int ret, i;
@@ -92,9 +101,13 @@ static int __init register_devices(void)
 	if (IS_ERR(nvkvm.class))
 		return PTR_ERR(nvkvm.class);
 
-	/* /dev/nvidiactl — control device, minor 255 */
-	ret = alloc_chrdev_region(&devno, NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE,
-				  1, "nvidiactl");
+	/* /dev/nvidiactl — prefer major 195 minor 255 (NVIDIA standard) */
+	devno = MKDEV(NV_NVIDIA_MAJOR, NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE);
+	ret = register_chrdev_region(devno, 1, "nvidiactl");
+	if (ret)
+		ret = alloc_chrdev_region(&devno,
+					  NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE,
+					  1, "nvidiactl");
 	if (ret)
 		goto err_class;
 	nvkvm.ctl_major = MAJOR(devno);
@@ -105,12 +118,15 @@ static int __init register_devices(void)
 		goto err_ctl_region;
 	device_create(nvkvm.class, NULL, devno, NULL, "nvidiactl");
 
-	/* /dev/nvidia0 .. /dev/nvidia{N-1} */
+	/* /dev/nvidia0 .. /dev/nvidia{N-1} — prefer major 195 minor 0..N-1 */
 	nvkvm.num_gpus = min(num_gpus, NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1);
-	ret = alloc_chrdev_region(&nvkvm.gpu_devno_base, 0, nvkvm.num_gpus,
-				  "nvidia");
+	devno = MKDEV(NV_NVIDIA_MAJOR, 0);
+	ret = register_chrdev_region(devno, nvkvm.num_gpus, "nvidia");
+	if (ret)
+		ret = alloc_chrdev_region(&devno, 0, nvkvm.num_gpus, "nvidia");
 	if (ret)
 		goto err_ctl;
+	nvkvm.gpu_devno_base = devno;
 	nvkvm.gpu_major = MAJOR(nvkvm.gpu_devno_base);
 	for (i = 0; i < nvkvm.num_gpus; i++) {
 		devno = MKDEV(nvkvm.gpu_major, i);
@@ -188,6 +204,24 @@ static void unregister_devices(void)
 
 /* ── Device open/release ──────────────────────────────────────────────────── */
 
+/* Ensure the session has an isolate; creates one if isolate_id == 0. */
+static int nvkvm_ensure_isolate(struct nvkvm_session *session)
+{
+	__u32 isolate_id;
+	int ret;
+
+	mutex_lock(&session->isolate_lock);
+	if (session->isolate_id) {
+		mutex_unlock(&session->isolate_lock);
+		return 0;
+	}
+	ret = nvkvm_virtio_create_isolate((unsigned int)session->id, &isolate_id);
+	if (ret == 0)
+		session->isolate_id = isolate_id;
+	mutex_unlock(&session->isolate_lock);
+	return ret;
+}
+
 static int nvkvm_open(struct inode *inode, struct file *filp)
 {
 	struct nvkvm_fd_ctx *ctx;
@@ -195,8 +229,17 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	int dev_id;
 	int ret;
 
-	/* Determine which device is being opened from the minor number */
-	if (imajor(inode) == nvkvm.ctl_major)
+	/*
+	 * Determine which device is being opened.
+	 *
+	 * nvidiactl and nvidia0..N share major 195 (NV_NVIDIA_MAJOR) so we MUST
+	 * check BOTH major AND minor to identify nvidiactl (minor=255).  Checking
+	 * major alone incorrectly classifies every nvidia0 open as NVKVM_DEV_CTL.
+	 *
+	 * nvidia-uvm has a dynamic (distinct) major so major comparison is enough.
+	 */
+	if (imajor(inode) == nvkvm.ctl_major &&
+	    iminor(inode) == NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
 		dev_id = NVKVM_DEV_CTL;
 	else if (imajor(inode) == nvkvm.uvm_major)
 		dev_id = NVKVM_DEV_UVM;
@@ -216,9 +259,17 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	}
 	init_waitqueue_head(&ctx->poll_wq);
 	atomic_set(&ctx->poll_events, 0);
+	spin_lock_init(&ctx->mmap_lock);
+	INIT_LIST_HEAD(&ctx->mmap_regions);
+	mutex_init(&ctx->cpu_pages_lock);
+	INIT_LIST_HEAD(&ctx->cpu_pages);
 
-	/* Ask the host to open the corresponding real device */
-	ret = nvkvm_virtio_open(dev_id, filp->f_flags, &resp);
+	/*
+	 * Legacy open — kept for compat; gives us fd_token for the old ioctl path.
+	 * Will be removed once all callers use the isolate path.
+	 */
+	ret = nvkvm_virtio_open(dev_id, filp->f_flags,
+				(unsigned int)ctx->session->id, &resp);
 	if (ret) {
 		nvkvm_session_put(ctx->session);
 		kfree(ctx);
@@ -227,14 +278,49 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	if (resp.status) {
 		nvkvm_session_put(ctx->session);
 		kfree(ctx);
-		return -resp.status;
+		return -(int)resp.status;
+	}
+	ctx->fd_token = resp.fd_token;
+
+	/*
+	 * New isolate path: open a QEMU-side handle, ensure the session has an
+	 * isolate, and distribute the handle to it.
+	 */
+	{
+		__u32 handle_id = 0;
+		ret = nvkvm_virtio_open_nvidia_handle(dev_id, filp->f_flags,
+						      (unsigned int)ctx->session->id,
+						      &handle_id);
+		if (ret) {
+			pr_warn("nvkvm: open_nvidia_handle failed %d, using legacy\n",
+				ret);
+			goto done;
+		}
+		ctx->handle_id = handle_id;
+
+		ret = nvkvm_ensure_isolate(ctx->session);
+		if (ret) {
+			pr_warn("nvkvm: create_isolate failed %d, using legacy\n",
+				ret);
+			nvkvm_virtio_close_handle(handle_id);
+			ctx->handle_id = 0;
+			goto done;
+		}
+
+		ret = nvkvm_virtio_copy_handle_to_isolate(handle_id,
+							  ctx->session->isolate_id);
+		if (ret) {
+			pr_warn("nvkvm: copy_handle_to_isolate failed %d\n", ret);
+			nvkvm_virtio_close_handle(handle_id);
+			ctx->handle_id = 0;
+		}
 	}
 
-	ctx->fd_token = resp.fd_token;
+done:
 	filp->private_data = ctx;
-
-	pr_debug("nvkvm: opened dev_id=%d fd_token=%u tgid=%d\n",
-		 dev_id, ctx->fd_token, current->tgid);
+	pr_debug("nvkvm: opened dev_id=%d fd_token=%u handle_id=%u isolate_id=%u tgid=%d\n",
+		 dev_id, ctx->fd_token, ctx->handle_id,
+		 ctx->session->isolate_id, current->tgid);
 	return 0;
 }
 
@@ -246,7 +332,22 @@ static int nvkvm_release(struct inode *inode, struct file *filp)
 	if (!ctx)
 		return 0;
 
-	nvkvm_virtio_close(ctx->fd_token, &resp);
+	/* New path: release handle from isolate before closing it */
+	if (ctx->handle_id && ctx->session->isolate_id)
+		nvkvm_virtio_close_handle_on_isolate(ctx->handle_id,
+						     ctx->session->isolate_id);
+	if (ctx->handle_id) {
+		nvkvm_virtio_close_handle(ctx->handle_id);
+		ctx->handle_id = 0;
+	}
+
+	/* Legacy close */
+	if (ctx->fd_token)
+		nvkvm_virtio_close(ctx->fd_token, &resp);
+
+	/* Tear down any CPU page migrations for this fd */
+	nvkvm_cpu_pages_free(ctx);
+	mutex_destroy(&ctx->cpu_pages_lock);
 
 	/* Tear down any mmap regions owned by this FD */
 	nvkvm_mmap_release_fd(ctx);
@@ -272,6 +373,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	void *params_buf = NULL;
 	void __user *uparams = (void __user *)arg;
 	size_t param_size;
+	void *aux_buf = NULL;
+	size_t aux_size = 0;
+	void __user *aux_uptr = NULL;
 	long ret;
 
 	if (!ctx)
@@ -293,9 +397,103 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (!params_buf)
 			return -ENOMEM;
 
-		if (copy_from_user(params_buf, uparams, param_size)) {
+		/*
+		 * Some UVM ioctls (notably UVM_DEINITIALIZE) are called with a
+		 * NULL arg by libnvml.  The native NVIDIA UVM driver accepts NULL
+		 * and treats it as "use empty/default params".  Mirror that
+		 * behaviour: skip the copy and forward the zero-initialised buffer.
+		 */
+		if (uparams != NULL &&
+		    copy_from_user(params_buf, uparams, param_size)) {
 			kfree(params_buf);
 			return -EFAULT;
+		}
+	}
+
+	/*
+	 * For ioctls with embedded secondary buffers: extract the secondary data
+	 * BEFORE the sanitizer zeroes the pointer fields.  We carry the data in
+	 * the aux slot so the host can reconstruct it without ever seeing a raw
+	 * guest VA.
+	 *
+	 * NV_ESC_RM_CONTROL: secondary buffer = cmd-specific params (in+out).
+	 * NV_ESC_RM_ALLOC (NVOS21): secondary buffer = class-specific alloc params
+	 *   (input only; size determined by h_class).
+	 * NV_ESC_RM_ALLOC (NVOS64): secondary buffer = class-specific alloc params
+	 *   (input only; alloc_parms_size tells us the size).
+	 */
+	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
+		struct nvos54_parameters *ctrl = params_buf;
+		if (ctrl->params_size > 0 && ctrl->params != 0) {
+			if (ctrl->params_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+				kfree(params_buf);
+				return -EINVAL;
+			}
+			aux_uptr = (void __user *)(uintptr_t)ctrl->params;
+			aux_buf = kzalloc(ctrl->params_size, GFP_KERNEL);
+			if (!aux_buf) {
+				kfree(params_buf);
+				return -ENOMEM;
+			}
+			if (copy_from_user(aux_buf, aux_uptr, ctrl->params_size)) {
+				kfree(aux_buf);
+				kfree(params_buf);
+				return -EFAULT;
+			}
+			aux_size = ctrl->params_size;
+		}
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
+		   param_size == sizeof(struct nvos21_parameters) && params_buf) {
+		struct nvos21_parameters *alloc = params_buf;
+		if (alloc->p_alloc_parms != 0) {
+			size_t ap_size = 0;
+
+			switch (alloc->h_class) {
+			case NV01_DEVICE_0:
+				ap_size = sizeof(struct nv0080_alloc_parameters);
+				break;
+			case NV20_SUBDEVICE_0:
+				ap_size = sizeof(struct nv2080_alloc_parameters);
+				break;
+			}
+			if (ap_size > 0) {
+				aux_buf = kzalloc(ap_size, GFP_KERNEL);
+				if (!aux_buf) {
+					kfree(params_buf);
+					return -ENOMEM;
+				}
+				if (copy_from_user(aux_buf,
+						   (void __user *)(uintptr_t)alloc->p_alloc_parms,
+						   ap_size)) {
+					kfree(aux_buf);
+					kfree(params_buf);
+					return -EFAULT;
+				}
+				aux_size = ap_size;
+			}
+		}
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
+		   param_size == sizeof(struct nvos64_parameters) && params_buf) {
+		struct nvos64_parameters *alloc = params_buf;
+		if (alloc->alloc_parms_size > 0 && alloc->p_alloc_parms != 0) {
+			if (alloc->alloc_parms_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+				kfree(params_buf);
+				return -EINVAL;
+			}
+			/* aux_uptr: we don't need copy-back for alloc params (input only) */
+			aux_buf = kzalloc(alloc->alloc_parms_size, GFP_KERNEL);
+			if (!aux_buf) {
+				kfree(params_buf);
+				return -ENOMEM;
+			}
+			if (copy_from_user(aux_buf,
+					   (void __user *)(uintptr_t)alloc->p_alloc_parms,
+					   alloc->alloc_parms_size)) {
+				kfree(aux_buf);
+				kfree(params_buf);
+				return -EFAULT;
+			}
+			aux_size = alloc->alloc_parms_size;
 		}
 	}
 
@@ -306,19 +504,74 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 */
 	ret = nvkvm_sanitize_ioctl_params(ctx, cmd, params_buf, param_size);
 	if (ret) {
+		kfree(aux_buf);
 		kfree(params_buf);
 		return ret;
 	}
 
-	/* Forward to host and wait for response */
-	ret = nvkvm_virtio_ioctl(ctx, cmd, params_buf, param_size);
+	/* Forward to host via the appropriate path */
+	if (ctx->handle_id && ctx->session->isolate_id) {
+		/*
+		 * Isolate path: ioctl runs in the isolate process so the NVIDIA
+		 * driver sees a valid VA space.  On EFAULT the isolate returns
+		 * the faulting GVA; we map the backing region and retry.
+		 */
+		__u32 ioctl_flags = 0;
+		__u64 fault_addr  = 0;
+		int retries;
 
-	/* Copy updated parameters back to userspace */
-	if (ret >= 0 && param_size > 0) {
+#define NVKVM_MAX_EFAULT_RETRIES 128
+		for (retries = 0; retries < NVKVM_MAX_EFAULT_RETRIES; retries++) {
+			fault_addr = 0;
+			ret = nvkvm_virtio_ioctl_on_isolate(ctx, cmd,
+							    params_buf, param_size,
+							    aux_buf, aux_size,
+							    ioctl_flags,
+							    &fault_addr);
+			if (ret != -EFAULT || !fault_addr)
+				break;
+
+			ioctl_flags |= NVKVM_IOCTL_FL_RETRY_EFAULT;
+
+			if (nvkvm_efault_resolve(ctx, fault_addr)) {
+				ret = -EFAULT;
+				break;
+			}
+		}
+
+		/*
+		 * Write back any CPU pages migrated during this ioctl.
+		 * The NVIDIA driver may have written results into the isolate's
+		 * copy of the page (e.g. DtoH data); copy it back to the guest.
+		 */
+		nvkvm_cpu_pages_writeback(ctx);
+	} else {
+		/* Legacy path (no isolate): ioctl runs in QEMU thread directly */
+		ret = nvkvm_virtio_ioctl(ctx, cmd, params_buf, param_size,
+					 aux_buf, aux_size);
+	}
+
+	/*
+	 * Always copy parameters back to userspace, even on driver error.
+	 * The NVIDIA RM may populate response fields even when returning an error
+	 * (e.g. CHECK_VERSION_STR fills version_string and returns EINVAL).
+	 * Only skip if the transport itself failed (ret == -ENOMEM / -ENOSPC)
+	 * and params_buf was never written to shared memory.
+	 */
+	if (param_size > 0 && uparams != NULL &&
+	    ret != -ENOMEM && ret != -ENOSPC && ret != -EFAULT) {
 		if (copy_to_user(uparams, params_buf, param_size))
 			ret = -EFAULT;
 	}
 
+	/* Copy back the aux buffer (RM_CONTROL output params) to userspace */
+	if (aux_buf && aux_uptr && ret != -ENOMEM && ret != -ENOSPC &&
+	    ret != -EFAULT) {
+		if (copy_to_user(aux_uptr, aux_buf, aux_size))
+			ret = -EFAULT;
+	}
+
+	kfree(aux_buf);
 	kfree(params_buf);
 	return ret;
 }
@@ -371,6 +624,9 @@ static struct virtio_driver nvkvm_virtio_driver = {
 static int nvkvm_virtio_probe(struct virtio_device *vdev)
 {
 	int ret;
+
+	pr_info("nvkvm: probe called for virtio device id=0x%x\n",
+		vdev->id.device);
 
 	ret = nvkvm_virtio_init(vdev, &nvkvm);
 	if (ret) {

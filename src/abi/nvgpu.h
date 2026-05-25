@@ -30,9 +30,16 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 
 #define NV01_NULL_OBJECT  0x00000000U
 
+/* ── RM status codes ─────────────────────────────────────────────────────── */
+
+#define NV_OK                   0x00000000U
+#define NV_ERR_NOT_SUPPORTED    0x00000057U
+
 /* ── Object class IDs ────────────────────────────────────────────────────── */
 
-/* Root / client */
+/* Root / client — libnvidia-ml uses class=0 (NV01_ROOT) for root allocation,
+ * older apps may use NV01_ROOT_CLIENT=0x41.  Both create a root client. */
+#define NV01_ROOT                           0x00000000U  /* same as NV01_NULL_OBJECT */
 #define NV01_ROOT_CLIENT                    0x00000041U
 /* Devices */
 #define NV01_DEVICE_0                       0x00000080U
@@ -94,18 +101,23 @@ struct nvos21_parameters {
 
 /*
  * NVOS64_PARAMETERS — used when hRightsRequested != NULL (newer drivers).
+ *
+ * Field order matches NVIDIA open-gpu-kernel-modules nvos.h NVOS64_PARAMETERS:
+ *   hRoot, hObjectParent, hObjectNew, hClass, pAllocParms(8),
+ *   paramsSize(4), flags(4), status(4), reserved(4), hRightsRequested(8)
+ * = 48 bytes total.
  */
 struct nvos64_parameters {
 	nvhandle_t h_root;
 	nvhandle_t h_object_parent;
 	nvhandle_t h_object_new;
 	nvclassid_t h_class;
-	nvp64_t    p_alloc_parms;
-	nvp64_t    p_rights_requested;  /* pointer to RS_ACCESS_MASK */
-	__u32      alloc_parms_size;
+	nvp64_t    p_alloc_parms;       /* pointer to class-specific alloc struct */
+	__u32      alloc_parms_size;    /* size of alloc params buffer            */
 	__u32      flags;
 	__u32      status;
 	__u32      reserved;
+	nvp64_t    p_rights_requested;  /* pointer to RS_ACCESS_MASK (may be NULL) */
 };
 
 /* ── NV_ESC_RM_FREE ──────────────────────────────────────────────────────── */
@@ -371,6 +383,71 @@ struct nv_ioctl_alloc_context_dma2 {
 	nvhandle_t h_dma;
 	__u32      status;
 };
+
+/* ── NV0080_ALLOC_PARAMETERS — alloc params for NV01_DEVICE_0 ────────────── */
+
+struct nv0080_alloc_parameters {
+	__u32      device_id;
+	nvhandle_t h_client_share;
+	nvhandle_t h_target_client;
+	nvhandle_t h_target_device;
+	__u32      flags;
+	__u32      _pad0;
+	__u64      va_space_size;
+	__u64      va_start_internal;
+	__u64      va_limit_internal;
+	__u32      va_mode;
+	__u32      _pad1;
+};
+
+/* ── NV2080_ALLOC_PARAMETERS — alloc params for NV20_SUBDEVICE_0 ─────────── */
+
+struct nv2080_alloc_parameters {
+	__u32      sub_device_id;
+};
+
+/* ── NV_ESC_RM_CONTROL command IDs used in tests ─────────────────────────── */
+
+#define NV0080_CTRL_CMD_GPU_GET_NUM_SUBDEVICES 0x00800280U
+
+struct nv0080_ctrl_gpu_get_num_subdevices_params {
+	__u32 num_sub_devices;
+};
+
+/* ── NV0080_CTRL_CMD_GPU_GET_VIRTUALIZATION_MODE (0x800289) ──────────────── */
+
+#define NV0080_CTRL_CMD_GPU_GET_VIRTUALIZATION_MODE 0x00800289U
+
+#define NV0080_CTRL_GPU_VIRTUALIZATION_MODE_NONE            0U
+#define NV0080_CTRL_GPU_VIRTUALIZATION_MODE_VGX             1U
+#define NV0080_CTRL_GPU_VIRTUALIZATION_MODE_HOST_VGPU       2U
+#define NV0080_CTRL_GPU_VIRTUALIZATION_MODE_HOST_VSGA       3U
+#define NV0080_CTRL_GPU_VIRTUALIZATION_MODE_PASSTHROUGHGUEST 4U
+
+struct nv0080_ctrl_gpu_get_virtualization_mode_params {
+	__u32 virtualization_mode;
+	__u32 b_is_grid_licensed;
+};
+
+/* ── NV2080_CTRL_CMD_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO (0x20800406) ─ */
+
+#define NV2080_CTRL_CMD_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO 0x20800406U
+
+/* ── NV2080_CTRL_CMD_MC_GET_ARCH_INFO (0x20801701) ──────────────────────── */
+
+#define NV2080_CTRL_CMD_MC_GET_ARCH_INFO    0x20801701U
+
+/* ── NV2080_CTRL_CMD_GPU_GET_GID_INFO (0x2080014a) ──────────────────────── */
+
+#define NV2080_CTRL_CMD_GPU_GET_GID_INFO    0x2080014aU
+
+/* ── NV2080_CTRL_CMD_GPU_GET_NAME_STRING (0x20800110) ────────────────────── */
+
+#define NV2080_CTRL_CMD_GPU_GET_NAME_STRING 0x20800110U
+
+/* ── NV2080_CTRL_CMD_GPU_GET_INFO_V2 (0x20800102) ───────────────────────── */
+
+#define NV2080_CTRL_CMD_GPU_GET_INFO_V2     0x20800102U
 
 /* ── Frontend ioctl numbers (IOC_NR portion only) ────────────────────────── */
 

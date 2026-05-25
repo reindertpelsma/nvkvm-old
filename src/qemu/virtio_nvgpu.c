@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "virtio_nvgpu.h"
 
@@ -141,7 +142,7 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 	};
 	uint32_t dev_id    = le32_to_cpu(req->dev_id);
 	uint32_t flags     = le32_to_cpu(req->flags);
-	uint32_t session_id;
+	uint32_t session_id = le32_to_cpu(req->session_id);
 	struct nvkvm_session *session;
 	struct nvkvm_host_fd *hfd;
 	int fd;
@@ -165,12 +166,7 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 		goto send;
 	}
 
-	/*
-	 * Find or create the session for the requesting guest process.
-	 * The session_id in OPEN requests is the guest tgid (process ID).
-	 * We use the tgid as a hint but assign our own stable session_id.
-	 */
-	session_id = le32_to_cpu(req->flags) >> 16; /* upper 16 bits = tgid hint */
+	/* Find or create the session for the requesting guest process. */
 	pthread_mutex_lock(&nv->sessions_lock);
 	session = nvkvm_session_find(nv, session_id);
 	if (!session) {
@@ -375,8 +371,8 @@ static void handle_mmap(VirtIONvgpu *nv, VirtQueue *vq,
 	struct nvkvm_mmap_region *region = NULL;
 	int ret;
 
-	/* Validate length */
-	if (!length || length > SZ_1G || (length & ~PAGE_MASK)) {
+	/* Validate length: must be non-zero, ≤1 GiB, page-aligned */
+	if (!length || length > (1UL << 30) || (length & (4096UL - 1))) {
 		resp_msg.resp.status = cpu_to_le32(EINVAL);
 		goto send;
 	}
@@ -535,6 +531,153 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			handle_munmap(nv, vq, elem, &hdr, &req);
 			break;
 		}
+
+		/* ── Isolate/handle request types ────────────────────────────────── */
+
+#define ISOLATE_REQ(TYPE, req_t, resp_t, handler) \
+		case TYPE: { \
+			struct req_t  req  = {0}; \
+			struct resp_t resp = {0}; \
+			struct { struct nvkvm_hdr h; struct resp_t r; } out; \
+			iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr), \
+				   &req, sizeof(req)); \
+			handler(nv, &req, &resp); \
+			out.h = hdr; out.r = resp; \
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out)); \
+			virtqueue_push(vq, elem, sizeof(out)); \
+			virtio_notify(VIRTIO_DEVICE(nv), vq); \
+			break; \
+		}
+
+		ISOLATE_REQ(NVKVM_REQ_LIST_NVIDIA_DEVICES,
+			    nvkvm_req_list_nvidia_devices,
+			    nvkvm_resp_list_nvidia_devices,
+			    nvkvm_req_list_nvidia_devices)
+		ISOLATE_REQ(NVKVM_REQ_OPEN_NVIDIA_HANDLE,
+			    nvkvm_req_open_nvidia_handle,
+			    nvkvm_resp_open_nvidia_handle,
+			    nvkvm_req_open_nvidia_handle)
+		ISOLATE_REQ(NVKVM_REQ_OPEN_MEMORY_HANDLE,
+			    nvkvm_req_open_memory_handle,
+			    nvkvm_resp_open_memory_handle,
+			    nvkvm_req_open_memory_handle)
+		ISOLATE_REQ(NVKVM_REQ_CLOSE_HANDLE,
+			    nvkvm_req_close_handle,
+			    nvkvm_resp_close_handle,
+			    nvkvm_req_close_handle)
+		ISOLATE_REQ(NVKVM_REQ_CREATE_ISOLATE,
+			    nvkvm_req_create_isolate,
+			    nvkvm_resp_create_isolate,
+			    nvkvm_req_create_isolate)
+		ISOLATE_REQ(NVKVM_REQ_KILL_ISOLATE,
+			    nvkvm_req_kill_isolate,
+			    nvkvm_resp_kill_isolate,
+			    nvkvm_req_kill_isolate)
+		ISOLATE_REQ(NVKVM_REQ_COPY_HANDLE_TO_ISOLATE,
+			    nvkvm_req_copy_handle_to_isolate,
+			    nvkvm_resp_copy_handle_to_isolate,
+			    nvkvm_req_copy_handle_to_isolate)
+		ISOLATE_REQ(NVKVM_REQ_CLOSE_HANDLE_ON_ISOLATE,
+			    nvkvm_req_close_handle_on_isolate,
+			    nvkvm_resp_close_handle_on_isolate,
+			    nvkvm_req_close_handle_on_isolate)
+		ISOLATE_REQ(NVKVM_REQ_POLL_ON_ISOLATE,
+			    nvkvm_req_poll_on_isolate,
+			    nvkvm_resp_poll_on_isolate,
+			    nvkvm_req_poll_on_isolate)
+		ISOLATE_REQ(NVKVM_REQ_UNPOLL_ON_ISOLATE,
+			    nvkvm_req_unpoll_on_isolate,
+			    nvkvm_resp_unpoll_on_isolate,
+			    nvkvm_req_unpoll_on_isolate)
+
+		case NVKVM_REQ_IOCTL_ON_ISOLATE: {
+			struct nvkvm_req_ioctl_on_isolate  req  = {0};
+			struct nvkvm_resp_ioctl_on_isolate resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			/* param/aux buffers are in shared memory */
+			void *pb = req.param_size > 0 &&
+				   slot_valid(nv, req.shm_slot) ?
+				   slot_ptr(nv, req.shm_slot) : NULL;
+			void *ab = req.aux_size > 0 &&
+				   slot_valid(nv, req.shm_aux_slot) ?
+				   slot_ptr(nv, req.shm_aux_slot) : NULL;
+			nvkvm_req_ioctl_on_isolate(nv, &req, &resp, pb, ab);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_ioctl_on_isolate r; } out;
+			out.h = hdr; out.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out));
+			virtqueue_push(vq, elem, sizeof(out));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
+		case NVKVM_REQ_MMAP_ON_ISOLATE: {
+			struct nvkvm_req_mmap_on_isolate  req  = {0};
+			struct nvkvm_resp_mmap_on_isolate resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			nvkvm_req_mmap_on_isolate(nv, &req, &resp);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_mmap_on_isolate r; } out;
+			out.h = hdr; out.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out));
+			virtqueue_push(vq, elem, sizeof(out));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
+		case NVKVM_REQ_MUNMAP_ON_ISOLATE: {
+			struct nvkvm_req_munmap_on_isolate  req  = {0};
+			struct nvkvm_resp_munmap_on_isolate resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			nvkvm_req_munmap_on_isolate(nv, &req, &resp);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_munmap_on_isolate r; } out;
+			out.h = hdr; out.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out));
+			virtqueue_push(vq, elem, sizeof(out));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
+		case NVKVM_REQ_WRITE_MEMORY_HANDLE: {
+			struct nvkvm_req_write_memory_handle  req  = {0};
+			struct nvkvm_resp_write_memory_handle resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			void *db = (req.size > 0 && slot_valid(nv, req.shm_slot)) ?
+				   slot_ptr(nv, req.shm_slot) : NULL;
+			nvkvm_req_write_memory_handle(nv, &req, &resp, db);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_write_memory_handle r; } wout;
+			wout.h = hdr; wout.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &wout, sizeof(wout));
+			virtqueue_push(vq, elem, sizeof(wout));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
+		case NVKVM_REQ_READ_MEMORY_HANDLE: {
+			struct nvkvm_req_read_memory_handle  req  = {0};
+			struct nvkvm_resp_read_memory_handle resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			void *db = (req.size > 0 && slot_valid(nv, req.shm_slot)) ?
+				   slot_ptr(nv, req.shm_slot) : NULL;
+			nvkvm_req_read_memory_handle(nv, &req, &resp, db);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_read_memory_handle r; } rout;
+			rout.h = hdr; rout.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &rout, sizeof(rout));
+			virtqueue_push(vq, elem, sizeof(rout));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
+#undef ISOLATE_REQ
+
 		default:
 			error_report("nvkvm: unknown request type %u",
 				     le32_to_cpu(hdr.type));
@@ -545,6 +688,20 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 	}
 }
 
+/* ── Virtio config space ─────────────────────────────────────────────────── */
+
+static void nvkvm_get_config(VirtIODevice *vdev, uint8_t *config)
+{
+	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
+	memcpy(config, &nv->config_space, sizeof(nv->config_space));
+}
+
+static uint64_t nvkvm_get_features(VirtIODevice *vdev, uint64_t features,
+				   Error **errp)
+{
+	return features;
+}
+
 /* ── Device realize / unrealize ──────────────────────────────────────────── */
 
 static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
@@ -553,7 +710,7 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	VirtIONvgpu  *nv   = VIRTIO_NVGPU(dev);
 	int fd;
 
-	virtio_init(vdev, VIRTIO_ID_NVGPU, 0);
+	virtio_init(vdev, VIRTIO_ID_NVGPU, sizeof(struct nvkvm_virtio_config));
 
 	nv->vq_tx  = virtio_add_queue(vdev, 256, nvkvm_tx_handler);
 	nv->vq_rx  = virtio_add_queue(vdev, 256, NULL);
@@ -602,15 +759,44 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	pthread_mutex_init(&nv->mmap_win_lock, NULL);
 	TAILQ_INIT(&nv->sessions);
 
-	/* TODO: register shm_base as a guest memory region via
-	 * memory_region_init_ram_ptr() and expose via BAR.
-	 * For now, shared memory is accessed via virtio descriptors pointing
-	 * to guest RAM that both sides agree on. */
+	/* Initialize isolate/handle managers */
+	nvkvm_handle_table_init(&nv->handles);
+	nvkvm_isolate_table_init(&nv->isolates);
+
+	/* Register shared memory as a KVM memory region at NVKVM_SHM_GPA_BASE.
+	 * The guest reads shm_base/shm_len from the virtio config space and maps
+	 * this region to access ioctl parameter slots with zero virtio copies. */
+	memory_region_init_ram_ptr(&nv->shm_mr, OBJECT(dev), "virtio-nvgpu-shm",
+				   nv->shm_size, nv->shm_base);
+	memory_region_add_subregion(get_system_memory(),
+				    NVKVM_SHM_GPA_BASE, &nv->shm_mr);
+	nv->shm_mr_registered = true;
+	nv->shm_gpa = NVKVM_SHM_GPA_BASE;
+
+	/* Mmap window: 16 GB GPA range for GPU memory mappings */
+	nv->mmap_win_gpa  = NVKVM_MMAP_WIN_GPA_BASE;
+	nv->mmap_win_size = NVKVM_MMAP_WIN_SIZE;
+	nv->mmap_win_cur  = 0;
+
+	/* Populate virtio config space so the guest can locate both regions */
+	nv->config_space.shm_base     = cpu_to_le64(NVKVM_SHM_GPA_BASE);
+	nv->config_space.shm_len      = cpu_to_le64(nv->shm_size);
+	nv->config_space.mmap_win_gpa = cpu_to_le64(NVKVM_MMAP_WIN_GPA_BASE);
+	nv->config_space.mmap_win_len = cpu_to_le64(NVKVM_MMAP_WIN_SIZE);
 }
 
 static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(dev);
+
+	/* Tear down isolates and handles before shared memory */
+	nvkvm_isolate_table_fini(&nv->isolates);
+	nvkvm_handle_table_fini(&nv->handles);
+
+	if (nv->shm_mr_registered) {
+		memory_region_del_subregion(get_system_memory(), &nv->shm_mr);
+		nv->shm_mr_registered = false;
+	}
 
 	if (nv->shm_base && nv->shm_base != MAP_FAILED)
 		munmap(nv->shm_base, nv->shm_size);
@@ -629,9 +815,12 @@ static const TypeInfo virtio_nvgpu_info = {
 
 static void virtio_nvgpu_class_init(ObjectClass *klass, void *data)
 {
-	DeviceClass *dc = DEVICE_CLASS(klass);
-	dc->realize   = virtio_nvgpu_device_realize;
-	dc->unrealize = virtio_nvgpu_device_unrealize;
+	VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
+
+	vdc->realize     = virtio_nvgpu_device_realize;
+	vdc->unrealize   = virtio_nvgpu_device_unrealize;
+	vdc->get_features = nvkvm_get_features;
+	vdc->get_config   = nvkvm_get_config;
 }
 
 static void virtio_nvgpu_register_types(void)
