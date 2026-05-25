@@ -639,6 +639,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	u32 orig_nvos64_size   = 0;       /* RM_ALLOC nvos64.alloc_parms_size */
 	u64 orig_nvos21_alloc  = 0;       /* RM_ALLOC nvos21.p_alloc_parms */
 	bool have_nvos64_orig  = false;
+	/* UVM ioctls with embedded fds: caller passes a guest fd that we
+	 * rewrite to a handle_id before forwarding.  CUDA reads the field back
+	 * after the ioctl and treats a non-matching value as a sanity-check
+	 * failure (manifests as cuInit returning 999 unknown error).  Save the
+	 * original value here and restore it on the response. */
+	__s32 orig_uvm_mm_init_fd = 0;
+	bool have_uvm_mm_init     = false;
+	__u32 orig_uvm_rm_ctrl_fd = 0;
+	bool have_uvm_rm_ctrl     = false;
 	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
 	    param_size == sizeof(struct nvos54_parameters)) {
 		orig_nvos54_params =
@@ -654,6 +663,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		   param_size == sizeof(struct nvos21_parameters)) {
 		orig_nvos21_alloc =
 			((struct nvos21_parameters *)params_buf)->p_alloc_parms;
+	} else if (cmd == UVM_MM_INITIALIZE && params_buf &&
+		   param_size == sizeof(struct uvm_mm_initialize_params)) {
+		orig_uvm_mm_init_fd =
+			((struct uvm_mm_initialize_params *)params_buf)->uvm_fd;
+		have_uvm_mm_init = true;
+	} else if (params_buf &&
+		   (cmd == UVM_REGISTER_GPU_VASPACE ||
+		    cmd == UVM_REGISTER_CHANNEL ||
+		    cmd == UVM_MAP_EXTERNAL_ALLOCATION)) {
+		/* rm_ctrl_fd is at offset 16 in each of these structs (after the
+		 * 16-byte uuid).  See abi/uvm.h. */
+		if (param_size >= 20) {
+			orig_uvm_rm_ctrl_fd =
+				*(__u32 *)((char *)params_buf + 16);
+			have_uvm_rm_ctrl = true;
+		}
 	}
 
 	/*
@@ -743,6 +768,12 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			   param_size == sizeof(struct nvos21_parameters)) {
 			((struct nvos21_parameters *)params_buf)->p_alloc_parms =
 				orig_nvos21_alloc;
+		} else if (have_uvm_mm_init &&
+			   param_size == sizeof(struct uvm_mm_initialize_params)) {
+			((struct uvm_mm_initialize_params *)params_buf)->uvm_fd =
+				orig_uvm_mm_init_fd;
+		} else if (have_uvm_rm_ctrl && param_size >= 20) {
+			*(__u32 *)((char *)params_buf + 16) = orig_uvm_rm_ctrl_fd;
 		}
 	}
 

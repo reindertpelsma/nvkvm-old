@@ -667,7 +667,8 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	pthread_mutex_lock(&iso->lock);
 	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
 	struct nvkvm_handle *h = valid ? nvkvm_handle_get(ht, handle_id) : NULL;
-	int fd = (h && h->fd >= 0) ? h->fd : -1;
+	int fd        = (h && h->fd >= 0) ? h->fd : -1;
+	int h_dev_id  = h ? h->dev_id : 0;
 	pthread_mutex_unlock(&iso->lock);
 
 	if (!valid)
@@ -678,6 +679,7 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	struct isolate_cmd_receive_fd hdr = {
 		.type      = ISOLATE_CMD_RECEIVE_FD,
 		.handle_id = handle_id,
+		.dev_id    = (uint32_t)h_dev_id,
 	};
 	struct msghdr   msg  = { 0 };
 	struct iovec    iov  = { .iov_base = &hdr, .iov_len = sizeof(hdr) };

@@ -45,6 +45,10 @@
 struct isolate_cmd_receive_fd {
 	uint32_t type;        /* ISOLATE_CMD_RECEIVE_FD */
 	uint32_t handle_id;   /* key to store this fd under */
+	uint32_t dev_id;      /* NVKVM_DEV_* — lets the stub swap in a
+	                       * locally-opened fd for UVM, whose file
+	                       * ownership must match the calling mm. */
+	uint32_t reserved;    /* keep struct 8-byte aligned for future fields */
 };
 
 /* ── CLOSE_FD ────────────────────────────────────────────────────────────── */

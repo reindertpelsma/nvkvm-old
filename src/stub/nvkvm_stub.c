@@ -89,6 +89,23 @@ struct nvkvm_stub_uvm_register_channel_params {
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER  (1UL << 3)
 #endif
 
+/*
+ * UVM file ownership work-around.
+ *
+ * The NVIDIA UVM driver's UVM_MM_INITIALIZE rejects (NV_ERR_INVALID_ARGUMENT)
+ * when the file passed via uvm_fd was opened by a different mm than the
+ * caller. Since QEMU opens /dev/nvidia-uvm and passes it via SCM_RIGHTS to
+ * us, the file's owning mm is QEMU and our MM_INITIALIZE call is rejected.
+ *
+ * Fix: open /dev/nvidia-uvm twice in the stub itself (before seccomp), and
+ * when QEMU sends a RECEIVE_FD with dev_id == NVKVM_DEV_UVM, drop the
+ * SCM_RIGHTS fd and use one of our local opens instead.
+ */
+#define NVKVM_STUB_UVM_LOCAL_POOL_SIZE 2
+static int  uvm_local_fds[NVKVM_STUB_UVM_LOCAL_POOL_SIZE];
+static int  uvm_local_next_idx = 0;
+static pthread_mutex_t uvm_local_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── Syscall wrappers ────────────────────────────────────────────────────── */
 
 static __attribute__((noreturn)) void stub_exit(int code)
@@ -1000,6 +1017,15 @@ int main(void)
 	for (int i = 0; i < NVKVM_STUB_WORKERS; i++)
 		pthread_create(&workers[i], NULL, worker_thread, NULL);
 
+	/* Pre-open /dev/nvidia-uvm so the stub itself owns the file's mm
+	 * context.  UVM_MM_INITIALIZE only links files whose owner mm matches
+	 * the calling task; without this, fds passed via SCM_RIGHTS from
+	 * QEMU get rejected with NV_ERR_INVALID_ARGUMENT. */
+	for (int i = 0; i < NVKVM_STUB_UVM_LOCAL_POOL_SIZE; i++)
+		uvm_local_fds[i] = (int)syscall(SYS_openat, AT_FDCWD,
+						"/dev/nvidia-uvm",
+						O_RDWR | O_CLOEXEC);
+
 	/* QEMU sends kvm fd via SCM_RIGHTS first; we send listener fd back.
 	 * On failure (e.g. older QEMU), apply seccomp without NEW_LISTENER. */
 	if (do_spawn_handshake() < 0)
@@ -1058,6 +1084,22 @@ int main(void)
 			}
 			int fd;
 			__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+
+			/* For UVM, drop the QEMU-owned fd and use one of our
+			 * pre-opened local fds whose owning mm is the stub. */
+			if (n >= (long)sizeof(struct isolate_cmd_receive_fd) &&
+			    cmd.recv_fd.dev_id == 1 /* NVKVM_DEV_UVM */) {
+				pthread_mutex_lock(&uvm_local_lock);
+				int local = -1;
+				if (uvm_local_next_idx <
+				    NVKVM_STUB_UVM_LOCAL_POOL_SIZE)
+					local = uvm_local_fds[uvm_local_next_idx++];
+				pthread_mutex_unlock(&uvm_local_lock);
+				if (local >= 0) {
+					stub_close(fd);
+					fd = local;
+				}
+			}
 			pthread_mutex_lock(&fd_mutex);
 			if (cmd.recv_fd.handle_id < MAX_HANDLES &&
 			    handle_fds[cmd.recv_fd.handle_id] >= 0)
