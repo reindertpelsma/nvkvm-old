@@ -510,6 +510,15 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		}
 	}
 	long ret = host_ioctl(ctx->hfd->fd, cmd, ctx->params_buf);
+	/* UVM ioctl result logging */
+	if (cmd == UVM_INITIALIZE || cmd == UVM_MM_INITIALIZE ||
+	    cmd == UVM_DEINITIALIZE || cmd == UVM_REGISTER_GPU ||
+	    cmd == UVM_UNREGISTER_GPU) {
+		const uint32_t *p = (const uint32_t *)ctx->params_buf;
+		uint32_t rm_status = ctx->params_buf ? p[ctx->param_size/4 - 1] : 0xffffffff;
+		fprintf(stderr, "nvkvm: uvm ioctl cmd=0x%x dev_id=%d ret=%ld rm_status=0x%x\n",
+			cmd, ctx->hfd->dev_id, ret, rm_status);
+	}
 	if (_IOC_NR(cmd) == NV_ESC_NUMA_INFO) {
 		fprintf(stderr,
 			"nvkvm: numa_info: hfd=%d cmd=0x%x size=%u ret=%ld errno=%d\n",
