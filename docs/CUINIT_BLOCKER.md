@@ -3,6 +3,64 @@
 This is a forensic breakdown of where each implementation diverges on the
 UVM call sequence that cuInit issues during device probe.
 
+## Current status (2026-05-26)
+
+After stripping the install_isolate_mapping path and the
+UVM_MM_INITIALIZE mask, cuInit still fails with code 100
+(CUDA_ERROR_NO_DEVICE). All ioctls succeed individually:
+
+  UVM_INITIALIZE      rm_status=0x0
+  UVM_MM_INITIALIZE   rm_status=0x10006  (NV_WARN_NOTHING_TO_DO,
+                                          expected on this driver build,
+                                          libcuda handles as success)
+  UVM_PAGEABLE_MEM_ACCESS  rm_status=0x0
+  ...followed by ~60 successful RM_CONTROL / RM_ALLOC / RM_FREE...
+  RM_MAP_MEMORY (0xc038464e)  ret=0  nvstatus=0x0
+  UVM_DEINITIALIZE  rm_status=0x0
+  (libcuda gives up)
+
+The host strace from the same libcuda version, on the same driver, does
+**not** stop after RM_MAP_MEMORY — it goes on to UVM_REGISTER_GPU_VASPACE,
+UVM_REGISTER_GPU, then `mmap(/dev/nvidia0, 65536, PROT_WRITE, MAP_SHARED, fd, 0)`
+to actually map the GPU memory into the calling process's mm.
+
+Our guest never gets to that mmap. Hypothesis (high confidence):
+RM_MAP_MEMORY's response contains a *virtual address* (in the stub's mm,
+where the stub will do the actual mmap on nvidia0). libcuda reads that
+address, finds it isn't valid in its own mm (it's in the stub's mm),
+treats this as "no device", and bails.
+
+## The architectural fix needed
+
+This is exactly the problem the original `install_isolate_mapping`
+design was trying to solve, before we discovered KVM strict-mm made the
+stub-side syscall impossible. The right design, now understood:
+
+1. Stub does the nvidia ioctls (including RM_MAP_MEMORY)
+2. When RM_MAP_MEMORY returns, stub does its own `mmap(nvidia0, ..., offset)`
+   to materialize the mapping in stub's mm
+3. Stub sends "I mapped this fd at offset O, size S" to QEMU via the
+   existing socket
+4. QEMU mmaps the **same** nvidia0 fd (received from stub via SCM_RIGHTS)
+   at any QEMU VA — both processes share the underlying physical pages
+   because it's the same struct file
+5. QEMU calls `KVM_SET_USER_MEMORY_REGION(QEMU_VA → GPA)`
+6. QEMU returns the **GPA** to the stub
+7. Stub returns the GPA (disguised as a VA, since libcuda will just
+   `mmap(nvidia0, MAP_FIXED, ..., offset=ret_VA)` on it) to libcuda via
+   the ioctl response
+8. Guest module's `mmap(nvidia0)` then maps that GVA → GPA in the guest
+   userspace mm
+
+That collapses the install_isolate_mapping idea into the regular mmap
+path, with QEMU doing the KVM region call (which is correct re mm
+strict-equality), and the stub still owning the ioctl path.
+
+This is a multi-day refactor — see `docs/ARCHITECTURE.md` "Known wrong"
+items 1–4 for the full delta.
+
+## Original analysis (preserved for reference)
+
 ## The sequence libcuda issues (verified via strace)
 
 For driver 575.51.03 + CUDA 12.9 libcuda, the relevant tail of the cuInit
