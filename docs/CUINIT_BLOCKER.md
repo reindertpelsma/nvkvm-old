@@ -56,6 +56,37 @@ Candidates worth diagnosing next:
   which is also 0x27 in UVM-space) returned correctly — we may be
   showing libcuda a "0 memory size" GPU.
 
+## Pointer #2: RM_ALLOC with hClass=0xde fails
+
+Added a second diagnostic (commit pending) that prints hClient /
+hParent / hObjNew / hClass for any RM_ALLOC that returns non-zero
+nvstatus.  Observed output:
+
+  nvkvm: RM_ALLOC failed: hClient=0xc1d00a2a hParent=0x5c000003
+         hObjNew=0x5c000006 hClass=0xde nvstatus=0x1f
+
+Class **0xde is `RM_USER_SHARED_DATA`** (per
+`gvisor/pkg/abi/nvgpu/classes.go:61`), a newer-driver class for an
+RM↔userspace shared-data region.  The driver returns
+`NV_ERR_INVALID_ARGUMENT` (0x1f) — almost certainly because the
+allocation params (nvos21 or nvos64 alloc_params extension) for this
+class are wrong / missing / have the wrong size.
+
+**This is the concrete fix-target.**  Investigation:
+1. Find what `NV00DE_ALLOC_PARAMETERS` (or similar) the driver expects
+   for hClass=0xde.  Open-source `kernel-open/nvidia/src/kernel/rmapi/`
+   in the driver source.
+2. Add the param struct to `src/abi/nvgpu.h`.
+3. Make sure the guest module's sanitizer + alloc_params_size table
+   handles this class (the [[nvos64-abi-fix]] pattern: when CUDA leaves
+   alloc_parms_size at 0, we must fall back to the right per-class
+   size).
+4. Re-run cuinit_test.
+
+If libcuda treats RM_USER_SHARED_DATA allocation as fatal (likely —
+the post-CUDA-12 driver pretty much requires this region for any
+context), this single ABI bug could be the root cause of "no device."
+
 The dual-mmap architectural refactor in `docs/ARCHITECTURE.md` is still
 needed to actually expose RM_MAP_MEMORY's region to the guest after this
 ABI question is settled.

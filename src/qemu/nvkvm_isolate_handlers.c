@@ -307,10 +307,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	}
 
 	/* DIAG: for RM_MAP_MEMORY, dump pLinearAddress so we can see what the
-	 * kernel returned to the stub.  If it's a stub-mm VA (high 0x7f...
-	 * range, typical of mmap'd regions), libcuda — running in the guest
-	 * userspace mm — can't dereference it, which is the suspected cause
-	 * of cuInit's "no device" failure. */
+	 * kernel returned to the stub. */
 	if (_IOC_NR(req->cmd) == NV_ESC_RM_MAP_MEMORY && param_buf &&
 	    req->param_size >= 40) {
 		uint64_t plinear = 0;
@@ -320,6 +317,23 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		fprintf(stderr,
 			"nvkvm: RM_MAP_MEMORY response: pLinearAddress=0x%llx status=0x%x\n",
 			(unsigned long long)plinear, mm_status);
+	}
+
+	/* DIAG: for RM_ALLOC, dump hClient/hParent/hObjNew/hClass when
+	 * nvstatus is non-zero, so we can see which class the driver
+	 * rejected.  nvos21 has hClient, hParent, hObjNew, hClass at the
+	 * start; nvos64 has the same layout for the first 16 bytes. */
+	if (_IOC_NR(req->cmd) == NV_ESC_RM_ALLOC && nvstatus &&
+	    param_buf && req->param_size >= 16) {
+		uint32_t hClient = 0, hParent = 0, hObjNew = 0, hClass = 0;
+		memcpy(&hClient, (char *)param_buf + 0,  sizeof(uint32_t));
+		memcpy(&hParent, (char *)param_buf + 4,  sizeof(uint32_t));
+		memcpy(&hObjNew, (char *)param_buf + 8,  sizeof(uint32_t));
+		memcpy(&hClass,  (char *)param_buf + 12, sizeof(uint32_t));
+		fprintf(stderr,
+			"nvkvm: RM_ALLOC failed: hClient=0x%x hParent=0x%x "
+			"hObjNew=0x%x hClass=0x%x nvstatus=0x%x\n",
+			hClient, hParent, hObjNew, hClass, nvstatus);
 	}
 
 	if (inner_cmd) {

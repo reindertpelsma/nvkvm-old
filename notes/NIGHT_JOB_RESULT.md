@@ -35,17 +35,23 @@ push it — see `nvkvm_isolate_handlers.c` if I left it in dirty state).
 
 ## What's next
 
-The "no device" needs the mmap-collapse architectural refactor laid out in:
+Two parallel tracks:
 
-- `docs/ARCHITECTURE.md` → "Known wrong" items 1–4
-- `docs/CUINIT_BLOCKER.md` → "The architectural fix needed"
+**Track A — fix the RM_ALLOC hClass=0xde bug (likely the immediate
+"no device" trigger)**.  Class 0xde is RM_USER_SHARED_DATA, post-CUDA-12
+drivers depend on this region.  Our forwarded allocation params are
+rejected with NV_ERR_INVALID_ARGUMENT.  Concrete steps in
+`docs/CUINIT_BLOCKER.md` "Pointer #2".  Probably hours-to-days of
+ABI-archaeology; same shape as the [[nvos64-abi-fix]] from earlier.
 
-Concretely:
-1. Stub opens nvidia fds (today QEMU does).
-2. Stub SCM_RIGHTS the fd to QEMU.
-3. On RM_MAP_MEMORY (or any nvidia mmap path): stub mmaps + QEMU mmaps the same fd; QEMU calls `KVM_SET_USER_MEMORY_REGION(QEMU_VA → GPA)`; the GPA gets returned to libcuda disguised as a VA, then guest module's `.mmap` fop does `vm_insert_pfn(guest_VA → GPA)`.
+**Track B — the dual-mmap architectural refactor** for actually
+exposing RM_MAP_MEMORY regions to the guest, described in
+`docs/ARCHITECTURE.md` "Known wrong" items 1–4 and `docs/CUINIT_BLOCKER.md`
+"The architectural fix needed".
 
-This is multi-day work and crosses too many design calls to do unattended. Whoever picks this up should read `docs/ARCHITECTURE.md` start to finish first.
+Doing Track A first is sensible: it might un-stick cuInit on its own.
+If after fixing it cuInit still bails, Track B is the inevitable next
+step.
 
 ## Things I did NOT do (intentional)
 
