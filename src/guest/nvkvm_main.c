@@ -622,6 +622,41 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
+	 * Save the user-space pointer fields the sanitizer is about to clear,
+	 * so we can restore them in the response before copy_to_user. CUDA
+	 * reads these back after the ioctl as a "did this struct go through
+	 * the driver?" check — they must round-trip unchanged. We don't trust
+	 * them on the way *to* the driver (the host has no access to guest
+	 * VAs), but we restore them on the way *back* to the caller.
+	 *
+	 * Diagnosed 2026-05-25 via tools/diag/nvioctl_trace: host's RM_CONTROL
+	 * keeps nvos54.params == caller's user VA across the ioctl, ours was
+	 * blanking it.
+	 */
+	u64 orig_nvos54_params = 0;       /* RM_CONTROL nvos54.params  */
+	u64 orig_nvos64_alloc  = 0;       /* RM_ALLOC nvos64.p_alloc_parms */
+	u64 orig_nvos64_rights = 0;       /* RM_ALLOC nvos64.p_rights_requested */
+	u32 orig_nvos64_size   = 0;       /* RM_ALLOC nvos64.alloc_parms_size */
+	u64 orig_nvos21_alloc  = 0;       /* RM_ALLOC nvos21.p_alloc_parms */
+	bool have_nvos64_orig  = false;
+	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
+	    param_size == sizeof(struct nvos54_parameters)) {
+		orig_nvos54_params =
+			((struct nvos54_parameters *)params_buf)->params;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && params_buf &&
+		   param_size == sizeof(struct nvos64_parameters)) {
+		struct nvos64_parameters *a = params_buf;
+		orig_nvos64_alloc  = a->p_alloc_parms;
+		orig_nvos64_rights = a->p_rights_requested;
+		orig_nvos64_size   = a->alloc_parms_size;
+		have_nvos64_orig   = true;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && params_buf &&
+		   param_size == sizeof(struct nvos21_parameters)) {
+		orig_nvos21_alloc =
+			((struct nvos21_parameters *)params_buf)->p_alloc_parms;
+	}
+
+	/*
 	 * Sanitize embedded pointer and FD fields before forwarding.
 	 * The sanitizer replaces guest VA pointers with slot references and
 	 * translates session-local FD tokens to their host-facing equivalents.
@@ -679,6 +714,37 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		/* Legacy path (no isolate): ioctl runs in QEMU thread directly */
 		ret = nvkvm_virtio_ioctl(ctx, cmd, params_buf, param_size,
 					 aux_buf, aux_size);
+	}
+
+	/*
+	 * Restore the user-space pointer fields the sanitizer (and stub) blanked.
+	 * CUDA expects to read its own pointer back unchanged across the ioctl;
+	 * not restoring them causes cuInit to give up with CUDA_ERROR_NO_DEVICE.
+	 * Only restore on success-ish responses — if the driver returned an
+	 * error we still keep the host's writes (status field etc.) but the
+	 * caller's pointer should round-trip.
+	 */
+	if (params_buf && ret != -ENOMEM && ret != -ENOSPC && ret != -EFAULT) {
+		if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && orig_nvos54_params &&
+		    param_size == sizeof(struct nvos54_parameters)) {
+			((struct nvos54_parameters *)params_buf)->params =
+				orig_nvos54_params;
+		} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
+			   param_size == sizeof(struct nvos64_parameters)) {
+			struct nvos64_parameters *a = params_buf;
+			if (orig_nvos64_alloc)  a->p_alloc_parms      = orig_nvos64_alloc;
+			if (orig_nvos64_rights) a->p_rights_requested = orig_nvos64_rights;
+			/* paramsSize must round-trip too — the host driver
+			 * does not write it; CUDA verifies the OUT value
+			 * matches the IN. Our sanitizer fills it in by class
+			 * when CUDA leaves it at 0; restore the caller's
+			 * original value here. */
+			if (have_nvos64_orig)   a->alloc_parms_size   = orig_nvos64_size;
+		} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && orig_nvos21_alloc &&
+			   param_size == sizeof(struct nvos21_parameters)) {
+			((struct nvos21_parameters *)params_buf)->p_alloc_parms =
+				orig_nvos21_alloc;
+		}
 	}
 
 	/*

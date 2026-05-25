@@ -37,3 +37,4 @@ gvisor/
 *.qcow2
 *.iso
 *.img
+tools/diag/nvioctl_trace
