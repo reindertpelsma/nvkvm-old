@@ -233,6 +233,61 @@ int nvkvm_handle_rm_free(struct nvkvm_req_ctx *ctx)
 
 /* ── NV_ESC_RM_CONTROL ────────────────────────────────────────────────────── */
 
+/*
+ * NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x101) contains embedded pointer
+ * fields (pDriverVersionBuffer etc.) that hold guest user-space VAs.  The host
+ * NVIDIA driver calls copy_to_user() on those addresses, which fails because
+ * they are guest VAs, not QEMU process VAs.  Fix by replacing them with
+ * malloc'd host-side buffers, calling the ioctl, then restoring the original
+ * addresses.  The changelist numbers are written into the params struct itself
+ * (no embedded pointer) and come back via aux_buf normally; the string data is
+ * discarded because CUDA's device enumeration only uses the numeric fields.
+ */
+static int nvkvm_ctrl_get_build_version(struct nvkvm_req_ctx *ctx,
+					struct nvos54_parameters *p)
+{
+	struct nv0000_ctrl_system_get_build_version_params *ver =
+		(struct nv0000_ctrl_system_get_build_version_params *)(uintptr_t)p->params;
+	uint32_t sz = ver->size_of_strings;
+	char *drv_buf = NULL, *ver_buf = NULL, *title_buf = NULL;
+	nvp64_t saved_drv, saved_ver_p, saved_title;
+	long ret;
+
+	if (sz > 0 && sz <= 4096) {
+		drv_buf   = calloc(1, sz);
+		ver_buf   = calloc(1, sz);
+		title_buf = calloc(1, sz);
+		if (!drv_buf || !ver_buf || !title_buf) {
+			free(drv_buf); free(ver_buf); free(title_buf);
+			return -ENOMEM;
+		}
+	}
+
+	saved_drv   = ver->p_driver_version_buffer;
+	saved_ver_p = ver->p_version_buffer;
+	saved_title = ver->p_title_buffer;
+
+	ver->p_driver_version_buffer = drv_buf   ? (nvp64_t)(uintptr_t)drv_buf   : 0;
+	ver->p_version_buffer        = ver_buf   ? (nvp64_t)(uintptr_t)ver_buf   : 0;
+	ver->p_title_buffer          = title_buf ? (nvp64_t)(uintptr_t)title_buf : 0;
+
+	ret = host_ioctl(ctx->hfd->fd,
+		_IOWR('F', NV_ESC_RM_CONTROL, struct nvos54_parameters), p);
+
+	fprintf(stderr,
+		"nvkvm: get_build_version: ret=%ld status=0x%x changelist=%u official=%u\n",
+		ret, p->status,
+		ver->changelist_number, ver->official_changelist_number);
+
+	/* Restore guest VA pointers so guest can see its own addresses */
+	ver->p_driver_version_buffer = saved_drv;
+	ver->p_version_buffer        = saved_ver_p;
+	ver->p_title_buffer          = saved_title;
+
+	free(drv_buf); free(ver_buf); free(title_buf);
+	return (int)ret;
+}
+
 int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx)
 {
 	struct nvos54_parameters *p = ctx->params_buf;
@@ -269,9 +324,16 @@ int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx)
 		return -EINVAL;
 	}
 
-	ret = host_ioctl(ctx->hfd->fd,
-		_IOWR('F', NV_ESC_RM_CONTROL,
-		      struct nvos54_parameters), p);
+	/* Dispatch commands with embedded pointer fields to dedicated handlers */
+	if (p->cmd == NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION &&
+	    ctx->aux_buf &&
+	    p->params_size >= sizeof(struct nv0000_ctrl_system_get_build_version_params)) {
+		ret = nvkvm_ctrl_get_build_version(ctx, p);
+	} else {
+		ret = host_ioctl(ctx->hfd->fd,
+			_IOWR('F', NV_ESC_RM_CONTROL,
+			      struct nvos54_parameters), p);
+	}
 
 	fprintf(stderr, "nvkvm: rm_control: ret=%ld status=0x%x cmd=0x%x\n",
 		ret, p->status, p->cmd);

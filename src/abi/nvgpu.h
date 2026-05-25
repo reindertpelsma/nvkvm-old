@@ -406,6 +406,21 @@ struct nv2080_alloc_parameters {
 	__u32      sub_device_id;
 };
 
+/* ── NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x101) ────────────────────── */
+
+#define NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION 0x00000101U
+
+/* NV_DECLARE_ALIGNED(NvP64, 8) fields: 4-byte pad before each 8-byte pointer */
+struct nv0000_ctrl_system_get_build_version_params {
+	__u32    size_of_strings;
+	__u32    _pad0;
+	nvp64_t  p_driver_version_buffer;  /* out: e.g. "575.51.03" */
+	nvp64_t  p_version_buffer;         /* out: numeric version   */
+	nvp64_t  p_title_buffer;           /* out: display title     */
+	__u32    changelist_number;        /* out */
+	__u32    official_changelist_number; /* out */
+};
+
 /* ── NV_ESC_RM_CONTROL command IDs used in tests ─────────────────────────── */
 
 #define NV0080_CTRL_CMD_GPU_GET_NUM_SUBDEVICES 0x00800280U
