@@ -66,6 +66,21 @@
 #define NVKVM_MMAP_WIN_GPA_BASE     0x18000000000ULL  /* 1.5 TB */
 #define NVKVM_MMAP_WIN_SIZE         (16ULL << 30)     /* 16 GB window */
 
+/*
+ * Sparse GPA window: a large VMM-backed GPA range used for memory-ioctl
+ * GPA assignments where the guest doesn't yet have backing for the
+ * userspace VA (cuMemAlloc, cuMallocManaged, sparse mmaps, etc.).
+ *
+ * VMM backing: one anon MAP_NORESERVE region of this size in QEMU's
+ * mm.  KVM_SET_USER_MEMORY_REGION at startup maps the whole window
+ * GPA -> VMM_VA in one slot.  Host kernel demand-faults pages on
+ * first access, KVM never sees the fault, guest never sees the fault.
+ *
+ * Lives above the existing 16 GB mmap window.
+ */
+#define NVKVM_SPARSE_GPA_BASE       0x20000000000ULL  /* 2 TB  */
+#define NVKVM_SPARSE_GPA_SIZE       (128ULL << 30)    /* 128 GB sparse window */
+
 /* ── Object graph (mirrors gVisor nvproxy object.go) ────────────────────── */
 
 struct nvkvm_object;
@@ -191,6 +206,20 @@ typedef struct VirtIONvgpu {
 	uint64_t            mmap_win_cur;   /* next available GPA offset    */
 	pthread_mutex_t     mmap_win_lock;
 
+	/*
+	 * Sparse GPA window — see NVKVM_SPARSE_GPA_BASE in the comment block
+	 * above.  sparse_gpa_base / sparse_size are GPA-space; sparse_vmm_va
+	 * is the MAP_NORESERVE anon region in QEMU's mm that backs the slot.
+	 * sparse_cur is the next free GPA offset; sparse_kvm_slot is the
+	 * KVM memory slot ID we installed at device realize.
+	 */
+	uint64_t            sparse_gpa_base;
+	size_t              sparse_size;
+	void               *sparse_vmm_va;
+	uint64_t            sparse_cur;
+	int                 sparse_kvm_slot;
+	pthread_mutex_t     sparse_lock;
+
 	/* Session table */
 	TAILQ_HEAD(, nvkvm_session) sessions;
 	pthread_mutex_t             sessions_lock;
@@ -313,6 +342,27 @@ void nvkvm_obj_add_dep(struct nvkvm_client *client,
 
 /* nvkvm_mmap_host.c */
 void nvkvm_set_kvm_vm_fd(int fd);
+
+/*
+ * Sparse GPA window helpers.  See NVKVM_SPARSE_GPA_BASE.
+ *
+ * nvkvm_sparse_init: called once at device realize.  mmaps the VMM-side
+ * window as MAP_NORESERVE | MAP_ANONYMOUS and installs the KVM region.
+ * Returns 0 on success, -errno on failure.  Subsequent allocations from
+ * nvkvm_sparse_gpa_alloc only succeed after this returns 0.
+ *
+ * nvkvm_sparse_gpa_alloc(size): hand out a fresh GPA in the sparse
+ * window.  size is rounded up to PAGE_SIZE.  Returns 0 if exhausted.
+ * No backing is allocated — host kernel demand-faults on first access.
+ *
+ * nvkvm_gpa_to_vmm_va(gpa, size): translate a GPA in the sparse window
+ * to a VMM-mm void*.  Returns NULL if gpa+size is outside the window.
+ * The returned pointer is stable for the lifetime of the device.
+ */
+int   nvkvm_sparse_init(VirtIONvgpu *nv);
+void  nvkvm_sparse_fini(VirtIONvgpu *nv);
+uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
+void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
 VirtIONvgpu *nvkvm_get_global_device(void);
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
 int  nvkvm_mmap_create(VirtIONvgpu *nv, struct nvkvm_host_fd *hfd,

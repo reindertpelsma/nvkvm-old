@@ -825,6 +825,14 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	nv->mmap_win_size = NVKVM_MMAP_WIN_SIZE;
 	nv->mmap_win_cur  = 0;
 
+	/* Sparse GPA window — used by the memory-ioctl path for guest-VA
+	 * regions that don't yet have backing.  Lazy via MAP_NORESERVE +
+	 * a single big KVM region. */
+	nv->sparse_kvm_slot = -1;
+	if (nvkvm_sparse_init(nv) < 0)
+		fprintf(stderr, "nvkvm: sparse window unavailable; "
+			"memory-ioctl path will degrade\n");
+
 	/* Populate virtio config space so the guest can locate both regions */
 	nv->config_space.shm_base     = cpu_to_le64(NVKVM_SHM_GPA_BASE);
 	nv->config_space.shm_len      = cpu_to_le64(nv->shm_size);

@@ -118,6 +118,92 @@ void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out)
 	*gpa_out = alloc_gpa(nv, length);
 }
 
+/* ── Sparse GPA window ────────────────────────────────────────────────────── */
+
+/* Forward decls — definitions follow this block. */
+static int  kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
+				   bool readonly, int *slot_out);
+static void kvm_remove_memory_region(int slot);
+
+/*
+ * One-shot setup of the sparse window — large MAP_NORESERVE region in
+ * QEMU's mm + a single KVM memory slot covering the whole GPA range.
+ * Host kernel demand-faults pages on first access by either side
+ * (QEMU CPU, nvidia driver via DMA, or guest via EPT).
+ *
+ * Called from virtio_nvgpu_device_realize after the kvm-vm fd is known.
+ */
+int nvkvm_sparse_init(VirtIONvgpu *nv)
+{
+	if (nv->sparse_vmm_va) return 0;  /* already initialised */
+
+	void *va = mmap(NULL, NVKVM_SPARSE_GPA_SIZE,
+			PROT_READ | PROT_WRITE,
+			MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
+			-1, 0);
+	if (va == MAP_FAILED) {
+		fprintf(stderr,
+			"nvkvm_sparse_init: mmap %llu GiB failed: %s\n",
+			(unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
+			strerror(errno));
+		return -errno;
+	}
+
+	int slot = -1;
+	int rc = kvm_add_memory_region(NVKVM_SPARSE_GPA_BASE, va,
+					NVKVM_SPARSE_GPA_SIZE, false, &slot);
+	if (rc) {
+		munmap(va, NVKVM_SPARSE_GPA_SIZE);
+		return rc;
+	}
+
+	pthread_mutex_init(&nv->sparse_lock, NULL);
+	nv->sparse_gpa_base = NVKVM_SPARSE_GPA_BASE;
+	nv->sparse_size     = NVKVM_SPARSE_GPA_SIZE;
+	nv->sparse_vmm_va   = va;
+	nv->sparse_cur      = 0;
+	nv->sparse_kvm_slot = slot;
+	fprintf(stderr,
+		"nvkvm_sparse_init: %llu GiB at GPA=0x%llx VMM=%p slot=%d\n",
+		(unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
+		(unsigned long long)NVKVM_SPARSE_GPA_BASE, va, slot);
+	return 0;
+}
+
+void nvkvm_sparse_fini(VirtIONvgpu *nv)
+{
+	if (!nv->sparse_vmm_va) return;
+	if (nv->sparse_kvm_slot >= 0) kvm_remove_memory_region(nv->sparse_kvm_slot);
+	munmap(nv->sparse_vmm_va, nv->sparse_size);
+	nv->sparse_vmm_va = NULL;
+	pthread_mutex_destroy(&nv->sparse_lock);
+}
+
+uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
+{
+	if (!nv->sparse_vmm_va) return 0;
+	size = (size + 4095) & ~4095ULL;
+	pthread_mutex_lock(&nv->sparse_lock);
+	uint64_t off = (nv->sparse_cur + 4095) & ~4095ULL;
+	if (off + size > nv->sparse_size) {
+		pthread_mutex_unlock(&nv->sparse_lock);
+		fprintf(stderr, "nvkvm_sparse_gpa_alloc: window exhausted\n");
+		return 0;
+	}
+	nv->sparse_cur = off + size;
+	pthread_mutex_unlock(&nv->sparse_lock);
+	return nv->sparse_gpa_base + off;
+}
+
+void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size)
+{
+	if (!nv->sparse_vmm_va) return NULL;
+	if (gpa < nv->sparse_gpa_base) return NULL;
+	uint64_t off = gpa - nv->sparse_gpa_base;
+	if (off >= nv->sparse_size || off + size > nv->sparse_size) return NULL;
+	return (char *)nv->sparse_vmm_va + off;
+}
+
 /* ── KVM memory slot management ───────────────────────────────────────────── */
 
 /*
