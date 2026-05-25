@@ -68,10 +68,8 @@ struct uvm_deinitialize_params {
 };
 
 struct uvm_mm_initialize_params {
-	__u64 user_va_base;
-	__u64 user_va_length;
-	__u32 rm_status;
-	__u32 reserved;
+	__s32 uvm_fd;    /* IN:  fd_token of the primary UVM fd (UVM_INITIALIZE was called on it) */
+	__u32 rm_status; /* OUT: NV_STATUS */
 };
 
 /* 16-byte UUID for GPU identification */

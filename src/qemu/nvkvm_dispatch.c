@@ -146,7 +146,31 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	switch (cmd) {
 	case UVM_INITIALIZE:
 	case UVM_DEINITIALIZE:
-	case UVM_MM_INITIALIZE:
+		return nvkvm_handle_simple_ioctl(ctx, cmd);
+
+	/*
+	 * UVM_MM_INITIALIZE: links the secondary MM fd to the primary UVM fd.
+	 * uvm_fd contains the fd_token of the primary UVM open (from the guest
+	 * sanitizer); translate to the real host fd before forwarding.
+	 */
+	case UVM_MM_INITIALIZE: {
+		struct uvm_mm_initialize_params *p = ctx->params_buf;
+		struct nvkvm_host_fd *uvm_hfd =
+			nvkvm_fd_lookup(ctx->session, (uint32_t)p->uvm_fd);
+		if (!uvm_hfd) {
+			fprintf(stderr, "nvkvm: UVM_MM_INITIALIZE: uvm_fd token %d not found\n",
+				p->uvm_fd);
+			return -EBADF;
+		}
+		int saved = p->uvm_fd;
+		p->uvm_fd = (int32_t)uvm_hfd->fd;
+		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		fprintf(stderr, "nvkvm: UVM_MM_INITIALIZE: uvm_fd_token=%d host_fd=%d ret=%d rm_status=0x%x\n",
+			saved, uvm_hfd->fd, ret, p->rm_status);
+		p->uvm_fd = 0;
+		return ret;
+	}
+
 	case UVM_CREATE_RANGE_GROUP:
 	case UVM_DESTROY_RANGE_GROUP:
 	case UVM_FREE:

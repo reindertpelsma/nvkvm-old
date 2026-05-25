@@ -188,6 +188,8 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 
 	resp_msg.resp.fd_token = cpu_to_le32(hfd->token);
 	resp_msg.resp.status   = 0;
+	fprintf(stderr, "nvkvm: open: dev_id=%u session=%u token=%u host_fd=%d\n",
+		dev_id, session->id, hfd->token, hfd->fd);
 
 send:
 	iov_from_buf(elem->in_sg, elem->in_num, 0,

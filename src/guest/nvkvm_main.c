@@ -523,25 +523,44 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
 		   param_size == sizeof(struct nvos64_parameters) && params_buf) {
 		struct nvos64_parameters *alloc = params_buf;
-		if (alloc->alloc_parms_size > 0 && alloc->p_alloc_parms != 0) {
-			if (alloc->alloc_parms_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+		if (alloc->p_alloc_parms != 0) {
+			/* CUDA often leaves alloc_parms_size=0 and relies on the
+			 * driver to size the buffer by hClass. Honor an explicit
+			 * size if provided, otherwise fall back to the per-class
+			 * size (same table as the nvos21 path above). */
+			size_t ap_size = alloc->alloc_parms_size;
+			if (ap_size == 0) {
+				switch (alloc->h_class) {
+				case NV01_DEVICE_0:
+					ap_size = sizeof(struct nv0080_alloc_parameters);
+					break;
+				case NV20_SUBDEVICE_0:
+					ap_size = sizeof(struct nv2080_alloc_parameters);
+					break;
+				}
+			}
+			if (ap_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
 				kfree(params_buf);
 				return -EINVAL;
 			}
-			/* aux_uptr: we don't need copy-back for alloc params (input only) */
-			aux_buf = kzalloc(alloc->alloc_parms_size, GFP_KERNEL);
-			if (!aux_buf) {
-				kfree(params_buf);
-				return -ENOMEM;
+			if (ap_size > 0) {
+				aux_buf = kzalloc(ap_size, GFP_KERNEL);
+				if (!aux_buf) {
+					kfree(params_buf);
+					return -ENOMEM;
+				}
+				if (copy_from_user(aux_buf,
+						   (void __user *)(uintptr_t)alloc->p_alloc_parms,
+						   ap_size)) {
+					kfree(aux_buf);
+					kfree(params_buf);
+					return -EFAULT;
+				}
+				aux_size = ap_size;
+				/* Sync the size back so the host driver sees a
+				 * consistent (params, paramsSize) pair. */
+				alloc->alloc_parms_size = (u32)ap_size;
 			}
-			if (copy_from_user(aux_buf,
-					   (void __user *)(uintptr_t)alloc->p_alloc_parms,
-					   alloc->alloc_parms_size)) {
-				kfree(aux_buf);
-				kfree(params_buf);
-				return -EFAULT;
-			}
-			aux_size = alloc->alloc_parms_size;
 		}
 	}
 
@@ -558,11 +577,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/* Forward to host via the appropriate path */
-	if (ctx->handle_id && ctx->session->isolate_id) {
+	if (ctx->handle_id && ctx->session->isolate_id &&
+	    ctx->dev_id != NVKVM_DEV_UVM) {
 		/*
 		 * Isolate path: ioctl runs in the isolate process so the NVIDIA
 		 * driver sees a valid VA space.  On EFAULT the isolate returns
 		 * the faulting GVA; we map the backing region and retry.
+		 *
+		 * UVM ioctls always use the legacy QEMU-direct path: the UVM
+		 * kernel context must live in a single process (QEMU's).  Sending
+		 * UVM_MM_INITIALIZE et al. to the stub would require translating
+		 * fd_token → stub fd inside the stub, which it cannot do.
 		 */
 		__u32 ioctl_flags = 0;
 		__u64 fault_addr  = 0;

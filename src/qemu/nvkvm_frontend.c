@@ -510,12 +510,17 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		}
 	}
 	long ret = host_ioctl(ctx->hfd->fd, cmd, ctx->params_buf);
-	/* UVM ioctl result logging */
-	if (cmd == UVM_INITIALIZE || cmd == UVM_MM_INITIALIZE ||
-	    cmd == UVM_DEINITIALIZE || cmd == UVM_REGISTER_GPU ||
-	    cmd == UVM_UNREGISTER_GPU) {
-		const uint32_t *p = (const uint32_t *)ctx->params_buf;
-		uint32_t rm_status = ctx->params_buf ? p[ctx->param_size/4 - 1] : 0xffffffff;
+	/* UVM ioctl result logging — rm_status is at a command-specific offset */
+	if (cmd == UVM_INITIALIZE || cmd == UVM_DEINITIALIZE ||
+	    cmd == UVM_REGISTER_GPU || cmd == UVM_UNREGISTER_GPU) {
+		/* These structs all have rm_status as the first uint32 or second
+		 * uint32 (after flags/reserved).  Print offset-4 bytes which
+		 * covers both layouts. */
+		uint32_t rm_status = 0;
+		if (ctx->params_buf && ctx->param_size >= 8)
+			memcpy(&rm_status,
+			       (const char *)ctx->params_buf + 4,
+			       sizeof(rm_status));
 		fprintf(stderr, "nvkvm: uvm ioctl cmd=0x%x dev_id=%d ret=%ld rm_status=0x%x\n",
 			cmd, ctx->hfd->dev_id, ret, rm_status);
 	}

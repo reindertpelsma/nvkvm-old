@@ -103,9 +103,10 @@ struct nvos21_parameters {
  * NVOS64_PARAMETERS — used when hRightsRequested != NULL (newer drivers).
  *
  * Field order matches NVIDIA open-gpu-kernel-modules nvos.h NVOS64_PARAMETERS:
- *   hRoot, hObjectParent, hObjectNew, hClass, pAllocParms(8),
- *   paramsSize(4), flags(4), status(4), reserved(4), hRightsRequested(8)
- * = 48 bytes total.
+ *   hRoot(4), hObjectParent(4), hObjectNew(4), hClass(4),
+ *   pAllocParms(8), pRightsRequested(8),
+ *   paramsSize(4), flags(4), status(4), reserved(4)
+ * = 48 bytes total. (Cross-checked with gVisor pkg/abi/nvgpu/frontend.go.)
  */
 struct nvos64_parameters {
 	nvhandle_t h_root;
@@ -113,11 +114,11 @@ struct nvos64_parameters {
 	nvhandle_t h_object_new;
 	nvclassid_t h_class;
 	nvp64_t    p_alloc_parms;       /* pointer to class-specific alloc struct */
+	nvp64_t    p_rights_requested;  /* pointer to RS_ACCESS_MASK (may be NULL) */
 	__u32      alloc_parms_size;    /* size of alloc params buffer            */
 	__u32      flags;
 	__u32      status;
 	__u32      reserved;
-	nvp64_t    p_rights_requested;  /* pointer to RS_ACCESS_MASK (may be NULL) */
 };
 
 /* ── NV_ESC_RM_FREE ──────────────────────────────────────────────────────── */

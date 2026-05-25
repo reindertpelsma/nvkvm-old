@@ -194,12 +194,72 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
  * secondary buffer in the aux slot before this call; here we just zero the
  * pointer. The host will reconstruct it from the aux slot.
  */
+/* Helper: translate a guest fd to its fd_token. Returns -EBADF on error. */
+static __s32 guest_fd_to_token(int guest_fd)
+{
+	struct file *f = fget(guest_fd);
+	__s32 token;
+
+	if (!f)
+		return -EBADF;
+	{
+		struct nvkvm_fd_ctx *other = f->private_data;
+		if (!other) {
+			fput(f);
+			return -EBADF;
+		}
+		token = (__s32)other->fd_token;
+	}
+	fput(f);
+	return token;
+}
+
 int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				unsigned int cmd,
 				void *buf, size_t size)
 {
 	if (!buf || size == 0)
 		return 0;
+
+	/* UVM ioctls with embedded fd fields (matched on full cmd word) */
+	switch (cmd) {
+	case UVM_MM_INITIALIZE: {
+		struct uvm_mm_initialize_params *p = buf;
+		if (p->uvm_fd >= 0) {
+			__s32 token = guest_fd_to_token(p->uvm_fd);
+			if (token < 0)
+				return -EBADF;
+			p->uvm_fd = token;
+		}
+		return 0;
+	}
+	case UVM_REGISTER_GPU_VASPACE: {
+		struct uvm_register_gpu_vaspace_params *p = buf;
+		__s32 token = guest_fd_to_token((int)p->rm_ctrl_fd);
+		if (token < 0)
+			return -EBADF;
+		p->rm_ctrl_fd = (nvhandle_t)token;
+		return 0;
+	}
+	case UVM_REGISTER_CHANNEL: {
+		struct uvm_register_channel_params *p = buf;
+		__s32 token = guest_fd_to_token((int)p->rm_ctrl_fd);
+		if (token < 0)
+			return -EBADF;
+		p->rm_ctrl_fd = (nvhandle_t)token;
+		return 0;
+	}
+	case UVM_MAP_EXTERNAL_ALLOCATION: {
+		struct uvm_map_external_allocation_params *p = buf;
+		__s32 token = guest_fd_to_token((int)p->rm_ctrl_fd);
+		if (token < 0)
+			return -EBADF;
+		p->rm_ctrl_fd = (nvhandle_t)token;
+		return 0;
+	}
+	default:
+		break;
+	}
 
 	switch (NV_IOC_NR(cmd)) {
 

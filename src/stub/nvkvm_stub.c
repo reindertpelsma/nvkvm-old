@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <elf.h>
+#include <stdio.h>
 
 #include "../common/nvkvm_isolate_proto.h"
 
@@ -230,6 +231,8 @@ struct ioctl_job {
 	int      valid;   /* 1 = slot occupied */
 };
 
+static void *blob_alloc(size_t size);
+
 static struct ioctl_job     job_queue[MAX_INFLIGHT];
 static pthread_mutex_t      queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t       queue_cond  = PTHREAD_COND_INITIALIZER;
@@ -309,26 +312,101 @@ static void *worker_thread(void *arg)
 					 sizeof(uint64_t));
 		}
 
+		/*
+		 * GET_BUILD_VERSION (inner cmd=0x101) has three embedded string
+		 * pointer fields (p_driver_version_buffer, p_version_buffer,
+		 * p_title_buffer) at aux_buf offsets 8, 16, 24.  The guest fills
+		 * these with guest-VA buffers that are not valid in the stub's
+		 * address space; the host driver calls copy_to_user with them,
+		 * fails silently, and leaves changelist_number=0, which causes
+		 * cuInit to return CUDA_ERROR_SYSTEM_NOT_READY.
+		 *
+		 * Fix: allocate stub-local string buffers and redirect the
+		 * pointer fields.  After the ioctl, zero them before sending the
+		 * aux_buf back so the guest cannot see stub VAs.
+		 */
+		uint32_t str_sz = 0;
+		if ((job.cmd & 0xff) == 0x2a &&        /* NV_ESC_RM_CONTROL */
+		    job.aux_size > 0 && job.param_size >= 12) {
+			uint32_t inner_cmd;
+			__builtin_memcpy(&inner_cmd,
+					 (char *)job.param_buf + 8,
+					 sizeof(uint32_t));
+			if (inner_cmd == 0x00000101U) {    /* GET_BUILD_VERSION */
+				/*
+				 * nv0000_ctrl_system_get_build_version_params is
+				 * 40 bytes; the guest extends aux_buf to
+				 * 40 + 3*sz so the host driver can write strings
+				 * into the extension area without accessing guest VAs.
+				 * Point the embedded string pointer fields at the
+				 * extension region already present in job.aux_buf.
+				 */
+				uint32_t sz = 0;
+				if (job.aux_size >= 4)
+					__builtin_memcpy(&sz, job.aux_buf, sizeof(uint32_t));
+				if (sz > 0 && sz <= 512 &&
+				    job.aux_size >= 40 + (size_t)sz * 3) {
+					str_sz = sz; /* flag: zero pointers after ioctl */
+					uint64_t p1, p2, p3;
+					p1 = (uint64_t)(uintptr_t)((char *)job.aux_buf + 40);
+					p2 = p1 + sz;
+					p3 = p1 + 2 * sz;
+					__builtin_memcpy((char *)job.aux_buf +  8, &p1, 8);
+					__builtin_memcpy((char *)job.aux_buf + 16, &p2, 8);
+					__builtin_memcpy((char *)job.aux_buf + 24, &p3, 8);
+				}
+			}
+		}
+
+		/* NV_ESC_CARD_INFO: log how many valid entries the driver returned */
+		int is_card_info = ((job.cmd & 0xff) == 0xc8 &&
+				    job.param_size > 0 && job.aux_size == 0);
+
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
 		int  err  = (ret < 0) ? errno : 0;
 
-		/* Zero the pointer field before sending back (don't leak host VA) */
+		if (is_card_info) {
+			int n = 0;
+			size_t entry_sz = 80; /* sizeof(nv_ioctl_card_info) on x86-64 */
+			size_t count = job.param_size / entry_sz;
+			for (size_t i = 0; i < count && i < 32; i++) {
+				uint8_t valid = *((uint8_t *)job.param_buf + i * entry_sz);
+				if (valid) n++;
+			}
+			dprintf(2, "nvkvm_stub: CARD_INFO ret=%ld err=%d param_size=%u valid_entries=%d\n",
+				ret, err, job.param_size, n);
+		}
+
+		/* Zero the embedded pointer field in nvos54 (don't leak host VA) */
 		if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t zero = 0;
 			__builtin_memcpy((char *)job.param_buf + 16, &zero,
 					 sizeof(uint64_t));
 		}
 
+		/* Zero GET_BUILD_VERSION embedded string pointer fields (host VAs) */
+		if (str_sz > 0) {
+			uint64_t z = 0;
+			__builtin_memcpy((char *)job.aux_buf +  8, &z, 8);
+			__builtin_memcpy((char *)job.aux_buf + 16, &z, 8);
+			__builtin_memcpy((char *)job.aux_buf + 24, &z, 8);
+		}
+
 		/*
-		 * Extract NvStatus from the response struct.  For nvos54
-		 * (RM_CONTROL) and nvos21/nvos64 (RM_ALLOC), the status field
-		 * is at offset 28 in the 32-byte layout.  Larger structs (like
-		 * nvos64 which is 48 bytes) have status at a different offset;
-		 * read conservatively only for param_size >= 32.
+		 * Extract NvStatus from the response struct.
+		 *   nvos54 (RM_CONTROL, 32 bytes): status at offset 28
+		 *   nvos21 (RM_ALLOC,  32 bytes): status at offset 28
+		 *   nvos64 (RM_ALLOC,  48 bytes): status at offset 40
+		 *     (after hRoot/parent/new/class, pAllocParms, pRightsRequested,
+		 *      paramsSize, flags — then status; see gVisor frontend.go).
 		 */
 		uint32_t nvstatus = 0;
-		if (job.param_size >= 32)
+		if (job.param_size == 48)
+			__builtin_memcpy(&nvstatus,
+					 (char *)job.param_buf + 40,
+					 sizeof(uint32_t));
+		else if (job.param_size >= 32)
 			__builtin_memcpy(&nvstatus,
 					 (char *)job.param_buf + 28,
 					 sizeof(uint32_t));
