@@ -271,10 +271,25 @@ static int nvkvm_ctrl_get_build_version(struct nvkvm_req_ctx *ctx,
 	ret = host_ioctl(ctx->hfd->fd,
 		_IOWR('F', NV_ESC_RM_CONTROL, struct nvos54_parameters), p);
 
-	fprintf(stderr,
-		"nvkvm: get_build_version: ret=%ld status=0x%x changelist=%u official=%u\n",
-		ret, p->status,
-		ver->changelist_number, ver->official_changelist_number);
+	if (sz > 0 && sz <= 512 &&
+	    ctx->aux_size >= p->params_size + (size_t)3 * sz) {
+		char *ext = (char *)ver + p->params_size;
+		/* Ensure null-terminated for printing */
+		char drv[65] = {0}, version[65] = {0}, titl[65] = {0};
+		memcpy(drv, ext, sz < 64 ? sz : 64);
+		memcpy(version, ext + sz, sz < 64 ? sz : 64);
+		memcpy(titl, ext + 2 * sz, sz < 64 ? sz : 64);
+		fprintf(stderr,
+			"nvkvm: get_build_version: ret=%ld status=0x%x changelist=%u official=%u sz=%u drv='%s' ver='%s' title='%s'\n",
+			ret, p->status,
+			ver->changelist_number, ver->official_changelist_number,
+			sz, drv, version, titl);
+	} else {
+		fprintf(stderr,
+			"nvkvm: get_build_version: ret=%ld status=0x%x changelist=%u official=%u sz=%u (no ext)\n",
+			ret, p->status,
+			ver->changelist_number, ver->official_changelist_number, sz);
+	}
 
 	/* Zero the pointer fields before returning to guest — they're host VAs
 	 * and meaningless in the guest context; the guest copies strings by offset. */
