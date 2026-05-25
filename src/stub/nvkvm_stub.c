@@ -326,12 +326,44 @@ static void *worker_thread(void *arg)
 		 * aux_buf back so the guest cannot see stub VAs.
 		 */
 		uint32_t str_sz = 0;
+		uint32_t info_list_size = 0; /* if non-zero, info_list pointer must be re-zeroed after the ioctl */
+		uint32_t info_list_base = 0; /* base offset of info_list area in aux_buf */
 		if ((job.cmd & 0xff) == 0x2a &&        /* NV_ESC_RM_CONTROL */
 		    job.aux_size > 0 && job.param_size >= 12) {
 			uint32_t inner_cmd;
 			__builtin_memcpy(&inner_cmd,
 					 (char *)job.param_buf + 8,
 					 sizeof(uint32_t));
+			/* InfoList family (NV2080_CTRL_CMD_GR_GET_INFO etc.):
+			 * aux_buf layout is [base_params][list_size*8 bytes of list].
+			 * The base params has list_size at offset 0 and the info_list
+			 * pointer at offset 8 (currently zero — guest cleared it). We
+			 * point info_list at the extension area so the host driver
+			 * writes into our own memory. After the ioctl we zero the
+			 * pointer again so we don't leak a host VA back to the guest. */
+			if (inner_cmd == 0x00410110U || /* NV0041_CTRL_CMD_GET_SURFACE_INFO */
+			    inner_cmd == 0x00801104U || /* NV0080_CTRL_CMD_GR_GET_INFO */
+			    inner_cmd == 0x20800802U || /* NV2080_CTRL_CMD_BIOS_GET_INFO */
+			    inner_cmd == 0x20801201U || /* NV2080_CTRL_CMD_GR_GET_INFO */
+			    inner_cmd == 0x20801301U || /* NV2080_CTRL_CMD_FB_GET_INFO */
+			    inner_cmd == 0x20801802U) { /* NV2080_CTRL_CMD_BUS_GET_INFO */
+				uint32_t ls = 0;
+				__builtin_memcpy(&ls, job.aux_buf, sizeof(uint32_t));
+				/* base_size is whatever the guest sent before the
+				 * extension; we recover it as aux_size - ls*8. */
+				if (ls > 0 && (size_t)ls * 8 < job.aux_size) {
+					uint32_t base = (uint32_t)(job.aux_size - (size_t)ls * 8);
+					if (base >= 16) {
+						uint64_t list_va =
+							(uint64_t)(uintptr_t)
+							((char *)job.aux_buf + base);
+						__builtin_memcpy((char *)job.aux_buf + 8,
+								 &list_va, 8);
+						info_list_size = ls;
+						info_list_base = base;
+					}
+				}
+			}
 			if (inner_cmd == 0x00000101U) {    /* GET_BUILD_VERSION */
 				/*
 				 * nv0000_ctrl_system_get_build_version_params is
@@ -392,6 +424,15 @@ static void *worker_thread(void *arg)
 			__builtin_memcpy((char *)job.aux_buf + 16, &z, 8);
 			__builtin_memcpy((char *)job.aux_buf + 24, &z, 8);
 		}
+
+		/* Zero the InfoList pointer we set above (don't leak host VA). The
+		 * driver-written list contents in [info_list_base ..] are preserved
+		 * — the guest module copies them out to the original user buffer. */
+		if (info_list_size > 0) {
+			uint64_t z = 0;
+			__builtin_memcpy((char *)job.aux_buf + 8, &z, 8);
+		}
+		(void)info_list_base;
 
 		/*
 		 * Extract NvStatus from the response struct.

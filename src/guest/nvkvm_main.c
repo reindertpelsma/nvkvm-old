@@ -451,6 +451,63 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			aux_size = ctrl->params_size;
 
 			/*
+			 * Commands that embed an `NvxxxCtrlXxxGetInfoParams` preamble
+			 * (info_list_size, pad, info_list pointer) at the start of the
+			 * inner params struct. The driver writes through the
+			 * info_list pointer, so we extend aux_buf to hold the list,
+			 * copy the user's list into the extension, and zero the
+			 * pointer field — QEMU substitutes a host VA pointing at the
+			 * extension. After the ioctl we copy the list back to the
+			 * original user-space address (saved off below). See gVisor
+			 * `ctrlIoctlHasInfoList` for the reference implementation.
+			 */
+			{
+				int has_info_list = 0;
+				switch (ctrl->cmd) {
+				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
+				case NV0080_CTRL_CMD_GR_GET_INFO:
+				case NV2080_CTRL_CMD_BIOS_GET_INFO:
+				case NV2080_CTRL_CMD_GR_GET_INFO:
+				case NV2080_CTRL_CMD_FB_GET_INFO:
+				case NV2080_CTRL_CMD_BUS_GET_INFO:
+					has_info_list = 1;
+					break;
+				}
+				if (has_info_list &&
+				    ctrl->params_size >= 16 /* size(4)+pad(4)+ptr(8) */) {
+					__u32 list_size = *(__u32 *)aux_buf;
+					__u64 list_ptr  = *(__u64 *)((char *)aux_buf + 8);
+					if (list_size > 0 && list_size <= 4096 && list_ptr != 0) {
+						size_t list_bytes =
+							(size_t)list_size *
+							NVXXX_CTRL_XXX_INFO_ENTRY_SIZE;
+						size_t ext = ctrl->params_size + list_bytes;
+						void *ext_buf = kzalloc(ext, GFP_KERNEL);
+						if (!ext_buf) {
+							kfree(aux_buf);
+							kfree(params_buf);
+							return -ENOMEM;
+						}
+						memcpy(ext_buf, aux_buf, ctrl->params_size);
+						if (copy_from_user((char *)ext_buf +
+								   ctrl->params_size,
+								   (void __user *)(uintptr_t)list_ptr,
+								   list_bytes)) {
+							kfree(ext_buf);
+							kfree(aux_buf);
+							kfree(params_buf);
+							return -EFAULT;
+						}
+						/* Zero info_list ptr; QEMU/stub fills with host VA */
+						*(__u64 *)((char *)ext_buf + 8) = 0;
+						kfree(aux_buf);
+						aux_buf  = ext_buf;
+						aux_size = ext;
+					}
+				}
+			}
+
+			/*
 			 * NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION has embedded
 			 * pointer fields (pDriverVersionBuffer etc.) pointing to
 			 * guest user-space string buffers.  The host NVIDIA driver
@@ -651,6 +708,53 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 */
 		if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
 			struct nvos54_parameters *ctrl = params_buf;
+
+			/*
+			 * InfoList family (NV2080_CTRL_CMD_GR_GET_INFO and friends):
+			 * aux_buf is sized to params_size + list_size*8; the trailing
+			 * region holds the driver-written list. Copy it back to the
+			 * original user-space list address, then restore the pointer
+			 * in aux_buf and write only the base params struct out.
+			 */
+			{
+				int has_info_list = 0;
+				switch (ctrl->cmd) {
+				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
+				case NV0080_CTRL_CMD_GR_GET_INFO:
+				case NV2080_CTRL_CMD_BIOS_GET_INFO:
+				case NV2080_CTRL_CMD_GR_GET_INFO:
+				case NV2080_CTRL_CMD_FB_GET_INFO:
+				case NV2080_CTRL_CMD_BUS_GET_INFO:
+					has_info_list = 1;
+					break;
+				}
+				if (has_info_list &&
+				    ctrl->params_size >= 16 &&
+				    aux_size > ctrl->params_size) {
+					struct {
+						__u32 list_size;
+						__u32 pad;
+						__u64 list_ptr;
+					} orig;
+					if (!copy_from_user(&orig, aux_uptr, sizeof(orig)) &&
+					    orig.list_size > 0 && orig.list_ptr != 0) {
+						size_t list_bytes =
+							(size_t)orig.list_size *
+							NVXXX_CTRL_XXX_INFO_ENTRY_SIZE;
+						if (aux_size >= ctrl->params_size + list_bytes) {
+							copy_to_user(
+								(void __user *)(uintptr_t)orig.list_ptr,
+								(char *)aux_buf + ctrl->params_size,
+								list_bytes);
+						}
+						/* Restore original pointer so userspace sees its VA */
+						*(__u64 *)((char *)aux_buf + 8) = orig.list_ptr;
+					}
+					if (copy_to_user(aux_uptr, aux_buf, ctrl->params_size))
+						ret = -EFAULT;
+					goto done_aux_copy;
+				}
+			}
 
 			if (ctrl->cmd == NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION &&
 			    ctrl->params_size >=

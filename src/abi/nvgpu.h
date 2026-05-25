@@ -422,6 +422,27 @@ struct nv0000_ctrl_system_get_build_version_params {
 	__u32    official_changelist_number; /* out */
 };
 
+/* ── Commands with embedded InfoList pointer (NvxxxCtrlXxxGetInfoParams) ── */
+/*
+ * These RM_CONTROL inner commands share a common preamble:
+ *   uint32 info_list_size;  // offset 0
+ *   uint32 _pad;            // offset 4
+ *   nvp64  info_list;       // offset 8   (pointer to info_list_size * 8 bytes)
+ *
+ * Each entry is two uint32: (index, data). CUDA pre-fills the index fields and
+ * reads the data fields after the call. The guest sanitizer must carry the
+ * list contents through the aux slot since the host has no access to guest VAs.
+ *
+ * Pulled from gVisor pkg/abi/nvgpu/ctrl.go.
+ */
+#define NV0041_CTRL_CMD_GET_SURFACE_INFO  0x00410110U
+#define NV0080_CTRL_CMD_GR_GET_INFO       0x00801104U
+#define NV2080_CTRL_CMD_BIOS_GET_INFO     0x20800802U
+#define NV2080_CTRL_CMD_GR_GET_INFO       0x20801201U
+#define NV2080_CTRL_CMD_FB_GET_INFO       0x20801301U
+#define NV2080_CTRL_CMD_BUS_GET_INFO      0x20801802U
+#define NVXXX_CTRL_XXX_INFO_ENTRY_SIZE    8U
+
 /* ── NV_ESC_RM_CONTROL command IDs used in tests ─────────────────────────── */
 
 #define NV0080_CTRL_CMD_GPU_GET_NUM_SUBDEVICES 0x00800280U
