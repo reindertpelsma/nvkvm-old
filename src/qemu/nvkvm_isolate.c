@@ -346,9 +346,9 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			dup2(sv[1], STDIN_FILENO);
 			close(sv[0]);
 			close(sv[1]);
-			char *const argv[] = { "nvkvm_stub", NULL };
-			char *const envp[] = { NULL };
-			fexecve(mfd, argv, envp);
+			const char *argv[] = { "nvkvm_stub", NULL };
+			const char *envp[] = { NULL };
+			fexecve(mfd, (char *const *)argv, (char *const *)envp);
 			_exit(127);
 		}
 		close(mfd);

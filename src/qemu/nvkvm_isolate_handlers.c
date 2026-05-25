@@ -270,10 +270,8 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
  *   3. QEMU sends MMAP command to isolate: map same fd at gva (MAP_FIXED).
  */
 
-/* Forward-declared from nvkvm_mmap_host.c */
-extern int  nvkvm_kvm_vm_fd;
-extern void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length,
-				  uint64_t *gpa_out);
+
+extern int nvkvm_kvm_vm_fd;
 
 #ifndef KVM_SET_USER_MEMORY_REGION
 #define NVKVM_KVMIO 0xAE
