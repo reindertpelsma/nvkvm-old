@@ -634,26 +634,36 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 				if (!copy_from_user(&orig, aux_uptr, sizeof(orig))) {
 					sz = orig.size_of_strings;
-					if (sz > 0 && sz <= 512 &&
-					    (nvp64_t)orig.p_driver_version_buffer) {
+					if (sz > 0 && sz <= 512) {
 						char *ext = (char *)aux_buf +
 							    ctrl->params_size;
-						/* drv version string */
+						/* Copy version strings to original user buffers */
 						if (orig.p_driver_version_buffer)
 							copy_to_user((void __user *)(uintptr_t)
 								     orig.p_driver_version_buffer,
 								     ext, sz);
-						/* version string */
 						if (orig.p_version_buffer)
 							copy_to_user((void __user *)(uintptr_t)
 								     orig.p_version_buffer,
 								     ext + sz, sz);
-						/* title string */
 						if (orig.p_title_buffer)
 							copy_to_user((void __user *)(uintptr_t)
 								     orig.p_title_buffer,
 								     ext + 2 * sz, sz);
 					}
+					/*
+					 * Restore the original user-space pointer values
+					 * in aux_buf before copying it back so CUDA can
+					 * still read its own pointer fields from the
+					 * returned params struct.
+					 */
+					((struct nv0000_ctrl_system_get_build_version_params *)
+					 aux_buf)->p_driver_version_buffer =
+						orig.p_driver_version_buffer;
+					((struct nv0000_ctrl_system_get_build_version_params *)
+					 aux_buf)->p_version_buffer = orig.p_version_buffer;
+					((struct nv0000_ctrl_system_get_build_version_params *)
+					 aux_buf)->p_title_buffer = orig.p_title_buffer;
 				}
 				/* Copy only the base params struct (not the extension) */
 				if (copy_to_user(aux_uptr, aux_buf, ctrl->params_size))
