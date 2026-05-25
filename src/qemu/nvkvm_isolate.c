@@ -35,11 +35,8 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 }
 
 #include "nvkvm_isolate.h"
-#include "nvkvm_install_mapping.h"
 #include "virtio_nvgpu.h"
 
-/* From nvkvm_mmap_host.c — set by nvkvm_set_kvm_vm_fd. */
-extern int nvkvm_kvm_vm_fd;
 #include "../../src/common/nvkvm_isolate_proto.h"
 
 #ifdef NVKVM_STUB_EMBEDDED
@@ -132,7 +129,6 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_ioctl      ioctl;
 		struct isolate_resp_mmap       mmap;
 		struct isolate_resp_poll_event poll_event;
-		struct isolate_resp_mapping    mapping;
 	} u;
 
 	for (;;) {
@@ -157,11 +153,6 @@ static void *isolate_reader_fn(void *arg)
 
 		case ISOLATE_RESP_MMAP:
 			reader_signal_sync(iso, 0, u.mmap.retval);
-			break;
-
-		case ISOLATE_RESP_MAPPING:
-			/* install / uninstall result from the stub */
-			reader_signal_sync(iso, u.mapping.status, 0);
 			break;
 
 		case ISOLATE_RESP_IOCTL: {
@@ -305,10 +296,6 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->next_req_id  = 1;
 			iso->sync_done    = false;
 			iso->reader_started = false;
-			iso->notify_fd    = -1;
-			iso->notify_started = false;
-			iso->install_head = NULL;
-			iso->next_slot    = 0;
 			*id_out = id;
 			return iso;
 		}
@@ -397,73 +384,6 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	iso->sock_fd = sv[0];
 	iso->alive   = true;
 
-	/*
-	 * Spawn handshake (must happen BEFORE the reader thread starts, since
-	 * we need exclusive read access on sv[0] for the notify-fd response).
-	 * If anything fails, the stub falls back to the no-KVM-fd seccomp
-	 * filter and the install_isolate_mapping RPC will return -ENOTSUP —
-	 * but the ioctl-forwarding path still works.
-	 */
-	if (nvkvm_kvm_vm_fd >= 0) {
-		struct {
-			uint32_t type;
-			uint32_t handle_id;  /* sentinel: 0xFFFFFFFF = kvm fd */
-		} msg = { 1 /*ISOLATE_CMD_RECEIVE_FD*/, 0xFFFFFFFFu };
-		char cm_buf[CMSG_SPACE(sizeof(int))] = {0};
-		struct iovec iov = { &msg, sizeof(msg) };
-		struct msghdr mh = {
-			.msg_iov        = &iov,
-			.msg_iovlen     = 1,
-			.msg_control    = cm_buf,
-			.msg_controllen = sizeof(cm_buf),
-		};
-		struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
-		cm->cmsg_level = SOL_SOCKET;
-		cm->cmsg_type  = SCM_RIGHTS;
-		cm->cmsg_len   = CMSG_LEN(sizeof(int));
-		memcpy(CMSG_DATA(cm), &nvkvm_kvm_vm_fd, sizeof(int));
-		ssize_t snt = sendmsg(iso->sock_fd, &mh, 0);
-		fprintf(stderr, "nvkvm_isolate: handshake sendmsg=%zd errno=%d kvm_fd=%d\n",
-			snt, snt < 0 ? errno : 0, nvkvm_kvm_vm_fd);
-		if (snt > 0) {
-			/* Bound the wait so a broken/old stub can't hang spawn forever. */
-			struct pollfd pfd = { .fd = iso->sock_fd, .events = POLLIN };
-			int pr = poll(&pfd, 1, 1500 /* ms */);
-			if (pr > 0 && (pfd.revents & POLLIN)) {
-				struct {
-					uint32_t type;
-					uint32_t reserved;
-				} rmsg = {0};
-				char rcm_buf[CMSG_SPACE(sizeof(int))] = {0};
-				struct iovec riov = { &rmsg, sizeof(rmsg) };
-				struct msghdr rmh = {
-					.msg_iov        = &riov,
-					.msg_iovlen     = 1,
-					.msg_control    = rcm_buf,
-					.msg_controllen = sizeof(rcm_buf),
-				};
-				ssize_t got = recvmsg(iso->sock_fd, &rmh, 0);
-				fprintf(stderr,
-					"nvkvm_isolate: handshake recvmsg=%zd type=0x%x\n",
-					got, rmsg.type);
-				if (got == (ssize_t)sizeof(rmsg) &&
-				    rmsg.type == 0x10 /*ISOLATE_RESP_OK*/) {
-					struct cmsghdr *rcm = CMSG_FIRSTHDR(&rmh);
-					if (rcm && rcm->cmsg_level == SOL_SOCKET &&
-					    rcm->cmsg_type == SCM_RIGHTS) {
-						int nfd;
-						memcpy(&nfd, CMSG_DATA(rcm), sizeof(int));
-						iso->notify_fd = nfd;
-					}
-				}
-			} else {
-				fprintf(stderr,
-					"nvkvm_isolate: handshake poll timed out (pr=%d) "
-					"— stub did not return listener fd\n", pr);
-			}
-		}
-	}
-
 	/* Start the reader thread before announcing success. */
 	if (pthread_create(&iso->reader_tid, NULL, isolate_reader_fn, iso)) {
 		int e = errno;
@@ -476,25 +396,11 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	}
 	iso->reader_started = true;
 
-	/* If the handshake landed a notify_fd, start the USER_NOTIF
-	 * supervisor. Failure here is non-fatal — install_mapping just
-	 * won't work for this isolate. */
-	if (iso->notify_fd >= 0) {
-		VirtIONvgpu *nv_dev = nvkvm_get_global_device();
-		if (!nv_dev || nvkvm_install_supervisor_start(nv_dev, iso) < 0) {
-			fprintf(stderr,
-				"nvkvm_isolate: install supervisor failed; "
-				"install_mapping will return ENOTSUP\n");
-			close(iso->notify_fd);
-			iso->notify_fd = -1;
-		}
-	}
-
 	*isolate_id_out = id;
 
 	fprintf(stderr,
-		"nvkvm_isolate: created isolate %u pid=%d sock=%d notify_fd=%d\n",
-		id, pid, sv[0], iso->notify_fd);
+		"nvkvm_isolate: created isolate %u pid=%d sock=%d\n",
+		id, pid, sv[0]);
 	return 0;
 }
 
@@ -537,10 +443,6 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 		pthread_join(iso->reader_tid, NULL);
 		iso->reader_started = false;
 	}
-
-	/* Stop the USER_NOTIF supervisor (also frees the install whitelist). */
-	if (iso->notify_started)
-		nvkvm_install_supervisor_stop(iso);
 
 	pid_t pid = iso->pid;
 	if (pid > 0) {

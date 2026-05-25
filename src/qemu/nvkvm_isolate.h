@@ -35,7 +35,6 @@
  * the caller's stack and is registered/deregistered internally.
  */
 struct nvkvm_pending_ioctl;
-struct nvkvm_install_entry;
 
 struct nvkvm_isolate {
 	uint32_t    id;
@@ -72,27 +71,6 @@ struct nvkvm_isolate {
 	int         sync_error;     /* -errno or 0 */
 	int         sync_mmap_retval;
 
-	/*
-	 * Seccomp USER_NOTIF listener fd for the stub's
-	 * KVM_SET_USER_MEMORY_REGION calls. -1 if the stub didn't set up
-	 * the listener (older stub or KVM-fd handshake failed).
-	 *
-	 * Per-isolate supervisor thread polls notify_fd, validates each
-	 * trapped syscall against install_whitelist, then CONTINUE / EPERM.
-	 */
-	int         notify_fd;
-	pthread_t   notify_tid;
-	bool        notify_started;
-
-	/*
-	 * Per-isolate install whitelist for KVM_SET_USER_MEMORY_REGION
-	 * args. Populated by install_isolate_mapping RPC handlers before
-	 * sending ISOLATE_CMD_INSTALL_MAPPING to the stub. Looked up by
-	 * the USER_NOTIF supervisor when the kernel traps the call.
-	 */
-	struct nvkvm_install_entry *install_head;
-	pthread_mutex_t            install_lock;
-	uint32_t                   next_slot;
 };
 
 struct nvkvm_isolate_table {

@@ -36,7 +36,6 @@
 #include <stdio.h>
 
 #include "virtio_nvgpu.h"
-#include "nvkvm_install_mapping.h"
 #include <dirent.h>
 
 /* ── Device node paths on the host ──────────────────────────────────────── */
@@ -680,53 +679,6 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			break;
 		}
 
-		case NVKVM_REQ_INSTALL_ISOLATE_MAPPING: {
-			struct nvkvm_req_install_isolate_mapping req = {0};
-			struct nvkvm_resp_install_isolate_mapping resp = {0};
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			uint64_t gpa = 0;
-			int rc = nvkvm_install_isolate_mapping(
-				nv,
-				le32_to_cpu(req.session_id),
-				le32_to_cpu(req.isolate_id),
-				le64_to_cpu(req.gva),
-				le64_to_cpu(req.size),
-				le64_to_cpu(req.gpa_target),
-				le32_to_cpu(req.prot),
-				&gpa);
-			resp.status = cpu_to_le32((uint32_t)(rc < 0 ? -rc : 0));
-			resp.gpa    = cpu_to_le64(gpa);
-			struct { struct nvkvm_hdr h;
-				 struct nvkvm_resp_install_isolate_mapping r; } iout;
-			iout.h = hdr; iout.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &iout, sizeof(iout));
-			virtqueue_push(vq, elem, sizeof(iout));
-			virtio_notify(VIRTIO_DEVICE(nv), vq);
-			break;
-		}
-
-		case NVKVM_REQ_UNINSTALL_ISOLATE_MAPPING: {
-			struct nvkvm_req_uninstall_isolate_mapping req = {0};
-			struct nvkvm_resp_uninstall_isolate_mapping resp = {0};
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			int rc = nvkvm_uninstall_isolate_mapping(
-				nv,
-				le32_to_cpu(req.session_id),
-				le32_to_cpu(req.isolate_id),
-				le64_to_cpu(req.gva),
-				le64_to_cpu(req.size));
-			resp.status = cpu_to_le32((uint32_t)(rc < 0 ? -rc : 0));
-			struct { struct nvkvm_hdr h;
-				 struct nvkvm_resp_uninstall_isolate_mapping r; } uout;
-			uout.h = hdr; uout.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &uout, sizeof(uout));
-			virtqueue_push(vq, elem, sizeof(uout));
-			virtio_notify(VIRTIO_DEVICE(nv), vq);
-			break;
-		}
-
 #undef ISOLATE_REQ
 
 		default:
@@ -776,11 +728,10 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 
 	/*
 	 * Find QEMU's KVM VM fd by scanning our own /proc/self/fd for the
-	 * "anon_inode:kvm-vm" entry. (We can't include sysemu/kvm_int.h to
-	 * reach kvm_state->vmfd from common code — kvm_int.h is target-only.)
-	 *
-	 * Done at device realize so isolates spawned later can SCM_RIGHTS
-	 * this fd to the stub for install_isolate_mapping.
+	 * "anon_inode:kvm-vm" entry, so the nvidia/UVM mmap path in
+	 * nvkvm_isolate_handlers.c can call KVM_SET_USER_MEMORY_REGION
+	 * on it.  (We can't include sysemu/kvm_int.h here — kvm_int.h is
+	 * target-only.)
 	 */
 	{
 		DIR *d = opendir("/proc/self/fd");
@@ -797,8 +748,7 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 					int fd = atoi(de->d_name);
 					nvkvm_set_kvm_vm_fd(fd);
 					fprintf(stderr,
-						"nvkvm: registered KVM vm fd %d for "
-						"install_isolate_mapping\n", fd);
+						"nvkvm: registered KVM vm fd %d\n", fd);
 					break;
 				}
 			}

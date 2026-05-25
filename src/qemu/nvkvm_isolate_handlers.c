@@ -281,24 +281,6 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	/* Short-circuit UVM_MM_INITIALIZE: the kernel UVM driver returns
-	 * NV_ERR_NOT_SUPPORTED (0x10006) for our two-fd-same-mm setup, and
-	 * the side effect of that failure is that subsequent UVM ioctls on
-	 * the primary fd return EBADF.  cuInit treats NV_ERR_NOT_SUPPORTED
-	 * here as fatal anyway, so just don't forward — fake a success
-	 * response.  See uvm_via_isolate_needed memory. */
-	if (req->cmd == 75 /* UVM_MM_INITIALIZE */ &&
-	    param_buf && req->param_size >= 8) {
-		uint32_t zero = 0;
-		memcpy((char *)param_buf + 4, &zero, 4); /* rm_status = 0 */
-		resp->retval   = 0;
-		resp->status   = 0;
-		resp->nvstatus = 0;
-		fprintf(stderr,
-			"nvkvm: ioctl_on_isolate UVM_MM_INITIALIZE: short-circuited (returning fake success)\n");
-		return 0;
-	}
-
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
@@ -362,21 +344,6 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			fprintf(stderr,
 				"nvkvm: ioctl_on_isolate UVM: cmd=0x%x rm_status=0x%x\n",
 				req->cmd, rmst);
-			/* UVM_MM_INITIALIZE returns either 0x1f (INVALID_ARGUMENT,
-			 * when the secondary fd's mm doesn't match the caller) or
-			 * 0x10006 (NOT_SUPPORTED, when the driver decides the link
-			 * isn't applicable — e.g. two fds in the same mm).  Mask
-			 * both to NV_OK so cuInit proceeds.  The driver's internal
-			 * state for the primary UVM fd is established by
-			 * UVM_INITIALIZE itself; MM_INITIALIZE is bookkeeping that
-			 * cuInit treats as fatal unless rm_status is 0. */
-			if (req->cmd == 75 && (rmst == 0x1f || rmst == 0x10006)) {
-				uint32_t zero = 0;
-				memcpy((char *)param_buf + rm_status_off, &zero, 4);
-				fprintf(stderr,
-					"nvkvm: ioctl_on_isolate UVM: masking MM_INIT rm_status 0x%x → 0\n",
-					rmst);
-			}
 		}
 	}
 	return 0;

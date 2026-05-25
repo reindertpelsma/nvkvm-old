@@ -110,21 +110,6 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_WRITE_MEMORY_HANDLE    23  /* shm_slot → memfd (page upload) */
 #define NVKVM_REQ_READ_MEMORY_HANDLE     24  /* memfd → shm_slot (writeback)   */
 
-/*
- * install_isolate_mapping — guest kernel asks QEMU to expose a (gva, size)
- * range from the isolate's mm at a guest physical address. QEMU validates,
- * adds the (slot, gpa, gva, size) to the per-isolate install whitelist,
- * tells the stub to call KVM_SET_USER_MEMORY_REGION, and the seccomp
- * USER_NOTIF supervisor in QEMU validates the trapped call against the
- * whitelist before allowing the kernel to commit it.
- *
- * Idempotent on (isolate_id, gva, size): re-sends with the same triple
- * return the same gpa and don't double-install. See
- * docs/INSTALL_ISOLATE_MAPPING.md.
- */
-#define NVKVM_REQ_INSTALL_ISOLATE_MAPPING   25
-#define NVKVM_REQ_UNINSTALL_ISOLATE_MAPPING 26
-
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
 struct nvkvm_hdr {
@@ -370,59 +355,6 @@ struct nvkvm_req_unpoll_on_isolate {
 };
 
 struct nvkvm_resp_unpoll_on_isolate {
-	__le32 status;
-	__le32 reserved;
-};
-
-/* ── INSTALL_ISOLATE_MAPPING ────────────────────────────────────────────────
- *
- * Tells QEMU to expose (gva, size) from the named isolate's mm at gpa_target
- * (or at any free GPA in the mmap window if gpa_target == 0).
- *
- * Sent by the guest kernel after a UVM mapping ioctl returns successfully,
- * after RM_MAP_MEMORY returns successfully, etc. Idempotent on
- * (isolate_id, gva, size).
- *
- * QEMU validates:
- *   - isolate_id is alive in session_id
- *   - gva range is sane and (if gpa_target != 0) gpa_target is inside the
- *     reserved mmap window
- *   - size > 0, page-aligned
- *   - a re-read of /proc/<stub>/maps shows the VA is backed by a VMA whose
- *     path is /dev/nvidia* (provenance defence in depth)
- *
- * On accept, QEMU picks a slot number, records the whitelist entry, and
- * sends ISOLATE_CMD_INSTALL_MAPPING to the stub. The stub calls
- * KVM_SET_USER_MEMORY_REGION; the seccomp USER_NOTIF traps the call;
- * QEMU's supervisor re-validates the args against the whitelist, then
- * CONTINUEs the syscall.
- */
-struct nvkvm_req_install_isolate_mapping {
-	__le32 session_id;
-	__le32 isolate_id;
-	__le64 gva;              /* in the isolate's mm, also a guest user VA */
-	__le64 size;             /* multiple of PAGE_SIZE                       */
-	__le64 gpa_target;       /* 0 = let QEMU pick                           */
-	__le32 prot;             /* PROT_READ [|PROT_WRITE]                     */
-	__le32 reserved;
-};
-
-struct nvkvm_resp_install_isolate_mapping {
-	__le32 status;           /* 0 ok / -errno failure                       */
-	__le32 reserved;
-	__le64 gpa;              /* GPA at which the mapping is live; 0 on err  */
-};
-
-/* ── UNINSTALL_ISOLATE_MAPPING ─────────────────────────────────────────────── */
-
-struct nvkvm_req_uninstall_isolate_mapping {
-	__le32 session_id;
-	__le32 isolate_id;
-	__le64 gva;              /* must match a prior install                  */
-	__le64 size;
-};
-
-struct nvkvm_resp_uninstall_isolate_mapping {
 	__le32 status;
 	__le32 reserved;
 };
