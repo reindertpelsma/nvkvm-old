@@ -24,11 +24,41 @@ The host strace from the same libcuda version, on the same driver, does
 UVM_REGISTER_GPU, then `mmap(/dev/nvidia0, 65536, PROT_WRITE, MAP_SHARED, fd, 0)`
 to actually map the GPU memory into the calling process's mm.
 
-Our guest never gets to that mmap. Hypothesis (high confidence):
-RM_MAP_MEMORY's response contains a *virtual address* (in the stub's mm,
-where the stub will do the actual mmap on nvidia0). libcuda reads that
-address, finds it isn't valid in its own mm (it's in the stub's mm),
-treats this as "no device", and bails.
+Our guest never gets to that mmap.
+
+**Hypothesis updated 2026-05-26.** Added pLinearAddress logging to QEMU
+dispatch (commit pending). Output:
+
+  nvkvm: RM_MAP_MEMORY response: pLinearAddress=0xc0bb0000 status=0x0
+
+That's a *low 32-bit* value, **not** a stub-mm VA (which would be 0x7f…
+range). So the initial "stub VA leaks out" framing was wrong.
+
+What 0xc0bb0000 actually is: likely a GPU-side BAR offset / handle the
+kernel writes back, intended as the `offset` argument to a subsequent
+`mmap(/dev/nvidia0, …, offset=0xc0bb0000)` that materialises the
+mapping in the calling-process mm.
+
+Strace shows libcuda **does not call mmap** — it `close(14)` (the
+nvidia0 fd it was about to mmap on) immediately after RM_MAP_MEMORY
+returns, then proceeds through cleanup RM_FREEs and exits. So libcuda
+is reading something in the response (or in a prior RM_CONTROL response)
+that tells it the device isn't usable.
+
+Candidates worth diagnosing next:
+- Compare the full nvos33_parameters response byte-by-byte to host
+  (status, flags, fd, reserved fields, length).
+- Earlier RM_CONTROL responses for capability/topology queries that
+  may have returned values libcuda treats as "device not viable" —
+  NV0080_CTRL_CMD_GPU_GET_CLASSLIST, NV2080_CTRL_CMD_GPU_GET_INFO,
+  NV2080_CTRL_CMD_BUS_GET_INFO, NV2080_CTRL_CMD_FB_GET_INFO.
+- Whether RM_ALLOC_MEMORY (NR=0x27 frontend, not UVM_PAGEABLE_MEM_ACCESS
+  which is also 0x27 in UVM-space) returned correctly — we may be
+  showing libcuda a "0 memory size" GPU.
+
+The dual-mmap architectural refactor in `docs/ARCHITECTURE.md` is still
+needed to actually expose RM_MAP_MEMORY's region to the guest after this
+ABI question is settled.
 
 ## The architectural fix needed
 

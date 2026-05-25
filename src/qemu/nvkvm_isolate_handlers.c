@@ -305,6 +305,23 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	    req->param_size >= 12) {
 		memcpy(&inner_cmd, (char *)param_buf + 8, sizeof(uint32_t));
 	}
+
+	/* DIAG: for RM_MAP_MEMORY, dump pLinearAddress so we can see what the
+	 * kernel returned to the stub.  If it's a stub-mm VA (high 0x7f...
+	 * range, typical of mmap'd regions), libcuda — running in the guest
+	 * userspace mm — can't dereference it, which is the suspected cause
+	 * of cuInit's "no device" failure. */
+	if (_IOC_NR(req->cmd) == NV_ESC_RM_MAP_MEMORY && param_buf &&
+	    req->param_size >= 40) {
+		uint64_t plinear = 0;
+		uint32_t mm_status = 0;
+		memcpy(&plinear, (char *)param_buf + 32, sizeof(uint64_t));
+		memcpy(&mm_status, (char *)param_buf + 40, sizeof(uint32_t));
+		fprintf(stderr,
+			"nvkvm: RM_MAP_MEMORY response: pLinearAddress=0x%llx status=0x%x\n",
+			(unsigned long long)plinear, mm_status);
+	}
+
 	if (inner_cmd) {
 		fprintf(stderr,
 			"nvkvm: ioctl_on_isolate: isolate=%u handle=%u cmd=0x%x "
