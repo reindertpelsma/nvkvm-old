@@ -600,17 +600,30 @@ static int simple_req(__u32 req_type,
 {
 	struct nvkvm_inflight *inf;
 	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	void *buf;
 	int ret;
 
-	/* The hdr is at the start of req_buf; caller has already filled it */
-	inf = inflight_alloc(req_id);
-	if (!inf)
+	/*
+	 * Callers may pass stack-allocated structs.  On kernels with
+	 * CONFIG_VMAP_STACK, kernel stack pages are vmapped and virt_to_page()
+	 * returns the wrong physical page, making them unusable for
+	 * scatter-gather DMA.  Copy into a kmalloc'd buffer first.
+	 */
+	buf = kmalloc(req_len, GFP_KERNEL);
+	if (!buf)
 		return -ENOMEM;
+	memcpy(buf, req_buf, req_len);
 
-	((struct nvkvm_hdr *)req_buf)->type   = cpu_to_le32(req_type);
-	((struct nvkvm_hdr *)req_buf)->req_id = cpu_to_le32(req_id);
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(req_type);
+	((struct nvkvm_hdr *)buf)->req_id = cpu_to_le32(req_id);
 
-	ret = nvkvm_send_sync(&nvkvm, req_buf, req_len, inf);
+	inf = inflight_alloc(req_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	ret = nvkvm_send_sync(&nvkvm, buf, req_len, inf);
 	if (ret == 0) {
 		if (inf->status)
 			ret = -(int)inf->status;
@@ -618,6 +631,7 @@ static int simple_req(__u32 req_type,
 			*retval_out = inf->retval;
 	}
 	kfree(inf);
+	kfree(buf);
 	return ret;
 }
 
