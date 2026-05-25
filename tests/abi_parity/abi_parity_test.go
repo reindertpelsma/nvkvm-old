@@ -81,6 +81,18 @@ func TestFrontendStructSizes(t *testing.T) {
 	})
 }
 
+// TestAllocParamStructSizes verifies the per-hClass alloc-param structs
+// embedded in nvos21/nvos64. The driver sizes the buffer it expects by
+// hClass; if our size table is wrong, RM_ALLOC returns NV_ERR_INVALID_ARGUMENT
+// (this was the cuInit blocker for class 0xDE prior to its addition).
+func TestAllocParamStructSizes(t *testing.T) {
+	checkSizes(t, []sizeCase{
+		{"nv0080_alloc_parameters (NV01_DEVICE_0)", Sizes.Nv0080, 56},
+		{"nv2080_alloc_parameters (NV20_SUBDEVICE_0)", Sizes.Nv2080, 4},
+		{"nv00de_alloc_parameters_v545 (RM_USER_SHARED_DATA)", Sizes.Nv00deV545, 8},
+	})
+}
+
 // TestUVMStructSizes verifies that UVM ioctl parameter structs are correctly
 // sized. These are more variable across driver versions than frontend structs.
 func TestUVMStructSizes(t *testing.T) {

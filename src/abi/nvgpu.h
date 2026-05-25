@@ -407,6 +407,16 @@ struct nv2080_alloc_parameters {
 	__u32      sub_device_id;
 };
 
+/* ── NV00DE_ALLOC_PARAMETERS — alloc params for RM_USER_SHARED_DATA (0xDE) ── */
+
+#define RM_USER_SHARED_DATA 0x000000DEU
+
+/* V545 layout (driver >= 545.23.06): a single uint64. Our target driver
+ * 575.51.03 uses this layout. */
+struct nv00de_alloc_parameters_v545 {
+	__u64 polled_data_mask;
+};
+
 /* ── NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x101) ────────────────────── */
 
 #define NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION 0x00000101U

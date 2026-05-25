@@ -22,6 +22,11 @@ package abi_parity
 // static size_t sz_nvos46(void)  { return sizeof(struct nvos46_parameters); }
 // static size_t sz_nvos47(void)  { return sizeof(struct nvos47_parameters); }
 //
+// // Per-hClass alloc-param structs (RM_ALLOC nested params)
+// static size_t sz_nv0080(void)  { return sizeof(struct nv0080_alloc_parameters); }
+// static size_t sz_nv2080(void)  { return sizeof(struct nv2080_alloc_parameters); }
+// static size_t sz_nv00de_v545(void) { return sizeof(struct nv00de_alloc_parameters_v545); }
+//
 // // ioctl wrapper structs
 // static size_t sz_card_info(void)    { return sizeof(struct nv_ioctl_card_info); }
 // static size_t sz_reg_fd(void)       { return sizeof(struct nv_ioctl_register_fd); }
@@ -121,6 +126,11 @@ var Sizes = struct {
 	Nvos46 uintptr
 	Nvos47 uintptr
 
+	// Per-hClass alloc-param structs
+	Nv0080     uintptr
+	Nv2080     uintptr
+	Nv00deV545 uintptr
+
 	// ioctl wrapper structs
 	CardInfo   uintptr
 	RegFd      uintptr
@@ -183,6 +193,10 @@ var Sizes = struct {
 	Nvos32: uintptr(C.sz_nvos32()),
 	Nvos46: uintptr(C.sz_nvos46()),
 	Nvos47: uintptr(C.sz_nvos47()),
+
+	Nv0080:     uintptr(C.sz_nv0080()),
+	Nv2080:     uintptr(C.sz_nv2080()),
+	Nv00deV545: uintptr(C.sz_nv00de_v545()),
 
 	CardInfo:   uintptr(C.sz_card_info()),
 	RegFd:      uintptr(C.sz_reg_fd()),

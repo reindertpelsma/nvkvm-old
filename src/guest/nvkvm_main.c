@@ -560,6 +560,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case NV20_SUBDEVICE_0:
 				ap_size = sizeof(struct nv2080_alloc_parameters);
 				break;
+			case RM_USER_SHARED_DATA:
+				ap_size = sizeof(struct nv00de_alloc_parameters_v545);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -593,6 +596,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				case NV20_SUBDEVICE_0:
 					ap_size = sizeof(struct nv2080_alloc_parameters);
+					break;
+				case RM_USER_SHARED_DATA:
+					ap_size = sizeof(struct nv00de_alloc_parameters_v545);
 					break;
 				}
 			}
