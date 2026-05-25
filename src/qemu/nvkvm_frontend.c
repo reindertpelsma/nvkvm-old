@@ -249,27 +249,24 @@ static int nvkvm_ctrl_get_build_version(struct nvkvm_req_ctx *ctx,
 	struct nv0000_ctrl_system_get_build_version_params *ver =
 		(struct nv0000_ctrl_system_get_build_version_params *)(uintptr_t)p->params;
 	uint32_t sz = ver->size_of_strings;
-	char *drv_buf = NULL, *ver_buf = NULL, *title_buf = NULL;
-	nvp64_t saved_drv, saved_ver_p, saved_title;
 	long ret;
 
-	if (sz > 0 && sz <= 4096) {
-		drv_buf   = calloc(1, sz);
-		ver_buf   = calloc(1, sz);
-		title_buf = calloc(1, sz);
-		if (!drv_buf || !ver_buf || !title_buf) {
-			free(drv_buf); free(ver_buf); free(title_buf);
-			return -ENOMEM;
-		}
+	/*
+	 * The guest extended aux_buf to sizeof(params) + 3*sz. Point the
+	 * embedded pointer fields into the extension area so the host NVIDIA
+	 * driver writes the version strings there instead of trying to
+	 * copy_to_user a guest VA.  The guest will copy the strings from the
+	 * returned aux_buf back to its original user-space buffers.
+	 */
+	if (sz > 0 && sz <= 512 &&
+	    ctx->aux_size >= p->params_size + (size_t)3 * sz) {
+		char *ext = (char *)ver + p->params_size;
+
+		ver->p_driver_version_buffer = (nvp64_t)(uintptr_t)(ext);
+		ver->p_version_buffer        = (nvp64_t)(uintptr_t)(ext + sz);
+		ver->p_title_buffer          = (nvp64_t)(uintptr_t)(ext + 2 * sz);
 	}
-
-	saved_drv   = ver->p_driver_version_buffer;
-	saved_ver_p = ver->p_version_buffer;
-	saved_title = ver->p_title_buffer;
-
-	ver->p_driver_version_buffer = drv_buf   ? (nvp64_t)(uintptr_t)drv_buf   : 0;
-	ver->p_version_buffer        = ver_buf   ? (nvp64_t)(uintptr_t)ver_buf   : 0;
-	ver->p_title_buffer          = title_buf ? (nvp64_t)(uintptr_t)title_buf : 0;
+	/* else: no extension (or sz=0) — leave pointers at 0, driver fills numbers */
 
 	ret = host_ioctl(ctx->hfd->fd,
 		_IOWR('F', NV_ESC_RM_CONTROL, struct nvos54_parameters), p);
@@ -279,12 +276,12 @@ static int nvkvm_ctrl_get_build_version(struct nvkvm_req_ctx *ctx,
 		ret, p->status,
 		ver->changelist_number, ver->official_changelist_number);
 
-	/* Restore guest VA pointers so guest can see its own addresses */
-	ver->p_driver_version_buffer = saved_drv;
-	ver->p_version_buffer        = saved_ver_p;
-	ver->p_title_buffer          = saved_title;
+	/* Zero the pointer fields before returning to guest — they're host VAs
+	 * and meaningless in the guest context; the guest copies strings by offset. */
+	ver->p_driver_version_buffer = 0;
+	ver->p_version_buffer        = 0;
+	ver->p_title_buffer          = 0;
 
-	free(drv_buf); free(ver_buf); free(title_buf);
 	return (int)ret;
 }
 

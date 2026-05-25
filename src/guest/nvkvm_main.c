@@ -441,6 +441,46 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				return -EFAULT;
 			}
 			aux_size = ctrl->params_size;
+
+			/*
+			 * NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION has embedded
+			 * pointer fields (pDriverVersionBuffer etc.) pointing to
+			 * guest user-space string buffers.  The host NVIDIA driver
+			 * can't write to guest VAs.  Extend aux_buf to hold the
+			 * strings inline, zero the embedded pointers (QEMU replaces
+			 * them with host VAs pointing into the extension), then copy
+			 * the strings back to the original user-space buffers after
+			 * the ioctl returns.
+			 */
+			if (ctrl->cmd == NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION &&
+			    ctrl->params_size >=
+			    sizeof(struct nv0000_ctrl_system_get_build_version_params)) {
+				struct nv0000_ctrl_system_get_build_version_params *ver =
+					aux_buf;
+				__u32 sz = ver->size_of_strings;
+
+				if (sz > 0 && sz <= 512) {
+					size_t ext = ctrl->params_size + 3 * sz;
+					void *ext_buf = kzalloc(ext, GFP_KERNEL);
+
+					if (!ext_buf) {
+						kfree(aux_buf);
+						kfree(params_buf);
+						return -ENOMEM;
+					}
+					memcpy(ext_buf, aux_buf, ctrl->params_size);
+					/* Zero guest VA pointers; QEMU fills in host VAs */
+					((struct nv0000_ctrl_system_get_build_version_params *)
+					 ext_buf)->p_driver_version_buffer = 0;
+					((struct nv0000_ctrl_system_get_build_version_params *)
+					 ext_buf)->p_version_buffer = 0;
+					((struct nv0000_ctrl_system_get_build_version_params *)
+					 ext_buf)->p_title_buffer = 0;
+					kfree(aux_buf);
+					aux_buf  = ext_buf;
+					aux_size = ext;
+				}
+			}
 		}
 	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
 		   param_size == sizeof(struct nvos21_parameters) && params_buf) {
@@ -567,8 +607,64 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	/* Copy back the aux buffer (RM_CONTROL output params) to userspace */
 	if (aux_buf && aux_uptr && ret != -ENOMEM && ret != -ENOSPC &&
 	    ret != -EFAULT) {
+		/*
+		 * For NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION: the original
+		 * user-space pointer fields were replaced with zeros before
+		 * forwarding to QEMU.  QEMU wrote the version strings into the
+		 * extension area of aux_buf (at offsets sizeof(params), +sz, +2*sz).
+		 * Copy the strings back to the original user-space buffer addresses
+		 * that the caller passed in, then copy only the base params struct
+		 * to aux_uptr so the embedded pointers in userspace remain valid.
+		 */
+		if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
+			struct nvos54_parameters *ctrl = params_buf;
+
+			if (ctrl->cmd == NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION &&
+			    ctrl->params_size >=
+			    sizeof(struct nv0000_ctrl_system_get_build_version_params) &&
+			    aux_size > ctrl->params_size) {
+				/*
+				 * aux_size = params_size + 3*sz; the extension area
+				 * holds [drv_string][ver_string][title_string].
+				 * We read the original user-space string pointers from
+				 * the ORIGINAL copy of the params struct (in aux_uptr).
+				 */
+				struct nv0000_ctrl_system_get_build_version_params orig;
+				__u32 sz;
+
+				if (!copy_from_user(&orig, aux_uptr, sizeof(orig))) {
+					sz = orig.size_of_strings;
+					if (sz > 0 && sz <= 512 &&
+					    (nvp64_t)orig.p_driver_version_buffer) {
+						char *ext = (char *)aux_buf +
+							    ctrl->params_size;
+						/* drv version string */
+						if (orig.p_driver_version_buffer)
+							copy_to_user((void __user *)(uintptr_t)
+								     orig.p_driver_version_buffer,
+								     ext, sz);
+						/* version string */
+						if (orig.p_version_buffer)
+							copy_to_user((void __user *)(uintptr_t)
+								     orig.p_version_buffer,
+								     ext + sz, sz);
+						/* title string */
+						if (orig.p_title_buffer)
+							copy_to_user((void __user *)(uintptr_t)
+								     orig.p_title_buffer,
+								     ext + 2 * sz, sz);
+					}
+				}
+				/* Copy only the base params struct (not the extension) */
+				if (copy_to_user(aux_uptr, aux_buf, ctrl->params_size))
+					ret = -EFAULT;
+				goto done_aux_copy;
+			}
+		}
 		if (copy_to_user(aux_uptr, aux_buf, aux_size))
 			ret = -EFAULT;
+done_aux_copy:
+		;
 	}
 
 	kfree(aux_buf);
