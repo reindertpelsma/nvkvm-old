@@ -236,6 +236,51 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
 				void *param_buf, void *aux_buf)
 {
+	/*
+	 * REGISTER_FD must be handled directly by QEMU: the stub holds the
+	 * real host fds (same kernel file descriptions via SCM_RIGHTS), but
+	 * the param carries a guest fd_token rather than a host fd number.
+	 * We translate token → host fd here and call ioctl() ourselves, so
+	 * the kernel associates the correct underlying file descriptions.
+	 */
+	if (_IOC_NR(req->cmd) == NV_ESC_REGISTER_FD && param_buf) {
+		struct nv_ioctl_register_fd *p = param_buf;
+		struct nvkvm_session *session;
+		struct nvkvm_host_fd *ctl_hfd;
+		struct nvkvm_handle  *gpu_h;
+		long ret;
+
+		pthread_mutex_lock(&nv->sessions_lock);
+		session = nvkvm_session_find(nv, req->session_id);
+		pthread_mutex_unlock(&nv->sessions_lock);
+		if (!session) { resp->retval = (uint64_t)(int64_t)-EBADF; return 0; }
+
+		pthread_mutex_lock(&session->lock);
+		ctl_hfd = nvkvm_fd_lookup(session, (uint32_t)p->ctl_fd);
+		pthread_mutex_unlock(&session->lock);
+		if (!ctl_hfd) { resp->retval = (uint64_t)(int64_t)-EBADF; return 0; }
+
+		gpu_h = nvkvm_handle_get(&nv->handles, req->handle_id);
+		if (!gpu_h || gpu_h->fd < 0) {
+			resp->retval = (uint64_t)(int64_t)-EBADF;
+			return 0;
+		}
+
+		int32_t saved_ctl = p->ctl_fd;
+		p->ctl_fd = (int32_t)ctl_hfd->fd;
+		ret = ioctl(gpu_h->fd, req->cmd, p);
+		if (ret < 0) ret = -errno;
+		p->ctl_fd = saved_ctl;
+
+		resp->retval = (ret < 0) ? (uint64_t)(int64_t)ret : (uint64_t)ret;
+		fprintf(stderr,
+			"nvkvm: register_fd (isolate path): isolate=%u handle=%u "
+			"gpu_fd=%d ctl_fd=%d ret=%lld\n",
+			req->isolate_id, req->handle_id,
+			gpu_h->fd, ctl_hfd->fd, (long long)ret);
+		return 0;
+	}
+
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,

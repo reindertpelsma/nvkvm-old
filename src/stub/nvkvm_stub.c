@@ -39,7 +39,7 @@
 #include <pthread.h>
 #include <elf.h>
 
-#include "../../common/nvkvm_isolate_proto.h"
+#include "../common/nvkvm_isolate_proto.h"
 
 /* ── Syscall wrappers ────────────────────────────────────────────────────── */
 
@@ -293,28 +293,44 @@ static void *worker_thread(void *arg)
 			goto send_resp;
 		}
 
-		/* Wire aux pointer into param blob for RM_CONTROL */
-		if (job.param_size >= 40 && job.aux_size > 0) {
+		/*
+		 * Wire aux buffer pointer into param blob.
+		 *
+		 * RM_CONTROL (nvos54, 32 bytes) and RM_ALLOC (nvos21 32 bytes,
+		 * nvos64 48 bytes) both have their embedded pointer field at
+		 * offset 16 (after four 4-byte handles/integers).  The guest
+		 * zeroes this field and puts the secondary buffer in the aux
+		 * slot; we restore the host-accessible address here so the
+		 * driver can dereference it.
+		 */
+		if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
-			__builtin_memcpy((char *)job.param_buf + 24, &aux_ptr,
+			__builtin_memcpy((char *)job.param_buf + 16, &aux_ptr,
 					 sizeof(uint64_t));
 		}
 
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
-		int  err  = (ret < 0) ? -(int)ret : 0;
+		int  err  = (ret < 0) ? errno : 0;
 
-		/* Restore param pointer to 0 before sending back */
-		if (job.param_size >= 40 && job.aux_size > 0) {
+		/* Zero the pointer field before sending back (don't leak host VA) */
+		if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t zero = 0;
-			__builtin_memcpy((char *)job.param_buf + 24, &zero,
+			__builtin_memcpy((char *)job.param_buf + 16, &zero,
 					 sizeof(uint64_t));
 		}
 
+		/*
+		 * Extract NvStatus from the response struct.  For nvos54
+		 * (RM_CONTROL) and nvos21/nvos64 (RM_ALLOC), the status field
+		 * is at offset 28 in the 32-byte layout.  Larger structs (like
+		 * nvos64 which is 48 bytes) have status at a different offset;
+		 * read conservatively only for param_size >= 32.
+		 */
 		uint32_t nvstatus = 0;
-		if (job.param_size >= 40)
+		if (job.param_size >= 32)
 			__builtin_memcpy(&nvstatus,
-					 (char *)job.param_buf + 36,
+					 (char *)job.param_buf + 28,
 					 sizeof(uint32_t));
 
 		resp.retval     = err ? -err : (int32_t)ret;
@@ -354,33 +370,6 @@ static void *blob_alloc(size_t size)
 }
 
 /* ── Command handlers (reader thread) ───────────────────────────────────── */
-
-static void handle_receive_fd(uint32_t handle_id)
-{
-	char buf[1] = {0};
-	char cbuf[CMSG_SPACE(sizeof(int))];
-	struct iovec iov = { buf, 1 };
-	struct msghdr msg = {
-		.msg_iov = &iov, .msg_iovlen = 1,
-		.msg_control = cbuf, .msg_controllen = sizeof(cbuf),
-	};
-	long n = stub_recvmsg(SOCK_FD, &msg, MSG_WAITALL);
-	if (n < 0) { send_error(EIO); return; }
-
-	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
-	if (!cm || cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) {
-		send_error(EINVAL); return;
-	}
-	int fd;
-	__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
-
-	pthread_mutex_lock(&fd_mutex);
-	if (handle_id < MAX_HANDLES && handle_fds[handle_id] >= 0)
-		stub_close(handle_fds[handle_id]);
-	handle_store(handle_id, fd);
-	pthread_mutex_unlock(&fd_mutex);
-	send_ok();
-}
 
 static void handle_close_fd(uint32_t handle_id)
 {
@@ -514,6 +503,15 @@ static void apply_seccomp(void)
 
 /* ── Self-relocation ─────────────────────────────────────────────────────── */
 
+/*
+ * apply_relocations() is only needed when the stub binary is loaded via
+ * fexecve() from a memfd (embedded/NVKVM_STUB_EMBEDDED build).  In that
+ * scenario there is no dynamic linker to process RELA entries, so we do it
+ * ourselves in a constructor.  When the stub is executed normally from disk
+ * the kernel dynamic linker already handles all relocations before constructors
+ * run, so applying them again would corrupt global-pointer state.
+ */
+#ifdef NVKVM_STUB_EMBEDDED
 extern char __ehdr_start[];
 extern char _DYNAMIC[];
 
@@ -541,6 +539,7 @@ static void apply_relocations(void)
 		}
 	}
 }
+#endif /* NVKVM_STUB_EMBEDDED */
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
@@ -562,65 +561,87 @@ int main(void)
 
 	apply_seccomp();
 
-	/* Reader loop — handles all non-IOCTL commands inline */
+	/*
+	 * Reader loop — reads ONE complete SEQPACKET message per iteration.
+	 *
+	 * SOCK_SEQPACKET preserves message boundaries: a single read() consumes
+	 * exactly one send() and discards any excess bytes if the buffer is
+	 * smaller than the message.  The old split-read approach (read type,
+	 * then read the rest) therefore discarded the body of every message.
+	 *
+	 * Fix: use recvmsg() with a union buffer large enough for any command
+	 * struct, so the entire header arrives in one call.  Ancillary data
+	 * (SCM_RIGHTS for RECEIVE_FD) is handled inline.
+	 *
+	 * Variable-length param/aux blobs for IOCTL are sent as separate
+	 * SEQPACKET messages by QEMU and are still read individually below.
+	 */
 	for (;;) {
-		uint32_t type;
-		if (recv_full(&type, sizeof(type)) < 0)
-			break;
+		union {
+			uint32_t                        type;
+			struct isolate_cmd_receive_fd   recv_fd;
+			struct isolate_cmd_close_fd     close_fd;
+			struct isolate_cmd_ioctl        ioctl_cmd;
+			struct isolate_cmd_mmap         mmap_cmd;
+			struct isolate_cmd_munmap       munmap_cmd;
+			struct isolate_cmd_poll         poll_cmd;
+			struct isolate_cmd_unpoll       unpoll_cmd;
+		} cmd;
+		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
-		switch (type) {
+		struct iovec iov = { &cmd, sizeof(cmd) };
+		struct msghdr msg_hdr = {
+			.msg_iov        = &iov,
+			.msg_iovlen     = 1,
+			.msg_control    = cmsg_buf,
+			.msg_controllen = sizeof(cmsg_buf),
+		};
+
+		long n = stub_recvmsg(SOCK_FD, &msg_hdr, 0);
+		if (n <= 0)
+			break;
+		if (n < (long)sizeof(uint32_t))
+			goto done;
+
+		switch (cmd.type) {
 		case ISOLATE_CMD_RECEIVE_FD: {
-			uint32_t hid;
-			if (recv_full(&hid, sizeof(hid)) < 0) goto done;
-			handle_receive_fd(hid);
+			struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);
+			if (!cm || cm->cmsg_level != SOL_SOCKET ||
+			    cm->cmsg_type != SCM_RIGHTS) {
+				send_error(EINVAL);
+				break;
+			}
+			int fd;
+			__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+			pthread_mutex_lock(&fd_mutex);
+			if (cmd.recv_fd.handle_id < MAX_HANDLES &&
+			    handle_fds[cmd.recv_fd.handle_id] >= 0)
+				stub_close(handle_fds[cmd.recv_fd.handle_id]);
+			handle_store(cmd.recv_fd.handle_id, fd);
+			pthread_mutex_unlock(&fd_mutex);
+			send_ok();
 			break;
 		}
-		case ISOLATE_CMD_CLOSE_FD: {
-			uint32_t hid;
-			if (recv_full(&hid, sizeof(hid)) < 0) goto done;
-			handle_close_fd(hid);
+		case ISOLATE_CMD_CLOSE_FD:
+			handle_close_fd(cmd.close_fd.handle_id);
 			break;
-		}
-		case ISOLATE_CMD_IOCTL: {
-			struct isolate_cmd_ioctl cmd;
-			/* type already read; read the rest */
-			if (recv_full((char *)&cmd + sizeof(uint32_t),
-				      sizeof(cmd) - sizeof(uint32_t)) < 0)
-				goto done;
-			cmd.type = type;
-			handle_ioctl_cmd(&cmd);
+		case ISOLATE_CMD_IOCTL:
+			handle_ioctl_cmd(&cmd.ioctl_cmd);
 			break;
-		}
-		case ISOLATE_CMD_MMAP: {
-			struct isolate_cmd_mmap cmd;
-			if (recv_full((char *)&cmd + sizeof(uint32_t),
-				      sizeof(cmd) - sizeof(uint32_t)) < 0)
-				goto done;
-			cmd.type = type;
-			handle_mmap(&cmd);
+		case ISOLATE_CMD_MMAP:
+			handle_mmap(&cmd.mmap_cmd);
 			break;
-		}
-		case ISOLATE_CMD_MUNMAP: {
-			struct isolate_cmd_munmap cmd;
-			if (recv_full((char *)&cmd + sizeof(uint32_t),
-				      sizeof(cmd) - sizeof(uint32_t)) < 0)
-				goto done;
-			cmd.type = type;
-			handle_munmap_cmd(&cmd);
+		case ISOLATE_CMD_MUNMAP:
+			handle_munmap_cmd(&cmd.munmap_cmd);
 			break;
-		}
-		case ISOLATE_CMD_POLL: {
-			struct { uint32_t handle_id, events, reserved; } body;
-			if (recv_full(&body, sizeof(body)) < 0) goto done;
-			(void)body; send_ok();  /* TODO: background poll */
+		case ISOLATE_CMD_POLL:
+			(void)cmd.poll_cmd;
+			send_ok();  /* TODO: background poll */
 			break;
-		}
-		case ISOLATE_CMD_UNPOLL: {
-			uint32_t hid;
-			if (recv_full(&hid, sizeof(hid)) < 0) goto done;
-			(void)hid; send_ok();
+		case ISOLATE_CMD_UNPOLL:
+			(void)cmd.unpoll_cmd;
+			send_ok();
 			break;
-		}
 		case ISOLATE_CMD_EXIT:
 			goto done;
 		default:
