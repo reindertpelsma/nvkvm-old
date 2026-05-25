@@ -13,9 +13,9 @@
  *
  *   - All ioctl parameter sizes are checked against a compile-time table
  *     before the blob is copied from userspace.
- *   - Pointer fields inside ioctl structs are checked or zeroed before the
- *     blob is placed in shared memory — the host backend never receives raw
- *     guest userspace virtual addresses.
+ *   - The isolate's userspace VA layout mirrors the guest process's, so the
+ *     host backend can dereference embedded pointers as-is. Pointer fields
+ *     are preserved verbatim; no zeroing or translation is performed.
  *   - mmap requests are validated for range/flag sanity before forwarding.
  *
  * The module does NOT trust the host either: any host response that would

@@ -880,6 +880,12 @@ static int do_spawn_handshake(void)
 	long sn = syscall(SYS_sendmsg, SOCK_FD, &msg_out, 0);
 	hsdbg("nvkvm_stub: sent listener fd back\n");
 	if (sn < 0) return -1;
+
+	/* Close our reference to the listener — QEMU's supervisor is the
+	 * only reader now. Keeping our own reference open is harmless but
+	 * unnecessary; closing it keeps the stub's fdtable tidy. */
+	stub_close((int)listener_fd);
+	hsdbg("nvkvm_stub: closed local listener fd\n");
 	return 0;
 }
 

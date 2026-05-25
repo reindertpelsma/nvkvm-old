@@ -12,6 +12,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,19 +139,45 @@ static int peek_remote(pid_t pid, uint64_t addr, void *out, size_t len)
 static void *supervisor_thread(void *arg)
 {
 	struct nvkvm_isolate *iso = (struct nvkvm_isolate *)arg;
+
+	/* Block all signals in this thread.  QEMU directs SIGALRM and
+	 * other timer signals to the I/O thread; if the supervisor thread
+	 * happens to absorb them, QEMU's main loop stalls. */
+	sigset_t allsigs;
+	sigfillset(&allsigs);
+	pthread_sigmask(SIG_SETMASK, &allsigs, NULL);
+
+	fprintf(stderr,
+		"nvkvm_install: supervisor thread started isolate=%u notify_fd=%d\n",
+		iso->id, iso->notify_fd);
 	while (iso->alive && iso->notify_fd >= 0) {
 		struct nvkvm_seccomp_notif notif = {0};
-		if (ioctl(iso->notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &notif) < 0) {
-			if (errno == EINTR) continue;
-			if (errno == ENOENT) continue; /* tracee gone; loop */
+		int rc = ioctl(iso->notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &notif);
+		if (rc < 0) {
+			int e = errno;
+			if (e == EINTR) continue;
+			if (e == ENOENT) continue; /* tracee gone */
+			fprintf(stderr,
+				"nvkvm_install: supervisor RECV failed errno=%d (%s) — "
+				"exiting thread\n", e, strerror(e));
 			break;
 		}
+		fprintf(stderr,
+			"nvkvm_install: supervisor got notif id=%llu pid=%u nr=%d "
+			"args[0]=0x%llx args[1]=0x%llx args[2]=0x%llx\n",
+			(unsigned long long)notif.id,
+			(unsigned int)notif.pid,
+			notif.data.nr,
+			(unsigned long long)notif.data.args[0],
+			(unsigned long long)notif.data.args[1],
+			(unsigned long long)notif.data.args[2]);
+		int xrc;
 
 		/* The trapped syscall is ioctl(kvm_fd, KVM_SET_USER_MEMORY_REGION,
 		 * &region). region is in the stub's mm at notif.data.args[2]. */
 		uint64_t region_ptr = notif.data.args[2];
 		struct kvm_userspace_memory_region_compat region;
-		int rc = peek_remote(notif.pid, region_ptr,
+		xrc = peek_remote(notif.pid, region_ptr,
 				     &region, sizeof(region));
 
 		struct nvkvm_seccomp_notif_resp resp = {
@@ -160,7 +187,7 @@ static void *supervisor_thread(void *arg)
 			.flags = 0,
 		};
 
-		if (rc != (int)sizeof(region)) {
+		if (xrc != (int)sizeof(region)) {
 			/* Could not validate; reject. */
 			resp.error = -EFAULT;
 			goto send_resp;
@@ -211,7 +238,20 @@ int nvkvm_install_supervisor_start(struct VirtIONvgpu *nv,
 	pthread_mutex_init(&iso->install_lock, NULL);
 	iso->install_head = NULL;
 	iso->next_slot    = NVKVM_INSTALL_SLOT_BASE;
-	int rc = pthread_create(&iso->notify_tid, NULL, supervisor_thread, iso);
+	/* Block all signals while spawning so the new thread inherits a
+	 * fully-blocked mask.  This is essential because QEMU directs timer
+	 * and IPI signals to specific threads; any thread that absorbs them
+	 * causes the I/O thread to miss timer events. */
+	sigset_t allsigs, oldmask;
+	sigfillset(&allsigs);
+	pthread_sigmask(SIG_SETMASK, &allsigs, &oldmask);
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int rc = pthread_create(&iso->notify_tid, &attr, supervisor_thread, iso);
+	pthread_attr_destroy(&attr);
+	pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
 	if (rc) return -rc;
 	iso->notify_started = true;
 	return 0;
@@ -223,7 +263,7 @@ void nvkvm_install_supervisor_stop(struct nvkvm_isolate *iso)
 	int fd = iso->notify_fd;
 	iso->notify_fd = -1;
 	if (fd >= 0) close(fd); /* wakes the RECV ioctl with -1/EBADF */
-	pthread_join(iso->notify_tid, NULL);
+	/* Thread is detached; it cleans itself up after returning. */
 	iso->notify_started = false;
 	pthread_mutex_lock(&iso->install_lock);
 	while (iso->install_head) {

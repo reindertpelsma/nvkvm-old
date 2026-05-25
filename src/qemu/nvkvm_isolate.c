@@ -478,17 +478,8 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	/* If the handshake landed a notify_fd, start the USER_NOTIF
 	 * supervisor. Failure here is non-fatal — install_mapping just
-	 * won't work for this isolate.
-	 *
-	 * NOTE: temporarily gated behind NVKVM_ENABLE_INSTALL_MAPPING env
-	 * var while we debug a stub-death issue that appears with the new
-	 * spawn handshake. The seccomp filter still uses NEW_LISTENER and
-	 * USER_NOTIF for KVM_SET_USER_MEMORY_REGION, so any such call from
-	 * the stub will block forever — but the stub never makes such a
-	 * call unless QEMU sends an ISOLATE_CMD_INSTALL_MAPPING. So leaving
-	 * the supervisor stopped is safe (and effectively returns ENOTSUP
-	 * for install_isolate_mapping). */
-	if (iso->notify_fd >= 0 && getenv("NVKVM_ENABLE_INSTALL_MAPPING")) {
+	 * won't work for this isolate. */
+	if (iso->notify_fd >= 0) {
 		VirtIONvgpu *nv_dev = nvkvm_get_global_device();
 		if (!nv_dev || nvkvm_install_supervisor_start(nv_dev, iso) < 0) {
 			fprintf(stderr,
