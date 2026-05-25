@@ -66,20 +66,6 @@
 #define NVKVM_MMAP_WIN_GPA_BASE     0x18000000000ULL  /* 1.5 TB */
 #define NVKVM_MMAP_WIN_SIZE         (16ULL << 30)     /* 16 GB window */
 
-/* ── Device constants ────────────────────────────────────────────────────── */
-
-/* Vendor-specific virtio device ID for NVIDIA GPU ioctl passthrough */
-#define VIRTIO_ID_NVGPU             50
-
-/*
- * Guest-physical address layout for shared memory and mmap window.
- * These live above any realistic guest RAM ceiling (1 TB and 1.5 TB),
- * so they never alias guest RAM regardless of VM size.
- */
-#define NVKVM_SHM_GPA_BASE          0x10000000000ULL  /* 1 TB  */
-#define NVKVM_MMAP_WIN_GPA_BASE     0x18000000000ULL  /* 1.5 TB */
-#define NVKVM_MMAP_WIN_SIZE         (16ULL << 30)     /* 16 GB window */
-
 /* ── Object graph (mirrors gVisor nvproxy object.go) ────────────────────── */
 
 struct nvkvm_object;
