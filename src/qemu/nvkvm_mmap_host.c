@@ -80,12 +80,6 @@ void nvkvm_set_kvm_vm_fd(int fd)
 	nvkvm_kvm_vm_fd = fd;
 }
 
-/* Thin wrapper used by nvkvm_isolate_handlers.c for double-mmap GPA allocation */
-void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out)
-{
-	*gpa_out = alloc_gpa(nv, length);
-}
-
 /* ── GPA allocator ────────────────────────────────────────────────────────── */
 
 /*
@@ -116,6 +110,12 @@ static uint64_t alloc_gpa(VirtIONvgpu *nv, size_t length)
 	nv->mmap_win_cur += length;
 	pthread_mutex_unlock(&nv->mmap_win_lock);
 	return gpa;
+}
+
+/* Thin wrapper used by nvkvm_isolate_handlers.c for double-mmap GPA allocation */
+void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out)
+{
+	*gpa_out = alloc_gpa(nv, length);
 }
 
 /* ── KVM memory slot management ───────────────────────────────────────────── */

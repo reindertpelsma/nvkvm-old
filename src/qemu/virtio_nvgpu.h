@@ -327,6 +327,7 @@ void nvkvm_obj_add_dep(struct nvkvm_client *client,
 
 /* nvkvm_mmap_host.c */
 void nvkvm_set_kvm_vm_fd(int fd);
+void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
 int  nvkvm_mmap_create(VirtIONvgpu *nv, struct nvkvm_host_fd *hfd,
 		       uint64_t offset, size_t length,
 		       int prot, int flags,

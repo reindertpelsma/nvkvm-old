@@ -89,6 +89,9 @@ struct nvkvm_shm_ctrl {
 /* Legacy (compat, will be removed) */
 #define NVKVM_REQ_OPEN                   1
 #define NVKVM_REQ_CLOSE                  2
+#define NVKVM_REQ_IOCTL                  3
+#define NVKVM_REQ_MMAP                   4
+#define NVKVM_REQ_MUNMAP                 5
 
 /* Isolate/handle architecture */
 #define NVKVM_REQ_LIST_NVIDIA_DEVICES    10  /* enumerate host GPU devices     */
@@ -117,7 +120,7 @@ struct nvkvm_hdr {
 /* ── LIST_NVIDIA_DEVICES ─────────────────────────────────────────────────── */
 
 struct nvkvm_req_list_nvidia_devices {
-	/* no payload */
+	__le32 reserved;
 };
 
 #define NVKVM_MAX_DEVICES  32
