@@ -325,6 +325,8 @@ int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx)
 	}
 
 	/* Dispatch commands with embedded pointer fields to dedicated handlers */
+	fprintf(stderr, "nvkvm: rm_control: cmd=0x%x params_size=%u aux_buf=%p p->params=0x%llx\n",
+		p->cmd, p->params_size, ctx->aux_buf, (unsigned long long)p->params);
 	if (p->cmd == NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION &&
 	    ctx->aux_buf &&
 	    p->params_size >= sizeof(struct nv0000_ctrl_system_get_build_version_params)) {
