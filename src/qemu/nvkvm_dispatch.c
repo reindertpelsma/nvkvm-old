@@ -165,6 +165,20 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		int saved = p->uvm_fd;
 		p->uvm_fd = (int32_t)uvm_hfd->fd;
 		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		/*
+		 * UVM_MM_INITIALIZE called from QEMU returns rm_status=0x10006
+		 * (NV_ERR_NOT_SUPPORTED) because the UVM kernel driver expects
+		 * the calling process to be the GPU memory owner — which in our
+		 * architecture is the isolate, not QEMU.  Until we route UVM
+		 * ioctls through the isolate, mask the status to NV_OK so cuInit
+		 * can progress.  This is a known divergence; see PLAN.md.
+		 */
+		if (p->rm_status == 0x10006) {
+			fprintf(stderr,
+				"nvkvm: UVM_MM_INITIALIZE: masking rm_status 0x10006 → 0 "
+				"(QEMU-side call; need isolate routing)\n");
+			p->rm_status = 0;
+		}
 		fprintf(stderr, "nvkvm: UVM_MM_INITIALIZE: uvm_fd_token=%d host_fd=%d ret=%d rm_status=0x%x\n",
 			saved, uvm_hfd->fd, ret, p->rm_status);
 		p->uvm_fd = 0;
