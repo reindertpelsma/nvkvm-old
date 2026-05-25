@@ -669,17 +669,16 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/* Forward to host via the appropriate path */
-	if (ctx->handle_id && ctx->session->isolate_id &&
-	    ctx->dev_id != NVKVM_DEV_UVM) {
+	if (ctx->handle_id && ctx->session->isolate_id) {
 		/*
 		 * Isolate path: ioctl runs in the isolate process so the NVIDIA
 		 * driver sees a valid VA space.  On EFAULT the isolate returns
 		 * the faulting GVA; we map the backing region and retry.
 		 *
-		 * UVM ioctls always use the legacy QEMU-direct path: the UVM
-		 * kernel context must live in a single process (QEMU's).  Sending
-		 * UVM_MM_INITIALIZE et al. to the stub would require translating
-		 * fd_token → stub fd inside the stub, which it cannot do.
+		 * UVM ioctls also go through the isolate — the UVM kernel must
+		 * track the GPU-memory owner, which is the isolate.  Embedded
+		 * fd_tokens have already been translated to handle_ids in the
+		 * sanitizer; the stub looks them up via its handle table.
 		 */
 		__u32 ioctl_flags = 0;
 		__u64 fault_addr  = 0;

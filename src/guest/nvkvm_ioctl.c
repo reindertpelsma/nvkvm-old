@@ -214,6 +214,31 @@ static __s32 guest_fd_to_token(int guest_fd)
 	return token;
 }
 
+/*
+ * Helper: translate a guest fd to its QEMU-side handle_id.  Returns -EBADF on
+ * error or 0 if the fd has no associated isolate-side handle.  Used for UVM
+ * ioctls that go through the isolate path — the embedded fd needs to be a
+ * handle_id so the stub can look up its own local fd.
+ */
+static __s32 guest_fd_to_handle_id(int guest_fd)
+{
+	struct file *f = fget(guest_fd);
+	__s32 handle_id;
+
+	if (!f)
+		return -EBADF;
+	{
+		struct nvkvm_fd_ctx *other = f->private_data;
+		if (!other || !other->handle_id) {
+			fput(f);
+			return -EBADF;
+		}
+		handle_id = (__s32)other->handle_id;
+	}
+	fput(f);
+	return handle_id;
+}
+
 int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				unsigned int cmd,
 				void *buf, size_t size)
@@ -221,40 +246,47 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 	if (!buf || size == 0)
 		return 0;
 
-	/* UVM ioctls with embedded fd fields (matched on full cmd word) */
+	/*
+	 * UVM ioctls with embedded fd fields (matched on full cmd word).
+	 *
+	 * Embedded fds become handle_ids — the host backend resolves them via
+	 * the isolate's handle table (UVM runs through the isolate so the
+	 * driver sees the right mm).  Returning the original guest fd value
+	 * unchanged would expose a host VA bug; we set to 0 on miss.
+	 */
 	switch (cmd) {
 	case UVM_MM_INITIALIZE: {
 		struct uvm_mm_initialize_params *p = buf;
 		if (p->uvm_fd >= 0) {
-			__s32 token = guest_fd_to_token(p->uvm_fd);
-			if (token < 0)
+			__s32 hid = guest_fd_to_handle_id(p->uvm_fd);
+			if (hid < 0)
 				return -EBADF;
-			p->uvm_fd = token;
+			p->uvm_fd = hid;
 		}
 		return 0;
 	}
 	case UVM_REGISTER_GPU_VASPACE: {
 		struct uvm_register_gpu_vaspace_params *p = buf;
-		__s32 token = guest_fd_to_token((int)p->rm_ctrl_fd);
-		if (token < 0)
+		__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
+		if (hid < 0)
 			return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)token;
+		p->rm_ctrl_fd = (nvhandle_t)hid;
 		return 0;
 	}
 	case UVM_REGISTER_CHANNEL: {
 		struct uvm_register_channel_params *p = buf;
-		__s32 token = guest_fd_to_token((int)p->rm_ctrl_fd);
-		if (token < 0)
+		__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
+		if (hid < 0)
 			return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)token;
+		p->rm_ctrl_fd = (nvhandle_t)hid;
 		return 0;
 	}
 	case UVM_MAP_EXTERNAL_ALLOCATION: {
 		struct uvm_map_external_allocation_params *p = buf;
-		__s32 token = guest_fd_to_token((int)p->rm_ctrl_fd);
-		if (token < 0)
+		__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
+		if (hid < 0)
 			return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)token;
+		p->rm_ctrl_fd = (nvhandle_t)hid;
 		return 0;
 	}
 	default:

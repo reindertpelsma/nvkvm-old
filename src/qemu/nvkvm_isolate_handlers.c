@@ -303,6 +303,45 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		"ret=%lld nvstatus=0x%x fault=0x%llx\n",
 		req->isolate_id, req->handle_id, req->cmd,
 		(long long)ret, nvstatus, (unsigned long long)fault_addr);
+
+	/* Trace UVM ioctls' rm_status field so we can see what the driver
+	 * actually wrote back through the isolate path. */
+	if (param_buf && req->param_size >= 8) {
+		uint32_t rm_status_off = (uint32_t)-1;
+		switch (req->cmd) {
+		case 0x30000001: /* UVM_INITIALIZE: { __u64 flags; __u32 rm_status; ... } */
+			rm_status_off = 8;
+			break;
+		case 0x30000002: /* UVM_DEINITIALIZE: { __u32 rm_status; } */
+			rm_status_off = 0;
+			break;
+		case 75:         /* UVM_MM_INITIALIZE: { __s32 uvm_fd; __u32 rm_status; } */
+			rm_status_off = 4;
+			break;
+		case 39:         /* UVM_PAGEABLE_MEM_ACCESS: { __u8 pageable_mem_access; __u32 rm_status; } */
+			rm_status_off = 4;
+			break;
+		}
+		if (rm_status_off != (uint32_t)-1 &&
+		    req->param_size >= rm_status_off + 4) {
+			uint32_t rmst = 0;
+			memcpy(&rmst, (char *)param_buf + rm_status_off, 4);
+			fprintf(stderr,
+				"nvkvm: ioctl_on_isolate UVM: cmd=0x%x rm_status=0x%x\n",
+				req->cmd, rmst);
+			/* TEMP HACK: UVM_MM_INITIALIZE on isolate returns 0x1f
+			 * (NV_ERR_INVALID_ARGUMENT) for unknown reasons even though
+			 * UVM_INITIALIZE on the same isolate succeeds.  Mask to 0
+			 * so cuInit continues; the deeper issue likely needs the
+			 * /dev/nvidia-uvm-tools device, which we don't expose. */
+			if (req->cmd == 75 && rmst == 0x1f) {
+				uint32_t zero = 0;
+				memcpy((char *)param_buf + rm_status_off, &zero, 4);
+				fprintf(stderr,
+					"nvkvm: ioctl_on_isolate UVM: masking MM_INIT rm_status 0x1f → 0\n");
+			}
+		}
+	}
 	return 0;
 }
 

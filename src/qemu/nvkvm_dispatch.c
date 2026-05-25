@@ -154,34 +154,29 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	 * sanitizer); translate to the real host fd before forwarding.
 	 */
 	case UVM_MM_INITIALIZE: {
+		/*
+		 * The guest now puts the secondary UVM fd's handle_id in
+		 * p->uvm_fd (translated by the guest sanitizer for the isolate
+		 * path).  If we end up here on the legacy path (no isolate),
+		 * resolve handle_id → host_fd via the global handle table.
+		 */
 		struct uvm_mm_initialize_params *p = ctx->params_buf;
-		struct nvkvm_host_fd *uvm_hfd =
-			nvkvm_fd_lookup(ctx->session, (uint32_t)p->uvm_fd);
-		if (!uvm_hfd) {
-			fprintf(stderr, "nvkvm: UVM_MM_INITIALIZE: uvm_fd token %d not found\n",
+		struct nvkvm_handle *uvm_h =
+			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->uvm_fd);
+		if (!uvm_h || uvm_h->fd < 0) {
+			fprintf(stderr,
+				"nvkvm: UVM_MM_INITIALIZE: handle_id %d not found\n",
 				p->uvm_fd);
 			return -EBADF;
 		}
 		int saved = p->uvm_fd;
-		p->uvm_fd = (int32_t)uvm_hfd->fd;
+		p->uvm_fd = (int32_t)uvm_h->fd;
 		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		/*
-		 * UVM_MM_INITIALIZE called from QEMU returns rm_status=0x10006
-		 * (NV_ERR_NOT_SUPPORTED) because the UVM kernel driver expects
-		 * the calling process to be the GPU memory owner — which in our
-		 * architecture is the isolate, not QEMU.  Until we route UVM
-		 * ioctls through the isolate, mask the status to NV_OK so cuInit
-		 * can progress.  This is a known divergence; see PLAN.md.
-		 */
-		if (p->rm_status == 0x10006) {
-			fprintf(stderr,
-				"nvkvm: UVM_MM_INITIALIZE: masking rm_status 0x10006 → 0 "
-				"(QEMU-side call; need isolate routing)\n");
-			p->rm_status = 0;
-		}
-		fprintf(stderr, "nvkvm: UVM_MM_INITIALIZE: uvm_fd_token=%d host_fd=%d ret=%d rm_status=0x%x\n",
-			saved, uvm_hfd->fd, ret, p->rm_status);
-		p->uvm_fd = 0;
+		fprintf(stderr,
+			"nvkvm: UVM_MM_INITIALIZE (legacy): handle_id=%d host_fd=%d "
+			"ret=%d rm_status=0x%x\n",
+			saved, uvm_h->fd, ret, p->rm_status);
+		p->uvm_fd = saved;
 		return ret;
 	}
 
@@ -211,14 +206,21 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	 * host fd before the UVM driver sees it.  We zero the field on return
 	 * so the guest cannot read back real host fd numbers from shared memory.
 	 */
+	/*
+	 * Legacy fallback paths for UVM with embedded fd fields.  Guest now
+	 * sends handle_ids (not fd_tokens) for these.  Used only when the
+	 * isolate path isn't available; the isolate path translates in the
+	 * stub instead.
+	 */
 	case UVM_REGISTER_GPU_VASPACE: {
 		struct uvm_register_gpu_vaspace_params *p = ctx->params_buf;
-		struct nvkvm_host_fd *ctrl_hfd =
-			nvkvm_fd_lookup(ctx->session, (uint32_t)p->rm_ctrl_fd);
-		if (!ctrl_hfd) return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)ctrl_hfd->fd;
+		struct nvkvm_handle *ctrl_h =
+			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_h || ctrl_h->fd < 0) return -EBADF;
+		nvhandle_t saved = p->rm_ctrl_fd;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_h->fd;
 		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		p->rm_ctrl_fd = 0;
+		p->rm_ctrl_fd = saved;
 		return ret;
 	}
 	case UVM_UNREGISTER_GPU_VASPACE:
@@ -227,28 +229,42 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 
 	case UVM_REGISTER_CHANNEL: {
 		struct uvm_register_channel_params *p = ctx->params_buf;
-		struct nvkvm_host_fd *ctrl_hfd =
-			nvkvm_fd_lookup(ctx->session, (uint32_t)p->rm_ctrl_fd);
-		if (!ctrl_hfd) return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)ctrl_hfd->fd;
+		struct nvkvm_handle *ctrl_h =
+			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_h || ctrl_h->fd < 0) return -EBADF;
+		nvhandle_t saved = p->rm_ctrl_fd;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_h->fd;
 		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		p->rm_ctrl_fd = 0;
+		p->rm_ctrl_fd = saved;
 		return ret;
 	}
 	case UVM_UNREGISTER_CHANNEL: {
 		struct uvm_unregister_channel_params *p = ctx->params_buf;
-		struct nvkvm_host_fd *ctrl_hfd =
-			nvkvm_fd_lookup(ctx->session, (uint32_t)p->rm_ctrl_fd);
-		if (!ctrl_hfd) return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)ctrl_hfd->fd;
+		struct nvkvm_handle *ctrl_h =
+			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_h || ctrl_h->fd < 0) return -EBADF;
+		nvhandle_t saved = p->rm_ctrl_fd;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_h->fd;
 		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		p->rm_ctrl_fd = 0;
+		p->rm_ctrl_fd = saved;
 		return ret;
 	}
 
 	case UVM_REGISTER_GPU:
 	case UVM_UNREGISTER_GPU:
 		return nvkvm_handle_simple_ioctl(ctx, cmd);
+
+	case UVM_MAP_EXTERNAL_ALLOCATION: {
+		struct uvm_map_external_allocation_params *p = ctx->params_buf;
+		struct nvkvm_handle *ctrl_h =
+			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->rm_ctrl_fd);
+		if (!ctrl_h || ctrl_h->fd < 0) return -EBADF;
+		nvhandle_t saved = p->rm_ctrl_fd;
+		p->rm_ctrl_fd = (nvhandle_t)ctrl_h->fd;
+		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		p->rm_ctrl_fd = saved;
+		return ret;
+	}
 	}
 
 	/* Frontend ioctls — IOC_NR dispatch */

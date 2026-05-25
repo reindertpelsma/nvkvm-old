@@ -43,12 +43,47 @@
 #include "../common/nvkvm_isolate_proto.h"
 
 /*
+ * UVM ioctl struct layouts.  We need just enough to find the embedded fd
+ * field offset for each ioctl; full kernel headers aren't available here.
+ */
+struct nvkvm_stub_uvm_mm_initialize_params {
+	int32_t  uvm_fd;       /* offset 0  */
+	uint32_t rm_status;
+};
+struct nvkvm_stub_uvm_uuid { uint8_t b[16]; };
+struct nvkvm_stub_uvm_register_gpu_vaspace_params {
+	struct nvkvm_stub_uvm_uuid gpu_uuid; /* 16 */
+	uint32_t rm_ctrl_fd;                 /* offset 16 */
+	uint32_t h_client;
+	uint32_t h_va_space;
+	uint32_t rm_status;
+};
+struct nvkvm_stub_uvm_register_channel_params {
+	struct nvkvm_stub_uvm_uuid gpu_uuid;
+	uint32_t rm_ctrl_fd;                 /* offset 16 */
+	uint32_t h_client;
+	uint32_t h_channel;
+	uint32_t rm_status;
+	uint64_t base;
+	uint64_t length;
+};
+
+/*
  * KVM ioctl number for KVM_SET_USER_MEMORY_REGION on x86_64.
  * From <linux/kvm.h>:
  *   _IOW(KVMIO=0xAE, 0x46, struct kvm_userspace_memory_region)
  *   struct is 32 bytes (slot+flags+gpa+size+userspace_addr).
  */
 #define NVKVM_KVM_SET_USER_MEMORY_REGION  0x4020ae46UL
+
+/*
+ * UVM ioctl numbers we recognise for embedded-fd translation.
+ * These mirror the values in src/abi/uvm.h.
+ */
+#define NVKVM_STUB_UVM_MM_INITIALIZE          75
+#define NVKVM_STUB_UVM_REGISTER_GPU_VASPACE   25
+#define NVKVM_STUB_UVM_REGISTER_CHANNEL       27
+#define NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION 33
 
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER  (1UL << 3)
@@ -418,9 +453,69 @@ static void *worker_thread(void *arg)
 		int is_card_info = ((job.cmd & 0xff) == 0xc8 &&
 				    job.param_size > 0 && job.aux_size == 0);
 
+		/*
+		 * UVM ioctls with embedded fd fields carry a handle_id (assigned
+		 * by QEMU) in those fields.  Translate to our local fd before
+		 * calling ioctl so the UVM driver sees a real fd.
+		 */
+		int32_t saved_uvm_embedded_fd = 0;
+		size_t  uvm_embedded_fd_off   = 0;
+		int     uvm_has_embedded_fd   = 0;
+		if (job.param_size >= 4) {
+			switch (job.cmd) {
+			case NVKVM_STUB_UVM_MM_INITIALIZE:
+				uvm_embedded_fd_off =
+				    offsetof(struct nvkvm_stub_uvm_mm_initialize_params, uvm_fd);
+				uvm_has_embedded_fd = 1;
+				break;
+			case NVKVM_STUB_UVM_REGISTER_GPU_VASPACE:
+				uvm_embedded_fd_off =
+				    offsetof(struct nvkvm_stub_uvm_register_gpu_vaspace_params, rm_ctrl_fd);
+				uvm_has_embedded_fd = 1;
+				break;
+			case NVKVM_STUB_UVM_REGISTER_CHANNEL:
+				uvm_embedded_fd_off =
+				    offsetof(struct nvkvm_stub_uvm_register_channel_params, rm_ctrl_fd);
+				uvm_has_embedded_fd = 1;
+				break;
+			case NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION:
+				/* rm_ctrl_fd is after base+length+offset+uuid+map_offset+count = 48,
+				 * then 4 bytes padding to align u64 fields (struct layout has
+				 * trailing u64s so compiler aligns). Offset is 52. */
+				uvm_embedded_fd_off = 52;
+				uvm_has_embedded_fd = 1;
+				break;
+			}
+		}
+		if (uvm_has_embedded_fd &&
+		    job.param_size >= uvm_embedded_fd_off + 4) {
+			int32_t hid;
+			__builtin_memcpy(&hid,
+					 (char *)job.param_buf + uvm_embedded_fd_off,
+					 sizeof(int32_t));
+			saved_uvm_embedded_fd = hid;
+			int local_fd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
+			if (local_fd < 0) {
+				dprintf(2, "nvkvm_stub: UVM cmd=0x%x: handle_id=%d not in stub table\n",
+					job.cmd, hid);
+				resp.retval = -EBADF;
+				goto send_resp;
+			}
+			int32_t lfd32 = local_fd;
+			__builtin_memcpy((char *)job.param_buf + uvm_embedded_fd_off,
+					 &lfd32, sizeof(int32_t));
+		}
+
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
 		int  err  = (ret < 0) ? errno : 0;
+
+		/* Restore embedded fd so the guest sees its own handle_id back. */
+		if (uvm_has_embedded_fd &&
+		    job.param_size >= uvm_embedded_fd_off + 4) {
+			__builtin_memcpy((char *)job.param_buf + uvm_embedded_fd_off,
+					 &saved_uvm_embedded_fd, sizeof(int32_t));
+		}
 
 		if (is_card_info) {
 			int n = 0;
