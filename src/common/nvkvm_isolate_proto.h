@@ -28,6 +28,8 @@
 #define ISOLATE_CMD_POLL         6   /* fd + events; start background poll   */
 #define ISOLATE_CMD_UNPOLL       7   /* fd; stop background poll             */
 #define ISOLATE_CMD_EXIT         8   /* clean shutdown                       */
+#define ISOLATE_CMD_INSTALL_MAPPING   10 /* call KVM_SET_USER_MEMORY_REGION  */
+#define ISOLATE_CMD_UNINSTALL_MAPPING 11 /* same, with size=0 (slot removal) */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -36,6 +38,7 @@
 #define ISOLATE_RESP_IOCTL       0x12  /* ioctl result + optional data       */
 #define ISOLATE_RESP_MMAP        0x13  /* mmap result                        */
 #define ISOLATE_RESP_POLL_EVENT  0x14  /* async: fd became ready             */
+#define ISOLATE_RESP_MAPPING     0x15  /* install/uninstall result           */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -137,6 +140,31 @@ struct isolate_resp_ok {
 struct isolate_resp_error {
 	uint32_t type;        /* ISOLATE_RESP_ERROR */
 	int32_t  err;         /* errno */
+};
+
+/* ── INSTALL_MAPPING / UNINSTALL_MAPPING ────────────────────────────────────
+ *
+ * QEMU tells the stub to call KVM_SET_USER_MEMORY_REGION on the kvm vm fd
+ * the stub received via SCM_RIGHTS at spawn. The stub does not validate;
+ * the seccomp USER_NOTIF supervisor in QEMU re-validates the trapped
+ * syscall args against QEMU's whitelist before allowing the call.
+ *
+ * UNINSTALL is just INSTALL with size=0 — that's how KVM removes a slot.
+ * We give it a distinct command type so the stub can log it differently.
+ */
+struct isolate_cmd_install_mapping {
+	uint32_t type;        /* ISOLATE_CMD_INSTALL_MAPPING / _UNINSTALL_MAPPING */
+	uint32_t slot;        /* KVM memory slot                                   */
+	uint64_t gva;          /* userspace_addr for KVM (in stub's mm)            */
+	uint64_t size;
+	uint64_t gpa;
+	uint32_t prot;        /* PROT_READ | PROT_WRITE                            */
+	uint32_t flags;       /* reserved                                          */
+};
+
+struct isolate_resp_mapping {
+	uint32_t type;        /* ISOLATE_RESP_MAPPING */
+	int32_t  status;      /* 0 on success, -errno on failure                   */
 };
 
 /* ── EXIT ────────────────────────────────────────────────────────────────── */

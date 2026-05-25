@@ -42,6 +42,18 @@
 
 #include "../common/nvkvm_isolate_proto.h"
 
+/*
+ * KVM ioctl number for KVM_SET_USER_MEMORY_REGION on x86_64.
+ * From <linux/kvm.h>:
+ *   _IOW(KVMIO=0xAE, 0x46, struct kvm_userspace_memory_region)
+ *   struct is 32 bytes (slot+flags+gpa+size+userspace_addr).
+ */
+#define NVKVM_KVM_SET_USER_MEMORY_REGION  0x4020ae46UL
+
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER  (1UL << 3)
+#endif
+
 /* ── Syscall wrappers ────────────────────────────────────────────────────── */
 
 static __attribute__((noreturn)) void stub_exit(int code)
@@ -111,6 +123,18 @@ static long stub_sigaction(int sig, const struct sigaction *act,
 
 static pthread_mutex_t write_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t fd_mutex     = PTHREAD_MUTEX_INITIALIZER;
+
+/* ── Globals for install_isolate_mapping ─────────────────────────────────── */
+
+/* The KVM VM fd that QEMU SCM_RIGHTS'd at spawn. The stub uses this for
+ * KVM_SET_USER_MEMORY_REGION; seccomp filter is configured to USER_NOTIF
+ * exactly that fd+ioctl combination so QEMU's supervisor revalidates
+ * before the kernel commits the call. */
+static int g_kvm_fd      = -1;
+
+/* /proc/self/maps held open before seccomp so the stub can answer
+ * provenance questions later without needing openat. */
+static int g_proc_maps_fd = -1;
 
 /* ── Handle fd table ─────────────────────────────────────────────────────── */
 
@@ -576,48 +600,145 @@ static void handle_munmap_cmd(struct isolate_cmd_munmap *cmd)
 	send_ok();
 }
 
+/* ── install_mapping handlers ────────────────────────────────────────────── */
+
+/*
+ * Call KVM_SET_USER_MEMORY_REGION on the kvm fd we received at spawn.
+ * The seccomp filter routes this to USER_NOTIF so QEMU's supervisor
+ * revalidates the args before the kernel commits the call.
+ *
+ * For install: gva is the stub-side userspace_addr, size > 0, gpa is
+ * where the region appears in the guest.  For uninstall: same struct,
+ * size = 0 (kernel semantics — slot is removed when size=0).
+ */
+struct nvkvm_kvm_userspace_memory_region {
+	uint32_t slot;
+	uint32_t flags;
+	uint64_t guest_phys_addr;
+	uint64_t memory_size;
+	uint64_t userspace_addr;
+};
+
+#ifndef KVM_MEM_READONLY
+#define KVM_MEM_READONLY (1UL << 1)
+#endif
+
+static void handle_install_mapping(struct isolate_cmd_install_mapping *cmd,
+				   int is_uninstall)
+{
+	struct isolate_resp_mapping resp = { .type = ISOLATE_RESP_MAPPING };
+
+	if (g_kvm_fd < 0) {
+		resp.status = -EBADF;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	struct nvkvm_kvm_userspace_memory_region region = {
+		.slot            = cmd->slot,
+		.flags           = (cmd->prot & 2 /*PROT_WRITE*/) ? 0 : KVM_MEM_READONLY,
+		.guest_phys_addr = cmd->gpa,
+		.memory_size     = is_uninstall ? 0 : cmd->size,
+		.userspace_addr  = cmd->gva,
+	};
+	long ret = stub_ioctl(g_kvm_fd, NVKVM_KVM_SET_USER_MEMORY_REGION, &region);
+	resp.status = (ret < 0) ? -errno : 0;
+	locked_send(&resp, sizeof(resp));
+}
+
 /* ── Seccomp ─────────────────────────────────────────────────────────────── */
 
-static void apply_seccomp(void)
+/*
+ * Apply the seccomp filter. When `kvm_fd >= 0`, the filter routes
+ *   ioctl(kvm_fd, KVM_SET_USER_MEMORY_REGION, *)
+ * to SECCOMP_RET_USER_NOTIF and returns the listener fd from
+ * seccomp(SECCOMP_SET_MODE_FILTER, NEW_LISTENER, ...).  When `kvm_fd < 0`
+ * (fallback path used if QEMU did not pass a kvm fd), the filter just
+ * permits the previously-allowed syscalls.
+ *
+ * Returns the listener fd (>=0) when NEW_LISTENER was set, 0 when not,
+ * -errno on failure.
+ */
+static long apply_seccomp(int kvm_fd)
 {
-#define JUMP_ALLOW(nr) \
-	BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr), 0, 1), \
-	BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)
+	struct sock_filter filter[64];
+	int n = 0;
 
-	struct sock_filter filter[] = {
-		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
-			 offsetof(struct seccomp_data, arch)),
-		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, AUDIT_ARCH_X86_64, 1, 0),
-		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
-		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
-			 offsetof(struct seccomp_data, nr)),
-		JUMP_ALLOW(SYS_read),
-		JUMP_ALLOW(SYS_write),
-		JUMP_ALLOW(SYS_recvmsg),
-		JUMP_ALLOW(SYS_sendmsg),
-		JUMP_ALLOW(SYS_ioctl),
-		JUMP_ALLOW(SYS_mmap),
-		JUMP_ALLOW(SYS_mprotect),
-		JUMP_ALLOW(SYS_munmap),
-		JUMP_ALLOW(SYS_ppoll),
-		JUMP_ALLOW(SYS_close),
-		JUMP_ALLOW(SYS_exit_group),
-		JUMP_ALLOW(SYS_rt_sigaction),
-		JUMP_ALLOW(SYS_rt_sigreturn),
-		JUMP_ALLOW(SYS_futex),     /* needed by pthreads */
-		JUMP_ALLOW(SYS_clone),     /* needed for pthread_create */
-		JUMP_ALLOW(SYS_set_robust_list),
-		JUMP_ALLOW(SYS_madvise),
-		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM),
-	};
-#undef JUMP_ALLOW
+#define EMIT(...) do { \
+	struct sock_filter _f = __VA_ARGS__; \
+	filter[n++] = _f; \
+} while (0)
+#define ALLOW_IF(nr_val) do { \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 1)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
+} while (0)
+
+	/* Arch check */
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, arch)));
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, AUDIT_ARCH_X86_64, 1, 0));
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS));
+
+	/* Load nr */
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, nr)));
+
+	/* KVM_SET_USER_MEMORY_REGION on kvm_fd → USER_NOTIF (before generic ioctl allow) */
+	if (kvm_fd >= 0) {
+		/* JT to first stmt of kvm-block; JF skips it.
+		 * Block length: load args[0], cmp fd, load args[1], cmp cmd,
+		 *  ret USER_NOTIF, reload nr  = 6 stmts. */
+		EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_ioctl, 0, 6));
+		EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
+			      offsetof(struct seccomp_data, args[0])));
+		/* if fd != kvm_fd, skip USER_NOTIF block */
+		EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (uint32_t)kvm_fd, 0, 3));
+		EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
+			      offsetof(struct seccomp_data, args[1])));
+		EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,
+			      (uint32_t)NVKVM_KVM_SET_USER_MEMORY_REGION, 0, 1));
+		EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_USER_NOTIF));
+		/* Common landing pad — reload nr for the generic allowlist below */
+		EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, nr)));
+	}
+
+	ALLOW_IF(SYS_read);
+	ALLOW_IF(SYS_write);
+	ALLOW_IF(SYS_recvmsg);
+	ALLOW_IF(SYS_sendmsg);
+	ALLOW_IF(SYS_ioctl);
+	ALLOW_IF(SYS_mmap);
+	ALLOW_IF(SYS_mprotect);
+	ALLOW_IF(SYS_munmap);
+	ALLOW_IF(SYS_ppoll);
+	ALLOW_IF(SYS_close);
+	ALLOW_IF(SYS_exit_group);
+	ALLOW_IF(SYS_rt_sigaction);
+	ALLOW_IF(SYS_rt_sigreturn);
+	ALLOW_IF(SYS_futex);
+	ALLOW_IF(SYS_clone);
+	ALLOW_IF(SYS_set_robust_list);
+	ALLOW_IF(SYS_madvise);
+	ALLOW_IF(SYS_lseek);
+	ALLOW_IF(SYS_pread64);
+
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
+
+#undef ALLOW_IF
+#undef EMIT
 
 	struct sock_fprog prog = {
-		.len    = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+		.len    = (unsigned short)n,
 		.filter = filter,
 	};
 	stub_prctl(38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0);
-	stub_seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
+	if (kvm_fd >= 0) {
+		long r = stub_seccomp(SECCOMP_SET_MODE_FILTER,
+				      SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+		if (r < 0) return -errno;
+		return r; /* listener fd */
+	}
+	long r = stub_seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
+	if (r < 0) return -errno;
+	return 0;
 }
 
 /* ── Self-relocation ─────────────────────────────────────────────────────── */
@@ -662,6 +783,106 @@ static void apply_relocations(void)
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+/*
+ * Spawn handshake: before applying seccomp, expect QEMU to send the KVM VM
+ * fd via SCM_RIGHTS in a single one-shot message. If no such message
+ * arrives (e.g. unit-test harness), fall back to the no-kvm-fd path and
+ * apply seccomp without USER_NOTIF.
+ *
+ * On success, sets g_kvm_fd and returns the seccomp listener fd
+ * (which we send back to QEMU). Returns -1 if we couldn't get a kvm fd
+ * (degraded mode: install_mapping requests will fail with -EBADF).
+ */
+/* Debug write — bypasses libc, writes raw to fd 2 (inherited from QEMU). */
+static void hsdbg(const char *s)
+{
+	size_t n = 0; while (s[n]) n++;
+	stub_write(2, s, n);
+}
+
+static int do_spawn_handshake(void)
+{
+	hsdbg("nvkvm_stub: handshake start\n");
+	/* Open /proc/self/maps before lockdown so we can read it later. */
+	g_proc_maps_fd = (int)syscall(SYS_openat, AT_FDCWD,
+				      "/proc/self/maps", O_RDONLY | O_CLOEXEC);
+	hsdbg("nvkvm_stub: opened /proc/self/maps\n");
+
+	/* Receive the KVM VM fd via SCM_RIGHTS. */
+	struct isolate_cmd_receive_fd recv;
+	char cmsg_buf[CMSG_SPACE(sizeof(int))];
+	struct iovec iov = { &recv, sizeof(recv) };
+	struct msghdr msg_hdr = {
+		.msg_iov        = &iov,
+		.msg_iovlen     = 1,
+		.msg_control    = cmsg_buf,
+		.msg_controllen = sizeof(cmsg_buf),
+	};
+	long n = stub_recvmsg(SOCK_FD, &msg_hdr, 0);
+	hsdbg("nvkvm_stub: recvmsg returned\n");
+	{
+		/* Print actual received bytes hex for debugging. */
+		char buf[80];
+		const char *hex = "0123456789abcdef";
+		int p = 0;
+		buf[p++] = 'n'; buf[p++] = '='; buf[p++] = '0'+ (int)n%10; buf[p++] = ' ';
+		buf[p++] = 't'; buf[p++] = '=';
+		for (int i = 3; i >= 0; i--) {
+			unsigned b = ((unsigned char *)&recv.type)[i];
+			buf[p++] = hex[(b>>4)&0xf]; buf[p++] = hex[b&0xf];
+		}
+		buf[p++] = ' '; buf[p++] = 'h'; buf[p++] = '=';
+		for (int i = 3; i >= 0; i--) {
+			unsigned b = ((unsigned char *)&recv.handle_id)[i];
+			buf[p++] = hex[(b>>4)&0xf]; buf[p++] = hex[b&0xf];
+		}
+		buf[p++] = '\n';
+		stub_write(2, buf, p);
+	}
+	if (n != (long)sizeof(recv) ||
+	    recv.type != ISOLATE_CMD_RECEIVE_FD ||
+	    recv.handle_id != 0xFFFFFFFFu) {
+		hsdbg("nvkvm_stub: handshake: not RECEIVE_FD/0xFFFFFFFF — degrading\n");
+		return -1;
+	}
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);
+	if (!cm || cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) {
+		hsdbg("nvkvm_stub: handshake: no SCM_RIGHTS — degrading\n");
+		return -1;
+	}
+	__builtin_memcpy(&g_kvm_fd, CMSG_DATA(cm), sizeof(int));
+	hsdbg("nvkvm_stub: got kvm fd\n");
+
+	/* Apply seccomp with NEW_LISTENER. */
+	long listener_fd = apply_seccomp(g_kvm_fd);
+	hsdbg("nvkvm_stub: apply_seccomp returned\n");
+	if (listener_fd <= 0) {
+		hsdbg("nvkvm_stub: apply_seccomp failed/no listener\n");
+		return -1;
+	}
+
+	/* Send listener fd back. */
+	struct isolate_resp_ok rok = { .type = ISOLATE_RESP_OK };
+	char cm_out[CMSG_SPACE(sizeof(int))];
+	struct iovec iov_out = { &rok, sizeof(rok) };
+	struct msghdr msg_out = {
+		.msg_iov        = &iov_out,
+		.msg_iovlen     = 1,
+		.msg_control    = cm_out,
+		.msg_controllen = sizeof(cm_out),
+	};
+	struct cmsghdr *cmo = CMSG_FIRSTHDR(&msg_out);
+	cmo->cmsg_level = SOL_SOCKET;
+	cmo->cmsg_type  = SCM_RIGHTS;
+	cmo->cmsg_len   = CMSG_LEN(sizeof(int));
+	int lfd = (int)listener_fd;
+	__builtin_memcpy(CMSG_DATA(cmo), &lfd, sizeof(int));
+	long sn = syscall(SYS_sendmsg, SOCK_FD, &msg_out, 0);
+	hsdbg("nvkvm_stub: sent listener fd back\n");
+	if (sn < 0) return -1;
+	return 0;
+}
+
 int main(void)
 {
 	handle_table_init();
@@ -678,7 +899,10 @@ int main(void)
 	for (int i = 0; i < NVKVM_STUB_WORKERS; i++)
 		pthread_create(&workers[i], NULL, worker_thread, NULL);
 
-	apply_seccomp();
+	/* QEMU sends kvm fd via SCM_RIGHTS first; we send listener fd back.
+	 * On failure (e.g. older QEMU), apply seccomp without NEW_LISTENER. */
+	if (do_spawn_handshake() < 0)
+		apply_seccomp(-1);
 
 	/*
 	 * Reader loop — reads ONE complete SEQPACKET message per iteration.
@@ -697,14 +921,15 @@ int main(void)
 	 */
 	for (;;) {
 		union {
-			uint32_t                        type;
-			struct isolate_cmd_receive_fd   recv_fd;
-			struct isolate_cmd_close_fd     close_fd;
-			struct isolate_cmd_ioctl        ioctl_cmd;
-			struct isolate_cmd_mmap         mmap_cmd;
-			struct isolate_cmd_munmap       munmap_cmd;
-			struct isolate_cmd_poll         poll_cmd;
-			struct isolate_cmd_unpoll       unpoll_cmd;
+			uint32_t                            type;
+			struct isolate_cmd_receive_fd       recv_fd;
+			struct isolate_cmd_close_fd         close_fd;
+			struct isolate_cmd_ioctl            ioctl_cmd;
+			struct isolate_cmd_mmap             mmap_cmd;
+			struct isolate_cmd_munmap           munmap_cmd;
+			struct isolate_cmd_poll             poll_cmd;
+			struct isolate_cmd_unpoll           unpoll_cmd;
+			struct isolate_cmd_install_mapping  install_mapping_cmd;
 		} cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
@@ -760,6 +985,12 @@ int main(void)
 		case ISOLATE_CMD_UNPOLL:
 			(void)cmd.unpoll_cmd;
 			send_ok();
+			break;
+		case ISOLATE_CMD_INSTALL_MAPPING:
+			handle_install_mapping(&cmd.install_mapping_cmd, 0);
+			break;
+		case ISOLATE_CMD_UNINSTALL_MAPPING:
+			handle_install_mapping(&cmd.install_mapping_cmd, 1);
 			break;
 		case ISOLATE_CMD_EXIT:
 			goto done;
