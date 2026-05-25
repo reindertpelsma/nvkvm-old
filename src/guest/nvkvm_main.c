@@ -92,6 +92,13 @@ static const struct file_operations nvkvm_fops = {
  */
 #define NV_NVIDIA_MAJOR 195
 
+static char *nvkvm_devnode(const struct device *dev, umode_t *mode)
+{
+	if (mode)
+		*mode = 0666;
+	return NULL;
+}
+
 static int __init register_devices(void)
 {
 	int ret, i;
@@ -100,6 +107,7 @@ static int __init register_devices(void)
 	nvkvm.class = class_create("nvkvm");
 	if (IS_ERR(nvkvm.class))
 		return PTR_ERR(nvkvm.class);
+	nvkvm.class->devnode = nvkvm_devnode;
 
 	/* /dev/nvidiactl — prefer major 195 minor 255 (NVIDIA standard) */
 	devno = MKDEV(NV_NVIDIA_MAJOR, NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE);
