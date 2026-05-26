@@ -3,7 +3,63 @@
 This is a forensic breakdown of where each implementation diverges on the
 UVM call sequence that cuInit issues during device probe.
 
-## Current status (2026-05-26)
+## Current status (2026-05-26 — late)
+
+cuInit still returns 100, but the *reason* now is several layers deeper
+than at the start of the day.  Today's commits, in order, each unblocked
+one concrete failure mode:
+
+1. **hClass=0xDE size (RM_USER_SHARED_DATA)** — driver wants 8 bytes
+   (NV00DE_ALLOC_PARAMETERS_V545); we were sending 0.  cuInit moved from
+   "no device" (100) → 999 (unknown error).
+2. **IOCTL NR collision** — sanitize/dispatch matched `_IOC_NR(cmd)` for
+   frontend ioctls but UVM_PAGEABLE_MEM_ACCESS (0x27) ==
+   NV_ESC_RM_ALLOC_MEMORY (0x27).  The 8-byte UVM struct was read as a
+   48-byte nvos02-with-fd, garbage interpreted as fd → EBADF.  Fix: gate
+   the NR switches on `_IOC_TYPE == 'F'`.  cuInit reached UVM init and
+   the first RM_MAP_MEMORY.
+3. **hClass=0x90F1 size (FERMI_VASPACE_A)** — same shape as 0xDE: missing
+   from the size fallback table.  Added NV_VASPACE_ALLOCATION_PARAMETERS
+   (48 bytes, pre-V580 layout).  cuInit reached an even deeper class.
+
+## Next concrete failure (today's stopping point)
+
+Two issues blocking the next step, both surfaced by the new RM_ALLOC
+hex-dump diagnostic:
+
+### a) NV50_MEMORY_VIRTUAL (hClass=0x50A0) — embedded pointer
+
+Adding the size (128 bytes, NV_MEMORY_ALLOCATION_PARAMS_V545) lets the
+alloc reach the driver, which then dereferences the embedded `address`
+field (NvP64 at offset 104) in the *isolate* process and hangs the
+calling thread (kernel hung-task warning in dmesg).  CUDA fills this
+with a libcuda-process VA that means nothing to the isolate's mm.
+
+**Fix needed:** per-class aux sanitizer that zeros `address` before
+forwarding, then writes it back on return (or installs it via the
+GPA window so the value the driver writes is actually visible to
+libcuda).  Same story for the other classes that share this struct.
+
+### b) RM_MAP_MEMORY embedded fd not translated in stub
+
+Earlier "this worked" was luck — `fd_token` happened to match an unused
+isolate-side fd number.  Now that more handles are opened first,
+`fd_token=25` is passed into the kernel and rejected with
+NV_ERR_INVALID_ARGUMENT (0x1F).  The legacy QEMU dispatch translated
+fd_token → host fd; the isolate path doesn't.
+
+**Fix needed:** stub-side translation of the embedded fd in
+`nv_ioctl_nvos33_parameters_with_fd` (and the same for
+`nv_ioctl_nvos02_parameters_with_fd` once 0x50A0 is wired in).
+
+Both are tractable now that the diagnostic dumps the struct
+contents.  RM_MAP_MEMORY's eventual install path (host VA →
+GPA-window region) is the broader dual-mmap architectural work
+described in `docs/ARCHITECTURE.md`.
+
+---
+
+## Original analysis below (historical)
 
 After stripping the install_isolate_mapping path and the
 UVM_MM_INITIALIZE mask, cuInit still fails with code 100

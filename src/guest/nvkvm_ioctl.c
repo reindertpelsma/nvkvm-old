@@ -353,19 +353,16 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		struct nv_ioctl_nvos33_parameters_with_fd *p = buf;
 		p->p_linear_address = 0;     /* host fills this in        */
 		if (p->fd >= 0) {
-			struct file *f = fget(p->fd);
-			if (!f)
+			/* isolate path: send handle_id so the stub can resolve
+			 * via its handle table (fd_token is a QEMU-side concept
+			 * the stub doesn't know about).  Previously sent
+			 * fd_token, which the kernel only accepted by coincidence
+			 * when the value happened to match an unused isolate
+			 * fd. */
+			__s32 hid = guest_fd_to_handle_id(p->fd);
+			if (hid < 0)
 				return -EBADF;
-			{
-				struct nvkvm_fd_ctx *other =
-					f->private_data;
-				if (!other) {
-					fput(f);
-					return -EBADF;
-				}
-				p->fd = (__s32)other->fd_token;
-			}
-			fput(f);
+			p->fd = hid;
 		}
 		break;
 	}

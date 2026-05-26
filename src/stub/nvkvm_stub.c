@@ -511,6 +511,56 @@ static void *worker_thread(void *arg)
 					 &lfd32, sizeof(int32_t));
 		}
 
+		/*
+		 * Frontend ioctls with embedded fd fields:
+		 *   NV_ESC_RM_MAP_MEMORY   — fd at offset 48 in
+		 *     nv_ioctl_nvos33_parameters_with_fd.
+		 *   NV_ESC_RM_ALLOC_MEMORY — fd at offset 40 in
+		 *     nv_ioctl_nvos02_parameters_with_fd.
+		 * The guest sanitizer puts a handle_id there; the stub maps
+		 * handle_id → its local fd via handle_lookup, calls ioctl,
+		 * restores the handle_id on the way back.  Same shape as the
+		 * UVM block above.  cmd encoding has TYPE='F' so check the
+		 * low byte (_IOC_NR) against 0x4e / 0x27.
+		 */
+		int32_t saved_fe_embedded_fd = 0;
+		size_t  fe_embedded_fd_off   = 0;
+		int     fe_has_embedded_fd   = 0;
+		if (((job.cmd >> 8) & 0xff) == 'F') {
+			switch (job.cmd & 0xff) {
+			case 0x4e:  /* NV_ESC_RM_MAP_MEMORY */
+				fe_embedded_fd_off = 48;
+				fe_has_embedded_fd = 1;
+				break;
+			case 0x27:  /* NV_ESC_RM_ALLOC_MEMORY */
+				fe_embedded_fd_off = 40;
+				fe_has_embedded_fd = 1;
+				break;
+			}
+		}
+		if (fe_has_embedded_fd &&
+		    job.param_size >= fe_embedded_fd_off + 4) {
+			int32_t hid;
+			__builtin_memcpy(&hid,
+					 (char *)job.param_buf + fe_embedded_fd_off,
+					 sizeof(int32_t));
+			saved_fe_embedded_fd = hid;
+			if (hid > 0) {
+				int local_fd = handle_lookup((uint32_t)hid);
+				if (local_fd < 0) {
+					dprintf(2, "nvkvm_stub: FE cmd=0x%x: "
+						"embedded handle_id=%d not in "
+						"stub table\n", job.cmd, hid);
+					resp.retval = -EBADF;
+					goto send_resp;
+				}
+				int32_t lfd32 = local_fd;
+				__builtin_memcpy((char *)job.param_buf +
+						 fe_embedded_fd_off,
+						 &lfd32, sizeof(int32_t));
+			}
+		}
+
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
 		int  err  = (ret < 0) ? errno : 0;
@@ -520,6 +570,11 @@ static void *worker_thread(void *arg)
 		    job.param_size >= uvm_embedded_fd_off + 4) {
 			__builtin_memcpy((char *)job.param_buf + uvm_embedded_fd_off,
 					 &saved_uvm_embedded_fd, sizeof(int32_t));
+		}
+		if (fe_has_embedded_fd &&
+		    job.param_size >= fe_embedded_fd_off + 4) {
+			__builtin_memcpy((char *)job.param_buf + fe_embedded_fd_off,
+					 &saved_fe_embedded_fd, sizeof(int32_t));
 		}
 
 		if (is_card_info) {
