@@ -461,6 +461,60 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			 * original user-space address (saved off below). See gVisor
 			 * `ctrlIoctlHasInfoList` for the reference implementation.
 			 */
+			/*
+			 * NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST has two embedded
+			 * NvP64 list pointers (PChannelHandleList, PChannelList),
+			 * each pointing at a u32 array of NumChannels entries.
+			 * Both lists are IN+OUT for the driver: it reads them
+			 * to filter then writes back the results.  Extend
+			 * aux_buf to hold both lists inline, copy the user
+			 * buffers into the extension, and zero the pointer
+			 * fields — stub substitutes host VAs pointing at the
+			 * extension area.  After the ioctl we copy the lists
+			 * back to the original user buffers.  See gVisor
+			 * ctrlDevFIFOGetChannelList.
+			 */
+			if (ctrl->cmd == NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST &&
+			    ctrl->params_size >= 24) {
+				__u32 num_channels = *(__u32 *)aux_buf;
+				__u64 p_handles    = *(__u64 *)((char *)aux_buf + 8);
+				__u64 p_list       = *(__u64 *)((char *)aux_buf + 16);
+				if (num_channels > 0 && num_channels <= 4096 &&
+				    p_handles && p_list) {
+					size_t list_bytes = (size_t)num_channels *
+							    sizeof(__u32);
+					size_t ext = ctrl->params_size +
+						     2 * list_bytes;
+					void *ext_buf = kzalloc(ext, GFP_KERNEL);
+					if (!ext_buf) {
+						kfree(aux_buf);
+						kfree(params_buf);
+						return -ENOMEM;
+					}
+					memcpy(ext_buf, aux_buf, ctrl->params_size);
+					if (copy_from_user((char *)ext_buf +
+							   ctrl->params_size,
+							   (void __user *)(uintptr_t)p_handles,
+							   list_bytes) ||
+					    copy_from_user((char *)ext_buf +
+							   ctrl->params_size +
+							   list_bytes,
+							   (void __user *)(uintptr_t)p_list,
+							   list_bytes)) {
+						kfree(ext_buf);
+						kfree(aux_buf);
+						kfree(params_buf);
+						return -EFAULT;
+					}
+					/* Zero ptrs; stub fills them */
+					*(__u64 *)((char *)ext_buf + 8)  = 0;
+					*(__u64 *)((char *)ext_buf + 16) = 0;
+					kfree(aux_buf);
+					aux_buf  = ext_buf;
+					aux_size = ext;
+				}
+			}
+
 			{
 				int has_info_list = 0;
 				switch (ctrl->cmd) {
@@ -582,6 +636,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case HOPPER_CHANNEL_GPFIFO_A:
 				ap_size = sizeof(struct nv_channel_alloc_params_v570);
 				break;
+			case NV01_EVENT_OS_EVENT:
+				ap_size = sizeof(struct nv0005_alloc_parameters);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -637,6 +694,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case AMPERE_CHANNEL_GPFIFO_A:
 				case HOPPER_CHANNEL_GPFIFO_A:
 					ap_size = sizeof(struct nv_channel_alloc_params_v570);
+					break;
+				case NV01_EVENT_OS_EVENT:
+					ap_size = sizeof(struct nv0005_alloc_parameters);
 					break;
 				}
 			}
@@ -856,6 +916,44 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			 * original user-space list address, then restore the pointer
 			 * in aux_buf and write only the base params struct out.
 			 */
+			/* FIFO_GET_CHANNELLIST response: copy both lists back to
+			 * the original user pointers, then restore those pointers
+			 * in aux_buf so userspace sees them unchanged. */
+			if (ctrl->cmd == NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST &&
+			    ctrl->params_size >= 24 &&
+			    aux_size > ctrl->params_size) {
+				struct {
+					__u32 num_channels;
+					__u32 pad;
+					__u64 p_handles;
+					__u64 p_list;
+				} orig;
+				if (!copy_from_user(&orig, aux_uptr, sizeof(orig)) &&
+				    orig.num_channels > 0) {
+					size_t list_bytes = (size_t)orig.num_channels *
+							    sizeof(__u32);
+					if (aux_size >= ctrl->params_size + 2 * list_bytes) {
+						if (orig.p_handles)
+							copy_to_user(
+								(void __user *)(uintptr_t)orig.p_handles,
+								(char *)aux_buf + ctrl->params_size,
+								list_bytes);
+						if (orig.p_list)
+							copy_to_user(
+								(void __user *)(uintptr_t)orig.p_list,
+								(char *)aux_buf + ctrl->params_size +
+								list_bytes,
+								list_bytes);
+					}
+					/* Restore pointers */
+					*(__u64 *)((char *)aux_buf + 8)  = orig.p_handles;
+					*(__u64 *)((char *)aux_buf + 16) = orig.p_list;
+				}
+				if (copy_to_user(aux_uptr, aux_buf, ctrl->params_size))
+					ret = -EFAULT;
+				goto done_aux_copy;
+			}
+
 			{
 				int has_info_list = 0;
 				switch (ctrl->cmd) {

@@ -384,6 +384,22 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		break;
 	}
 
+	case NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO: {
+		/* The driver uses the old/new CPU addresses purely for its
+		 * own bookkeeping of which userspace VAs alias a given
+		 * device mapping.  In the nvkvm forwarded model that
+		 * bookkeeping happens in our mmap path, not in the
+		 * isolate's mm — so the addresses libcuda passes are
+		 * meaningless to the driver and it returns NV_ERR
+		 * (nvstatus=0x2) when it can't find them.  Zero both so
+		 * the driver short-circuits and returns OK; the mapping
+		 * still works because we install it via the GPA window. */
+		struct nvos56_parameters *p = buf;
+		p->p_old_cpu_address = 0;
+		p->p_new_cpu_address = 0;
+		break;
+	}
+
 	case NV_ESC_RM_VID_HEAP_CONTROL: {
 		struct nvos32_parameters *p = buf;
 		p->p_memory = 0;

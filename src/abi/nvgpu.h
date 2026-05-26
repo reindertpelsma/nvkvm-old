@@ -461,6 +461,20 @@ struct nv_ctxshare_allocation_parameters {
 	__u32      subctx_id;
 };
 
+/* ── NV0005_ALLOC_PARAMETERS — for NV01_EVENT_OS_EVENT (0x79) and friends ── */
+/*    Data field is actually an FD (eventfd) for NV01_EVENT_OS_EVENT — the
+ *    driver calls osUserHandleToKernelPtr() to translate it.  That means
+ *    libcuda passes a guest-userspace fd, the driver dereferences it in
+ *    the isolate, and it fails.  See [[ioctl-nr-collision-bug]] for the
+ *    related pattern. */
+struct nv0005_alloc_parameters {
+	nvhandle_t  h_parent_client;
+	nvhandle_t  h_src_resource;
+	nvclassid_t h_class;
+	__u32       notify_index;
+	__u64       data;  /* fd for NV01_EVENT_OS_EVENT */
+};
+
 /* ── NV_MEMORY_DESC_PARAMS — embedded in channel-alloc params ─────────────── */
 struct nv_memory_desc_params {
 	__u64 base;
@@ -569,6 +583,7 @@ struct nv0000_ctrl_system_get_build_version_params {
  */
 #define NV0041_CTRL_CMD_GET_SURFACE_INFO  0x00410110U
 #define NV0080_CTRL_CMD_GR_GET_INFO       0x00801104U
+#define NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST 0x0080170dU
 #define NV2080_CTRL_CMD_BIOS_GET_INFO     0x20800802U
 #define NV2080_CTRL_CMD_GR_GET_INFO       0x20801201U
 #define NV2080_CTRL_CMD_FB_GET_INFO       0x20801301U

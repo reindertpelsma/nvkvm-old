@@ -117,11 +117,9 @@ struct uvm_register_channel_params {
 
 struct uvm_unregister_channel_params {
 	struct uvm_uuid gpu_uuid;
-	nvhandle_t rm_ctrl_fd;
 	nvhandle_t h_client;
 	nvhandle_t h_channel;
 	__u32 rm_status;
-	__u32 reserved;
 };
 
 struct uvm_create_range_group_params {

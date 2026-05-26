@@ -428,6 +428,32 @@ static void *worker_thread(void *arg)
 					}
 				}
 			}
+			if (inner_cmd == 0x0080170dU) {
+				/* NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST.  Layout:
+				 *   [params 24 bytes][handles N*4][list N*4]
+				 * Guest zeroed the two embedded pointers at
+				 * offsets 8 and 16; point them at our extension.
+				 * After the ioctl we zero them again so we don't
+				 * leak host VAs back. */
+				uint32_t nc = 0;
+				if (job.aux_size >= 4)
+					__builtin_memcpy(&nc, job.aux_buf,
+							 sizeof(uint32_t));
+				if (nc > 0 && nc <= 4096 &&
+				    job.aux_size >= 24 + (size_t)nc * 8) {
+					uint64_t p_handles =
+						(uint64_t)(uintptr_t)
+						((char *)job.aux_buf + 24);
+					uint64_t p_list = p_handles + (size_t)nc * 4;
+					__builtin_memcpy((char *)job.aux_buf + 8,
+							 &p_handles, 8);
+					__builtin_memcpy((char *)job.aux_buf + 16,
+							 &p_list, 8);
+					/* flag: re-zero after ioctl */
+					info_list_size = nc;  /* repurpose flag */
+					info_list_base = 0xFFFFFFFFU; /* sentinel */
+				}
+			}
 			if (inner_cmd == 0x00000101U) {    /* GET_BUILD_VERSION */
 				/*
 				 * nv0000_ctrl_system_get_build_version_params is
@@ -612,6 +638,9 @@ static void *worker_thread(void *arg)
 		if (info_list_size > 0) {
 			uint64_t z = 0;
 			__builtin_memcpy((char *)job.aux_buf + 8, &z, 8);
+			/* FIFO_GET_CHANNELLIST has a second pointer at +16. */
+			if (info_list_base == 0xFFFFFFFFU)
+				__builtin_memcpy((char *)job.aux_buf + 16, &z, 8);
 		}
 		(void)info_list_base;
 
