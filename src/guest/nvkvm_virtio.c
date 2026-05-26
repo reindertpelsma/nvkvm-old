@@ -915,26 +915,32 @@ int nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
 	struct {
 		struct nvkvm_hdr                      hdr;
 		struct nvkvm_req_write_memory_handle  req;
-	} msg = {};
+	} *msg;
 	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
 	struct nvkvm_inflight *inf;
 	int ret;
 
-	inf = inflight_alloc(req_id);
-	if (!inf)
+	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+	if (!msg)
 		return -ENOMEM;
+	inf = inflight_alloc(req_id);
+	if (!inf) {
+		kfree(msg);
+		return -ENOMEM;
+	}
 
-	msg.hdr.type      = cpu_to_le32(NVKVM_REQ_WRITE_MEMORY_HANDLE);
-	msg.hdr.req_id    = cpu_to_le32(req_id);
-	msg.req.handle_id = cpu_to_le32(handle_id);
-	msg.req.shm_slot  = cpu_to_le32((__u32)shm_slot);
-	msg.req.offset    = cpu_to_le64(offset);
-	msg.req.size      = cpu_to_le32(size);
+	msg->hdr.type      = cpu_to_le32(NVKVM_REQ_WRITE_MEMORY_HANDLE);
+	msg->hdr.req_id    = cpu_to_le32(req_id);
+	msg->req.handle_id = cpu_to_le32(handle_id);
+	msg->req.shm_slot  = cpu_to_le32((__u32)shm_slot);
+	msg->req.offset    = cpu_to_le64(offset);
+	msg->req.size      = cpu_to_le32(size);
 
-	ret = nvkvm_send_sync(&nvkvm, &msg, sizeof(msg), inf);
+	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0 && inf->status)
 		ret = -(int)inf->status;
 	kfree(inf);
+	kfree(msg);
 	return ret;
 }
 
@@ -944,26 +950,32 @@ int nvkvm_virtio_read_memory_handle(__u32 handle_id, __u64 offset,
 	struct {
 		struct nvkvm_hdr                     hdr;
 		struct nvkvm_req_read_memory_handle  req;
-	} msg = {};
+	} *msg;
 	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
 	struct nvkvm_inflight *inf;
 	int ret;
 
-	inf = inflight_alloc(req_id);
-	if (!inf)
+	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+	if (!msg)
 		return -ENOMEM;
+	inf = inflight_alloc(req_id);
+	if (!inf) {
+		kfree(msg);
+		return -ENOMEM;
+	}
 
-	msg.hdr.type      = cpu_to_le32(NVKVM_REQ_READ_MEMORY_HANDLE);
-	msg.hdr.req_id    = cpu_to_le32(req_id);
-	msg.req.handle_id = cpu_to_le32(handle_id);
-	msg.req.shm_slot  = cpu_to_le32((__u32)shm_slot);
-	msg.req.offset    = cpu_to_le64(offset);
-	msg.req.size      = cpu_to_le32(size);
+	msg->hdr.type      = cpu_to_le32(NVKVM_REQ_READ_MEMORY_HANDLE);
+	msg->hdr.req_id    = cpu_to_le32(req_id);
+	msg->req.handle_id = cpu_to_le32(handle_id);
+	msg->req.shm_slot  = cpu_to_le32((__u32)shm_slot);
+	msg->req.offset    = cpu_to_le64(offset);
+	msg->req.size      = cpu_to_le32(size);
 
-	ret = nvkvm_send_sync(&nvkvm, &msg, sizeof(msg), inf);
+	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0 && inf->status)
 		ret = -(int)inf->status;
 	kfree(inf);
+	kfree(msg);
 	return ret;
 }
 

@@ -108,21 +108,25 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 			      (unsigned long)(gpa_base >> PAGE_SHIFT),
 			      vma_len, vma->vm_page_prot);
 	if (ret) {
-		/* Ask host to undo the mmap */
+		/* Ask host to undo the mmap.  Use kmalloc, not stack — see
+		 * comment in nvkvm_mmap_release_fd about CONFIG_VMAP_STACK. */
 		struct {
-			struct nvkvm_hdr               hdr;
+			struct nvkvm_hdr                   hdr;
 			struct nvkvm_req_munmap_on_isolate req;
-		} umsg = {
-			.hdr.type          = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE),
-			.hdr.req_id        = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_req_id)),
-			.req.isolate_id    = cpu_to_le32(ctx->session->isolate_id),
-			.req.mmap_token    = cpu_to_le32(mmap_token),
-		};
+		} *umsg;
 		struct nvkvm_inflight uinf;
-		init_completion(&uinf.done);
-		uinf.req_id = le32_to_cpu(umsg.hdr.req_id);
-		nvkvm_send_sync(&nvkvm, &umsg, sizeof(umsg), &uinf);
+		umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
+		if (umsg) {
+			umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
+			umsg->hdr.req_id     = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->req.isolate_id = cpu_to_le32(ctx->session->isolate_id);
+			umsg->req.mmap_token = cpu_to_le32(mmap_token);
+			init_completion(&uinf.done);
+			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
+			kfree(umsg);
+		}
 		return ret;
 	}
 
@@ -245,16 +249,19 @@ out_unmap_legacy: {
 		struct {
 			struct nvkvm_hdr        hdr;
 			struct nvkvm_req_munmap req;
-		} umsg = {
-			.hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP),
-			.hdr.req_id     = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_req_id)),
-			.req.mmap_token = cpu_to_le32(resp.mmap_token),
-		};
+		} *umsg;
 		struct nvkvm_inflight uinf;
-		init_completion(&uinf.done);
-		uinf.req_id = le32_to_cpu(umsg.hdr.req_id);
-		nvkvm_send_sync(&nvkvm, &umsg, sizeof(umsg), &uinf);
+		umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
+		if (umsg) {
+			umsg->hdr.type    = cpu_to_le32(NVKVM_REQ_MUNMAP);
+			umsg->hdr.req_id  = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->req.mmap_token = cpu_to_le32(resp.mmap_token);
+			init_completion(&uinf.done);
+			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
+			kfree(umsg);
+		}
 	}
 out_msg:
 	kfree(inf);
@@ -515,40 +522,52 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 	list_splice_init(&ctx->mmap_regions, &to_free);
 	spin_unlock(&ctx->mmap_lock);
 
+	/*
+	 * The two send-sync call sites below previously built `umsg` on the
+	 * stack and passed it to sg_init_one().  On CONFIG_VMAP_STACK kernels
+	 * (Ubuntu's default) virt_to_page() returns a bogus physical page for
+	 * vmapped stack, so QEMU's DMA read sees zeros — hdr.type lands as 0
+	 * and the QEMU dispatch rejects it with "unknown request type 0".
+	 * The whole virtio queue then deadlocks because the inflight record
+	 * never completes.  Copy into a kmalloc'd buffer (same workaround
+	 * simple_req uses).
+	 */
 	list_for_each_entry_safe(region, tmp, &to_free, list) {
 		if (region->handle_id && isolate_id) {
-			/* New path: MUNMAP_ON_ISOLATE */
 			struct {
 				struct nvkvm_hdr                   hdr;
 				struct nvkvm_req_munmap_on_isolate req;
-			} umsg = {
-				.hdr.type          = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE),
-				.hdr.req_id        = cpu_to_le32(
-						atomic_inc_return(&nvkvm.next_req_id)),
-				.req.isolate_id    = cpu_to_le32(isolate_id),
-				.req.mmap_token    = cpu_to_le32(region->mmap_token),
-			};
+			} *umsg;
 			struct nvkvm_inflight uinf;
+			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
+			if (!umsg) goto next;
+			umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
+			umsg->hdr.req_id     = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->req.isolate_id = cpu_to_le32(isolate_id);
+			umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
 			init_completion(&uinf.done);
-			uinf.req_id = le32_to_cpu(umsg.hdr.req_id);
-			nvkvm_send_sync(&nvkvm, &umsg, sizeof(umsg), &uinf);
+			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
+			kfree(umsg);
 		} else {
-			/* Legacy path: MUNMAP */
 			struct {
 				struct nvkvm_hdr        hdr;
 				struct nvkvm_req_munmap req;
-			} umsg = {
-				.hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP),
-				.hdr.req_id     = cpu_to_le32(
-						atomic_inc_return(&nvkvm.next_req_id)),
-				.req.mmap_token = cpu_to_le32(region->mmap_token),
-			};
+			} *umsg;
 			struct nvkvm_inflight uinf;
+			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
+			if (!umsg) goto next;
+			umsg->hdr.type    = cpu_to_le32(NVKVM_REQ_MUNMAP);
+			umsg->hdr.req_id  = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
 			init_completion(&uinf.done);
-			uinf.req_id = le32_to_cpu(umsg.hdr.req_id);
-			nvkvm_send_sync(&nvkvm, &umsg, sizeof(umsg), &uinf);
+			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
+			kfree(umsg);
 		}
-
+next:
 		list_del(&region->list);
 		kfree(region);
 	}
