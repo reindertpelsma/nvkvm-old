@@ -255,6 +255,16 @@ struct uvm_pageable_mem_access_params {
 	__u32 rm_status;
 };
 
+/* UVM_PAGEABLE_MEM_ACCESS_ON_GPU (cmd 70) — libcuda calls this right after
+ * UVM_REGISTER_GPU; if the guest module returns -ENOTTY libcuda treats the
+ * device as broken and gives up cuCtxCreate. */
+struct uvm_pageable_mem_access_on_gpu_params {
+	__u8  gpu_uuid[16];        /* IN  NvProcessorUuid */
+	__u8  pageable_mem_access; /* OUT NvBool */
+	__u8  reserved[3];
+	__u32 rm_status;           /* OUT */
+};
+
 struct uvm_alloc_semaphore_pool_params {
 	__u64 base;
 	__u64 length;

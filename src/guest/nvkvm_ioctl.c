@@ -95,6 +95,8 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return sizeof(struct uvm_validate_va_range_params);
 	case UVM_PAGEABLE_MEM_ACCESS:
 		return sizeof(struct uvm_pageable_mem_access_params);
+	case UVM_PAGEABLE_MEM_ACCESS_ON_GPU:
+		return sizeof(struct uvm_pageable_mem_access_on_gpu_params);
 	case UVM_ALLOC_SEMAPHORE_POOL:
 		return sizeof(struct uvm_alloc_semaphore_pool_params);
 	}

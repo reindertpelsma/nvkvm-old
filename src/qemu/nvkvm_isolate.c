@@ -365,6 +365,18 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			dup2(sv[1], STDIN_FILENO);
 			close(sv[0]);
 			close(sv[1]);
+			/* DEBUG: inject ioctl-dump LD_PRELOAD if requested */
+			const char *dbg = getenv("NVKVM_STUB_LD_PRELOAD");
+			if (dbg && *dbg) {
+				setenv("LD_PRELOAD", dbg, 1);
+				/* If TRACE_FILE env vars exist for stub, override
+				 * the inherited QEMU ones so the stub writes to
+				 * its own file. */
+				const char *stf = getenv("NVKVM_STUB_TRACE_FILE");
+				const char *stt = getenv("NVKVM_STUB_TRACE_TAG");
+				if (stf) setenv("TRACE_FILE", stf, 1);
+				if (stt) setenv("TRACE_TAG", stt, 1);
+			}
 			execl(stub_path, "nvkvm_stub", NULL);
 			_exit(127);
 		}
