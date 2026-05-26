@@ -1,5 +1,11 @@
 # cuInit "no device" blocker — host vs gVisor vs nvkvm comparison
 
+## RESOLVED 2026-05-26
+
+cuInit now returns 0 and reports 1 GPU.  See [[cuinit-first-success]].
+The remaining work is on cuCtxCreate / cuMemAlloc, summarised at the
+end of this document.
+
 This is a forensic breakdown of where each implementation diverges on the
 UVM call sequence that cuInit issues during device probe.
 
