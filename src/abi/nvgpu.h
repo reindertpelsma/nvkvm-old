@@ -417,6 +417,51 @@ struct nv00de_alloc_parameters_v545 {
 	__u64 polled_data_mask;
 };
 
+/* ── NV_VASPACE_ALLOCATION_PARAMETERS — for FERMI_VASPACE_A (0x90F1) ──────── */
+
+/* Layout pre-580 driver (we target 575.51.03). */
+struct nv_vaspace_allocation_parameters {
+	__u32 index;
+	__u32 flags;
+	__u64 va_size;
+	__u64 va_start_internal;
+	__u64 va_limit_internal;
+	__u32 big_page_size;
+	__u32 _pad0;
+	__u64 va_base;
+};
+
+/* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */
+/*    several other generic memory classes. V545 layout (driver >= 545.23.06,
+ *    matches our 575.51.03): adds numa_node + pad. */
+struct nv_memory_allocation_params_v545 {
+	__u32 owner;
+	__u32 type;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__s32 pitch;
+	__u32 attr;
+	__u32 attr2;
+	__u32 format;
+	__u32 compr_covg;
+	__u32 zcull_covg;
+	__u32 _pad0;
+	__u64 range_lo;
+	__u64 range_hi;
+	__u64 size;
+	__u64 alignment;
+	__u64 offset;
+	__u64 limit;
+	nvp64_t  address;
+	__u32 ctag_offset;
+	nvhandle_t h_va_space;
+	__u32 internal_flags;
+	__u32 tag;
+	__s32 numa_node;       /* added in V545 */
+	__u32 _pad1;
+};
+
 /* ── NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x101) ────────────────────── */
 
 #define NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION 0x00000101U

@@ -90,6 +90,8 @@ func TestAllocParamStructSizes(t *testing.T) {
 		{"nv0080_alloc_parameters (NV01_DEVICE_0)", Sizes.Nv0080, 56},
 		{"nv2080_alloc_parameters (NV20_SUBDEVICE_0)", Sizes.Nv2080, 4},
 		{"nv00de_alloc_parameters_v545 (RM_USER_SHARED_DATA)", Sizes.Nv00deV545, 8},
+		{"nv_vaspace_allocation_parameters (FERMI_VASPACE_A)", Sizes.NvVaspace, 48},
+		{"nv_memory_allocation_params_v545 (NV50_MEMORY_VIRTUAL)", Sizes.NvMemAlloc, 128},
 	})
 }
 

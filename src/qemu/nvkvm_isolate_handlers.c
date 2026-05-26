@@ -306,17 +306,30 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&inner_cmd, (char *)param_buf + 8, sizeof(uint32_t));
 	}
 
-	/* DIAG: for RM_MAP_MEMORY, dump pLinearAddress so we can see what the
-	 * kernel returned to the stub. */
+	/* DIAG: for RM_MAP_MEMORY, dump all params so we can see what the
+	 * kernel saw and what it returned. */
 	if (_IOC_NR(req->cmd) == NV_ESC_RM_MAP_MEMORY && param_buf &&
-	    req->param_size >= 40) {
-		uint64_t plinear = 0;
-		uint32_t mm_status = 0;
-		memcpy(&plinear, (char *)param_buf + 32, sizeof(uint64_t));
-		memcpy(&mm_status, (char *)param_buf + 40, sizeof(uint32_t));
+	    req->param_size >= 48) {
+		uint32_t h_client = 0, h_device = 0, h_memory = 0;
+		uint64_t offset = 0, length = 0, plinear = 0;
+		uint32_t mm_status = 0, flags = 0;
+		int32_t fd = 0;
+		memcpy(&h_client, (char *)param_buf + 0,  sizeof(uint32_t));
+		memcpy(&h_device, (char *)param_buf + 4,  sizeof(uint32_t));
+		memcpy(&h_memory, (char *)param_buf + 8,  sizeof(uint32_t));
+		memcpy(&offset,   (char *)param_buf + 16, sizeof(uint64_t));
+		memcpy(&length,   (char *)param_buf + 24, sizeof(uint64_t));
+		memcpy(&plinear,  (char *)param_buf + 32, sizeof(uint64_t));
+		memcpy(&mm_status,(char *)param_buf + 40, sizeof(uint32_t));
+		memcpy(&flags,    (char *)param_buf + 44, sizeof(uint32_t));
+		memcpy(&fd,       (char *)param_buf + 48, sizeof(int32_t));
 		fprintf(stderr,
-			"nvkvm: RM_MAP_MEMORY response: pLinearAddress=0x%llx status=0x%x\n",
-			(unsigned long long)plinear, mm_status);
+			"nvkvm: RM_MAP_MEMORY: h_client=0x%x h_device=0x%x "
+			"h_memory=0x%x offset=0x%llx length=0x%llx flags=0x%x "
+			"fd=%d -> pLinear=0x%llx status=0x%x\n",
+			h_client, h_device, h_memory,
+			(unsigned long long)offset, (unsigned long long)length,
+			flags, fd, (unsigned long long)plinear, mm_status);
 	}
 
 	/* DIAG: for RM_ALLOC, dump hClient/hParent/hObjNew/hClass when
@@ -330,10 +343,25 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&hParent, (char *)param_buf + 4,  sizeof(uint32_t));
 		memcpy(&hObjNew, (char *)param_buf + 8,  sizeof(uint32_t));
 		memcpy(&hClass,  (char *)param_buf + 12, sizeof(uint32_t));
+		uint32_t aps = 0;
+		if (req->param_size == sizeof(struct nvos64_parameters))
+			memcpy(&aps, (char *)param_buf + 32, sizeof(uint32_t));
 		fprintf(stderr,
 			"nvkvm: RM_ALLOC failed: hClient=0x%x hParent=0x%x "
-			"hObjNew=0x%x hClass=0x%x nvstatus=0x%x\n",
-			hClient, hParent, hObjNew, hClass, nvstatus);
+			"hObjNew=0x%x hClass=0x%x alloc_parms_size=%u aux_size=%u "
+			"nvstatus=0x%x\n",
+			hClient, hParent, hObjNew, hClass, aps,
+			req->aux_size, nvstatus);
+		/* hex dump first 64 bytes of aux_buf (the alloc params themselves) */
+		if (aux_buf && req->aux_size > 0) {
+			const uint8_t *b = aux_buf;
+			uint32_t n = req->aux_size < 64 ? req->aux_size : 64;
+			char hex[256] = {0};
+			for (uint32_t i = 0; i < n; i++)
+				snprintf(hex + i*3, sizeof(hex)-i*3, "%02x ", b[i]);
+			fprintf(stderr, "nvkvm: RM_ALLOC failed aux[%u]: %s\n",
+				n, hex);
+		}
 	}
 
 	if (inner_cmd) {
