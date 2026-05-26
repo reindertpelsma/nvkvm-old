@@ -772,7 +772,10 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 		return;
 	}
 	{
-		struct nv_ioctl_rm_api_version ver = {.cmd = 0};
+		/* '2' == NV_RM_API_VERSION_CMD_QUERY (driver returns its
+		 * version without enforcing a string compare). cmd=0 is
+		 * STRICT — open-source nvidia.ko enforces it. */
+		struct nv_ioctl_rm_api_version ver = {.cmd = '2'};
 		ioctl(fd, /* NV_ESC_CHECK_VERSION_STR */ _IOWR('F',
 		      NV_ESC_CHECK_VERSION_STR, struct nv_ioctl_rm_api_version),
 		      &ver);
