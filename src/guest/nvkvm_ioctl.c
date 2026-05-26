@@ -166,6 +166,8 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return sizeof(struct nv_ioctl_idle_channels);
 	case NV_ESC_RM_ALLOC_CONTEXT_DMA2:
 		return sizeof(struct nv_ioctl_alloc_context_dma2);
+	case NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO:
+		return sizeof(struct nvos56_parameters);
 	case NV_ESC_EXPORT_TO_DMABUF_FD:
 		return sizeof(struct nv_ioctl_export_to_dmabuf_fd);
 	}
@@ -288,20 +290,13 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		return 0;
 	}
 	case UVM_MAP_EXTERNAL_ALLOCATION: {
-		/* NOTE: our struct uvm_map_external_allocation_params reflects
-		 * the pre-V550 driver layout (one PerGPUAttribute).  The 575
-		 * driver expects V550 layout (PerGPUAttributes[256] array, then
-		 * an 8-byte count, *then* rm_ctrl_fd).  Reading at our offset
-		 * gets garbage — we observed rm_ctrl_fd=0, fget(0)=stdin,
-		 * private_data NULL → -EBADF.  Until the struct is reworked,
-		 * skip translation here so the driver can at least see the
-		 * raw value; that lets cuMemAlloc fail later with a real
-		 * error rather than EBADF in the sanitizer. */
 		struct uvm_map_external_allocation_params *p = buf;
-		if ((int32_t)p->rm_ctrl_fd > 0) {
-			__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
-			if (hid >= 0)
-				p->rm_ctrl_fd = (nvhandle_t)hid;
+		/* libcuda passes -1 as the "no ctrl fd specified" sentinel. */
+		if (p->rm_ctrl_fd >= 0) {
+			__s32 hid = guest_fd_to_handle_id(p->rm_ctrl_fd);
+			if (hid < 0)
+				return -EBADF;
+			p->rm_ctrl_fd = hid;
 		}
 		return 0;
 	}

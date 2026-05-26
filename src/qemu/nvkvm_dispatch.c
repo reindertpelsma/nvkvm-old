@@ -131,6 +131,8 @@ size_t nvkvm_ioctl_expected_param_size(unsigned int cmd)
 		return sizeof(struct nv_ioctl_idle_channels);
 	case NV_ESC_RM_ALLOC_CONTEXT_DMA2:
 		return sizeof(struct nv_ioctl_alloc_context_dma2);
+	case NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO:
+		return sizeof(struct nvos56_parameters);
 	case NV_ESC_EXPORT_TO_DMABUF_FD:
 		return sizeof(struct nv_ioctl_export_to_dmabuf_fd);
 	}
@@ -306,6 +308,7 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	case NV_ESC_RM_UNMAP_MEMORY_DMA:
 	case NV_ESC_RM_ALLOC_CONTEXT_DMA2:
 	case NV_ESC_EXPORT_TO_DMABUF_FD:
+	case NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO:
 		return nvkvm_handle_simple_ioctl(ctx, cmd);
 
 	/*

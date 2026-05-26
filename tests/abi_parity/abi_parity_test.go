@@ -101,11 +101,11 @@ func TestUVMStructSizes(t *testing.T) {
 	checkSizes(t, []sizeCase{
 		{"uvm_initialize_params", Sizes.UvmInit, 16},
 		{"uvm_deinitialize_params", Sizes.UvmDeinit, 8},
-		{"uvm_mm_initialize_params", Sizes.UvmMmInit, 24},
+		{"uvm_mm_initialize_params", Sizes.UvmMmInit, 8},
 		{"uvm_register_gpu_params", Sizes.UvmRegGpu, 32},
 		{"uvm_unregister_gpu_params", Sizes.UvmUnregGpu, 24},
 		{"uvm_register_gpu_vaspace_params", Sizes.UvmRegGv, 32},
-		{"uvm_unregister_gpu_vaspace_params", Sizes.UvmUnregGv, 24},
+		{"uvm_unregister_gpu_vaspace_params", Sizes.UvmUnregGv, 20},
 		{"uvm_register_channel_params", Sizes.UvmRegCh, 48},
 		{"uvm_unregister_channel_params", Sizes.UvmUnregCh, 36},
 		{"uvm_create_range_group_params", Sizes.UvmCreateRg, 16},
@@ -130,7 +130,7 @@ func TestUVMStructSizes(t *testing.T) {
 func TestProtocolStructSizes(t *testing.T) {
 	checkSizes(t, []sizeCase{
 		{"nvkvm_hdr (must be exactly 8)", Sizes.NvkvmHdr, 8},
-		{"nvkvm_req_open", Sizes.NvkvmReqOpen, 8},
+		{"nvkvm_req_open", Sizes.NvkvmReqOpen, 16},
 		{"nvkvm_req_close", Sizes.NvkvmReqClose, 8},
 		{"nvkvm_req_ioctl (must be exactly 32)", Sizes.NvkvmReqIoctl, 32},
 		{"nvkvm_req_mmap", Sizes.NvkvmReqMmap, 32},

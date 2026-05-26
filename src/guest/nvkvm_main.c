@@ -571,6 +571,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case NV01_MEMORY_SYSTEM:
 				ap_size = sizeof(struct nv_memory_allocation_params_v545);
 				break;
+			case KEPLER_CHANNEL_GROUP_A:
+				ap_size = sizeof(struct nv_channel_group_allocation_parameters);
+				break;
+			case FERMI_CONTEXT_SHARE_A:
+				ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
+				break;
+			case TURING_CHANNEL_GPFIFO_A:
+			case AMPERE_CHANNEL_GPFIFO_A:
+			case HOPPER_CHANNEL_GPFIFO_A:
+				ap_size = sizeof(struct nv_channel_alloc_params_v570);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -615,6 +626,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case NV01_MEMORY_LOCAL_USER:
 				case NV01_MEMORY_SYSTEM:
 					ap_size = sizeof(struct nv_memory_allocation_params_v545);
+					break;
+				case KEPLER_CHANNEL_GROUP_A:
+					ap_size = sizeof(struct nv_channel_group_allocation_parameters);
+					break;
+				case FERMI_CONTEXT_SHARE_A:
+					ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
+					break;
+				case TURING_CHANNEL_GPFIFO_A:
+				case AMPERE_CHANNEL_GPFIFO_A:
+				case HOPPER_CHANNEL_GPFIFO_A:
+					ap_size = sizeof(struct nv_channel_alloc_params_v570);
 					break;
 				}
 			}

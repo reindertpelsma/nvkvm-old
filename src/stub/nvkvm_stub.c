@@ -484,10 +484,12 @@ static void *worker_thread(void *arg)
 				uvm_has_embedded_fd = 1;
 				break;
 			case NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION:
-				/* rm_ctrl_fd is after base+length+offset+uuid+map_offset+count = 48,
-				 * then 4 bytes padding to align u64 fields (struct layout has
-				 * trailing u64s so compiler aligns). Offset is 52. */
-				uvm_embedded_fd_off = 52;
+				/* V550 layout (driver >= 550.54.14, our 575.51.03 included):
+				 * base(8) + length(8) + offset(8) +
+				 * per_gpu_attributes[256] (256 * 36 = 9216) +
+				 * gpu_attributes_count(8) = 9248
+				 * → rm_ctrl_fd at offset 9248. */
+				uvm_embedded_fd_off = 9248;
 				uvm_has_embedded_fd = 1;
 				break;
 			}
@@ -622,14 +624,26 @@ static void *worker_thread(void *arg)
 		 *      paramsSize, flags — then status; see gVisor frontend.go).
 		 */
 		uint32_t nvstatus = 0;
-		if (job.param_size == 48)
+		if (((job.cmd >> 8) & 0xff) == 'F') {
+			/* Frontend ioctls: nvstatus is at a fixed offset
+			 * inside the params struct. */
+			if (job.param_size == 48)
+				__builtin_memcpy(&nvstatus,
+						 (char *)job.param_buf + 40,
+						 sizeof(uint32_t));
+			else if (job.param_size >= 32)
+				__builtin_memcpy(&nvstatus,
+						 (char *)job.param_buf + 28,
+						 sizeof(uint32_t));
+		} else if (job.param_size >= 4) {
+			/* UVM ioctls (TYPE == 0): rm_status is the last
+			 * 4 bytes of the params struct for every UVM cmd
+			 * in our ABI (gVisor's "HasStatus" pattern). */
 			__builtin_memcpy(&nvstatus,
-					 (char *)job.param_buf + 40,
+					 (char *)job.param_buf +
+					 (job.param_size - 4),
 					 sizeof(uint32_t));
-		else if (job.param_size >= 32)
-			__builtin_memcpy(&nvstatus,
-					 (char *)job.param_buf + 28,
-					 sizeof(uint32_t));
+		}
 
 		resp.retval     = err ? -err : (int32_t)ret;
 		resp.nvstatus   = nvstatus;

@@ -66,7 +66,7 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define AMPERE_DMA_COPY_A                   0x0000C6B5U
 #define HOPPER_DMA_COPY_A                   0x0000CBB5U
 /* Memory classes */
-#define NV01_MEMORY_SYSTEM                  0x0000003DU
+#define NV01_MEMORY_SYSTEM                  0x0000003EU
 #define NV01_MEMORY_LOCAL_USER              0x00000040U
 #define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR    0x00000071U
 #define NV50_MEMORY_VIRTUAL                 0x000050A0U
@@ -206,6 +206,19 @@ struct nv_ioctl_nvos34_parameters {
 	nvp64_t    p_linear_address;  /* VA to unmap                     */
 	__u32      status;
 	__u32      flags;
+};
+
+/* ── NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO ─────────────────────────────────── */
+/*    NVOS56_PARAMETERS, 40 bytes. */
+struct nvos56_parameters {
+	nvhandle_t h_client;
+	nvhandle_t h_device;
+	nvhandle_t h_memory;
+	__u32      _pad0;
+	nvp64_t    p_old_cpu_address;
+	nvp64_t    p_new_cpu_address;
+	__u32      status;
+	__u32      _pad1;
 };
 
 /* ── NV_ESC_RM_VID_HEAP_CONTROL ──────────────────────────────────────────── */
@@ -429,6 +442,70 @@ struct nv_vaspace_allocation_parameters {
 	__u32 big_page_size;
 	__u32 _pad0;
 	__u64 va_base;
+};
+
+/* ── NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS — for KEPLER_CHANNEL_GROUP_A ─── */
+struct nv_channel_group_allocation_parameters {
+	nvhandle_t h_object_error;
+	nvhandle_t h_object_ecc_error;
+	nvhandle_t h_va_space;
+	__u32      engine_type;
+	__u8       b_is_calling_context_vgpu_plugin;
+	__u8       _pad0[3];
+};
+
+/* ── NV_CTXSHARE_ALLOCATION_PARAMETERS — for FERMI_CONTEXT_SHARE_A (0x9067) */
+struct nv_ctxshare_allocation_parameters {
+	nvhandle_t h_va_space;
+	__u32      flags;
+	__u32      subctx_id;
+};
+
+/* ── NV_MEMORY_DESC_PARAMS — embedded in channel-alloc params ─────────────── */
+struct nv_memory_desc_params {
+	__u64 base;
+	__u64 size;
+	__u32 address_space;
+	__u32 cache_attrib;
+};
+
+/* ── NV_CHANNEL_ALLOC_PARAMS_V570 — for TURING/AMPERE/HOPPER_CHANNEL_GPFIFO_A
+ *     on driver >= 570 (we're 575.51.03).  See gVisor's
+ *     NV_CHANNEL_ALLOC_PARAMS / _V570 — V570 adds TPCConfigID + pad. */
+#define NV_MAX_SUBDEVICES                 8
+#define NV_CC_CHAN_ALLOC_IV_SIZE_DWORD    3
+#define NV_CC_CHAN_ALLOC_NONCE_SIZE_DWORD 8
+
+struct nv_channel_alloc_params_v570 {
+	nvhandle_t h_object_error;
+	nvhandle_t h_object_buffer;
+	__u64 gpfifo_offset;
+	__u32 gpfifo_entries;
+	__u32 flags;
+	nvhandle_t h_context_share;
+	nvhandle_t h_va_space;
+	nvhandle_t h_userd_memory[NV_MAX_SUBDEVICES];
+	__u64      userd_offset[NV_MAX_SUBDEVICES];
+	__u32 engine_type;
+	__u32 cid;
+	__u32 sub_device_id;
+	nvhandle_t h_object_ecc_error;
+	struct nv_memory_desc_params instance_mem;
+	struct nv_memory_desc_params userd_mem;
+	struct nv_memory_desc_params ramfc_mem;
+	struct nv_memory_desc_params mthdbuf_mem;
+	nvhandle_t h_phys_channel_group;
+	__u32 internal_flags;
+	struct nv_memory_desc_params error_notifier_mem;
+	struct nv_memory_desc_params ecc_error_notifier_mem;
+	__u32 process_id;
+	__u32 sub_process_id;
+	__u32 encrypt_iv[NV_CC_CHAN_ALLOC_IV_SIZE_DWORD];
+	__u32 decrypt_iv[NV_CC_CHAN_ALLOC_IV_SIZE_DWORD];
+	__u32 hmac_nonce[NV_CC_CHAN_ALLOC_NONCE_SIZE_DWORD];
+	/* V570 extension */
+	__u32 tpc_config_id;
+	__u32 _pad0;
 };
 
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */

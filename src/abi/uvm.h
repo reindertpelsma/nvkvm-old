@@ -103,7 +103,6 @@ struct uvm_register_gpu_vaspace_params {
 struct uvm_unregister_gpu_vaspace_params {
 	struct uvm_uuid gpu_uuid;
 	__u32 rm_status;
-	__u32 reserved;
 };
 
 struct uvm_register_channel_params {
@@ -145,14 +144,32 @@ struct uvm_set_range_group_params {
 	__u32 reserved;
 };
 
+/* Per-GPU mapping attributes — one entry per registered GPU.
+ * From src/nvidia-uvm/uvm_ioctl.h: UvmGpuMappingAttributes.  36 bytes.
+ */
+struct uvm_gpu_mapping_attributes {
+	struct uvm_uuid gpu_uuid;
+	__u32 gpu_mapping_type;
+	__u32 gpu_caching_type;
+	__u32 gpu_format_type;
+	__u32 gpu_element_bits;
+	__u32 gpu_compression_type;
+};
+
+/* Driver 550.54.14+ uses the V550 layout: PerGPUAttributes[] became an
+ * array of UVM_MAX_GPUS_V2 = 32 * 8 = 256 entries (was 1 entry pre-V550),
+ * and GPUAttributesCount widened from u32 to u64.  Driver 575.51.03 uses
+ * this layout, so we follow gVisor's
+ * UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550. */
+#define UVM_MAX_GPUS_V2 (32 * 8)
+
 struct uvm_map_external_allocation_params {
 	__u64 base;
 	__u64 length;
 	__u64 offset;
-	struct uvm_uuid per_gpu_attrs_gpu_uuid;
-	__u64 per_gpu_attrs_map_offset;
-	__u32 per_gpu_attrs_count;
-	nvhandle_t rm_ctrl_fd;
+	struct uvm_gpu_mapping_attributes per_gpu_attributes[UVM_MAX_GPUS_V2];
+	__u64 gpu_attributes_count;
+	__s32 rm_ctrl_fd;
 	nvhandle_t h_client;
 	nvhandle_t h_memory;
 	__u32 rm_status;
