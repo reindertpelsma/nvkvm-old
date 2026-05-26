@@ -8,7 +8,7 @@
  * Multi-inflight design
  * =====================
  * Each isolate has a dedicated reader thread that demultiplexes IOCTL
- * responses by req_id onto per-caller condvars (stack-allocated by callers).
+ * responses by txn_id onto per-caller condvars (stack-allocated by callers).
  * Non-IOCTL (sync) commands serialize via sync_lock + sync_cond.
  * All socket writes are serialized by write_lock.
  *
@@ -45,7 +45,7 @@ struct nvkvm_isolate {
 	bool        in_use;
 
 	/*
-	 * lock: protects alive, in_use, pending_head, next_req_id.
+	 * lock: protects alive, in_use, pending_head, next_txn_id.
 	 * Held briefly; never during blocking I/O.
 	 */
 	pthread_mutex_t lock;
@@ -59,7 +59,7 @@ struct nvkvm_isolate {
 
 	/* In-flight async IOCTL list (intrusive linked list on callers' stacks). */
 	struct nvkvm_pending_ioctl *pending_head;
-	uint32_t    next_req_id;    /* monotonic counter, never 0 */
+	uint32_t    next_txn_id;    /* monotonic counter, never 0 */
 
 	/*
 	 * Sync command slot — one non-IOCTL command at a time.
@@ -115,7 +115,7 @@ int nvkvm_isolate_close_handle(struct nvkvm_isolate_table *t,
 
 /*
  * Forward an ioctl to the isolate asynchronously.
- * Multiple concurrent callers are supported; responses are matched by req_id.
+ * Multiple concurrent callers are supported; responses are matched by txn_id.
  * param_buf and aux_buf are updated in-place with the isolate's response data.
  * fault_addr_out receives the GVA that triggered SIGSEGV (0 if none).
  */

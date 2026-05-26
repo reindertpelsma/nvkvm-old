@@ -139,7 +139,7 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 		struct nvkvm_resp_open resp;
 	} resp_msg = {
 		.hdr.type   = hdr->type,
-		.hdr.req_id = hdr->req_id,
+		.hdr.txn_id = hdr->txn_id,
 	};
 	uint32_t dev_id    = le32_to_cpu(req->dev_id);
 	uint32_t flags     = le32_to_cpu(req->flags);
@@ -211,7 +211,7 @@ static void handle_close(VirtIONvgpu *nv, VirtQueue *vq,
 		struct nvkvm_resp_close resp;
 	} resp_msg = {
 		.hdr.type   = hdr->type,
-		.hdr.req_id = hdr->req_id,
+		.hdr.txn_id = hdr->txn_id,
 	};
 	uint32_t fd_token = le32_to_cpu(req->fd_token);
 	struct nvkvm_session *session = NULL;
@@ -259,7 +259,7 @@ static void handle_ioctl(VirtIONvgpu *nv, VirtQueue *vq,
 		struct nvkvm_resp_ioctl resp;
 	} resp_msg = {
 		.hdr.type   = hdr->type,
-		.hdr.req_id = hdr->req_id,
+		.hdr.txn_id = hdr->txn_id,
 	};
 	uint32_t fd_token    = le32_to_cpu(req->fd_token);
 	uint32_t cmd         = le32_to_cpu(req->cmd);
@@ -362,7 +362,7 @@ static void handle_mmap(VirtIONvgpu *nv, VirtQueue *vq,
 		struct nvkvm_resp_mmap resp;
 	} resp_msg = {
 		.hdr.type   = hdr->type,
-		.hdr.req_id = hdr->req_id,
+		.hdr.txn_id = hdr->txn_id,
 	};
 	uint32_t fd_token = le32_to_cpu(req->fd_token);
 	uint64_t offset   = le64_to_cpu(req->offset);
@@ -440,7 +440,7 @@ static void handle_munmap(VirtIONvgpu *nv, VirtQueue *vq,
 		struct nvkvm_resp_munmap resp;
 	} resp_msg = {
 		.hdr.type   = hdr->type,
-		.hdr.req_id = hdr->req_id,
+		.hdr.txn_id = hdr->txn_id,
 	};
 	uint32_t mmap_token = le32_to_cpu(req->mmap_token);
 	struct nvkvm_mmap_region *region = NULL;

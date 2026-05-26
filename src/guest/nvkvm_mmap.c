@@ -118,12 +118,12 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 		umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
 		if (umsg) {
 			umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
-			umsg->hdr.req_id     = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->hdr.txn_id     = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_txn_id));
 			umsg->req.isolate_id = cpu_to_le32(ctx->session->isolate_id);
 			umsg->req.mmap_token = cpu_to_le32(mmap_token);
 			init_completion(&uinf.done);
-			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
 			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
 			kfree(umsg);
 		}
@@ -174,7 +174,7 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	} *msg;
 	struct nvkvm_inflight *inf;
 	struct nvkvm_resp_mmap resp;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = atomic_inc_return(&nvkvm.next_txn_id);
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
@@ -185,10 +185,10 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 		return -ENOMEM;
 	}
 	init_completion(&inf->done);
-	inf->req_id = req_id;
+	inf->txn_id = txn_id;
 
 	msg->hdr.type     = cpu_to_le32(NVKVM_REQ_MMAP);
-	msg->hdr.req_id   = cpu_to_le32(req_id);
+	msg->hdr.txn_id   = cpu_to_le32(txn_id);
 	msg->req.fd_token = cpu_to_le32(ctx->fd_token);
 	msg->req.prot     = cpu_to_le32(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC));
 	msg->req.flags    = cpu_to_le32(vma->vm_flags & (VM_SHARED | VM_MAYSHARE));
@@ -254,11 +254,11 @@ out_unmap_legacy: {
 		umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
 		if (umsg) {
 			umsg->hdr.type    = cpu_to_le32(NVKVM_REQ_MUNMAP);
-			umsg->hdr.req_id  = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->hdr.txn_id  = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_txn_id));
 			umsg->req.mmap_token = cpu_to_le32(resp.mmap_token);
 			init_completion(&uinf.done);
-			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
 			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
 			kfree(umsg);
 		}
@@ -542,12 +542,12 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
 			if (!umsg) goto next;
 			umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
-			umsg->hdr.req_id     = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->hdr.txn_id     = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_txn_id));
 			umsg->req.isolate_id = cpu_to_le32(isolate_id);
 			umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
 			init_completion(&uinf.done);
-			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
 			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
 			kfree(umsg);
 		} else {
@@ -559,11 +559,11 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
 			if (!umsg) goto next;
 			umsg->hdr.type    = cpu_to_le32(NVKVM_REQ_MUNMAP);
-			umsg->hdr.req_id  = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_req_id));
+			umsg->hdr.txn_id  = cpu_to_le32(
+					atomic_inc_return(&nvkvm.next_txn_id));
 			umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
 			init_completion(&uinf.done);
-			uinf.req_id = le32_to_cpu(umsg->hdr.req_id);
+			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
 			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
 			kfree(umsg);
 		}

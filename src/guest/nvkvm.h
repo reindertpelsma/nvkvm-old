@@ -93,7 +93,7 @@ struct nvkvm_fd_ctx {
 
 struct nvkvm_inflight {
 	struct list_head    list;
-	__u32               req_id;
+	__u32               txn_id;
 	struct completion   done;
 	/* response fields filled by virtio TX completion callback */
 	__u64               retval;
@@ -136,10 +136,21 @@ struct nvkvm_state {
 	size_t                  shm_size;
 	size_t                  slot_size;
 
-	/* In-flight request tracking */
+	/* In-flight request tracking.
+	 *
+	 * txn_id is u32; the guest module assigns one per request and never
+	 * reuses an outstanding one. The bitmap tracks the set of currently
+	 * outstanding txn_ids so that even at the (impossibly high) rate
+	 * required for the u32 counter to wrap we never collide.
+	 *
+	 * Bitmap size is bounded to NVKVM_MAX_INFLIGHT; at 4096 in-flight
+	 * requests this is 512 bytes. Real workloads stay well under 256.
+	 */
+#define NVKVM_MAX_INFLIGHT 4096
 	spinlock_t              inflight_lock;
 	struct list_head        inflight_list;
-	atomic_t                next_req_id;
+	atomic_t                next_txn_id;        /* monotonic seed */
+	unsigned long           txn_inflight_bm[NVKVM_MAX_INFLIGHT / BITS_PER_LONG];
 
 	/* Slot allocator for shared memory */
 	spinlock_t              slot_lock;

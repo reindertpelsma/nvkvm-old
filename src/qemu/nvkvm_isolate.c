@@ -2,7 +2,7 @@
  * nvkvm_isolate.c — QEMU-side isolate process manager (multi-inflight)
  *
  * Each isolate has a dedicated reader thread that multiplexes IOCTL responses
- * by req_id onto per-caller condvars allocated on the callers' stacks.
+ * by txn_id onto per-caller condvars allocated on the callers' stacks.
  * Non-IOCTL commands serialize via sync_lock + sync_cond (one at a time).
  * All socket writes go through write_lock (prevents partial-send interleaving).
  *
@@ -51,7 +51,7 @@ static unsigned int         stub_elf_len = 0;
 /* ── In-flight IOCTL request (lives on the caller's stack) ──────────────── */
 
 struct nvkvm_pending_ioctl {
-	uint32_t        req_id;
+	uint32_t        txn_id;
 	bool            done;       /* set by reader thread */
 	pthread_cond_t  cond;       /* signaled by reader, waited under iso->lock */
 
@@ -156,7 +156,7 @@ static void *isolate_reader_fn(void *arg)
 			break;
 
 		case ISOLATE_RESP_IOCTL: {
-			uint32_t req_id     = u.ioctl.req_id;
+			uint32_t txn_id     = u.ioctl.txn_id;
 			int32_t  retval     = u.ioctl.retval;
 			uint32_t nvstatus   = u.ioctl.nvstatus;
 			uint64_t fault_addr = u.ioctl.fault_addr;
@@ -166,7 +166,7 @@ static void *isolate_reader_fn(void *arg)
 			/* Locate the pending caller (brief lock). */
 			pthread_mutex_lock(&iso->lock);
 			struct nvkvm_pending_ioctl *p = iso->pending_head;
-			while (p && p->req_id != req_id)
+			while (p && p->txn_id != txn_id)
 				p = p->next;
 			pthread_mutex_unlock(&iso->lock);
 
@@ -293,7 +293,7 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->alive        = false;
 			iso->sock_fd      = -1;
 			iso->pending_head = NULL;
-			iso->next_req_id  = 1;
+			iso->next_txn_id  = 1;
 			iso->sync_done    = false;
 			iso->reader_started = false;
 			*id_out = id;
@@ -673,9 +673,9 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 		pthread_cond_destroy(&pending.cond);
 		return -ENOENT;
 	}
-	pending.req_id = iso->next_req_id++;
-	if (iso->next_req_id == 0)
-		iso->next_req_id = 1;
+	pending.txn_id = iso->next_txn_id++;
+	if (iso->next_txn_id == 0)
+		iso->next_txn_id = 1;
 	pending.next      = iso->pending_head;
 	iso->pending_head = &pending;
 	pthread_mutex_unlock(&iso->lock);
@@ -688,7 +688,7 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 		.param_size = (uint32_t)param_size,
 		.aux_size   = (uint32_t)aux_size,
 		.flags      = flags,
-		.req_id     = pending.req_id,
+		.txn_id     = pending.txn_id,
 	};
 
 	pthread_mutex_lock(&iso->write_lock);

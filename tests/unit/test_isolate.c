@@ -7,7 +7,7 @@
  *   2. Sequential IOCTL forwarding — retval and nvstatus correctness
  *   3. Concurrent IOCTLs — N threads all complete without races
  *   4. Out-of-order responses — mock_stub delays some IOCTLs so responses
- *      arrive out of order; req_id matching must still be correct
+ *      arrive out of order; txn_id matching must still be correct
  *   5. Kill while IOCTL in-flight — callers wake with transport error
  *   6. Sync commands (mmap, munmap, poll, unpoll) — sequential OK responses
  */
@@ -189,7 +189,7 @@ TEST(concurrent_ioctl)
 /*
  * We send IOCTLs with handle_id values 0, 5, 10, 15, 20, ... (delay ms).
  * The stub delays each IOCTL by handle_id & 0xff milliseconds.
- * Responses arrive out of order; req_id matching must route them correctly.
+ * Responses arrive out of order; txn_id matching must route them correctly.
  * All callers must still return 0 (success) with no hang.
  */
 #define DELAY_THREADS  8

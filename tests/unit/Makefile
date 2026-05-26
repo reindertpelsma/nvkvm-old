@@ -9,6 +9,7 @@ LDFLAGS = -lpthread
 DISPATCH_SRCS = test_dispatch.c \
                 ../../src/qemu/nvkvm_objects.c \
                 ../../src/qemu/nvkvm_dispatch.c \
+                ../../src/qemu/nvkvm_handle.c \
                 frontend_stubs.c
 
 FRONTEND_SRCS = test_frontend.c \

@@ -57,16 +57,87 @@ void *nvkvm_slot_addr(struct nvkvm_state *state, int slot)
 	return (void __force *)state->shm_base + (size_t)slot * state->slot_size;
 }
 
+/* ── txn_id allocator ──────────────────────────────────────────────────── */
+
+/*
+ * Allocate a fresh u32 txn_id whose corresponding bit in the in-flight
+ * bitmap is currently clear. The next_txn_id seed advances monotonically;
+ * the bitmap is the safety net that prevents an unlikely (but theoretically
+ * possible) reuse-while-outstanding collision after wraparound.
+ *
+ * Returns the txn_id on success, or 0 if every slot is currently in use
+ * (caller should error out — this means NVKVM_MAX_INFLIGHT is too small).
+ */
+static __u32 nvkvm_txn_id_alloc(struct nvkvm_state *state)
+{
+	unsigned long flags;
+	__u32 seed = (__u32)atomic_inc_return(&state->next_txn_id);
+	for (unsigned tries = 0; tries < NVKVM_MAX_INFLIGHT; tries++) {
+		/* Map seed → bitmap slot. Avoid zero (sentinel).
+		 * Use the low log2(NVKVM_MAX_INFLIGHT) bits as the slot. */
+		unsigned slot = (seed + tries) % NVKVM_MAX_INFLIGHT;
+		if (slot == 0) continue;
+		spin_lock_irqsave(&state->inflight_lock, flags);
+		if (!test_and_set_bit(slot, state->txn_inflight_bm)) {
+			spin_unlock_irqrestore(&state->inflight_lock, flags);
+			/* Combine slot with epoch bits from seed so consecutive
+			 * uses of the same slot get distinct full txn_ids. */
+			__u32 epoch = (seed / NVKVM_MAX_INFLIGHT) & 0xFFFFF;
+			return (epoch << 12) | (slot & 0xFFF);
+		}
+		spin_unlock_irqrestore(&state->inflight_lock, flags);
+	}
+	return 0;
+}
+
+static void nvkvm_txn_id_free(struct nvkvm_state *state, __u32 txn_id)
+{
+	unsigned long flags;
+	unsigned slot = txn_id & 0xFFF;
+	if (slot == 0) return;
+	spin_lock_irqsave(&state->inflight_lock, flags);
+	clear_bit(slot, state->txn_inflight_bm);
+	spin_unlock_irqrestore(&state->inflight_lock, flags);
+}
+
 /* ── In-flight request helpers ───────────────────────────────────────────── */
 
-static struct nvkvm_inflight *inflight_alloc(__u32 req_id)
+/* Allocate inflight + reserve a txn_id bitmap slot in one shot.
+ * Returns NULL on memory failure OR on bitmap exhaustion.
+ * Caller must release with inflight_free() (never plain kfree). */
+static struct nvkvm_inflight *inflight_alloc(struct nvkvm_state *state)
+{
+	__u32 txn_id = nvkvm_txn_id_alloc(state);
+	if (txn_id == 0)
+		return NULL;
+	struct nvkvm_inflight *inf = kzalloc(sizeof(*inf), GFP_KERNEL);
+	if (!inf) {
+		nvkvm_txn_id_free(state, txn_id);
+		return NULL;
+	}
+	inf->txn_id = txn_id;
+	init_completion(&inf->done);
+	return inf;
+}
+
+/* Backward-compat shim still in use during the gradual migration. */
+static struct nvkvm_inflight *inflight_alloc_legacy(__u32 txn_id)
 {
 	struct nvkvm_inflight *inf = kzalloc(sizeof(*inf), GFP_KERNEL);
 	if (!inf)
 		return NULL;
-	inf->req_id = req_id;
+	inf->txn_id = txn_id;
 	init_completion(&inf->done);
 	return inf;
+}
+
+/* Free the inflight record AND release the txn_id slot. Always use this
+ * instead of kfree() for any inflight obtained from inflight_alloc(). */
+static void inflight_free(struct nvkvm_state *state, struct nvkvm_inflight *inf)
+{
+	if (!inf) return;
+	nvkvm_txn_id_free(state, inf->txn_id);
+	kfree(inf);
 }
 
 static void inflight_enqueue(struct nvkvm_state *state,
@@ -114,6 +185,19 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			pr_warn("nvkvm: tx_done: null resp_buf\n");
 			complete(&inf->done);
 			continue;
+		}
+
+		/* txn_id sanity check: the response must mirror the request's
+		 * txn_id. virtqueue ordering already gives us correct demux
+		 * via the data pointer, so a mismatch here means QEMU (or a
+		 * misbehaving wire) corrupted the round-trip. */
+		{
+			__u32 got = le32_to_cpu(hdr->txn_id);
+			if (got != inf->txn_id)
+				pr_warn_ratelimited(
+				    "nvkvm: txn_id mismatch on reply: sent 0x%x got 0x%x type=0x%x\n",
+				    inf->txn_id, got,
+				    le32_to_cpu(hdr->type));
 		}
 
 		switch (le32_to_cpu(hdr->type)) {
@@ -251,7 +335,7 @@ static void nvkvm_evt_callback(struct virtqueue *vq)
  *
  * @req_buf:  buffer holding nvkvm_hdr + request payload
  * @req_len:  total length
- * @inf:      pre-allocated inflight record (req_id already set)
+ * @inf:      pre-allocated inflight record (txn_id already set)
  *
  * Returns 0 on transport success (inf->status holds the operation result).
  */
@@ -304,20 +388,21 @@ int nvkvm_virtio_open(int dev_id, unsigned int flags, unsigned int session_id,
 		struct nvkvm_req_open req;
 	} *msg;
 	struct nvkvm_inflight *inf;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
 	}
 
 	msg->hdr.type          = cpu_to_le32(NVKVM_REQ_OPEN);
-	msg->hdr.req_id        = cpu_to_le32(req_id);
+	msg->hdr.txn_id        = cpu_to_le32(txn_id);
 	msg->req.dev_id        = cpu_to_le32(dev_id);
 	msg->req.flags         = cpu_to_le32(flags);
 	msg->req.session_id    = cpu_to_le32(session_id);
@@ -327,7 +412,7 @@ int nvkvm_virtio_open(int dev_id, unsigned int flags, unsigned int session_id,
 		resp_out->fd_token = (__u32)inf->retval;
 		resp_out->status   = inf->status;
 	}
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }
@@ -339,26 +424,27 @@ int nvkvm_virtio_close(__u32 fd_token, struct nvkvm_resp_close *resp_out)
 		struct nvkvm_req_close req;
 	} *msg;
 	struct nvkvm_inflight *inf;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
 	}
 
 	msg->hdr.type    = cpu_to_le32(NVKVM_REQ_CLOSE);
-	msg->hdr.req_id  = cpu_to_le32(req_id);
+	msg->hdr.txn_id  = cpu_to_le32(txn_id);
 	msg->req.fd_token = cpu_to_le32(fd_token);
 
 	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0)
 		resp_out->status = inf->status;
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }
@@ -373,7 +459,8 @@ long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx,
 		struct nvkvm_req_ioctl req;
 	} *msg;
 	struct nvkvm_inflight *inf;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	int shm_slot = -1;
 	int shm_aux_slot = -1;
 	long ret;
@@ -381,7 +468,7 @@ long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx,
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
@@ -422,7 +509,7 @@ long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx,
 	wmb();   /* ensure all slot writes visible before kick */
 
 	msg->hdr.type          = cpu_to_le32(NVKVM_REQ_IOCTL);
-	msg->hdr.req_id        = cpu_to_le32(req_id);
+	msg->hdr.txn_id        = cpu_to_le32(txn_id);
 	msg->req.fd_token      = cpu_to_le32(ctx->fd_token);
 	msg->req.cmd           = cpu_to_le32(cmd);
 	msg->req.param_size    = cpu_to_le32((__u32)param_size);
@@ -466,7 +553,7 @@ out_slot:
 	if (shm_slot >= 0)
 		nvkvm_slot_free(&nvkvm, shm_slot);
 out:
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }
@@ -528,7 +615,8 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 
 	spin_lock_init(&state->inflight_lock);
 	INIT_LIST_HEAD(&state->inflight_list);
-	atomic_set(&state->next_req_id, 0);
+	atomic_set(&state->next_txn_id, 0);
+	bitmap_zero(state->txn_inflight_bm, NVKVM_MAX_INFLIGHT);
 	spin_lock_init(&state->slot_lock);
 	bitmap_zero(state->slot_bitmap, NVKVM_SHM_NSLOTS);
 	/* Mark slot 0 (ctrl) as permanently allocated */
@@ -599,7 +687,8 @@ static int simple_req(__u32 req_type,
 		      __u64 *retval_out)
 {
 	struct nvkvm_inflight *inf;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	void *buf;
 	int ret;
 
@@ -615,9 +704,9 @@ static int simple_req(__u32 req_type,
 	memcpy(buf, req_buf, req_len);
 
 	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(req_type);
-	((struct nvkvm_hdr *)buf)->req_id = cpu_to_le32(req_id);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
 
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(buf);
 		return -ENOMEM;
@@ -630,7 +719,7 @@ static int simple_req(__u32 req_type,
 		else if (retval_out)
 			*retval_out = inf->retval;
 	}
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(buf);
 	return ret;
 }
@@ -744,7 +833,8 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 		struct nvkvm_req_ioctl_on_isolate req;
 	} *msg;
 	struct nvkvm_inflight *inf;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	int shm_slot = -1, shm_aux_slot = -1, shm_vma_slot = -1;
 	struct nvkvm_vma_entry *vma_buf = NULL;
 	size_t vma_count = 0;
@@ -753,7 +843,7 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
@@ -824,7 +914,7 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	wmb();
 
 	msg->hdr.type   = cpu_to_le32(NVKVM_REQ_IOCTL_ON_ISOLATE);
-	msg->hdr.req_id = cpu_to_le32(req_id);
+	msg->hdr.txn_id = cpu_to_le32(txn_id);
 	msg->req.isolate_id              = cpu_to_le32(ctx->session->isolate_id);
 	msg->req.handle_id               = cpu_to_le32(ctx->handle_id);
 	msg->req.cmd                     = cpu_to_le32(cmd);
@@ -872,7 +962,7 @@ out:
 	if (shm_vma_slot >= 0) nvkvm_slot_free(&nvkvm, shm_vma_slot);
 	if (shm_aux_slot >= 0) nvkvm_slot_free(&nvkvm, shm_aux_slot);
 	if (shm_slot >= 0)     nvkvm_slot_free(&nvkvm, shm_slot);
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }
@@ -916,21 +1006,22 @@ int nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
 		struct nvkvm_hdr                      hdr;
 		struct nvkvm_req_write_memory_handle  req;
 	} *msg;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	struct nvkvm_inflight *inf;
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
 	}
 
 	msg->hdr.type      = cpu_to_le32(NVKVM_REQ_WRITE_MEMORY_HANDLE);
-	msg->hdr.req_id    = cpu_to_le32(req_id);
+	msg->hdr.txn_id    = cpu_to_le32(txn_id);
 	msg->req.handle_id = cpu_to_le32(handle_id);
 	msg->req.shm_slot  = cpu_to_le32((__u32)shm_slot);
 	msg->req.offset    = cpu_to_le64(offset);
@@ -939,7 +1030,7 @@ int nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
 	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0 && inf->status)
 		ret = -(int)inf->status;
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }
@@ -951,21 +1042,22 @@ int nvkvm_virtio_read_memory_handle(__u32 handle_id, __u64 offset,
 		struct nvkvm_hdr                     hdr;
 		struct nvkvm_req_read_memory_handle  req;
 	} *msg;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	struct nvkvm_inflight *inf;
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
 	}
 
 	msg->hdr.type      = cpu_to_le32(NVKVM_REQ_READ_MEMORY_HANDLE);
-	msg->hdr.req_id    = cpu_to_le32(req_id);
+	msg->hdr.txn_id    = cpu_to_le32(txn_id);
 	msg->req.handle_id = cpu_to_le32(handle_id);
 	msg->req.shm_slot  = cpu_to_le32((__u32)shm_slot);
 	msg->req.offset    = cpu_to_le64(offset);
@@ -974,7 +1066,7 @@ int nvkvm_virtio_read_memory_handle(__u32 handle_id, __u64 offset,
 	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0 && inf->status)
 		ret = -(int)inf->status;
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }
@@ -991,20 +1083,21 @@ int nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
 		struct nvkvm_req_mmap_on_isolate req;
 	} *msg;
 	struct nvkvm_inflight *inf;
-	__u32 req_id = atomic_inc_return(&nvkvm.next_req_id);
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0) return -EBUSY;
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
-	inf = inflight_alloc(req_id);
+	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
 		return -ENOMEM;
 	}
 
 	msg->hdr.type       = cpu_to_le32(NVKVM_REQ_MMAP_ON_ISOLATE);
-	msg->hdr.req_id     = cpu_to_le32(req_id);
+	msg->hdr.txn_id     = cpu_to_le32(txn_id);
 	msg->req.isolate_id = cpu_to_le32(isolate_id);
 	msg->req.handle_id  = cpu_to_le32(handle_id);
 	msg->req.gva        = cpu_to_le64(gva);
@@ -1023,7 +1116,7 @@ int nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
 			if (mmap_token_out) *mmap_token_out = inf->nvstatus;
 		}
 	}
-	kfree(inf);
+	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
 }

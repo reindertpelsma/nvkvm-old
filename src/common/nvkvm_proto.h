@@ -115,7 +115,7 @@ struct nvkvm_shm_ctrl {
 
 struct nvkvm_hdr {
 	__le32 type;        /* NVKVM_REQ_*                            */
-	__le32 req_id;      /* guest-assigned, echoed in response     */
+	__le32 txn_id;      /* guest-assigned, echoed in response     */
 };
 
 /* ── LIST_NVIDIA_DEVICES ─────────────────────────────────────────────────── */

@@ -2,7 +2,7 @@
  * mock_stub.c — minimal nvkvm_stub lookalike for unit testing.
  *
  * Runs on stdin (a SOCK_SEQPACKET fd, as the real stub does).
- * - IOCTL: echoes req_id in retval; optional per-command delay via
+ * - IOCTL: echoes txn_id in retval; optional per-command delay via
  *   the low byte of handle_id (delay_ms = handle_id & 0xff).
  * - RECEIVE_FD, CLOSE_FD, MUNMAP, POLL, UNPOLL: sends RESP_OK.
  * - MMAP: sends RESP_MMAP with retval=0.
@@ -84,7 +84,7 @@ int main(void)
 		}
 
 		case ISOLATE_CMD_IOCTL: {
-			uint32_t req_id    = u.ioctl.req_id;
+			uint32_t txn_id    = u.ioctl.txn_id;
 			uint32_t param_sz  = u.ioctl.param_size;
 			uint32_t aux_sz    = u.ioctl.aux_size;
 			unsigned delay_ms  = u.ioctl.handle_id & 0xff;
@@ -101,7 +101,7 @@ int main(void)
 
 			struct isolate_resp_ioctl resp = {
 				.type       = ISOLATE_RESP_IOCTL,
-				.req_id     = req_id,
+				.txn_id     = txn_id,
 				.param_size = 0,
 				.aux_size   = 0,
 				.retval     = 0,

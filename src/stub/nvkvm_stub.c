@@ -11,7 +11,7 @@
  * are dispatched inline on the reader thread — they are fast and non-blocking.
  * IOCTL commands are queued to a pool of NVKVM_STUB_WORKERS worker threads.
  * Each worker executes the ioctl and writes the response back with the echoed
- * req_id so QEMU can match it to the waiting caller.
+ * txn_id so QEMU can match it to the waiting caller.
  *
  * All socket writes are protected by write_mutex.
  * The fd_table is protected by fd_mutex (workers and the reader share it).
@@ -283,7 +283,7 @@ static void clear_fault_addr(void)
 /* ── Thread pool ──────────────────────────────────────────────────────────── */
 
 struct ioctl_job {
-	uint32_t req_id;
+	uint32_t txn_id;
 	uint32_t handle_id;
 	uint32_t cmd;
 	uint32_t flags;
@@ -352,7 +352,7 @@ static void *worker_thread(void *arg)
 
 		struct isolate_resp_ioctl resp = {
 			.type     = ISOLATE_RESP_IOCTL,
-			.req_id   = job.req_id,
+			.txn_id   = job.txn_id,
 		};
 
 		if (fd < 0) {
@@ -868,11 +868,11 @@ static void handle_close_fd(uint32_t handle_id)
 static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 {
 	if (cmd->param_size > MAX_PARAM_SIZE || cmd->aux_size > MAX_PARAM_SIZE) {
-		/* Can't send error with req_id here in the old format;
+		/* Can't send error with txn_id here in the old format;
 		 * send a minimal error response. */
 		struct isolate_resp_ioctl resp = {
 			.type   = ISOLATE_RESP_IOCTL,
-			.req_id = cmd->req_id,
+			.txn_id = cmd->txn_id,
 			.retval = -EINVAL,
 		};
 		locked_send(&resp, sizeof(resp));
@@ -881,7 +881,7 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 	}
 
 	struct ioctl_job job = {
-		.req_id     = cmd->req_id,
+		.txn_id     = cmd->txn_id,
 		.handle_id  = cmd->handle_id,
 		.cmd        = cmd->cmd,
 		.flags      = cmd->flags,
@@ -896,7 +896,7 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 			stub_munmap(job.param_buf,
 				    (cmd->param_size + 4095) & ~4095UL);
 			struct isolate_resp_ioctl resp = {
-				.type = ISOLATE_RESP_IOCTL, .req_id = cmd->req_id,
+				.type = ISOLATE_RESP_IOCTL, .txn_id = cmd->txn_id,
 				.retval = -ENOMEM };
 			locked_send(&resp, sizeof(resp));
 			return;
@@ -911,7 +911,7 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 			stub_munmap(job.aux_buf,
 				    (cmd->aux_size + 4095) & ~4095UL);
 			struct isolate_resp_ioctl resp = {
-				.type = ISOLATE_RESP_IOCTL, .req_id = cmd->req_id,
+				.type = ISOLATE_RESP_IOCTL, .txn_id = cmd->txn_id,
 				.retval = -ENOMEM };
 			locked_send(&resp, sizeof(resp));
 			return;

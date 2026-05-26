@@ -59,7 +59,7 @@ struct isolate_cmd_close_fd {
 
 /*
  * IOCTL is the only command executed by the isolate's thread pool.
- * req_id is assigned by QEMU and echoed in the response so concurrent
+ * txn_id is assigned by QEMU and echoed in the response so concurrent
  * callers can match responses to pending requests.
  */
 struct isolate_cmd_ioctl {
@@ -69,13 +69,13 @@ struct isolate_cmd_ioctl {
 	uint32_t param_size;  /* bytes of param blob following this header */
 	uint32_t aux_size;    /* bytes of aux blob following param blob    */
 	uint32_t flags;       /* NVKVM_IOCTL_FL_* */
-	uint32_t req_id;      /* echoed in response for in-flight matching */
+	uint32_t txn_id;      /* echoed in response for in-flight matching */
 	uint32_t reserved;
 };
 
 struct isolate_resp_ioctl {
 	uint32_t type;        /* ISOLATE_RESP_IOCTL */
-	uint32_t req_id;      /* echoed from command */
+	uint32_t txn_id;      /* echoed from command */
 	uint32_t param_size;  /* bytes of updated param blob following     */
 	uint32_t aux_size;    /* bytes of updated aux blob following       */
 	int32_t  retval;      /* ioctl return value (0 or -errno)          */
