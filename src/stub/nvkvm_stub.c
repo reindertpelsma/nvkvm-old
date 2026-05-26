@@ -636,6 +636,41 @@ static void *worker_thread(void *arg)
 			}
 		}
 
+		/* DEBUG: dump full struct bytes for ALLOC_OS_EVENT and
+		 * NV01_EVENT_OS_EVENT alloc so we can compare bytes
+		 * exactly.  Per user: corruption is also possible. */
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    ((job.cmd & 0xff) == 0xce || (job.cmd & 0xff) == 0xcf) &&
+		    job.param_size >= 16) {
+			const uint8_t *p = (const uint8_t *)job.param_buf;
+			char hex[64] = {0};
+			for (int i = 0; i < 16; i++)
+				snprintf(hex + i*3, sizeof(hex) - i*3,
+					 "%02x ", p[i]);
+			dprintf(2, "nvkvm_stub: pre-ioctl 0x%x param[16]=%s\n",
+				job.cmd & 0xff, hex);
+		}
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    (job.cmd & 0xff) == 0x2b &&
+		    job.aux_size >= 24 && job.param_size >= 16) {
+			uint32_t hclass;
+			__builtin_memcpy(&hclass, (char *)job.param_buf + 12, 4);
+			if (hclass == 0x79) {
+				const uint8_t *p = (const uint8_t *)job.param_buf;
+				const uint8_t *a = (const uint8_t *)job.aux_buf;
+				char hex_p[160] = {0}, hex_a[80] = {0};
+				for (uint32_t i = 0; i < job.param_size && i < 48; i++)
+					snprintf(hex_p + i*3, sizeof(hex_p) - i*3,
+						 "%02x ", p[i]);
+				for (uint32_t i = 0; i < 24; i++)
+					snprintf(hex_a + i*3, sizeof(hex_a) - i*3,
+						 "%02x ", a[i]);
+				dprintf(2, "nvkvm_stub: pre-ioctl 0x79 param[%u]=%s\n",
+					job.param_size, hex_p);
+				dprintf(2, "nvkvm_stub: pre-ioctl 0x79 aux[24]  =%s\n",
+					hex_a);
+			}
+		}
 		/* DEBUG: dump the exact bytes the driver will see for the
 		 * ALLOC_OS_EVENT family + NV01_EVENT_OS_EVENT alloc, plus
 		 * a snapshot of /proc/self/fd so we can confirm the fd

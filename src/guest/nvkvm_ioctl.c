@@ -442,6 +442,9 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		 * Use handle_id, with the stub mapping to its local fd at
 		 * ioctl time. */
 		struct nv_ioctl_alloc_os_event *p = buf;
+		print_hex_dump(KERN_INFO,
+			"nvkvm guest pre  ALLOC_OS_EVENT: ",
+			DUMP_PREFIX_NONE, 16, 1, buf, size, false);
 		if (p->fd != (unsigned)-1) {
 			struct file *f = fget(p->fd);
 			if (!f)
@@ -454,6 +457,9 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 			}
 			fput(f);
 		}
+		print_hex_dump(KERN_INFO,
+			"nvkvm guest post ALLOC_OS_EVENT: ",
+			DUMP_PREFIX_NONE, 16, 1, buf, size, false);
 		break;
 	}
 

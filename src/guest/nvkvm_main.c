@@ -738,6 +738,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				    ap_size >= sizeof(struct nv0005_alloc_parameters)) {
 					struct nv0005_alloc_parameters *ep = aux_buf;
 					int user_fd = (int)(int32_t)ep->data;
+					/* Pre-translate dump: exactly what libcuda wrote */
+					print_hex_dump(KERN_INFO,
+						"nvkvm guest pre 0x79 nvos64: ",
+						DUMP_PREFIX_NONE, 48, 1,
+						params_buf, param_size, false);
+					print_hex_dump(KERN_INFO,
+						"nvkvm guest pre 0x79 aux:    ",
+						DUMP_PREFIX_NONE, 24, 1,
+						aux_buf, aux_size, false);
 					if (user_fd >= 0) {
 						struct file *f = fget(user_fd);
 						__u32 hid = 0;
@@ -751,6 +760,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						if (hid > 0)
 							ep->data = hid;
 					}
+					/* Post-translate dump */
+					print_hex_dump(KERN_INFO,
+						"nvkvm guest post 0x79 aux:   ",
+						DUMP_PREFIX_NONE, 24, 1,
+						aux_buf, aux_size, false);
 				}
 			}
 		}

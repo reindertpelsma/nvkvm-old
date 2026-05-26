@@ -281,6 +281,39 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
+	/* DEBUG: dump structs at the QEMU layer right before forwarding
+	 * to the isolate.  Only fd field should differ vs. guest's
+	 * post-translate dump.  Same applies to NV01_EVENT_OS_EVENT. */
+	if (_IOC_TYPE(req->cmd) == 'F' &&
+	    (_IOC_NR(req->cmd) == 0xce || _IOC_NR(req->cmd) == 0xcf) &&
+	    param_buf && req->param_size >= 16) {
+		const uint8_t *p = param_buf;
+		fprintf(stderr,
+			"nvkvm qemu pre 0x%x param[16]= "
+			"%02x %02x %02x %02x %02x %02x %02x %02x "
+			"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+			_IOC_NR(req->cmd),
+			p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+			p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+	}
+	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == 0x2b &&
+	    param_buf && aux_buf &&
+	    req->param_size >= 16 && req->aux_size >= 24) {
+		uint32_t hclass;
+		memcpy(&hclass, (char *)param_buf + 12, 4);
+		if (hclass == 0x79) {
+			const uint8_t *a = aux_buf;
+			fprintf(stderr,
+				"nvkvm qemu pre 0x79 aux[24]= "
+				"%02x %02x %02x %02x  %02x %02x %02x %02x "
+				"%02x %02x %02x %02x  %02x %02x %02x %02x "
+				"%02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],
+				a[8],a[9],a[10],a[11],a[12],a[13],a[14],a[15],
+				a[16],a[17],a[18],a[19],a[20],a[21],a[22],a[23]);
+		}
+	}
+
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
