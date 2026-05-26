@@ -636,6 +636,55 @@ static void *worker_thread(void *arg)
 			}
 		}
 
+		/* DEBUG: dump the exact bytes the driver will see for the
+		 * ALLOC_OS_EVENT family + NV01_EVENT_OS_EVENT alloc, plus
+		 * a snapshot of /proc/self/fd so we can confirm the fd
+		 * value we're handing to the driver actually maps to a
+		 * real nvidia file in this process. */
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    ((job.cmd & 0xff) == 0xce || (job.cmd & 0xff) == 0xcf) &&
+		    job.param_size >= 16) {
+			uint32_t hc, hd, fdval, st;
+			__builtin_memcpy(&hc,    (char *)job.param_buf + 0, 4);
+			__builtin_memcpy(&hd,    (char *)job.param_buf + 4, 4);
+			__builtin_memcpy(&fdval, (char *)job.param_buf + 8, 4);
+			__builtin_memcpy(&st,    (char *)job.param_buf + 12, 4);
+			char path[64];
+			int n = snprintf(path, sizeof(path),
+					 "/proc/self/fd/%u", fdval);
+			char link[128] = {0};
+			long lret = syscall(SYS_readlinkat, AT_FDCWD,
+					    path, link, sizeof(link)-1);
+			dprintf(2, "nvkvm_stub: pre-ioctl 0x%x hClient=0x%x fd=%u status=0x%x /proc/self/fd/%u=%s (ret=%ld)\n",
+				job.cmd & 0xff, hc, fdval, st, fdval,
+				lret > 0 ? link : "<none>", lret);
+			(void)hd; (void)n;
+		}
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    (job.cmd & 0xff) == 0x2b &&
+		    job.aux_size >= 24 && job.param_size >= 16) {
+			uint32_t hclass;
+			__builtin_memcpy(&hclass, (char *)job.param_buf + 12, 4);
+			if (hclass == 0x79) {
+				uint32_t hpc, hsr, hcl;
+				uint64_t data;
+				__builtin_memcpy(&hpc,   (char *)job.aux_buf + 0, 4);
+				__builtin_memcpy(&hsr,   (char *)job.aux_buf + 4, 4);
+				__builtin_memcpy(&hcl,   (char *)job.aux_buf + 8, 4);
+				__builtin_memcpy(&data,  (char *)job.aux_buf + 16, 8);
+				uint32_t fdval = (uint32_t)data;
+				char path[64], link[128] = {0};
+				snprintf(path, sizeof(path),
+					 "/proc/self/fd/%u", fdval);
+				long lret = syscall(SYS_readlinkat, AT_FDCWD,
+						    path, link, sizeof(link)-1);
+				dprintf(2, "nvkvm_stub: pre-ioctl NV01_EVENT_OS_EVENT hPC=0x%x hSR=0x%x data=%u /proc/self/fd/%u=%s (ret=%ld)\n",
+					hpc, hsr, fdval, fdval,
+					lret > 0 ? link : "<none>", lret);
+				(void)hcl;
+			}
+		}
+
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
 		int  err  = (ret < 0) ? errno : 0;
@@ -707,7 +756,12 @@ static void *worker_thread(void *arg)
 		uint32_t nvstatus = 0;
 		if (((job.cmd >> 8) & 0xff) == 'F') {
 			/* Frontend ioctls: nvstatus is at a fixed offset
-			 * inside the params struct. */
+			 * inside the params struct.  Sizes seen:
+			 *   16: nv_ioctl_alloc_os_event_t / free_os_event_t
+			 *       (hClient, hDevice, fd, Status@12)
+			 *   32: nvos21 (RM_ALLOC v1) / nvos54 (RM_CONTROL) /
+			 *       nvos00 etc — Status at offset 28
+			 *   48: nvos64 (RM_ALLOC v2) — Status at offset 40 */
 			if (job.param_size == 48)
 				__builtin_memcpy(&nvstatus,
 						 (char *)job.param_buf + 40,
@@ -715,6 +769,10 @@ static void *worker_thread(void *arg)
 			else if (job.param_size >= 32)
 				__builtin_memcpy(&nvstatus,
 						 (char *)job.param_buf + 28,
+						 sizeof(uint32_t));
+			else if (job.param_size == 16)
+				__builtin_memcpy(&nvstatus,
+						 (char *)job.param_buf + 12,
 						 sizeof(uint32_t));
 		} else if (job.param_size >= 4) {
 			/* UVM ioctls (TYPE == 0): rm_status is the last
@@ -980,7 +1038,7 @@ int main(void)
 						"/dev/nvidia-uvm",
 						O_RDWR | O_CLOEXEC);
 
-	apply_seccomp();
+	/* apply_seccomp(); — disabled for debugging, per user 2026-05-26 */
 
 	/*
 	 * Reader loop — reads ONE complete SEQPACKET message per iteration.
