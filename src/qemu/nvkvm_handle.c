@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <linux/memfd.h>
 #include <sys/syscall.h>
+#include <sys/eventfd.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
@@ -101,13 +102,28 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 			     uint32_t session_id, int dev_id, int flags,
 			     uint32_t *handle_id_out)
 {
-	const char *path = nvidia_dev_path(dev_id);
-	if (!path)
-		return -EINVAL;
+	int fd;
 
-	int fd = open(path, flags | O_CLOEXEC);
-	if (fd < 0)
-		return -errno;
+	if (dev_id == NVKVM_DEV_EVENTFD) {
+		/* libcuda passes an eventfd to RM_ALLOC NV01_EVENT_OS_EVENT
+		 * — that fd is only valid in the guest userspace process,
+		 * so we materialise a real eventfd inside QEMU on the same
+		 * path the nvidia handles use.  The same SCM_RIGHTS-to-
+		 * isolate flow gives the stub a usable fd to hand the
+		 * driver.  Subsequent event delivery back to the guest's
+		 * eventfd is via VQ_EVT (TODO; not needed for cuCtxCreate
+		 * + cuMemAlloc to make progress). */
+		fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		if (fd < 0)
+			return -errno;
+	} else {
+		const char *path = nvidia_dev_path(dev_id);
+		if (!path)
+			return -EINVAL;
+		fd = open(path, flags | O_CLOEXEC);
+		if (fd < 0)
+			return -errno;
+	}
 
 	pthread_mutex_lock(&t->lock);
 	uint32_t id;
@@ -124,7 +140,8 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 	*handle_id_out = id;
 	pthread_mutex_unlock(&t->lock);
 
-	fprintf(stderr, "nvkvm_handle: opened nvidia handle %u dev_id=%d fd=%d\n",
+	fprintf(stderr, "nvkvm_handle: opened %s handle %u dev_id=%d fd=%d\n",
+		dev_id == NVKVM_DEV_EVENTFD ? "eventfd" : "nvidia",
 		id, dev_id, fd);
 	return 0;
 }

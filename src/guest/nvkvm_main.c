@@ -721,6 +721,34 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				/* Sync the size back so the host driver sees a
 				 * consistent (params, paramsSize) pair. */
 				alloc->alloc_parms_size = (u32)ap_size;
+
+				/* NV01_EVENT_OS_EVENT: the Data field is libcuda's
+				 * eventfd, only valid in guest userspace.  Create
+				 * a real eventfd on the QEMU side, ship it to the
+				 * isolate via SCM_RIGHTS, and replace the user-
+				 * supplied fd with the resulting handle_id — the
+				 * stub will translate that to its local fd before
+				 * the driver sees it. */
+				if (alloc->h_class == NV01_EVENT_OS_EVENT &&
+				    ap_size >= sizeof(struct nv0005_alloc_parameters) &&
+				    ctx->session && ctx->session->isolate_id) {
+					struct nv0005_alloc_parameters *ep = aux_buf;
+					__u32 efd_handle = 0;
+					int err = nvkvm_virtio_open_nvidia_handle(
+						NVKVM_DEV_EVENTFD, 0,
+						(unsigned int)ctx->session->id,
+						&efd_handle);
+					if (err == 0) {
+						err = nvkvm_virtio_copy_handle_to_isolate(
+							efd_handle,
+							ctx->session->isolate_id);
+					}
+					if (err == 0) {
+						ep->data = efd_handle;
+					} else {
+						pr_warn("nvkvm: eventfd handle creation failed: %d\n", err);
+					}
+				}
 			}
 		}
 	}

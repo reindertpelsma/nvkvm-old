@@ -589,6 +589,47 @@ static void *worker_thread(void *arg)
 			}
 		}
 
+		/*
+		 * RM_ALLOC NV01_EVENT_OS_EVENT (hClass=0x79): the alloc
+		 * params struct (NV0005_ALLOC_PARAMETERS) is in aux_buf,
+		 * with Data (a 64-bit field containing the fd) at offset
+		 * 16.  The guest replaced Data with the handle_id of an
+		 * eventfd-typed handle we created in QEMU.  Translate
+		 * back to our local fd before the driver sees it; restore
+		 * the handle_id on the way back so the guest's view of
+		 * the data field is unchanged.
+		 */
+		int32_t saved_alloc_event_fd = 0;
+		int     have_alloc_event_fd  = 0;
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    (job.cmd & 0xff) == 0x2b /* NV_ESC_RM_ALLOC */ &&
+		    job.aux_size >= sizeof(uint64_t) * 3 &&
+		    job.param_size >= 16) {
+			uint32_t h_class = 0;
+			__builtin_memcpy(&h_class,
+					 (char *)job.param_buf + 12, /* nvos21+nvos64 alias */
+					 sizeof(uint32_t));
+			if (h_class == 0x79) {
+				uint64_t data64 = 0;
+				__builtin_memcpy(&data64,
+						 (char *)job.aux_buf + 16,
+						 sizeof(uint64_t));
+				int32_t hid = (int32_t)data64;
+				saved_alloc_event_fd = hid;
+				if (hid > 0) {
+					int local_fd = handle_lookup((uint32_t)hid);
+					if (local_fd < 0) {
+						resp.retval = -EBADF;
+						goto send_resp;
+					}
+					uint64_t lfd64 = (uint64_t)(uint32_t)local_fd;
+					__builtin_memcpy((char *)job.aux_buf + 16,
+							 &lfd64, sizeof(uint64_t));
+					have_alloc_event_fd = 1;
+				}
+			}
+		}
+
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
 		int  err  = (ret < 0) ? errno : 0;
@@ -598,6 +639,11 @@ static void *worker_thread(void *arg)
 		    job.param_size >= uvm_embedded_fd_off + 4) {
 			__builtin_memcpy((char *)job.param_buf + uvm_embedded_fd_off,
 					 &saved_uvm_embedded_fd, sizeof(int32_t));
+		}
+		if (have_alloc_event_fd) {
+			uint64_t hid64 = (uint64_t)(uint32_t)saved_alloc_event_fd;
+			__builtin_memcpy((char *)job.aux_buf + 16,
+					 &hid64, sizeof(uint64_t));
 		}
 		if (fe_has_embedded_fd &&
 		    job.param_size >= fe_embedded_fd_off + 4) {

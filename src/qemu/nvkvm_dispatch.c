@@ -240,17 +240,11 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		p->rm_ctrl_fd = saved;
 		return ret;
 	}
-	case UVM_UNREGISTER_CHANNEL: {
-		struct uvm_unregister_channel_params *p = ctx->params_buf;
-		struct nvkvm_handle *ctrl_h =
-			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->rm_ctrl_fd);
-		if (!ctrl_h || ctrl_h->fd < 0) return -EBADF;
-		nvhandle_t saved = p->rm_ctrl_fd;
-		p->rm_ctrl_fd = (nvhandle_t)ctrl_h->fd;
-		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		p->rm_ctrl_fd = saved;
-		return ret;
-	}
+	case UVM_UNREGISTER_CHANNEL:
+		/* gVisor's UVM_UNREGISTER_CHANNEL_PARAMS has no rm_ctrl_fd
+		 * — driver figures it out from hClient/hChannel.  No
+		 * translation needed; pass through. */
+		return nvkvm_handle_simple_ioctl(ctx, cmd);
 
 	case UVM_REGISTER_GPU:
 	case UVM_UNREGISTER_GPU:
