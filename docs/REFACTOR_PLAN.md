@@ -82,24 +82,37 @@ guest releases its guest fd.
 - **Refcount bracket extends from request reception through reply send**,
   not just dispatch.
 
-### CPU memory paths
+### CPU memory paths (in fast-path order)
 
-1. **mmap (99% of cases)** — guest kernel asks QEMU for memfd-backed GPA
-   pages. Guest kernel copies data in, swaps its own page tables to point
-   at memfd-backed GPA. Stub mmaps the same memfd. Driver sees the data.
-   No virtio R/W needed.
+**0. memfd-passthrough (the dominant case — must be the primary fast path).**
+   When guest userspace passes a CPU pointer into an ioctl, and that
+   pointer falls within a region already backed by one of our memfd-backed
+   GPA windows, *nothing has to move*. We already have a handle for the
+   memfd, the stub already has it mapped at a known VA, the guest writes
+   already land in the same physical pages the stub sees. The guest module:
+     - walks `find_vma(P)` → identifies the GPA window
+     - derives (memfd_handle_id, offset_within_handle, size)
+     - sends the ioctl request to QEMU carrying the triple; QEMU forwards
+       to the stub along with the precomputed stub-side VA
+     - stub rewrites the ioctl arg buffer to point at its own VA and calls
+   Zero copy, zero allocation, zero coordination. This is what every
+   CUDA-allocated buffer hits.
 
-2. **WRITE_MEMORY_HANDLE (rare, 1%)** — for buffers whose backing memory
-   isn't VMM heap (e.g. vfio MMIO, pre-existing memfd that can't be
-   swapped). Pointer rewrite in the ioctl, buffer bytes inline in virtio.
-   Invariant: per-page mutex; never two concurrent writes to overlapping
-   range. Stub has a tiny post-ioctl cleanup list for these (the only
-   table on stub side).
-
-3. **userfaultfd path (post-MVP)** — Step 5 PoC. Promote anonymous guest
-   pages to memfd-backed without guest-kernel cooperation. Useful for
-   `cudaHostRegister` etc. If KVM-UFFD doesn't cooperate on 6.8 kernel,
+1. **userfaultfd promote (the medium-rare case).**
+   Guest userspace allocated a buffer in plain anonymous memory (e.g. via
+   `cudaHostRegister` on existing-malloc'd memory). We migrate that GPA
+   region into a memfd window once, then the page falls into path (0)
+   forever after. Step 5 PoC. If KVM-UFFD doesn't cooperate on 6.8 kernel,
    fallback to brief vCPU pause.
+
+2. **WRITE_MEMORY_HANDLE (the residual edge case).**
+   Buffers whose backing memory genuinely can't be swapped — vfio MMIO,
+   PCI BAR pass-throughs from other devices, etc. Pointer rewrite in the
+   ioctl, buffer bytes copied inline via virtio. Invariant: per-page
+   mutex; never two concurrent writes to overlapping range. Stub has a
+   tiny post-ioctl cleanup list for these (the only table on stub side).
+   Slow but correct. Only path that doesn't hit the kernel struct file
+   that's already shared.
 
 ### GPA windows
 
@@ -300,6 +313,15 @@ move on until the prior step's tests are green.
 7. **The data path for CPU memory is mmap, not virtio R/W**.
    WRITE/READ_MEMORY_HANDLE exists only for buffers whose backing can't
    be swapped (vfio MMIO etc).
+
+7b. **memfd-passthrough is the dominant fast path**. If a pointer the
+    guest passes into an ioctl falls within an already-memfd-backed GPA
+    window, *do not copy anything*. Resolve `vma → (handle_id, offset,
+    size)` in the guest module, forward to QEMU, QEMU instructs the
+    stub to rewrite the ioctl arg to its own VA for that same memfd.
+    This is what every CUDA-allocated buffer hits. The userfaultfd
+    path and WRITE_MEMORY_HANDLE are fallbacks for pointers that
+    *aren't* memfd-backed yet (or can't be).
 8. **Closed driver is not a target**. Open driver only. Validate against
    open driver in Step 7.
 
