@@ -566,14 +566,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case FERMI_VASPACE_A:
 				ap_size = sizeof(struct nv_vaspace_allocation_parameters);
 				break;
-			/* NV50_MEMORY_VIRTUAL (0x50A0) is intentionally NOT included
-			 * here yet — its alloc params contain an embedded `address`
-			 * pointer (NvP64) that we currently forward unchanged.  The
-			 * NVIDIA driver dereferences it in the isolate process and
-			 * hangs the calling thread.  Need a dedicated sanitizer that
-			 * zeros the embedded pointer before forwarding, plus the
-			 * dual-mmap install path so the value the driver hands back
-			 * is visible to libcuda. */
+			case NV50_MEMORY_VIRTUAL:
+				ap_size = sizeof(struct nv_memory_allocation_params_v545);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -614,7 +609,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case FERMI_VASPACE_A:
 					ap_size = sizeof(struct nv_vaspace_allocation_parameters);
 					break;
-				/* NV50_MEMORY_VIRTUAL: see note above. */
+				case NV50_MEMORY_VIRTUAL:
+					ap_size = sizeof(struct nv_memory_allocation_params_v545);
+					break;
 				}
 			}
 			if (ap_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
