@@ -567,6 +567,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = sizeof(struct nv_vaspace_allocation_parameters);
 				break;
 			case NV50_MEMORY_VIRTUAL:
+			case NV01_MEMORY_LOCAL_USER:
+			case NV01_MEMORY_SYSTEM:
 				ap_size = sizeof(struct nv_memory_allocation_params_v545);
 				break;
 			}
@@ -610,6 +612,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = sizeof(struct nv_vaspace_allocation_parameters);
 					break;
 				case NV50_MEMORY_VIRTUAL:
+				case NV01_MEMORY_LOCAL_USER:
+				case NV01_MEMORY_SYSTEM:
 					ap_size = sizeof(struct nv_memory_allocation_params_v545);
 					break;
 				}

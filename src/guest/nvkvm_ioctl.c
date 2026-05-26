@@ -267,26 +267,42 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 	}
 	case UVM_REGISTER_GPU_VASPACE: {
 		struct uvm_register_gpu_vaspace_params *p = buf;
-		__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
-		if (hid < 0)
-			return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)hid;
+		/* CUDA passes -1 to mean "no ctrl fd" for some calls — leave
+		 * it alone, the driver checks it as a sentinel. */
+		if ((int32_t)p->rm_ctrl_fd >= 0) {
+			__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
+			if (hid < 0)
+				return -EBADF;
+			p->rm_ctrl_fd = (nvhandle_t)hid;
+		}
 		return 0;
 	}
 	case UVM_REGISTER_CHANNEL: {
 		struct uvm_register_channel_params *p = buf;
-		__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
-		if (hid < 0)
-			return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)hid;
+		if ((int32_t)p->rm_ctrl_fd >= 0) {
+			__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
+			if (hid < 0)
+				return -EBADF;
+			p->rm_ctrl_fd = (nvhandle_t)hid;
+		}
 		return 0;
 	}
 	case UVM_MAP_EXTERNAL_ALLOCATION: {
+		/* NOTE: our struct uvm_map_external_allocation_params reflects
+		 * the pre-V550 driver layout (one PerGPUAttribute).  The 575
+		 * driver expects V550 layout (PerGPUAttributes[256] array, then
+		 * an 8-byte count, *then* rm_ctrl_fd).  Reading at our offset
+		 * gets garbage — we observed rm_ctrl_fd=0, fget(0)=stdin,
+		 * private_data NULL → -EBADF.  Until the struct is reworked,
+		 * skip translation here so the driver can at least see the
+		 * raw value; that lets cuMemAlloc fail later with a real
+		 * error rather than EBADF in the sanitizer. */
 		struct uvm_map_external_allocation_params *p = buf;
-		__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
-		if (hid < 0)
-			return -EBADF;
-		p->rm_ctrl_fd = (nvhandle_t)hid;
+		if ((int32_t)p->rm_ctrl_fd > 0) {
+			__s32 hid = guest_fd_to_handle_id((int)p->rm_ctrl_fd);
+			if (hid >= 0)
+				p->rm_ctrl_fd = (nvhandle_t)hid;
+		}
 		return 0;
 	}
 	default:
