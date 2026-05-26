@@ -267,6 +267,15 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	}
 	}
 
+	/*
+	 * Guard the NR-based dispatch below: UVM cmds use _IOC_TYPE == 0 and
+	 * their NRs can collide with NV_ESC_* frontend NRs (e.g. UVM 0x27 ==
+	 * NV_ESC_RM_ALLOC_MEMORY).  Any unrecognised UVM cmd should fall
+	 * through to ENOTTY, not get reinterpreted as a frontend ioctl.
+	 */
+	if (_IOC_TYPE(cmd) != 'F')
+		return -ENOTTY;
+
 	/* Frontend ioctls — IOC_NR dispatch */
 	switch (NV_IOC_NR(cmd)) {
 	case NV_ESC_RM_ALLOC:

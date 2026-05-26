@@ -293,6 +293,17 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		break;
 	}
 
+	/*
+	 * The NR-based switch below ONLY applies to NVIDIA frontend ioctls
+	 * (/dev/nvidia0 + /dev/nvidiactl), which use _IOC_TYPE == 'F' (0x46).
+	 * Bare UVM ioctls (e.g. UVM_PAGEABLE_MEM_ACCESS = 0x27) use type 0 and
+	 * their NR can collide with frontend NRs (NV_ESC_RM_ALLOC_MEMORY is also
+	 * 0x27).  Without this gate we'd reinterpret an 8-byte UVM struct as a
+	 * 48-byte nvos02-with-fd, read garbage as p->fd, fget() → EBADF.
+	 */
+	if (_IOC_TYPE(cmd) != 'F')
+		return 0;
+
 	switch (NV_IOC_NR(cmd)) {
 
 	case NV_ESC_RM_ALLOC: {
