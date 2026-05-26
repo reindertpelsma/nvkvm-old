@@ -27,6 +27,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
@@ -722,31 +723,33 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * consistent (params, paramsSize) pair. */
 				alloc->alloc_parms_size = (u32)ap_size;
 
-				/* NV01_EVENT_OS_EVENT: the Data field is libcuda's
-				 * eventfd, only valid in guest userspace.  Create
-				 * a real eventfd on the QEMU side, ship it to the
-				 * isolate via SCM_RIGHTS, and replace the user-
-				 * supplied fd with the resulting handle_id — the
-				 * stub will translate that to its local fd before
-				 * the driver sees it. */
+				/* NV01_EVENT_OS_EVENT: Data is an FD pointing at one
+				 * of the /dev/nvidia* char devices (not a generic
+				 * eventfd — gVisor confirms via the frontendFD type
+				 * check, and the driver verifies f->f_op ==
+				 * nv_frontend_fops in osUserHandleToKernelPtr).  The
+				 * fd libcuda passes IS already opened through our
+				 * module, so we have a handle_id for it.  Same
+				 * translation pattern as UVM_MM_INITIALIZE's
+				 * uvm_fd: replace the user-supplied guest fd with
+				 * its handle_id; the stub maps that to its local
+				 * /dev/nvidia* fd. */
 				if (alloc->h_class == NV01_EVENT_OS_EVENT &&
-				    ap_size >= sizeof(struct nv0005_alloc_parameters) &&
-				    ctx->session && ctx->session->isolate_id) {
+				    ap_size >= sizeof(struct nv0005_alloc_parameters)) {
 					struct nv0005_alloc_parameters *ep = aux_buf;
-					__u32 efd_handle = 0;
-					int err = nvkvm_virtio_open_nvidia_handle(
-						NVKVM_DEV_EVENTFD, 0,
-						(unsigned int)ctx->session->id,
-						&efd_handle);
-					if (err == 0) {
-						err = nvkvm_virtio_copy_handle_to_isolate(
-							efd_handle,
-							ctx->session->isolate_id);
-					}
-					if (err == 0) {
-						ep->data = efd_handle;
-					} else {
-						pr_warn("nvkvm: eventfd handle creation failed: %d\n", err);
+					int user_fd = (int)(int32_t)ep->data;
+					if (user_fd >= 0) {
+						struct file *f = fget(user_fd);
+						__u32 hid = 0;
+						if (f) {
+							struct nvkvm_fd_ctx *other =
+								f->private_data;
+							if (other && other->handle_id)
+								hid = other->handle_id;
+							fput(f);
+						}
+						if (hid > 0)
+							ep->data = hid;
 					}
 				}
 			}

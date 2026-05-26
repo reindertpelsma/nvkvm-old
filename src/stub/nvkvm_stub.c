@@ -564,6 +564,12 @@ static void *worker_thread(void *arg)
 				fe_embedded_fd_off = 40;
 				fe_has_embedded_fd = 1;
 				break;
+			case 0xce:  /* NV_ESC_ALLOC_OS_EVENT */
+			case 0xcf:  /* NV_ESC_FREE_OS_EVENT */
+				/* both have { hClient, hDevice, fd, status } */
+				fe_embedded_fd_off = 8;
+				fe_has_embedded_fd = 1;
+				break;
 			}
 		}
 		if (fe_has_embedded_fd &&

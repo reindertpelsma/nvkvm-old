@@ -436,14 +436,12 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 	}
 
 	case NV_ESC_ALLOC_OS_EVENT: {
+		/* The driver indexes its event_list by (hClient, fd).  Whatever
+		 * value we send here must match what we send later as
+		 * NV01_EVENT_OS_EVENT.Data — same translation in both places.
+		 * Use handle_id, with the stub mapping to its local fd at
+		 * ioctl time. */
 		struct nv_ioctl_alloc_os_event *p = buf;
-		/*
-		 * p->fd is an eventfd; translate to the fd_token of the
-		 * corresponding nvkvm device FD the event is associated with.
-		 * If it's not a nvkvm FD, replace with a sentinel and let the
-		 * host handle it (the host will allocate its own eventfd and
-		 * relay events back via VQ_EVT).
-		 */
 		if (p->fd != (unsigned)-1) {
 			struct file *f = fget(p->fd);
 			if (!f)
@@ -451,7 +449,8 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 			{
 				struct nvkvm_fd_ctx *other =
 					f->private_data;
-				p->fd = other ? other->fd_token : (__u32)-1;
+				p->fd = (other && other->handle_id) ?
+					other->handle_id : (__u32)-1;
 			}
 			fput(f);
 		}
@@ -467,7 +466,8 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 			{
 				struct nvkvm_fd_ctx *other =
 					f->private_data;
-				p->fd = other ? other->fd_token : (__u32)-1;
+				p->fd = (other && other->handle_id) ?
+					other->handle_id : (__u32)-1;
 			}
 			fput(f);
 		}
