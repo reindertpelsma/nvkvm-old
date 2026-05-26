@@ -22,9 +22,12 @@ ISOLATE_SRCS  = test_isolate.c \
                 ../../src/qemu/nvkvm_isolate.c \
                 ../../src/qemu/nvkvm_handle.c
 
+TABLES_SRCS   = test_tables.c \
+                ../../src/qemu/nvkvm_tables.c
+
 .PHONY: all clean run
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -41,11 +44,15 @@ mock_stub: mock_stub.c
 test_isolate: $(ISOLATE_SRCS) mock_stub
 	$(CC) $(CFLAGS) -o $@ $(ISOLATE_SRCS) $(LDFLAGS)
 
-run: test_dispatch test_frontend test_handle test_isolate
+test_tables: $(TABLES_SRCS)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -DNVKVM_TABLES_NO_KVM -o $@ $(TABLES_SRCS) $(LDFLAGS)
+
+run: test_dispatch test_frontend test_handle test_isolate test_tables
 	./test_dispatch
 	./test_frontend
 	./test_handle
 	./test_isolate
+	./test_tables
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables

@@ -120,51 +120,9 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 		const char *path = nvidia_dev_path(dev_id);
 		if (!path)
 			return -EINVAL;
-
-		/*
-		 * Per-session /dev/nvidiactl dedup: open-source nvidia.ko's
-		 * rmclientValidate_IMPL (strict mode) compares pClient->pOSInfo
-		 * (the ctl nvfp at NV01_ROOT_CLIENT alloc time) with secInfo->
-		 * clientOSInfo (the ctl nvfp of the calling fd) on every ioctl;
-		 * mismatch yields NV_ERR_INVALID_CLIENT (0x23). libcuda inside
-		 * the guest opens /dev/nvidiactl repeatedly. If each guest open
-		 * gets its own host open, every opener has a different nvfp →
-		 * any subsequent op on a different opener fails the strict check.
-		 * Reuse the existing per-session host /dev/nvidiactl fd via dup()
-		 * so all guest opens share the same kernel struct file.
-		 *
-		 * /dev/nvidia0..N opens are NOT deduped: each ALLOC_OS_EVENT
-		 * needs its own nvfp (the driver indexes its event_list by
-		 * the nvfp of the calling fd).
-		 */
-		if (dev_id == NVKVM_DEV_CTL) {
-			pthread_mutex_lock(&t->lock);
-			int existing_fd = -1;
-			for (int i = 0; i < NVKVM_HANDLE_MAX; i++) {
-				struct nvkvm_handle *eh = &t->handles[i];
-				if (eh->in_use &&
-				    eh->type == NVKVM_HANDLE_TYPE_NVIDIA &&
-				    eh->session_id == session_id &&
-				    eh->dev_id == NVKVM_DEV_CTL) {
-					existing_fd = eh->fd;
-					break;
-				}
-			}
-			pthread_mutex_unlock(&t->lock);
-			if (existing_fd >= 0) {
-				fd = dup(existing_fd);
-				if (fd < 0)
-					return -errno;
-			} else {
-				fd = open(path, flags | O_CLOEXEC);
-				if (fd < 0)
-					return -errno;
-			}
-		} else {
-			fd = open(path, flags | O_CLOEXEC);
-			if (fd < 0)
-				return -errno;
-		}
+		fd = open(path, flags | O_CLOEXEC);
+		if (fd < 0)
+			return -errno;
 	}
 
 	pthread_mutex_lock(&t->lock);
