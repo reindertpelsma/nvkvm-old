@@ -283,7 +283,7 @@ static void emit_record(pid_t pid, pid_t tid, struct tid_state *s,
         inner_ptr_size(s->cmd, post, dump, &ip_post, &isz_post);
         unsigned long isz = s->inner_pre_size;
         if (isz_post > isz) isz = isz_post;
-        if (isz == 0)      isz = 64;
+        if (isz == 0)      isz = 512;
         if (isz > g_dump_len) isz = g_dump_len;
 
         unsigned char *ibuf_post = NULL;
@@ -383,7 +383,7 @@ static void handle_syscall_stop(pid_t tid)
             if (nr == 0x2a || nr == 0x2b) {
                 unsigned long ip = 0, isz = 0;
                 inner_ptr_size(s->cmd, s->pre, s->arg_size, &ip, &isz);
-                if (isz == 0) isz = 64;
+                if (isz == 0) isz = 512;
                 if (isz > g_dump_len) isz = g_dump_len;
                 if (ip) {
                     s->inner_pre_addr = ip;
