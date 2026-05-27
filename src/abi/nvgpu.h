@@ -62,9 +62,26 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define AMPERE_COMPUTE_A                    0x0000C6B1U
 #define HOPPER_COMPUTE_A                    0x0000CBB1U
 /* DMA copy */
-#define TURING_DMA_COPY_A                   0x0000C4B5U
+#define VOLTA_DMA_COPY_A                    0x0000C3B5U
+#define TURING_DMA_COPY_A                   0x0000C5B5U
 #define AMPERE_DMA_COPY_A                   0x0000C6B5U
-#define HOPPER_DMA_COPY_A                   0x0000CBB5U
+#define AMPERE_DMA_COPY_B                   0x0000C7B5U
+#define HOPPER_DMA_COPY_A                   0x0000C8B5U
+#define BLACKWELL_DMA_COPY_A                0x0000CBB5U
+
+/* NVB0B5_ALLOCATION_PARAMETERS — alloc params for all *_DMA_COPY_* classes
+ * above.  libcuda passes engineType here to select a specific copy-engine
+ * INSTANCE (NV2080_ENGINE_TYPE_COPY0/COPY1/COPY2/...).  Critical: if we
+ * don't forward these 8 bytes to the kernel, it reads zeros, the
+ * pParamToEngDescFn returns ENG_COPY(0) by default, the channel gets
+ * bound to runlist 0 (GR runlist) and GPFIFO_SCHEDULE fails with
+ * NV_ERR_NOT_READY — see [[gpfifo-schedule-runlist-bug]].  Diagnosed
+ * 2026-05-28 via guest-vs-host dmesg of NV906F_CTRL_GET_CLASS_ENGINEID
+ * returning engineID=9 (COPY0) on guest vs 10/11 on host. */
+struct nvb0b5_allocation_parameters {
+	__u32 version;
+	__u32 engine_type;
+};
 /* Memory classes */
 #define NV01_MEMORY_SYSTEM                  0x0000003EU
 #define NV01_MEMORY_LOCAL_USER              0x00000040U

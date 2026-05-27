@@ -710,6 +710,14 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case NV01_EVENT_OS_EVENT:
 				ap_size = sizeof(struct nv0005_alloc_parameters);
 				break;
+			case VOLTA_DMA_COPY_A:
+			case TURING_DMA_COPY_A:
+			case AMPERE_DMA_COPY_A:
+			case AMPERE_DMA_COPY_B:
+			case HOPPER_DMA_COPY_A:
+			case BLACKWELL_DMA_COPY_A:
+				ap_size = sizeof(struct nvb0b5_allocation_parameters);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -774,6 +782,14 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				case NV01_EVENT_OS_EVENT:
 					ap_size = sizeof(struct nv0005_alloc_parameters);
+					break;
+				case VOLTA_DMA_COPY_A:
+				case TURING_DMA_COPY_A:
+				case AMPERE_DMA_COPY_A:
+				case AMPERE_DMA_COPY_B:
+				case HOPPER_DMA_COPY_A:
+				case BLACKWELL_DMA_COPY_A:
+					ap_size = sizeof(struct nvb0b5_allocation_parameters);
 					break;
 				}
 			}
