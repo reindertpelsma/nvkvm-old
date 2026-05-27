@@ -430,6 +430,25 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
+	 * State-machine Step B: record UVM_INITIALIZE into ctx->uvm_state
+	 * but ALSO still forward it.  Reason: between Step B and Step E,
+	 * we keep the kernel side working — recording is additive, not
+	 * a substitute.  The full short-circuit lands in Step E along
+	 * with REALIZE_UVM_MAPPING.  Per docs/STATE_MACHINE_PLAN.md.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state &&
+	    cmd == UVM_INITIALIZE && params_buf &&
+	    param_size >= sizeof(struct uvm_initialize_params)) {
+		struct uvm_initialize_params *p = params_buf;
+		mutex_lock(&ctx->uvm_state->lock);
+		ctx->uvm_state->init_flags  = p->flags;
+		ctx->uvm_state->initialized = true;
+		mutex_unlock(&ctx->uvm_state->lock);
+		/* fall through to the normal forward path so the kernel
+		 * fd becomes VA_SPACE-typed.  Step E removes the forward. */
+	}
+
+	/*
 	 * Save caller-supplied user-space pointer / size fields BEFORE any
 	 * sanitizer (inline or via nvkvm_sanitize_ioctl_params) runs, so we
 	 * can restore them on the response.  CUDA verifies these round-trip

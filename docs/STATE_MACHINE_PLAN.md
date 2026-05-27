@@ -374,11 +374,16 @@ the step's target.**
   UVM fds in `nvkvm_open` (via the device-class info already in
   scope).  Allocate the state struct.  No behavior change yet.
 
-* **Step B: PURE_CONFIG short-circuit.**  Intercept UVM_INITIALIZE,
-  UVM_PAGEABLE_MEM_ACCESS, UVM_PAGEABLE_MEM_ACCESS_ON_GPU,
-  UVM_ENABLE_PEER_ACCESS, UVM_DISABLE_PEER_ACCESS.  Record into
-  state.  Return `NV_OK` without forwarding.  Verify test still passes
-  (these all return NV_OK on host today anyway).
+* **Step B: PURE_CONFIG recording (additive).**  Record
+  UVM_INITIALIZE flags into ctx->uvm_state.  But **also keep
+  forwarding** the ioctl so the kernel-side fd still becomes
+  VA_SPACE-typed.  The short-circuit lands in Step E along with the
+  realize call.  Reason: short-circuiting UVM_INITIALIZE before E
+  causes the kernel fd to stay untyped, and the next forwarded UVM
+  cmd (REGISTER_GPU) fails — regressing the test until Step E.
+  Recording is additive at Step B; replacement is wholesale at E.
+  Same applies to other PURE_CONFIG cmds whose recording happens
+  in Steps C/D — all forward as before until E.
 
 * **Step C: STATE_REGISTRATION recording.**  Intercept REGISTER_GPU,
   REGISTER_GPU_VASPACE, REGISTER_CHANNEL, CREATE_RANGE_GROUP.
@@ -449,6 +454,101 @@ etc. trigger MIGRATE/POPULATE_PAGEABLE).
 * **Regression**: after each step, run the kernel-side printk
   diagnostic (`docs/kernel_patches/`) and confirm we haven't
   regressed earlier stages.
+
+## 8a. QEMU validation hardening
+
+**Threat model**: assume a fully malicious guest VM.  Any byte of any
+field of any struct delivered to QEMU is attacker-controlled.  A
+single un-validated value reaching a syscall QEMU executes equals
+an attacker getting QEMU's host privileges (which by definition can
+access the GPU directly and may be running as root on the host).
+The validator's job is to make sure that does not happen — ever, for
+any cmd, on any code path, including future ones.  Whitelist
+everything; deny by default.
+
+**Isolate-bound ioctls have a softer requirement.**  When QEMU's
+role is purely to forward to the stub (no QEMU-side syscall), the
+stub IS the validation boundary — sandboxed, no host privileges,
+RM-handle-validated at the kernel level.  Strict per-field
+validation is still good practice for these (we already restore
+embedded-fd round-trips, sanitize VA pointers, etc.) but the
+**failure-mode equivalence is different**: a missed validation on
+an isolate-bound cmd costs at most a sandboxed-stub compromise;
+a missed validation on a QEMU-executed cmd costs host privilege.
+Plan accordingly when prioritizing audit effort.
+
+For every ioctl QEMU executes on its privileged side, the
+per-cmd validator is exhaustive and self-contained.  No "best-effort"
+or "trust the guest" — every byte that reaches the kernel is one
+QEMU put there, computed from a guest input that the validator
+explicitly approved.
+
+Per-cmd validator MUST:
+
+* **Size**: assert `guest_param_size == sizeof(known_struct)` exactly.
+  Reject under-length.  Truncate over-length silently — QEMU's own
+  kernel-bound buffer is allocated to the documented size only.
+
+* **Every field**: enumerated in the validator.  No field copied by
+  default; every field is either:
+    * **passthrough-with-bounds** (e.g. `length <= max_session_quota`)
+    * **translated** (e.g. `gva -> host_va` via per-session GVA map)
+    * **handle-translated** (e.g. `rm_ctrl_fd_handle -> stub_local_fd`)
+    * **flag-filtered** (see below)
+    * **must-be-zero** (rejected if non-zero)
+
+  Any field the validator hasn't enumerated is **zeroed** before the
+  kernel call.  Adding a new field to a struct in a future kernel
+  doesn't accidentally expose anything.
+
+* **Every pointer**: gVisor nvproxy has the reference behaviour
+  catalog — for each ioctl, every embedded NvP64 / userspace VA
+  pointer is documented as `inout`, `in-only`, `out-only`, list/
+  array, optional, etc.  Mirror that table.  In our model:
+    * No raw guest VA is ever sent to the host kernel.  Pointers are
+      either:
+        * replaced with `0` if the target data has been copied into a
+          side-channel (aux buffer) the kernel will read directly,
+        * or replaced with a host VA that QEMU computed by looking up
+          the guest VA in its session-local mapping table.
+    * After the ioctl, the response struct's pointer fields are
+      restored to the caller's original guest VA before returning,
+      per the writeback bug-class fix in [[writeback-bug-pattern]].
+
+* **Every flag**: per-cmd allowlist of bit values.
+    * Unknown bits → **rejected** (cmd returns EINVAL).
+    * Or, for known-safe-to-ignore bits, **stripped** (silently
+      cleared before the kernel call).
+    * Default policy is reject; strip is opt-in per bit.
+
+* **Every array / variable-length field**: count is bounded by a
+  per-session quota (e.g. perGpuAttributes[]: at most
+  `session.max_registered_gpus` entries).  Each array element
+  recursively goes through the same field-by-field validation.
+
+* **No transitive trust**: a field validated as a "handle" doesn't
+  imply anything about the resource it refers to.  The validator
+  re-resolves the handle against the session's tracking tables
+  EVERY time, even if the same handle appeared in the same struct
+  a millisecond ago.
+
+Concrete artifact: `src/qemu/realize_validators/<cmd>.c` — one file
+per cmd, generated from a small schema-like description (similar
+to how `nvproxy/seccomp_filters.go` is generated in gVisor).  Each
+validator file has a single entry point of shape:
+
+```c
+int validate_and_translate_<CMD>(
+    struct nvkvm_session *s,
+    const void *guest_buf,         /* sized strictly */
+    size_t guest_buf_size,
+    void *kernel_buf,              /* sized to sizeof(known struct) */
+    void *response_remap_table);   /* for writeback restore */
+```
+
+Returns `0` on success, `-errno` on rejection.  Test files in
+`tests/unit/realize_validators/` exercise every reject branch and
+every translation case per cmd.
 
 ## 9. Security notes
 
