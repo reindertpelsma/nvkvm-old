@@ -386,6 +386,86 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
+	 * Save caller-supplied user-space pointer / size fields BEFORE any
+	 * sanitizer (inline or via nvkvm_sanitize_ioctl_params) runs, so we
+	 * can restore them on the response.  CUDA verifies these round-trip
+	 * unchanged.
+	 *
+	 * Bug we already hit: capturing AFTER the inline sanitizer captured
+	 * `alloc_parms_size = 0x38` (the class-derived size we filled in for
+	 * the host driver) instead of CUDA's original 0 — and the restore
+	 * then "restored" that bogus value back over the kernel's writeback.
+	 */
+	u64 orig_nvos54_params = 0;       /* RM_CONTROL nvos54.params  */
+	u64 orig_nvos64_alloc  = 0;       /* RM_ALLOC nvos64.p_alloc_parms */
+	u64 orig_nvos64_rights = 0;       /* RM_ALLOC nvos64.p_rights_requested */
+	u32 orig_nvos64_size   = 0;       /* RM_ALLOC nvos64.alloc_parms_size */
+	u64 orig_nvos21_alloc  = 0;       /* RM_ALLOC nvos21.p_alloc_parms */
+	bool have_nvos64_orig  = false;
+	__s32 orig_uvm_mm_init_fd = 0;
+	bool have_uvm_mm_init     = false;
+	__u32 orig_uvm_rm_ctrl_fd = 0;
+	bool have_uvm_rm_ctrl     = false;
+	/* Embedded-fd fields in frontend ioctls: sanitizer overwrites these
+	 * with handle_ids; capture the caller's original guest-fd so the
+	 * response round-trips libcuda's value unchanged. */
+	__s32 orig_fe_ctl_fd = 0;     bool have_fe_ctl_fd = false;     /* REGISTER_FD       */
+	__u32 orig_fe_os_evt_fd = 0;  bool have_fe_os_evt_fd = false;  /* ALLOC/FREE_OS_EVT */
+	__s32 orig_fe_nvos02_fd = 0;  bool have_fe_nvos02_fd = false;  /* RM_ALLOC_MEMORY   */
+	__s32 orig_fe_nvos33_fd = 0;  bool have_fe_nvos33_fd = false;  /* RM_MAP_MEMORY     */
+	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
+	    param_size == sizeof(struct nvos54_parameters)) {
+		orig_nvos54_params =
+			((struct nvos54_parameters *)params_buf)->params;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && params_buf &&
+		   param_size == sizeof(struct nvos64_parameters)) {
+		struct nvos64_parameters *a = params_buf;
+		orig_nvos64_alloc  = a->p_alloc_parms;
+		orig_nvos64_rights = a->p_rights_requested;
+		orig_nvos64_size   = a->alloc_parms_size;
+		have_nvos64_orig   = true;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && params_buf &&
+		   param_size == sizeof(struct nvos21_parameters)) {
+		orig_nvos21_alloc =
+			((struct nvos21_parameters *)params_buf)->p_alloc_parms;
+	} else if (cmd == UVM_MM_INITIALIZE && params_buf &&
+		   param_size == sizeof(struct uvm_mm_initialize_params)) {
+		orig_uvm_mm_init_fd =
+			((struct uvm_mm_initialize_params *)params_buf)->uvm_fd;
+		have_uvm_mm_init = true;
+	} else if (params_buf &&
+		   (cmd == UVM_REGISTER_GPU_VASPACE ||
+		    cmd == UVM_REGISTER_CHANNEL ||
+		    cmd == UVM_MAP_EXTERNAL_ALLOCATION)) {
+		if (param_size >= 20) {
+			orig_uvm_rm_ctrl_fd =
+				*(__u32 *)((char *)params_buf + 16);
+			have_uvm_rm_ctrl = true;
+		}
+	} else if (_IOC_NR(cmd) == NV_ESC_REGISTER_FD && params_buf &&
+		   param_size >= sizeof(struct nv_ioctl_register_fd)) {
+		orig_fe_ctl_fd =
+			((struct nv_ioctl_register_fd *)params_buf)->ctl_fd;
+		have_fe_ctl_fd = true;
+	} else if ((_IOC_NR(cmd) == NV_ESC_ALLOC_OS_EVENT ||
+		    _IOC_NR(cmd) == NV_ESC_FREE_OS_EVENT) && params_buf &&
+		   param_size >= sizeof(struct nv_ioctl_alloc_os_event)) {
+		orig_fe_os_evt_fd =
+			((struct nv_ioctl_alloc_os_event *)params_buf)->fd;
+		have_fe_os_evt_fd = true;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC_MEMORY && params_buf &&
+		   param_size >= sizeof(struct nv_ioctl_nvos02_parameters_with_fd)) {
+		orig_fe_nvos02_fd =
+			((struct nv_ioctl_nvos02_parameters_with_fd *)params_buf)->fd;
+		have_fe_nvos02_fd = true;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_MAP_MEMORY && params_buf &&
+		   param_size >= sizeof(struct nv_ioctl_nvos33_parameters_with_fd)) {
+		orig_fe_nvos33_fd =
+			((struct nv_ioctl_nvos33_parameters_with_fd *)params_buf)->fd;
+		have_fe_nvos33_fd = true;
+	}
+
+	/*
 	 * For ioctls with embedded secondary buffers: extract the secondary data
 	 * BEFORE the sanitizer zeroes the pointer fields.  We carry the data in
 	 * the aux slot so the host can reconstruct it without ever seeing a raw
@@ -747,66 +827,6 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
-	 * Save the user-space pointer fields the sanitizer is about to clear,
-	 * so we can restore them in the response before copy_to_user. CUDA
-	 * reads these back after the ioctl as a "did this struct go through
-	 * the driver?" check — they must round-trip unchanged. We don't trust
-	 * them on the way *to* the driver (the host has no access to guest
-	 * VAs), but we restore them on the way *back* to the caller.
-	 *
-	 * Diagnosed 2026-05-25 via tools/diag/nvioctl_trace: host's RM_CONTROL
-	 * keeps nvos54.params == caller's user VA across the ioctl, ours was
-	 * blanking it.
-	 */
-	u64 orig_nvos54_params = 0;       /* RM_CONTROL nvos54.params  */
-	u64 orig_nvos64_alloc  = 0;       /* RM_ALLOC nvos64.p_alloc_parms */
-	u64 orig_nvos64_rights = 0;       /* RM_ALLOC nvos64.p_rights_requested */
-	u32 orig_nvos64_size   = 0;       /* RM_ALLOC nvos64.alloc_parms_size */
-	u64 orig_nvos21_alloc  = 0;       /* RM_ALLOC nvos21.p_alloc_parms */
-	bool have_nvos64_orig  = false;
-	/* UVM ioctls with embedded fds: caller passes a guest fd that we
-	 * rewrite to a handle_id before forwarding.  CUDA reads the field back
-	 * after the ioctl and treats a non-matching value as a sanity-check
-	 * failure (manifests as cuInit returning 999 unknown error).  Save the
-	 * original value here and restore it on the response. */
-	__s32 orig_uvm_mm_init_fd = 0;
-	bool have_uvm_mm_init     = false;
-	__u32 orig_uvm_rm_ctrl_fd = 0;
-	bool have_uvm_rm_ctrl     = false;
-	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
-	    param_size == sizeof(struct nvos54_parameters)) {
-		orig_nvos54_params =
-			((struct nvos54_parameters *)params_buf)->params;
-	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && params_buf &&
-		   param_size == sizeof(struct nvos64_parameters)) {
-		struct nvos64_parameters *a = params_buf;
-		orig_nvos64_alloc  = a->p_alloc_parms;
-		orig_nvos64_rights = a->p_rights_requested;
-		orig_nvos64_size   = a->alloc_parms_size;
-		have_nvos64_orig   = true;
-	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC && params_buf &&
-		   param_size == sizeof(struct nvos21_parameters)) {
-		orig_nvos21_alloc =
-			((struct nvos21_parameters *)params_buf)->p_alloc_parms;
-	} else if (cmd == UVM_MM_INITIALIZE && params_buf &&
-		   param_size == sizeof(struct uvm_mm_initialize_params)) {
-		orig_uvm_mm_init_fd =
-			((struct uvm_mm_initialize_params *)params_buf)->uvm_fd;
-		have_uvm_mm_init = true;
-	} else if (params_buf &&
-		   (cmd == UVM_REGISTER_GPU_VASPACE ||
-		    cmd == UVM_REGISTER_CHANNEL ||
-		    cmd == UVM_MAP_EXTERNAL_ALLOCATION)) {
-		/* rm_ctrl_fd is at offset 16 in each of these structs (after the
-		 * 16-byte uuid).  See abi/uvm.h. */
-		if (param_size >= 20) {
-			orig_uvm_rm_ctrl_fd =
-				*(__u32 *)((char *)params_buf + 16);
-			have_uvm_rm_ctrl = true;
-		}
-	}
-
-	/*
 	 * Sanitize embedded pointer and FD fields before forwarding.
 	 * The sanitizer replaces guest VA pointers with slot references and
 	 * translates session-local FD tokens to their host-facing equivalents.
@@ -900,6 +920,24 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				orig_uvm_mm_init_fd;
 		} else if (have_uvm_rm_ctrl && param_size >= 20) {
 			*(__u32 *)((char *)params_buf + 16) = orig_uvm_rm_ctrl_fd;
+		} else if (have_fe_ctl_fd && _IOC_NR(cmd) == NV_ESC_REGISTER_FD &&
+			   param_size >= sizeof(struct nv_ioctl_register_fd)) {
+			((struct nv_ioctl_register_fd *)params_buf)->ctl_fd =
+				orig_fe_ctl_fd;
+		} else if (have_fe_os_evt_fd &&
+			   (_IOC_NR(cmd) == NV_ESC_ALLOC_OS_EVENT ||
+			    _IOC_NR(cmd) == NV_ESC_FREE_OS_EVENT) &&
+			   param_size >= sizeof(struct nv_ioctl_alloc_os_event)) {
+			((struct nv_ioctl_alloc_os_event *)params_buf)->fd =
+				orig_fe_os_evt_fd;
+		} else if (have_fe_nvos02_fd && _IOC_NR(cmd) == NV_ESC_RM_ALLOC_MEMORY &&
+			   param_size >= sizeof(struct nv_ioctl_nvos02_parameters_with_fd)) {
+			((struct nv_ioctl_nvos02_parameters_with_fd *)params_buf)->fd =
+				orig_fe_nvos02_fd;
+		} else if (have_fe_nvos33_fd && _IOC_NR(cmd) == NV_ESC_RM_MAP_MEMORY &&
+			   param_size >= sizeof(struct nv_ioctl_nvos33_parameters_with_fd)) {
+			((struct nv_ioctl_nvos33_parameters_with_fd *)params_buf)->fd =
+				orig_fe_nvos33_fd;
 		}
 	}
 
