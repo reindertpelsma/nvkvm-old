@@ -282,8 +282,18 @@ int nvkvm_req_create_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	/* Record isolate_id in session */
+	/*
+	 * Find-or-create the QEMU-side session. The legacy NVKVM_REQ_OPEN
+	 * used to create it as a side effect of the first device open; in
+	 * the new flow CREATE_ISOLATE is the first request the guest sends
+	 * for a fresh session, so we own the creation here.
+	 */
+	pthread_mutex_lock(&nv->sessions_lock);
 	struct nvkvm_session *session = nvkvm_session_find(nv, req->session_id);
+	pthread_mutex_unlock(&nv->sessions_lock);
+	if (!session)
+		session = nvkvm_session_create(nv, req->session_id);
+
 	if (session) {
 		pthread_mutex_lock(&session->lock);
 		if (session->nisolates < 256)

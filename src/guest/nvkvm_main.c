@@ -234,7 +234,6 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 static int nvkvm_open(struct inode *inode, struct file *filp)
 {
 	struct nvkvm_fd_ctx *ctx;
-	struct nvkvm_resp_open resp;
 	int dev_id;
 	int ret;
 
@@ -274,59 +273,34 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	INIT_LIST_HEAD(&ctx->cpu_pages);
 
 	/*
-	 * Legacy open — kept for compat; gives us fd_token for the old ioctl path.
-	 * Will be removed once all callers use the isolate path.
-	 */
-	ret = nvkvm_virtio_open(dev_id, filp->f_flags,
-				(unsigned int)ctx->session->id, &resp);
-	if (ret) {
-		nvkvm_session_put(ctx->session);
-		kfree(ctx);
-		return ret;
-	}
-	if (resp.status) {
-		nvkvm_session_put(ctx->session);
-		kfree(ctx);
-		return -(int)resp.status;
-	}
-	ctx->fd_token = resp.fd_token;
-
-	/*
-	 * Isolate path: the stub now opens /dev/nvidia* in its own process
-	 * (correct nvfp/mm lineage) and ships the fd back via SCM_RIGHTS in
-	 * the OPEN_NVIDIA_HANDLE reply. The isolate must therefore exist
-	 * before the open. UVM still opens in QEMU; for it the order doesn't
-	 * matter but we keep one path for simplicity.
+	 * Open flow: spawn the isolate (creates the QEMU-side session as
+	 * a side effect) and then open the device via the stub so its
+	 * nvfp/mm lineage is the isolate process.
 	 */
 	{
 		__u32 handle_id = 0;
 
 		ret = nvkvm_ensure_isolate(ctx->session);
 		if (ret) {
-			pr_warn("nvkvm: create_isolate failed %d, using legacy\n",
-				ret);
-			goto done;
+			nvkvm_session_put(ctx->session);
+			kfree(ctx);
+			return ret;
 		}
 
 		ret = nvkvm_virtio_open_nvidia_handle(dev_id, filp->f_flags,
 						      (unsigned int)ctx->session->id,
 						      &handle_id);
 		if (ret) {
-			pr_warn("nvkvm: open_nvidia_handle failed %d, using legacy\n",
-				ret);
-			goto done;
+			nvkvm_session_put(ctx->session);
+			kfree(ctx);
+			return ret;
 		}
 		ctx->handle_id = handle_id;
-		/*
-		 * No COPY_HANDLE_TO_ISOLATE: the open response already
-		 * placed the fd in both the stub and QEMU's qemu_fd slot.
-		 */
 	}
 
-done:
 	filp->private_data = ctx;
-	pr_debug("nvkvm: opened dev_id=%d fd_token=%u handle_id=%u isolate_id=%u tgid=%d\n",
-		 dev_id, ctx->fd_token, ctx->handle_id,
+	pr_debug("nvkvm: opened dev_id=%d handle_id=%u isolate_id=%u tgid=%d\n",
+		 dev_id, ctx->handle_id,
 		 ctx->session->isolate_id, current->tgid);
 	return 0;
 }
@@ -334,12 +308,10 @@ done:
 static int nvkvm_release(struct inode *inode, struct file *filp)
 {
 	struct nvkvm_fd_ctx *ctx = filp->private_data;
-	struct nvkvm_resp_close resp;
 
 	if (!ctx)
 		return 0;
 
-	/* New path: release handle from isolate before closing it */
 	if (ctx->handle_id && ctx->session->isolate_id)
 		nvkvm_virtio_close_handle_on_isolate(ctx->handle_id,
 						     ctx->session->isolate_id);
@@ -347,10 +319,6 @@ static int nvkvm_release(struct inode *inode, struct file *filp)
 		nvkvm_virtio_close_handle(ctx->handle_id);
 		ctx->handle_id = 0;
 	}
-
-	/* Legacy close */
-	if (ctx->fd_token)
-		nvkvm_virtio_close(ctx->fd_token, &resp);
 
 	/* Tear down any CPU page migrations for this fd */
 	nvkvm_cpu_pages_free(ctx);

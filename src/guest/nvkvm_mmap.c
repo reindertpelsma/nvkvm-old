@@ -153,9 +153,6 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 {
 	unsigned long vma_len = vma->vm_end - vma->vm_start;
-	unsigned long gpa_base;
-	struct nvkvm_mmap_region *region;
-	int ret;
 
 	/* Basic validation: size must be page-aligned and non-zero */
 	if (!vma_len || (vma_len & ~PAGE_MASK))
@@ -163,110 +160,14 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	if (vma_len > SZ_1G)
 		return -EINVAL;
 
-	/* Prefer the new isolate path when available */
-	if (ctx->handle_id && ctx->session->isolate_id)
-		return nvkvm_mmap_request_isolate(ctx, vma);
+	/*
+	 * Open establishes ctx->handle_id and ctx->session->isolate_id; mmap
+	 * with either missing is a logic bug, not a fallback.
+	 */
+	if (!ctx->handle_id || !ctx->session->isolate_id)
+		return -EBADF;
 
-	/* ── Legacy path ─────────────────────────────────────────────────── */
-	struct {
-		struct nvkvm_hdr      hdr;
-		struct nvkvm_req_mmap req;
-	} *msg;
-	struct nvkvm_inflight *inf;
-	struct nvkvm_resp_mmap resp;
-	__u32 txn_id = atomic_inc_return(&nvkvm.next_txn_id);
-
-	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
-	inf = kzalloc(sizeof(*inf), GFP_KERNEL);
-	if (!inf) {
-		kfree(msg);
-		return -ENOMEM;
-	}
-	init_completion(&inf->done);
-	inf->txn_id = txn_id;
-
-	msg->hdr.type     = cpu_to_le32(NVKVM_REQ_MMAP);
-	msg->hdr.txn_id   = cpu_to_le32(txn_id);
-	msg->req.fd_token = cpu_to_le32(ctx->fd_token);
-	msg->req.prot     = cpu_to_le32(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC));
-	msg->req.flags    = cpu_to_le32(vma->vm_flags & (VM_SHARED | VM_MAYSHARE));
-	msg->req.offset   = cpu_to_le64((u64)vma->vm_pgoff << PAGE_SHIFT);
-	msg->req.length   = cpu_to_le64(vma_len);
-
-	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
-	if (ret)
-		goto out_msg;
-
-	resp.status   = inf->status;
-	resp.gpa_base = inf->retval;
-
-	if (resp.status) {
-		ret = -(int)resp.status;
-		goto out_msg;
-	}
-
-	gpa_base = (unsigned long)resp.gpa_base;
-
-	if (!nvkvm_gpa_in_mmap_window(gpa_base, vma_len)) {
-		pr_warn("nvkvm: host returned GPA %lx outside mmap window\n",
-			gpa_base);
-		ret = -EIO;
-		goto out_unmap_legacy;
-	}
-
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-
-	ret = remap_pfn_range(vma, vma->vm_start, gpa_base >> PAGE_SHIFT,
-			      vma_len, vma->vm_page_prot);
-	if (ret)
-		goto out_unmap_legacy;
-
-	region = kzalloc(sizeof(*region), GFP_KERNEL);
-	if (!region)
-		goto out_msg;
-
-	region->mmap_token = resp.mmap_token;
-	region->gpa_base   = gpa_base;
-	region->length     = vma_len;
-	region->offset     = (u64)vma->vm_pgoff << PAGE_SHIFT;
-	region->vma        = vma;
-
-	spin_lock(&ctx->mmap_lock);
-	list_add_tail(&region->list, &ctx->mmap_regions);
-	spin_unlock(&ctx->mmap_lock);
-
-	vma->vm_ops          = &nvkvm_vm_ops;
-	vma->vm_private_data = region;
-
-	kfree(inf);
-	kfree(msg);
-	return 0;
-
-out_unmap_legacy: {
-		struct {
-			struct nvkvm_hdr        hdr;
-			struct nvkvm_req_munmap req;
-		} *umsg;
-		struct nvkvm_inflight uinf;
-		umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
-		if (umsg) {
-			umsg->hdr.type    = cpu_to_le32(NVKVM_REQ_MUNMAP);
-			umsg->hdr.txn_id  = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_txn_id));
-			umsg->req.mmap_token = cpu_to_le32(resp.mmap_token);
-			init_completion(&uinf.done);
-			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
-			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
-			kfree(umsg);
-		}
-	}
-out_msg:
-	kfree(inf);
-	kfree(msg);
-	return ret;
+	return nvkvm_mmap_request_isolate(ctx, vma);
 }
 
 /*
@@ -540,34 +441,18 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 			} *umsg;
 			struct nvkvm_inflight uinf;
 			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
-			if (!umsg) goto next;
-			umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
-			umsg->hdr.txn_id     = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_txn_id));
-			umsg->req.isolate_id = cpu_to_le32(isolate_id);
-			umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
-			init_completion(&uinf.done);
-			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
-			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
-			kfree(umsg);
-		} else {
-			struct {
-				struct nvkvm_hdr        hdr;
-				struct nvkvm_req_munmap req;
-			} *umsg;
-			struct nvkvm_inflight uinf;
-			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
-			if (!umsg) goto next;
-			umsg->hdr.type    = cpu_to_le32(NVKVM_REQ_MUNMAP);
-			umsg->hdr.txn_id  = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_txn_id));
-			umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
-			init_completion(&uinf.done);
-			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
-			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
-			kfree(umsg);
+			if (umsg) {
+				umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
+				umsg->hdr.txn_id     = cpu_to_le32(
+						atomic_inc_return(&nvkvm.next_txn_id));
+				umsg->req.isolate_id = cpu_to_le32(isolate_id);
+				umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
+				init_completion(&uinf.done);
+				uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
+				nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
+				kfree(umsg);
+			}
 		}
-next:
 		list_del(&region->list);
 		kfree(region);
 	}
