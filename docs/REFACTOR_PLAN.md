@@ -593,6 +593,30 @@ guest in the NO-dedupe run is the smoking gun. The 401 in the
 NO-dedupe path goes through ~ 2000 retries; somewhere early one
 ioctl is getting wrong data that libcuda then thrashes against.
 
+Use `tools/diag/diff_traces_semantic.py` (added this session). It
+masks nvfp/VA noise and surfaces the actual semantic diffs.
+
+Already-surfaced finding to track down next session:
+**block 26 RM_ALLOC NV01_DEVICE_0**: paramsSize at offset 32 is 0
+in host POST, 0x38=56 in guest POST — the restore at
+nvkvm_main.c:881 (`a->alloc_parms_size = orig_nvos64_size`) is
+supposed to set this back to libcuda's original 0, but isn't
+taking effect. Either `have_nvos64_orig` isn't being set
+(check the save block at lines 770-776), or the restore branch
+is being skipped due to `ret` not matching, or copy_to_user is
+not propagating. A printk in the restore branch is the next move.
+
+If the restore IS taking effect on the guest module side, then
+the byte at offset 32 must be getting written by something
+downstream (QEMU or stub). But that's unlikely — the response
+flow doesn't touch this field after the kernel ioctl returns.
+
+Suspect this is the same root cause as the original 401 — a
+field libcuda passed as 0, we overrode for the kernel, but
+failed to restore on the response → libcuda reads its own field
+back as our value, decides something is wrong, takes a wrong
+code path.
+
 ### Architectural lesson learned
 
 When the symptom is "kernel returns NV_OK but the side-effect doesn't
