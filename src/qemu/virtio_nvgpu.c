@@ -38,8 +38,13 @@
 #include "virtio_nvgpu.h"
 #include <dirent.h>
 
-/* ── Device node paths on the host ──────────────────────────────────────── */
-
+/*
+ * host_dev_path was used by the legacy handle_open() that opened
+ * /dev/nvidia* in QEMU's process. Step 3 moved opens to the stub.
+ * nvkvm_handle_open_nvidia() in nvkvm_handle.c has its own path table.
+ * Kept under #if 0 with the rest of the legacy handlers as a tombstone.
+ */
+#if 0
 static const char *host_dev_path(int dev_id)
 {
 	static char buf[32];
@@ -50,6 +55,7 @@ static const char *host_dev_path(int dev_id)
 	snprintf(buf, sizeof(buf), "/dev/nvidia%d", dev_id - 16);
 	return buf;
 }
+#endif
 
 /* ── Session management ──────────────────────────────────────────────────── */
 
@@ -126,6 +132,14 @@ static void *slot_ptr(VirtIONvgpu *nv, uint32_t slot)
 {
 	return (char *)nv->shm_base + (size_t)slot * nv->slot_size;
 }
+
+/*
+ * Legacy NVKVM_REQ_OPEN / _CLOSE / _IOCTL / _MMAP / _MUNMAP request handlers.
+ * These are dead code as of Step 3d.1 (guest module no longer sends these
+ * request types). Kept under #if 0 as a tombstone until Step 3d.3 deletes
+ * them along with the underlying nvkvm_host_fd / session->fds machinery.
+ */
+#if 0
 
 /* ── OPEN request handler ─────────────────────────────────────────────────── */
 
@@ -477,6 +491,7 @@ send:
 	virtqueue_push(vq, elem, sizeof(resp_msg));
 	virtio_notify(VIRTIO_DEVICE(nv), vq);
 }
+#endif /* legacy NVKVM_REQ_OPEN/CLOSE/IOCTL/MMAP/MUNMAP handlers */
 
 /* ── VQ_TX callback ──────────────────────────────────────────────────────── */
 
@@ -499,41 +514,6 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 		}
 
 		switch (le32_to_cpu(hdr.type)) {
-		case NVKVM_REQ_OPEN: {
-			struct nvkvm_req_open req;
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			handle_open(nv, vq, elem, &hdr, &req);
-			break;
-		}
-		case NVKVM_REQ_CLOSE: {
-			struct nvkvm_req_close req;
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			handle_close(nv, vq, elem, &hdr, &req);
-			break;
-		}
-		case NVKVM_REQ_IOCTL: {
-			struct nvkvm_req_ioctl req;
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			handle_ioctl(nv, vq, elem, &hdr, &req);
-			break;
-		}
-		case NVKVM_REQ_MMAP: {
-			struct nvkvm_req_mmap req;
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			handle_mmap(nv, vq, elem, &hdr, &req);
-			break;
-		}
-		case NVKVM_REQ_MUNMAP: {
-			struct nvkvm_req_munmap req;
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			handle_munmap(nv, vq, elem, &hdr, &req);
-			break;
-		}
 
 		/* ── Isolate/handle request types ────────────────────────────────── */
 
