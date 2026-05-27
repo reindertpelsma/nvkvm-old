@@ -465,6 +465,26 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		have_fe_nvos33_fd = true;
 	}
 
+	/* NVOS56 UPDATE_DEVICE_MAPPING_INFO: the kernel uses pOldCpuAddress
+	 * as a lookup key on the host driver's CpuMapping table for the
+	 * calling process.  Because our stub mmaps the BAR at its own VAs
+	 * (which the kernel registered), and libcuda passes its guest-side
+	 * VAs (which the stub never had), the lookup ALWAYS fails on this
+	 * path and the kernel returns NV_ERR_OBJECT_NOT_FOUND (0x57).  The
+	 * mapping still works because we install the BAR pages into the
+	 * guest's GPA window via QEMU, so this ioctl is effectively
+	 * informational.  We save the caller's values so we can fake
+	 * success on the response path. */
+	__u64 orig_nvos56_old = 0, orig_nvos56_new = 0;
+	bool fake_nvos56_ok = false;
+	if (_IOC_NR(cmd) == NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO && params_buf &&
+	    param_size == sizeof(struct nvos56_parameters)) {
+		struct nvos56_parameters *p = params_buf;
+		orig_nvos56_old = p->p_old_cpu_address;
+		orig_nvos56_new = p->p_new_cpu_address;
+		fake_nvos56_ok  = true;
+	}
+
 	/*
 	 * For ioctls with embedded secondary buffers: extract the secondary data
 	 * BEFORE the sanitizer zeroes the pointer fields.  We carry the data in
@@ -938,6 +958,16 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			   param_size >= sizeof(struct nv_ioctl_nvos33_parameters_with_fd)) {
 			((struct nv_ioctl_nvos33_parameters_with_fd *)params_buf)->fd =
 				orig_fe_nvos33_fd;
+		} else if (fake_nvos56_ok &&
+			   _IOC_NR(cmd) == NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO &&
+			   param_size == sizeof(struct nvos56_parameters)) {
+			struct nvos56_parameters *p = params_buf;
+			/* Restore caller's pointer values so libcuda sees them
+			 * unchanged across the ioctl, and force status=NV_OK
+			 * to mask the kernel's unavoidable OBJECT_NOT_FOUND. */
+			p->p_old_cpu_address = orig_nvos56_old;
+			p->p_new_cpu_address = orig_nvos56_new;
+			p->status = 0;
 		}
 	}
 
