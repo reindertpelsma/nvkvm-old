@@ -198,26 +198,6 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
  * secondary buffer in the aux slot before this call; here we just zero the
  * pointer. The host will reconstruct it from the aux slot.
  */
-/* Helper: translate a guest fd to its fd_token. Returns -EBADF on error. */
-static __s32 guest_fd_to_token(int guest_fd)
-{
-	struct file *f = fget(guest_fd);
-	__s32 token;
-
-	if (!f)
-		return -EBADF;
-	{
-		struct nvkvm_fd_ctx *other = f->private_data;
-		if (!other) {
-			fput(f);
-			return -EBADF;
-		}
-		token = (__s32)other->fd_token;
-	}
-	fput(f);
-	return token;
-}
-
 /*
  * Helper: translate a guest fd to its QEMU-side handle_id.  Returns -EBADF on
  * error or 0 if the fd has no associated isolate-side handle.  Used for UVM
@@ -339,25 +319,18 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 
 	case NV_ESC_RM_ALLOC_MEMORY: {
 		struct nv_ioctl_nvos02_parameters_with_fd *p = buf;
-		p->p_memory = 0;             /* host fills this in        */
+		p->p_memory = 0;             /* host fills this in */
 		/*
-		 * p->fd is a guest fd token; translate to host fd_token.
-		 * A value of -1 means "no fd" and passes through unchanged.
+		 * Embedded fd is the handle_id of the target /dev/nvidia*
+		 * object; the stub translates handle_id → its local fd
+		 * before calling the kernel. -1 means "no fd" and passes
+		 * through unchanged.
 		 */
 		if (p->fd >= 0) {
-			struct file *f = fget(p->fd);
-			if (!f)
+			__s32 hid = guest_fd_to_handle_id(p->fd);
+			if (hid < 0)
 				return -EBADF;
-			{
-				struct nvkvm_fd_ctx *other =
-					f->private_data;
-				if (!other) {
-					fput(f);
-					return -EBADF;
-				}
-				p->fd = (__s32)other->fd_token;
-			}
-			fput(f);
+			p->fd = hid;
 		}
 		break;
 	}
@@ -418,21 +391,21 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 	}
 
 	case NV_ESC_REGISTER_FD: {
+		/*
+		 * REGISTER_FD's ctl_fd field becomes the handle_id of the
+		 * nvidiactl handle this gpu fd should reference; the stub
+		 * resolves handle_id → its local nvidiactl fd before the
+		 * driver sees it. The ioctl itself now runs in the stub
+		 * (not in QEMU) so the calling task's nvfp matches the
+		 * stub-allocated pClient — required by rmclientValidate
+		 * on the open driver.
+		 */
 		struct nv_ioctl_register_fd *p = buf;
 		if (p->ctl_fd >= 0) {
-			struct file *f = fget(p->ctl_fd);
-			if (!f)
+			__s32 hid = guest_fd_to_handle_id(p->ctl_fd);
+			if (hid < 0)
 				return -EBADF;
-			{
-				struct nvkvm_fd_ctx *other =
-					f->private_data;
-				if (!other) {
-					fput(f);
-					return -EBADF;
-				}
-				p->ctl_fd = (__s32)other->fd_token;
-			}
-			fput(f);
+			p->ctl_fd = hid;
 		}
 		break;
 	}

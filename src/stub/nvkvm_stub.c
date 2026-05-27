@@ -589,6 +589,11 @@ static void *worker_thread(void *arg)
 				fe_embedded_fd_off = 8;
 				fe_has_embedded_fd = 1;
 				break;
+			case 0xc9:  /* NV_ESC_REGISTER_FD */
+				/* struct { __s32 ctl_fd; } — fd at offset 0. */
+				fe_embedded_fd_off = 0;
+				fe_has_embedded_fd = 1;
+				break;
 			}
 		}
 		if (fe_has_embedded_fd &&

@@ -316,12 +316,13 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	case NV_ESC_RM_MAP_MEMORY: {
 		struct nv_ioctl_nvos33_parameters_with_fd *p = ctx->params_buf;
 		int ret;
-		/* Translate fd_token back to host fd */
+		/* Translate handle_id → host fd */
 		if (p->fd >= 0) {
-			struct nvkvm_host_fd *hfd2 =
-				nvkvm_fd_lookup(ctx->session, (uint32_t)p->fd);
-			if (!hfd2) return -EBADF;
-			p->fd = (int32_t)hfd2->fd;
+			struct nvkvm_handle *h =
+				nvkvm_handle_get(&ctx->nv->handles,
+						 (uint32_t)p->fd);
+			if (!h || h->fd < 0) return -EBADF;
+			p->fd = (int32_t)h->fd;
 		}
 		ret = nvkvm_handle_simple_ioctl(ctx, cmd);
 		p->p_linear_address = 0;  /* guest must not use host VA */
@@ -334,10 +335,11 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		struct nv_ioctl_nvos02_parameters_with_fd *p = ctx->params_buf;
 		int ret;
 		if (p->fd >= 0) {
-			struct nvkvm_host_fd *hfd2 =
-				nvkvm_fd_lookup(ctx->session, (uint32_t)p->fd);
-			if (!hfd2) return -EBADF;
-			p->fd = (int32_t)hfd2->fd;
+			struct nvkvm_handle *h =
+				nvkvm_handle_get(&ctx->nv->handles,
+						 (uint32_t)p->fd);
+			if (!h || h->fd < 0) return -EBADF;
+			p->fd = (int32_t)h->fd;
 		}
 		ret = nvkvm_handle_simple_ioctl(ctx, cmd);
 		p->p_memory = 0;
