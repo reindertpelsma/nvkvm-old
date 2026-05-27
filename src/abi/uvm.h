@@ -265,12 +265,20 @@ struct uvm_pageable_mem_access_on_gpu_params {
 	__u32 rm_status;           /* OUT */
 };
 
+/* UVM_ALLOC_SEMAPHORE_POOL_PARAMS — real size is 9248 bytes.  The
+ * earlier definition missed the per_gpu_attributes[UVM_MAX_GPUS_V2]
+ * array (256 entries * 36 bytes = 9216 bytes), so our forwarding sent
+ * a 32-byte buffer to the kernel.  The kernel reads sizeof(struct) =
+ * 9248 bytes from that buffer, runs past the page, returns -EFAULT.
+ * Diagnosed 2026-05-28 in the downstream cuCtxCreate=1 chain after
+ * the DMA-COPY engineType fix. */
 struct uvm_alloc_semaphore_pool_params {
 	__u64 base;
 	__u64 length;
+	struct uvm_gpu_mapping_attributes per_gpu_attributes[UVM_MAX_GPUS_V2];
 	__u64 gpu_attributes_count;
 	__u32 rm_status;
-	__u32 reserved;
+	__u32 _pad0;
 };
 
 #endif /* NVKVM_UVM_H */
