@@ -128,6 +128,25 @@ static long stub_recvmsg(int fd, struct msghdr *m, int fl)
 	return syscall(SYS_recvmsg, fd, m, fl);
 }
 
+static long stub_sendmsg(int fd, const struct msghdr *m, int fl)
+{
+	return syscall(SYS_sendmsg, fd, m, fl);
+}
+
+static long stub_openat(int dfd, const char *path, int flags)
+{
+	return syscall(SYS_openat, dfd, path, flags);
+}
+
+#ifndef SYS_eventfd2
+#define SYS_eventfd2 290   /* x86-64 */
+#endif
+
+static int stub_eventfd2(unsigned int initval, int flags)
+{
+	return (int)syscall(SYS_eventfd2, initval, flags);
+}
+
 static long stub_ioctl(int fd, unsigned long req, void *arg)
 {
 	return syscall(SYS_ioctl, fd, req, arg);
@@ -857,6 +876,120 @@ static void *blob_alloc(size_t size)
 
 /* ── Command handlers (reader thread) ───────────────────────────────────── */
 
+/*
+ * dev_id values match nvkvm_proto.h (NVKVM_DEV_CTL=0, NVKVM_DEV_UVM=1,
+ * NVKVM_DEV_GPU(n)=16+n, NVKVM_DEV_EVENTFD=0xFF). UVM is opened by QEMU and
+ * never reaches OPEN_DEVICE — the stub also has its own UVM pool for the
+ * file-owner-mm dance (see uvm_local_fds).
+ */
+static int dev_id_to_path(uint32_t dev_id, char *buf, size_t buflen)
+{
+	if (dev_id == 0) {              /* NVKVM_DEV_CTL */
+		if (buflen < sizeof("/dev/nvidiactl")) return -1;
+		__builtin_memcpy(buf, "/dev/nvidiactl", sizeof("/dev/nvidiactl"));
+		return 0;
+	}
+	if (dev_id >= 16 && dev_id < 16 + 16) {
+		unsigned n = dev_id - 16;
+		/* "/dev/nvidia" + up to 2 digits + NUL = 14 bytes */
+		if (buflen < 16) return -1;
+		__builtin_memcpy(buf, "/dev/nvidia", 11);
+		if (n < 10) {
+			buf[11] = '0' + (char)n;
+			buf[12] = 0;
+		} else {
+			buf[11] = '0' + (char)(n / 10);
+			buf[12] = '0' + (char)(n % 10);
+			buf[13] = 0;
+		}
+		return 0;
+	}
+	return -1;
+}
+
+/*
+ * Send an OPEN_DEVICE response. On success the opened fd is attached via
+ * SCM_RIGHTS in the same sendmsg as the response struct — QEMU's recvmsg
+ * picks both up atomically and there's no window where the fd exists in
+ * the stub but not in QEMU. On failure (retval != 0) no ancillary data
+ * is attached and the stub holds nothing.
+ */
+static int send_open_device_resp(uint32_t txn_id, int retval, int fd)
+{
+	struct isolate_resp_open_device resp = {
+		.type   = ISOLATE_RESP_OPEN_DEVICE,
+		.txn_id = txn_id,
+		.retval = retval,
+	};
+	struct iovec iov = { &resp, sizeof(resp) };
+	char cmsg_buf[CMSG_SPACE(sizeof(int))];
+	struct msghdr msg_hdr = {
+		.msg_iov     = &iov,
+		.msg_iovlen  = 1,
+	};
+	if (retval == 0 && fd >= 0) {
+		msg_hdr.msg_control    = cmsg_buf;
+		msg_hdr.msg_controllen = sizeof(cmsg_buf);
+		struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type  = SCM_RIGHTS;
+		cm->cmsg_len   = CMSG_LEN(sizeof(int));
+		__builtin_memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+		msg_hdr.msg_controllen = cm->cmsg_len;
+	}
+	pthread_mutex_lock(&write_mutex);
+	long r = stub_sendmsg(SOCK_FD, &msg_hdr, 0);
+	pthread_mutex_unlock(&write_mutex);
+	return r < 0 ? -1 : 0;
+}
+
+static void handle_open_device(struct isolate_cmd_open_device *cmd)
+{
+	int fd;
+
+	if (cmd->dev_id == 0xFF) {       /* NVKVM_DEV_EVENTFD */
+		/* EFD_NONBLOCK | EFD_CLOEXEC = 0x800 | 0x80000 */
+		fd = stub_eventfd2(0, /* EFD_NONBLOCK */ 0x800 |
+				   /* EFD_CLOEXEC */ 0x80000);
+	} else if (cmd->dev_id == 1) {   /* NVKVM_DEV_UVM */
+		/* UVM never goes through this path — QEMU opens UVM. */
+		send_open_device_resp(cmd->txn_id, -EINVAL, -1);
+		return;
+	} else {
+		char path[24];
+		if (dev_id_to_path(cmd->dev_id, path, sizeof(path)) < 0) {
+			send_open_device_resp(cmd->txn_id, -EINVAL, -1);
+			return;
+		}
+		fd = (int)stub_openat(AT_FDCWD, path,
+				      (int)cmd->flags | O_CLOEXEC);
+	}
+
+	if (fd < 0) {
+		send_open_device_resp(cmd->txn_id, -errno, -1);
+		return;
+	}
+
+	pthread_mutex_lock(&fd_mutex);
+	if (cmd->handle_id < MAX_HANDLES &&
+	    handle_fds[cmd->handle_id] >= 0) {
+		/* QEMU reused an id we already had. Close the prior holder
+		 * before overwriting — same defensive policy as RECEIVE_FD. */
+		stub_close(handle_fds[cmd->handle_id]);
+	}
+	handle_store(cmd->handle_id, fd);
+	pthread_mutex_unlock(&fd_mutex);
+
+	if (send_open_device_resp(cmd->txn_id, 0, fd) < 0) {
+		/* sendmsg failure: QEMU socket gone. The fd has been stored
+		 * locally but the SCM copy never made it; clean up so we
+		 * don't leak. Caller (reader loop) will tear down anyway. */
+		pthread_mutex_lock(&fd_mutex);
+		handle_remove(cmd->handle_id);
+		pthread_mutex_unlock(&fd_mutex);
+	}
+}
+
 static void handle_close_fd(uint32_t handle_id)
 {
 	pthread_mutex_lock(&fd_mutex);
@@ -990,6 +1123,8 @@ static long apply_seccomp(void)
 	ALLOW_IF(SYS_madvise);
 	ALLOW_IF(SYS_lseek);
 	ALLOW_IF(SYS_pread64);
+	ALLOW_IF(SYS_openat);
+	ALLOW_IF(SYS_eventfd2);
 
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
 
@@ -1100,6 +1235,7 @@ int main(void)
 			struct isolate_cmd_munmap           munmap_cmd;
 			struct isolate_cmd_poll             poll_cmd;
 			struct isolate_cmd_unpoll           unpoll_cmd;
+			struct isolate_cmd_open_device      open_dev;
 		} cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
@@ -1171,6 +1307,9 @@ int main(void)
 		case ISOLATE_CMD_UNPOLL:
 			(void)cmd.unpoll_cmd;
 			send_ok();
+			break;
+		case ISOLATE_CMD_OPEN_DEVICE:
+			handle_open_device(&cmd.open_dev);
 			break;
 		case ISOLATE_CMD_EXIT:
 			goto done;

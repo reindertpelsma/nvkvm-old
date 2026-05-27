@@ -28,6 +28,7 @@
 #define ISOLATE_CMD_POLL         6   /* fd + events; start background poll   */
 #define ISOLATE_CMD_UNPOLL       7   /* fd; stop background poll             */
 #define ISOLATE_CMD_EXIT         8   /* clean shutdown                       */
+#define ISOLATE_CMD_OPEN_DEVICE  9   /* stub opens /dev/nvidia*, replies w/ SCM_RIGHTS fd */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -36,6 +37,7 @@
 #define ISOLATE_RESP_IOCTL       0x12  /* ioctl result + optional data       */
 #define ISOLATE_RESP_MMAP        0x13  /* mmap result                        */
 #define ISOLATE_RESP_POLL_EVENT  0x14  /* async: fd became ready             */
+#define ISOLATE_RESP_OPEN_DEVICE 0x15  /* open result + fd via SCM_RIGHTS    */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -148,6 +150,39 @@ struct isolate_resp_error {
 struct isolate_cmd_exit {
 	uint32_t type;        /* ISOLATE_CMD_EXIT */
 	uint32_t reserved;
+};
+
+/* ── OPEN_DEVICE ─────────────────────────────────────────────────────────── */
+
+/*
+ * QEMU asks the stub to open /dev/nvidia* (or eventfd) so the file's nvfp/mm
+ * lineage matches the calling isolate process. The stub stores the fd under
+ * handle_id and replies with a SCM_RIGHTS-attached copy of the fd in the
+ * same sendmsg — QEMU then attaches that copy as the qemu_fd in its handle
+ * table, satisfying invariant "QEMU always holds a copy of every stub-opened
+ * fd via SCM_RIGHTS" (REFACTOR_PLAN §1, rule 5).
+ *
+ * dev_id values come from nvkvm_proto.h:
+ *   NVKVM_DEV_CTL (0)      → /dev/nvidiactl
+ *   NVKVM_DEV_GPU(n) (16+n)→ /dev/nvidia<n>
+ *   NVKVM_DEV_EVENTFD (0xFF) → eventfd2(0, EFD_NONBLOCK | EFD_CLOEXEC)
+ * /dev/nvidia-uvm and memfds are opened by QEMU, not via this command.
+ */
+struct isolate_cmd_open_device {
+	uint32_t type;        /* ISOLATE_CMD_OPEN_DEVICE */
+	uint32_t handle_id;   /* QEMU-assigned; stub stores fd under this id */
+	uint32_t dev_id;      /* NVKVM_DEV_CTL / NVKVM_DEV_GPU(n) / EVENTFD */
+	uint32_t flags;       /* O_RDWR etc; ignored for eventfd            */
+	uint32_t txn_id;      /* echoed in response                         */
+	uint32_t reserved;
+};
+
+struct isolate_resp_open_device {
+	uint32_t type;        /* ISOLATE_RESP_OPEN_DEVICE */
+	uint32_t txn_id;      /* echoed from command                        */
+	int32_t  retval;      /* 0 on success; -errno on failure (no SCM)   */
+	uint32_t reserved;
+	/* On success: one fd attached via SCM_RIGHTS in the same sendmsg.  */
 };
 
 #endif /* NVKVM_ISOLATE_PROTO_H */
