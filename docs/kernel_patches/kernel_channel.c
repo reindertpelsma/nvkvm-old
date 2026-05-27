@@ -2852,6 +2852,15 @@ NV_STATUS kchannelBindToRunlist_IMPL
     pGpu = GPU_RES_GET_GPU(pKernelChannel);
     pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
 
+    NV_PRINTF(LEVEL_ERROR,
+              "NVKVM_BINDRL: pid=%d hCh=0x%x localRmEngineType=%d engineDesc=0x%x prevRunlistId=%u kchEngineType=%d\n",
+              osGetCurrentProcess(),
+              kchannelGetDebugTag(pKernelChannel),
+              localRmEngineType,
+              engineDesc,
+              kchannelGetRunlistId(pKernelChannel),
+              pKernelChannel->engineType);
+
     // copied from setRunlistIdByEngineType
     if ((engineDesc == ENG_SW) || (engineDesc == ENG_BUS))
     {
