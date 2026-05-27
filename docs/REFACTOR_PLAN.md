@@ -541,26 +541,57 @@ the upstream RM_CONTROL whose response libcuda inspected to decide
 to skip the per-channel preemption-mode setup → fix the propagation
 of that response value.
 
-### Pre-existing latent issue: multiple nvidiactl opens
+### Pre-existing latent issue: multiple nvidiactl opens — experiment results
 
 libcuda opens `/dev/nvidiactl` multiple times within a single process.
 Each guest open in the current architecture becomes a fresh
 `open("/dev/nvidiactl")` in the stub — distinct struct files,
-distinct nvfps. libcuda is *mostly* careful to use the same fd for
-ops on a given pClient, but not 100%. This is plausibly why we see
-`UVM_UNREGISTER_CHANNEL` returning `NV_ERR_INSUFFICIENT_RESOURCES`
-on the first 4 attempts before succeeding.
+distinct nvfps.
 
-The **clean fix** (do NOT bring back the dup() hack): when the
-guest module asks for an nvidiactl handle in a session that already
-has one, return the SAME `handle_id` — so libcuda's multiple guest
-fds all point at the same stub-side struct file. Different
-fd_token (= different guest fds), same handle_id, same nvfp,
-robust strict-validate matching. The dedupe is at the handle_id
-allocation layer based on `(session_id, dev_id)`, not via dup().
+**Experiment (commit c5cb2bc, on branch `nvkvm-tables-refactor`)**: Added
+`nvkvm_handle_dedupe_ctl` so a second nvidiactl open in the same session
+returns the same `handle_id` with `guest_refcount++`. Multiple guest
+fds → one underlying stub struct file → one nvfp → strict-validate
+trivially matches across libcuda's repeated opens.
+
+**Empirical result**: cuCtxCreate failure changed from CUDA_ERROR_
+ILLEGAL_STATE (401) to CUDA_ERROR_ALREADY_ACQUIRED (210). RM_MAP_MEMORY
+at block 117 of the trace returns NV_ERR_STATE_IN_USE (0x63).
+
+**Root cause of the new failure**: `alloc_free.c:825` returns
+NV_ERR_STATE_IN_USE when a "single-instance" resource class (one
+allowed under a given parent) is already present. With dedupe,
+libcuda's two logical "client trees" collapse into one — when libcuda
+tries to add a second instance via what it thinks is a fresh fd, the
+kernel says "already there". So **dedupe is over-merging at the kernel
+state level**.
+
+**Trade-off** (both currently broken):
+- WITHOUT dedupe: 401 ILLEGAL_STATE, 2253 ioctls in trace, libcuda
+  retries many times then gives up.
+- WITH dedupe: 210 ALREADY_ACQUIRED, 871 ioctls in trace, libcuda
+  fails immediately on a specific kernel error.
+
+**Hypothesis for the correct fix**: NEITHER blanket dedupe NOR no
+dedupe is right. libcuda's bare-metal pattern works with multiple opens
+because each open establishes a fully independent client tree. We need
+to look at what specifically goes wrong WITHOUT dedupe — what op
+crosses fd boundaries — and either:
+  (a) fix that single op (likely an embedded-fd translation bug
+      somewhere in our pipeline that we missed); or
+  (b) make the dedupe per-class-aware — share the nvfp for "simple
+      identity" ops, fresh nvfp when libcuda's pattern requires
+      independent state.
 
 NOT_deduped: `/dev/nvidia0..N` (each ALLOC_OS_EVENT needs its own
 nvfp), `/dev/nvidia-uvm` (per-mm rule), eventfd (per-event).
+
+**Recommendation for next session**: revert dedupe and trace
+WITHOUT it with smarter normalization (mask all handles + addresses).
+The first ioctl whose semantic content differs between host and
+guest in the NO-dedupe run is the smoking gun. The 401 in the
+NO-dedupe path goes through ~ 2000 retries; somewhere early one
+ioctl is getting wrong data that libcuda then thrashes against.
 
 ### Architectural lesson learned
 
