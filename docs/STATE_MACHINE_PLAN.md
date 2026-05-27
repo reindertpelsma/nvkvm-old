@@ -41,19 +41,41 @@ syscall.  We migrate piece by piece, UVM first.
 
 ## 2. Architectural principle
 
-Two execution surfaces:
+Two execution surfaces — **QEMU is privileged, the stub is sandboxed**.
+That asymmetry drives every category boundary in this plan.
 
 * **Isolate execution** — the stub process.  Raw ioctl passthrough is
   acceptable because the stub is sandboxed (pClient/nvfp identity
   isolation by the kernel), and any unsafe behavior is contained
   within one stub per session.  All NV_ESC_RM_* (RM) cmds run here.
+  When in doubt, **prefer the stub** — it's the lower-trust execution
+  context and is also the better long-term compatibility target
+  (new kernel cmds added in future driver releases will Just Work
+  via the stub's passthrough without QEMU changes).
 
-* **QEMU execution** — everything that touches the realization layer
-  (mmap, GPA install, KVM region wiring, eventfd-on-isolate).  No
-  raw ioctl passthrough here.  Instead, the guest module sends
-  high-level **realize** messages describing the *end state* it
-  needs, and QEMU figures out the syscall sequence in its own,
-  controlled, ABI-stable way.
+* **QEMU execution** — privileged.  Owns realization (mmap, GPA
+  install, KVM region wiring) and the session-policy ground truth.
+  **No raw ioctl forwarding here.**  Every cmd QEMU executes is
+  privileged and:
+    * must be on an explicit allowlist,
+    * must have every argument validated against per-session policy,
+    * **must have the param size strictly checked against the known
+      struct size for that cmd** — if the guest sends more bytes,
+      they are truncated; if fewer, the cmd is rejected.  QEMU
+      builds its own kernel-bound buffer of the exact known size
+      and copies in only the validated fields.  Whatever bytes the
+      guest tried to smuggle past the documented struct end never
+      reach the host kernel.
+    * must have every pointer translated (GVA→GPA→host VA) by QEMU
+      itself, never trusted from the guest,
+    * unknown cmds are **denied**, not forwarded.
+
+  The contract: if a feature can be implemented by stub-passthrough,
+  it MUST be implemented that way — QEMU only sees the high-level
+  intent.  The realize messages described in §5 are the QEMU-facing
+  surface; their schemas are exhaustive, every field is bound to a
+  fixed kernel struct layout, and any non-conforming request is
+  rejected.
 
 The guest module becomes a state machine that:
 
