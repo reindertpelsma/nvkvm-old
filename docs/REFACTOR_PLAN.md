@@ -400,6 +400,107 @@ keep the refactor branch clean.
 
 ---
 
+## 6b. Architectural seam for memory-touching RM ops (May 2026)
+
+Step 3 (stub-owned opens) is fully shipped and validated. cuInit works on
+the open driver, test_ioctl_fwd 48/48. The next live blocker is
+**cuCtxCreate returning CUDA_ERROR_ILLEGAL_STATE (401)**. Root cause is
+*not* a single missing copy_to_user; it sits on a real architectural seam
+that this section documents so the next iteration doesn't repeat it.
+
+### Where the stack already does the right thing
+
+- `nvkvm_req_mmap_on_isolate` (QEMU) mmaps on its qemu_fd → installs a
+  KVM memory region (GPA → VMM_VA) → tells the stub to MAP_FIXED at the
+  same GVA so kernel-side resolves work when libcuda passes the VA in a
+  subsequent ioctl. **Live-sync over BAR1 is real**: writes from any of
+  guest GVA / guest GPA / QEMU VMM_VA / stub GVA all land on the same
+  physical BAR1 page.
+- `RM_ALLOC` (NVOS21/NVOS64) propagates the kernel's writes to
+  `pAllocParms` back to libcuda (commit 97caf2f).
+- `UVM_REGISTER_CHANNEL` runs on the stub's pre-opened UVM fd (correct
+  mm lineage) and returns nvstatus=0. `bIsContextBound` is set.
+
+### Where it still breaks
+
+`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE` returns `NV_ERR_NOT_READY (0x40)`. The
+`kchannelIsSchedulable_HAL` gate passes (verified — UVM_REGISTER_CHANNEL
+nvstatus=0). The error comes from the *internal* RM→GSP call that
+programs the hardware runlist with the channel's USERD/pushbuffer
+physical addresses. The kernel's view of these addresses must match
+what the GPU's MMU can resolve.
+
+### The architectural reason
+
+The open driver was designed around the invariant that **one process owns
+the file (`opener->mm`), the RM client tree (`pClient->pOSInfo`), and the
+calling task's `current->mm` for every ioctl** — all the same. gVisor's
+nvproxy preserves this trivially because the sentry IS that process. We
+explicitly split:
+
+- **Stub** owns the RM client tree (opens nvidiactl, allocates
+  NV01_ROOT_CLIENT, runs RM ioctls).
+- **QEMU** owns memory-side state (KVM region install, GPA placement,
+  VMM_VA for mmap targets).
+
+The kernel doesn't reject this split outright — most ioctls work. But for
+channel scheduling, the GSP-side code paths read kernel-internal state
+(per-channel USERD/pushbuffer/notifier physical addresses, runlist
+entries) that was produced by the alloc sequence the *stub* ran. The
+GPU's MMU then tries to resolve those addresses. If any piece of the
+kernel-internal addressing was computed against the stub's `current->mm`
+but the GPU actually needs a different mapping, schedule says
+"NOT_READY".
+
+`NV_CHANNEL_ALLOC_PARAMS_V570` (`src/abi/nvgpu.h`) carries SIX
+`nv_memory_desc_params` substructures — `instance_mem`, `userd_mem`,
+`ramfc_mem`, `mthdbuf_mem`, `error_notifier_mem`,
+`ecc_error_notifier_mem` — each a physical-address descriptor the kernel
+fills in. These are kernel-internal allocations, not user-visible memfds.
+We currently forward the channel-alloc params straight to the stub and
+the kernel does whatever it does inside the stub's process.
+
+### Two paths forward (decision pending)
+
+**Path A — gVisor-style parallel client graphs.** QEMU opens its own
+nvidiactl, allocates its own NV01_ROOT_CLIENT, maintains a handle
+translation table (libcuda's logical handle ↔ stub-side handle ↔
+qemu-side handle). Memory-touching RM ops run from QEMU's client tree;
+RM control runs from stub's. Hard work, multi-day, but the only way to
+exactly mirror the contract the open driver was written against. Eats
+the strict `rmclientValidate_IMPL` problem cleanly because each pClient
+is owned by exactly one process.
+
+**Path B — QEMU as proxy executor for memory-touching ops.** QEMU
+opens its own nvidiactl, but uses *the stub's* NV01_ROOT_CLIENT handle
+when running memory-touching ioctls. This requires bypassing or
+satisfying the strict validate check (e.g., open driver patched to
+match clientOSInfo lazily for memory-class allocs). Hacky on
+unmodified open driver; only viable if we plan to ship a
+debug-instrumented driver as part of the deployment. Rejected.
+
+**Conclusion:** Path A is the right next milestone. Step 3 (open
+ownership reversal) is the prerequisite that's now done; the next step
+is parallel pClient + handle translation.
+
+### Memory-region invariant (codified)
+
+QEMU is the **authoritative orchestrator**. The stub is a sandboxed
+syscall executor that QEMU dispatches to. The stub doesn't make policy
+decisions about memory layout. Every ioctl that produces a GPU-visible
+memory region or VA-space binding must, by the time it returns,
+result in: (a) a kernel-side allocation that the stub's process holds
+or that QEMU explicitly tracks, (b) a KVM memory region the guest can
+reach for any portion the guest needs direct access to, (c) a record
+in one of QEMU's four tables so cleanup is deterministic.
+
+The mechanism for memory-touching RM ops (Path A) is that QEMU runs
+the alloc directly through its own pClient and translates handles in
+both directions. Mechanism for memory-touching mmaps already exists
+(`nvkvm_req_mmap_on_isolate`).
+
+---
+
 ## 7. Pointers to existing memory entries
 
 - `event_os_event_paranoid_diag.md` — superseded by rmclient_validate_strict_fix.md
