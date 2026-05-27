@@ -572,6 +572,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		   param_size == sizeof(struct nvos21_parameters) && params_buf) {
 		struct nvos21_parameters *alloc = params_buf;
 		if (alloc->p_alloc_parms != 0) {
+			/* Same kernel-writes-back-aux requirement as the nvos64
+			 * path: track the user pointer so the alloc params copy
+			 * back after the ioctl. */
+			aux_uptr = (void __user *)(uintptr_t)alloc->p_alloc_parms;
 			size_t ap_size = 0;
 
 			switch (alloc->h_class) {
@@ -627,6 +631,12 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		   param_size == sizeof(struct nvos64_parameters) && params_buf) {
 		struct nvos64_parameters *alloc = params_buf;
 		if (alloc->p_alloc_parms != 0) {
+			/* Track the original user pointer so the kernel-written
+			 * alloc params (vaSize, vaBase, etc.) get copied back to
+			 * userspace after the ioctl. Without this libcuda sees
+			 * stale zeros and decides the GPU context is unusable
+			 * (CUDA_ERROR_ILLEGAL_STATE on cuCtxCreate). */
+			aux_uptr = (void __user *)(uintptr_t)alloc->p_alloc_parms;
 			/* CUDA often leaves alloc_parms_size=0 and relies on the
 			 * driver to size the buffer by hClass. Honor an explicit
 			 * size if provided, otherwise fall back to the per-class

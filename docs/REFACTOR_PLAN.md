@@ -175,6 +175,62 @@ An isolate may be closed only after:
 - UFFD-on-KVM-memory composition needs a standalone PoC. Until then, the
   mmap-from-day-one path is the only supported zero-copy path.
 
+### Gaps discovered during the cuCtxCreate-401 audit (2026-05-27)
+
+These are NOT in the original R1-R20 list and are NOT covered by the four
+tables alone — they are forwarding/ABI hazards that surface when libcuda
+exercises the alloc-class path.
+
+- **G1 — Per-alloc-class struct size table is duplicated and drift-prone.**
+  The guest `nvkvm_main.c` has two near-identical switch tables (nvos21 and
+  nvos64) that map hClass → sizeof(alloc_params). If libcuda is built
+  against a driver version whose struct grew (e.g. V580 added PASID to
+  NV_VASPACE_ALLOCATION_PARAMETERS), our 48-byte copy_from_user truncates
+  the tail and we send a short aux_buf. The driver reads past the end into
+  zeros — flags clear → VASize ends up 0. Fix: single shared table, keyed
+  by (hClass, driver_version), and refuse to forward if
+  `caller_supplied_size > our_known_size` instead of silently truncating.
+
+- **G2 — RM_ALLOC status field (nvos64 offset 40) is read by stub but
+  silently ignored on the cuCtxCreate path.** Stub extracts nvstatus and
+  forwards it; QEMU forwards to guest. But the QEMU diagnostic only prints
+  it when nvstatus != 0. If the driver succeeds (status=0) but vaSize=0,
+  there is no log line indicating "driver wrote zero." For
+  FERMI_VASPACE_A specifically, add a post-ioctl sanity check in
+  `nvkvm_req_ioctl_on_isolate`: if hClass==0x90F1 and status==0 and
+  va_size==0, log a loud warning with the full alloc params buffer.
+
+- **G3 — Two parallel handle tables coexist.** `src/qemu/nvkvm_tables.c`
+  (four-table model) is built and unit-tested but NOT yet wired into the
+  ioctl/open/mmap dispatch paths — those still use `nvkvm_handle.c` (old
+  table). The refactor sits mid-Step 3; until Step 3d lands, the old
+  table's `isolate_refcount` (incremented in `nvkvm_req_open_nvidia_handle`)
+  is the only ref-tracking. This works but means R3/R13's "refcount at
+  request reception" invariant is NOT yet enforced for in-flight ioctls
+  in the old code. Step 3 must complete and ALL dispatch sites migrate.
+
+- **G4 — Sync command serialization is per-isolate, not per-class.**
+  `iso->sync_lock` serializes OPEN_DEVICE, MMAP, MUNMAP, POLL, etc. against
+  each other. An OPEN_DEVICE blocks every other sync op for that isolate
+  while waiting for the stub round-trip. Not a correctness bug; mention so
+  we don't forget it later when scaling to many concurrent threads in the
+  guest.
+
+- **G5 — `nvkvm_req_open_nvidia_handle` bumps `isolate_refcount` but does
+  NOT insert into the iso↔hnd map of the new tables.** Both data structures
+  describe the same physical fact (this isolate holds an fd for this
+  handle). Step 3 migration must pick one and delete the other; do not let
+  the duplicate persist or close-handle paths will diverge.
+
+- **G6 — The aux_buf round-trip is correct for fixed-size structs but
+  ambiguous for `alloc_parms_size=0` callers.** Guest fills
+  `alloc->alloc_parms_size = ap_size` before forwarding (line ~690) and
+  restores caller's original value (0) after (line ~881). The driver,
+  however, may have populated a struct whose size differs from what CUDA
+  expected. CUDA verifies `paramsSize` round-trips (we restore) but does
+  NOT verify struct content beyond status/vaSize. Risk: if `ap_size` was
+  wrong (per G1), CUDA never finds out. Tied to G1.
+
 ---
 
 ## 3. Step-by-step plan
