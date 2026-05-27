@@ -196,6 +196,29 @@ int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
 		goto out;
 	}
 
+	/*
+	 * /dev/nvidiactl dedupe: libcuda opens nvidiactl repeatedly per
+	 * session and expects pClient ops to work consistently across all
+	 * those fds. The open driver's rmclientValidate_IMPL compares the
+	 * struct file's nvfp pointer-equality, so distinct underlying opens
+	 * yield distinct nvfps and any cross-fd reference fails strict
+	 * validate. Fix: reuse the same handle_id (and thus the same stub-
+	 * side struct file) for subsequent nvidiactl opens in the same
+	 * session. Multiple guest fds, one underlying nvfp, robust matching.
+	 *
+	 * Only NVKVM_DEV_CTL is deduped — /dev/nvidia0..N and eventfd need
+	 * their own nvfp per fd (ALLOC_OS_EVENT etc.).
+	 */
+	if ((int)req->dev_id == NVKVM_DEV_CTL) {
+		uint32_t existing = nvkvm_handle_dedupe_ctl(&nv->handles,
+							    req->session_id);
+		if (existing != 0) {
+			handle_id = existing;
+			ret = 0;
+			goto out;
+		}
+	}
+
 	ret = nvkvm_handle_alloc_pending(&nv->handles, req->session_id,
 					 (int)req->dev_id, &handle_id);
 	if (ret < 0)

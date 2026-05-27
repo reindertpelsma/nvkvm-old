@@ -133,10 +133,11 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 		close(fd);
 		return -EMFILE;
 	}
-	h->type       = NVKVM_HANDLE_TYPE_NVIDIA;
-	h->fd         = fd;
-	h->session_id = session_id;
-	h->dev_id     = dev_id;
+	h->type           = NVKVM_HANDLE_TYPE_NVIDIA;
+	h->fd             = fd;
+	h->session_id     = session_id;
+	h->dev_id         = dev_id;
+	h->guest_refcount = 1;
 	*handle_id_out = id;
 	pthread_mutex_unlock(&t->lock);
 
@@ -144,6 +145,25 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 		dev_id == NVKVM_DEV_EVENTFD ? "eventfd" : "nvidia",
 		id, dev_id, fd);
 	return 0;
+}
+
+uint32_t nvkvm_handle_dedupe_ctl(struct nvkvm_handle_table *t,
+				 uint32_t session_id)
+{
+	uint32_t found = 0;
+	pthread_mutex_lock(&t->lock);
+	for (int i = 1; i < NVKVM_HANDLE_MAX; i++) {
+		struct nvkvm_handle *h = &t->handles[i];
+		if (h->in_use && h->session_id == session_id &&
+		    h->type == NVKVM_HANDLE_TYPE_NVIDIA &&
+		    h->dev_id == NVKVM_DEV_CTL && h->fd >= 0) {
+			h->guest_refcount++;
+			found = h->id;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&t->lock);
+	return found;
 }
 
 int nvkvm_handle_alloc_pending(struct nvkvm_handle_table *t,
@@ -157,10 +177,11 @@ int nvkvm_handle_alloc_pending(struct nvkvm_handle_table *t,
 		pthread_mutex_unlock(&t->lock);
 		return -EMFILE;
 	}
-	h->type       = NVKVM_HANDLE_TYPE_NVIDIA;
-	h->fd         = -1;
-	h->session_id = session_id;
-	h->dev_id     = dev_id;
+	h->type           = NVKVM_HANDLE_TYPE_NVIDIA;
+	h->fd             = -1;
+	h->session_id     = session_id;
+	h->dev_id         = dev_id;
+	h->guest_refcount = 1;
 	*handle_id_out = id;
 	pthread_mutex_unlock(&t->lock);
 	return 0;
@@ -289,6 +310,17 @@ int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id)
 		pthread_mutex_unlock(&t->lock);
 		return -EBADF;
 	}
+	/* Drop one guest reference; only actually close when the last guest fd
+	 * goes away. This matters for deduped /dev/nvidiactl handles (see
+	 * nvkvm_handle_dedupe_ctl): multiple guest opens share one underlying
+	 * struct file, and any one close should not yank the fd from the
+	 * others. For non-deduped handles guest_refcount was set to 1 at
+	 * alloc time, so this decrements straight to 0. */
+	if (h->guest_refcount > 1) {
+		h->guest_refcount--;
+		pthread_mutex_unlock(&t->lock);
+		return 0;
+	}
 	if (h->isolate_refcount > 0) {
 		pthread_mutex_unlock(&t->lock);
 		return -EBUSY;
@@ -297,6 +329,7 @@ int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id)
 		close(h->fd);
 		h->fd = -1;
 	}
+	h->guest_refcount = 0;
 	h->in_use = false;
 	pthread_mutex_unlock(&t->lock);
 	return 0;
