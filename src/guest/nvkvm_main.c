@@ -430,22 +430,77 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
-	 * State-machine Step B: record UVM_INITIALIZE into ctx->uvm_state
-	 * but ALSO still forward it.  Reason: between Step B and Step E,
-	 * we keep the kernel side working — recording is additive, not
-	 * a substitute.  The full short-circuit lands in Step E along
-	 * with REALIZE_UVM_MAPPING.  Per docs/STATE_MACHINE_PLAN.md.
+	 * State-machine Steps B+C: record UVM config + state-registration
+	 * cmds into ctx->uvm_state.  ALSO still forward each so the
+	 * kernel side stays functional — recording is additive between
+	 * Step B and Step E.  The full short-circuit lands at Step E
+	 * along with REALIZE_UVM_MAPPING.  Per docs/STATE_MACHINE_PLAN.md.
+	 *
+	 * Per-cmd recording — these are tiny structs the guest module
+	 * trivially digests.  All allocations are GFP_KERNEL; mutex
+	 * held only across the recording, not across the forward.
 	 */
-	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state &&
-	    cmd == UVM_INITIALIZE && params_buf &&
-	    param_size >= sizeof(struct uvm_initialize_params)) {
-		struct uvm_initialize_params *p = params_buf;
-		mutex_lock(&ctx->uvm_state->lock);
-		ctx->uvm_state->init_flags  = p->flags;
-		ctx->uvm_state->initialized = true;
-		mutex_unlock(&ctx->uvm_state->lock);
-		/* fall through to the normal forward path so the kernel
-		 * fd becomes VA_SPACE-typed.  Step E removes the forward. */
+	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state && params_buf) {
+		struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+		switch (cmd) {
+		case UVM_INITIALIZE:
+			if (param_size >= sizeof(struct uvm_initialize_params)) {
+				struct uvm_initialize_params *p = params_buf;
+				mutex_lock(&st->lock);
+				st->init_flags  = p->flags;
+				st->initialized = true;
+				mutex_unlock(&st->lock);
+			}
+			break;
+		case UVM_REGISTER_GPU:
+			if (param_size >= sizeof(struct uvm_register_gpu_params)) {
+				struct uvm_register_gpu_params *p = params_buf;
+				struct nvkvm_uvm_gpu_reg *g =
+					kzalloc(sizeof(*g), GFP_KERNEL);
+				if (g) {
+					memcpy(g->gpu_uuid, p->gpu_uuid.uuid, 16);
+					mutex_lock(&st->lock);
+					list_add_tail(&g->list, &st->registered_gpus);
+					mutex_unlock(&st->lock);
+				}
+			}
+			break;
+		case UVM_REGISTER_GPU_VASPACE:
+			if (param_size >= sizeof(struct uvm_register_gpu_vaspace_params)) {
+				struct uvm_register_gpu_vaspace_params *p = params_buf;
+				struct nvkvm_uvm_vas_reg *v =
+					kzalloc(sizeof(*v), GFP_KERNEL);
+				if (v) {
+					memcpy(v->gpu_uuid, p->gpu_uuid.uuid, 16);
+					v->rm_ctrl_fd_handle_id = p->rm_ctrl_fd;
+					mutex_lock(&st->lock);
+					list_add_tail(&v->list,
+						      &st->registered_va_spaces);
+					mutex_unlock(&st->lock);
+				}
+			}
+			break;
+		case UVM_CREATE_RANGE_GROUP:
+			if (param_size >= sizeof(struct uvm_create_range_group_params)) {
+				struct uvm_create_range_group_params *p = params_buf;
+				struct nvkvm_uvm_range_group *r =
+					kzalloc(sizeof(*r), GFP_KERNEL);
+				if (r) {
+					r->range_group_id = p->range_group_id;
+					mutex_lock(&st->lock);
+					list_add_tail(&r->list, &st->range_groups);
+					mutex_unlock(&st->lock);
+				}
+			}
+			break;
+		/* UVM_REGISTER_CHANNEL also fits here; skip until needed
+		 * (libcuda calls it but the kernel-side channel is already
+		 * known via RM handles — recording is for parity, not
+		 * correctness). */
+		default:
+			break;
+		}
+		/* Fall through to normal forward path. */
 	}
 
 	/*
