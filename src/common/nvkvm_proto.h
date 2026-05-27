@@ -110,6 +110,7 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_UNPOLL_ON_ISOLATE      22  /* stop polling fd in isolate     */
 #define NVKVM_REQ_WRITE_MEMORY_HANDLE    23  /* shm_slot → memfd (page upload) */
 #define NVKVM_REQ_READ_MEMORY_HANDLE     24  /* memfd → shm_slot (writeback)   */
+#define NVKVM_REQ_REALIZE_UVM_MAPPING    25  /* state-machine mmap-realize     */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -444,6 +445,74 @@ struct nvkvm_req_munmap {
 struct nvkvm_resp_munmap {
 	__le32 status;
 	__le32 reserved;
+};
+
+/* ── REALIZE_UVM_MAPPING — state-machine mmap-realize ────────────────────────
+ *
+ * Sent by the guest module when libcuda mmap's a UVM fd whose state has been
+ * accumulated by PURE_CONFIG / STATE_REGISTRATION / MAPPING_INTENT recording
+ * (see docs/STATE_MACHINE_PLAN.md).
+ *
+ * The guest module places the per-fd uvm_state snapshot in a shm slot and
+ * the mode-specific intent params in another shm slot.  QEMU validates
+ * STRICTLY (sizes exact, fields enumerated, flags allowlisted) before
+ * issuing the batched ISOLATE_CMD_REALIZE_UVM_FD to the stub.
+ */
+
+/* Mode constants — must match nvkvm_uvm_mapping_intent.mode in the guest. */
+#define NVKVM_UVM_REALIZE_MODE_SEM_POOL      1
+#define NVKVM_UVM_REALIZE_MODE_EXTERNAL      2
+#define NVKVM_UVM_REALIZE_MODE_CREATE_RANGE  3
+
+#define NVKVM_UVM_MAX_REG_GPUS      16   /* QEMU enforces; below kernel UVM_MAX_GPUS */
+#define NVKVM_UVM_MAX_VA_SPACES     16
+#define NVKVM_UVM_MAX_RANGE_GROUPS  16
+
+/* Carried via state_shm_slot — fixed layout, QEMU validates lengths
+ * against the count fields. */
+struct nvkvm_uvm_state_snapshot {
+	__le64 init_flags;
+	__le32 n_gpus;
+	__le32 n_va_spaces;
+	__le32 n_range_groups;
+	__le32 _pad0;
+	struct {
+		__u8   gpu_uuid[16];
+	} gpus[NVKVM_UVM_MAX_REG_GPUS];
+	struct {
+		__u8   gpu_uuid[16];
+		__le32 rm_ctrl_fd_handle_id;
+		__le32 _pad;
+	} va_spaces[NVKVM_UVM_MAX_VA_SPACES];
+	__le64 range_group_ids[NVKVM_UVM_MAX_RANGE_GROUPS];
+};
+
+/* Carried via intent_shm_slot — variable shape per mode.  For
+ * MODE_SEM_POOL we ship the entire UVM_ALLOC_SEMAPHORE_POOL_PARAMS that
+ * the guest recorded (9248 bytes; QEMU validates size exactly). */
+
+struct nvkvm_req_realize_uvm_mapping {
+	__le32 isolate_id;
+	__le32 fd_handle_id;
+	__le32 mode;                   /* NVKVM_UVM_REALIZE_MODE_*    */
+	__le32 session_id;
+	__le64 gva;                    /* requested guest VA          */
+	__le64 length;
+	__le64 offset_hint;            /* libcuda's mmap offset       */
+	__le32 prot;
+	__le32 map_flags;
+	__le32 state_shm_slot;         /* nvkvm_uvm_state_snapshot    */
+	__le32 intent_shm_slot;        /* mode-specific intent bytes  */
+	__le32 intent_size;            /* size of intent blob         */
+	__le32 _pad0;
+};
+
+struct nvkvm_resp_realize_uvm_mapping {
+	__le64 gpa_base;               /* guest module remap_pfn_range here */
+	__le64 length;                 /* echo                              */
+	__le64 realize_token;          /* for teardown / side-effect routing */
+	__le32 rm_status;              /* NV_STATUS from the kernel realize  */
+	__le32 status;                 /* 0 on success, -errno otherwise     */
 };
 
 #define NVKVM_MAX_REQ_PAYLOAD  sizeof(struct nvkvm_req_ioctl_on_isolate)
