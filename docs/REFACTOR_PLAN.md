@@ -575,12 +575,19 @@ driver, then design.**
 
 ### What's next (concrete sequence)
 
-1. Add printk to every site in the open driver that can return
-   `NV_ERR_NOT_READY` from the channel-schedule path
-   (`kernel_channel_group_api.c`, `kernel_channel.c`, GR/FIFO
-   internal control handlers). Print enough context (channel
-   handle, engine, bound flags, runlist id, GSP state) to identify
-   which line and why.
+1. **Instrument the GSP-RPC return path** — not the kernel-side
+   internal control. On GSP-firmware GPUs (RTX 3060 with open driver
+   is *always* GSP-mode), `kchangrpapiSchedule_IMPL` takes the
+   `if (IS_GSP_CLIENT(pGpu))` branch and calls
+   `NV_RM_RPC_CONTROL(... NVA06C_CTRL_CMD_GPFIFO_SCHEDULE ...)`. The
+   error returns from GSP firmware, propagated back through the RPC
+   layer. So the printk must be at the RPC dispatch / return path
+   (see `kernel/vgpu/rpc.c` around `NV_RM_RPC_CONTROL_INTERNAL` for
+   the call site, and the response handler for GSP messages). A
+   `NVKVM_SCHED_DIAG` printk inside the non-GSP branch of
+   `kchangrpapiSchedule_IMPL` already exists but doesn't fire on
+   RTX 3060. To get the error origin, patch the GSP-RPC path AND log
+   the unpacked GSP response struct.
 2. With that ground truth, decide which of:
    (a) a missing aux-output propagation (similar to the 97caf2f
        fix, but for a different ioctl);
