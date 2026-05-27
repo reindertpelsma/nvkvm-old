@@ -485,6 +485,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		fake_nvos56_ok  = true;
 	}
 
+	/* NV_ESC_RM_UNMAP_MEMORY (nvos34): same VA-lookup pattern as NVOS56.
+	 * Kernel looks up CpuMapping by pLinearAddress; the stub's mmap'd VA
+	 * was registered there but libcuda passes its own guest-side VA, so
+	 * the lookup always returns NV_ERR_OBJECT_NOT_FOUND.  The unmap
+	 * itself is handled by our QEMU/KVM region-uninstall path (the GPA
+	 * goes away when the guest munmaps); the kernel record is informational
+	 * in our forwarded model.  Fake success on response. */
+	__u64 orig_nvos34_va = 0;
+	bool fake_nvos34_ok = false;
+	if (_IOC_NR(cmd) == NV_ESC_RM_UNMAP_MEMORY && params_buf &&
+	    param_size == sizeof(struct nv_ioctl_nvos34_parameters)) {
+		struct nv_ioctl_nvos34_parameters *p = params_buf;
+		orig_nvos34_va = p->p_linear_address;
+		fake_nvos34_ok = true;
+	}
+
 	/*
 	 * For ioctls with embedded secondary buffers: extract the secondary data
 	 * BEFORE the sanitizer zeroes the pointer fields.  We carry the data in
@@ -983,6 +999,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			 * to mask the kernel's unavoidable OBJECT_NOT_FOUND. */
 			p->p_old_cpu_address = orig_nvos56_old;
 			p->p_new_cpu_address = orig_nvos56_new;
+			p->status = 0;
+		} else if (fake_nvos34_ok &&
+			   _IOC_NR(cmd) == NV_ESC_RM_UNMAP_MEMORY &&
+			   param_size == sizeof(struct nv_ioctl_nvos34_parameters)) {
+			struct nv_ioctl_nvos34_parameters *p = params_buf;
+			/* Same VA-lookup-fail pattern as NVOS56; fake success. */
+			p->p_linear_address = orig_nvos34_va;
 			p->status = 0;
 		}
 	}
