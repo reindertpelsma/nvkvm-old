@@ -400,37 +400,200 @@ keep the refactor branch clean.
 
 ---
 
-## 6b. Architectural seam for memory-touching RM ops (May 2026)
+## 6b. Architectural seam, corrected understanding (May 2026)
 
 Step 3 (stub-owned opens) is fully shipped and validated. cuInit works on
 the open driver, test_ioctl_fwd 48/48. The next live blocker is
-**cuCtxCreate returning CUDA_ERROR_ILLEGAL_STATE (401)**. Root cause is
-*not* a single missing copy_to_user; it sits on a real architectural seam
-that this section documents so the next iteration doesn't repeat it.
+**cuCtxCreate returning CUDA_ERROR_ILLEGAL_STATE (401)**, manifesting as
+`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE` returning `NV_ERR_NOT_READY (0x40)`.
+
+### Architectural one-liner (canonical)
+
+> We do everything nvproxy does (transparent RM/UVM ioctl passthrough,
+> handle tracking, byte-faithful struct marshalling) — PLUS a real
+> memory and fd boundary that we mmap across between stub, QEMU and
+> the guest.
+
+That's the entire scope. Anything more ambitious than that (parallel
+pClient trees, RM resource-graph mirroring) is out of scope and was
+wrongly proposed earlier; see "Architectural lesson learned" below.
+
+### The identity translation tables (what each layer holds)
+
+The seam between guest libcuda and the host nvidia kernel is fd /
+handle translations and mmap regions. Each layer holds specific things:
+
+**File-descriptor identities:**
+
+| Identity      | Guest libcuda | Guest kmod | QEMU     | Stub | Host kmod |
+|---------------|---------------|------------|----------|------|-----------|
+| Guest fd      | yes           | yes        | no       | no   | no        |
+| handle_id     | no            | yes        | yes      | no   | no        |
+| qemu_fd       | no            | no         | yes      | no   | yes       |
+| stub_fd       | no            | no         | yes      | yes  | yes       |
+
+**Memory regions:**
+
+| Region   | Guest libcuda | Guest kmod | QEMU       | Stub       | Host kmod |
+|----------|---------------|------------|------------|------------|-----------|
+| GVA      | yes           | yes        | partially* | partially* | no        |
+| GPA      | no            | yes        | yes        | no         | no        |
+| QEMU VA  | no            | no         | yes        | no         | yes       |
+| Stub VA  | partially*    | partially* | partially* | yes        | yes       |
+| HPA      | no            | no         | no         | no         | yes       |
+
+`*` = shared via memfd or via the WRITE/READ_MEMORY_HANDLE path; the
+stub VA equals the GVA at a per-mmap level by construction (MAP_FIXED).
+
+**Nvidia RM identities (pClient handles, e.g., `0xc1d025ae`):**
+
+| Layer            | Holds table? |
+|------------------|--------------|
+| Guest libcuda    | yes (the authoritative view) |
+| Guest kmod       | no — pure passthrough |
+| QEMU             | no — pure passthrough |
+| Stub             | no — pure passthrough |
+| Host nvidia kmod | yes (the real driver state) |
+
+**Critical implication**: pClients are NOT something we translate or
+own at any of our boundaries. nvidia handles flow byte-for-byte from
+libcuda to the host kernel and back. Our forwarding only needs to
+get the fd-translation and mmap-region tables right.
+
+### What `clientOSInfo` actually is (the resolved misunderstanding)
+
+`rmclientValidate_IMPL` at `client.c:736` of the open driver is a
+**pointer-equality check** between two `nv_file_private_t *` (nvfp)
+pointers:
+
+  - `pClient->pOSInfo` — the nvfp at NV01_ROOT_CLIENT alloc time.
+  - `pSecInfo->clientOSInfo` — current ioctl's `nvfp->ctl_nvfp`
+    (or `nvfp` if no ctl), set by escape.c.
+
+The nvfp is per-`struct file`, not per-task and not per-mm. So:
+
+  - Two threads / fork() / SCM_RIGHTS sharing a struct file → same
+    nvfp → strict-validate PASSES across processes / mms.
+  - Two independent `open("/dev/nvidiactl")` calls → two struct files
+    → two nvfps → strict-validate FAILS only if libcuda then mixes
+    them in ops on the same pClient.
+
+**Consequence**: We can run memory-touching RM ops from QEMU on its
+SCM_RIGHTS-shared copy of a stub-opened nvidiactl/nvidia0 fd, and
+strict-validate will pass. Isolation is preserved via separate mm,
+fd table, seccomp, pid namespaces — none of which the driver checks.
+
+The earlier "Path A — parallel client graphs" proposal was over-
+engineered. The correct architecture is the simpler **Path B'**:
+
+> Stub opens nvidiactl + nvidia0 (security: minimal attack surface
+> for RM control). QEMU receives those fds via SCM_RIGHTS. RM control
+> ops run from the stub. Memory-touching RM ops (channel alloc,
+> RM_MAP_MEMORY_DMA, etc.) run from QEMU on its SCM_RIGHTS copy.
+> Strict validate passes either way — same struct file, same nvfp.
+
+This is a small, per-ioctl routing decision, not a parallel-graph
+refactor.
 
 ### Where the stack already does the right thing
 
-- `nvkvm_req_mmap_on_isolate` (QEMU) mmaps on its qemu_fd → installs a
-  KVM memory region (GPA → VMM_VA) → tells the stub to MAP_FIXED at the
-  same GVA so kernel-side resolves work when libcuda passes the VA in a
-  subsequent ioctl. **Live-sync over BAR1 is real**: writes from any of
-  guest GVA / guest GPA / QEMU VMM_VA / stub GVA all land on the same
-  physical BAR1 page.
+- `nvkvm_req_mmap_on_isolate` (QEMU) mmaps on its qemu_fd → installs
+  a KVM memory region (GPA → QEMU_VA) → tells the stub to MAP_FIXED
+  at the same GVA so kernel-side resolves work when libcuda passes
+  the VA in a subsequent ioctl. **Live-sync over BAR1 is real**:
+  writes from any of guest GVA / guest GPA / QEMU_VA / stub_VA all
+  land on the same physical BAR0/BAR1 page. Verified May 2026 via
+  /proc/self/maps inside the guest — 2MB USERD/pushbuffer mapping
+  lands at `0x200200000` (in the GPA window), doorbell 64KB write-
+  only mapping at a high VA, both backed by `/dev/nvidia0`.
 - `RM_ALLOC` (NVOS21/NVOS64) propagates the kernel's writes to
-  `pAllocParms` back to libcuda (commit 97caf2f).
-- `UVM_REGISTER_CHANNEL` runs on the stub's pre-opened UVM fd (correct
-  mm lineage) and returns nvstatus=0. `bIsContextBound` is set.
+  `pAllocParms` back to libcuda (commit 97caf2f closed the gap).
+- `UVM_REGISTER_CHANNEL` runs on the stub's pre-opened UVM fd
+  (correct mm lineage) and returns nvstatus=0. (Whether the side
+  effect — `bIsContextBound = TRUE` — actually took hold needs
+  driver-side printk to confirm; the ioctl returning NV_OK is
+  necessary but possibly not sufficient.)
+- libcuda treats `nv_memory_desc_params.phys_addr` etc. as opaque
+  kernel-owned values. It does NOT dereference them; it passes them
+  back into subsequent ioctls. The kernel verifies / re-resolves
+  internally. So physical-address propagation across our boundary
+  is not a layer we need to track. **Scope simplification.**
 
 ### Where it still breaks
 
-`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE` returns `NV_ERR_NOT_READY (0x40)`. The
-`kchannelIsSchedulable_HAL` gate passes (verified — UVM_REGISTER_CHANNEL
-nvstatus=0). The error comes from the *internal* RM→GSP call that
-programs the hardware runlist with the channel's USERD/pushbuffer
-physical addresses. The kernel's view of these addresses must match
-what the GPU's MMU can resolve.
+`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE` → `NV_ERR_NOT_READY (0x40)`. The
+`kchannelIsSchedulable_HAL` gate passes (UVM_REGISTER_CHANNEL is OK).
+The error comes from the *internal* RM→GSP call that programs the
+hardware runlist. Several missing pieces of channel state are most
+plausible upstream causes, all of which are RM_CONTROL types the
+**host issues but the guest does not** (libcuda forks its bring-up
+path earlier based on something it read):
 
-### The architectural reason
+  - `NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE` (`0x20801210`) —
+    sets WFI/GFXP/CILP preemption granularity per channel. Without
+    this, GPU scheduler may not consider the channel runlist-ready.
+  - `NV2080_CTRL_CMD_*` family `0x801909, 0x83de0309` — also missing.
+  - `NVA06C_CTRL_CMD_*` family `0xa06c0103, 0xa06c0105` — also missing.
+  - `RM_ALLOC` of class `0x83de` (`GT200_DEBUGGER`) — also missing.
+
+These divergences are *downstream* of the upstream divergence. Find
+the upstream RM_CONTROL whose response libcuda inspected to decide
+to skip the per-channel preemption-mode setup → fix the propagation
+of that response value.
+
+### Pre-existing latent issue: multiple nvidiactl opens
+
+libcuda opens `/dev/nvidiactl` multiple times within a single process.
+Each guest open in the current architecture becomes a fresh
+`open("/dev/nvidiactl")` in the stub — distinct struct files,
+distinct nvfps. libcuda is *mostly* careful to use the same fd for
+ops on a given pClient, but not 100%. This is plausibly why we see
+`UVM_UNREGISTER_CHANNEL` returning `NV_ERR_INSUFFICIENT_RESOURCES`
+on the first 4 attempts before succeeding.
+
+The **clean fix** (do NOT bring back the dup() hack): when the
+guest module asks for an nvidiactl handle in a session that already
+has one, return the SAME `handle_id` — so libcuda's multiple guest
+fds all point at the same stub-side struct file. Different
+fd_token (= different guest fds), same handle_id, same nvfp,
+robust strict-validate matching. The dedupe is at the handle_id
+allocation layer based on `(session_id, dev_id)`, not via dup().
+
+NOT_deduped: `/dev/nvidia0..N` (each ALLOC_OS_EVENT needs its own
+nvfp), `/dev/nvidia-uvm` (per-mm rule), eventfd (per-event).
+
+### Architectural lesson learned
+
+When the symptom is "kernel returns NV_OK but the side-effect doesn't
+land" — first reflex MUST be to instrument the driver (printk the
+internal path), NOT to design a refactor. Twice this session we
+talked about Path A / parallel client graphs as if it was the
+inevitable answer; both times the actual evidence (clientOSInfo is
+just nvfp; mmaps DO live-sync; libcuda doesn't deal in phys_addrs)
+pointed at a much smaller change. **Trust the trace, instrument the
+driver, then design.**
+
+### What's next (concrete sequence)
+
+1. Add printk to every site in the open driver that can return
+   `NV_ERR_NOT_READY` from the channel-schedule path
+   (`kernel_channel_group_api.c`, `kernel_channel.c`, GR/FIFO
+   internal control handlers). Print enough context (channel
+   handle, engine, bound flags, runlist id, GSP state) to identify
+   which line and why.
+2. With that ground truth, decide which of:
+   (a) a missing aux-output propagation (similar to the 97caf2f
+       fix, but for a different ioctl);
+   (b) the multiple-nvidiactl-open robustness fix (dedupe handle_id
+       per (session, dev_id));
+   (c) routing a specific RM_CONTROL through QEMU on its SCM_RIGHTS
+       fd (per Path B') — but only if the printk shows a concrete
+       cross-mm issue.
+3. Validate test_ioctl_fwd stays 48/48 after each fix.
+4. cumemalloc_test green = gate; then cuLaunchKernel; then small
+   model; then 7B.
+
+### The architectural reason (kept for context, now superseded by Path B')
 
 The open driver was designed around the invariant that **one process owns
 the file (`opener->mm`), the RM client tree (`pClient->pOSInfo`), and the
