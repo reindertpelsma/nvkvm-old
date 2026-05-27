@@ -644,6 +644,43 @@ diagnostic methodology (`stable_host_diff.py` against N host
 runs) found a real semantic divergence we hadn't seen with any
 earlier analysis. The tool is reusable for future bugs.
 
+### §6c Update (2026-05-27): /proc/self/maps hypothesis falsified
+
+Attempt (a) above ran into a complication: **libcuda bypasses libc
+for `openat`** (uses raw syscall, so `LD_PRELOAD`-based `open()`
+hooks don't intercept it). Built `tools/diag/maps_shim.c` anyway —
+works for test programs but doesn't catch libcuda's openat.
+
+In parallel, re-checked the actual nvidia-related entries in
+`/proc/self/maps` on host vs guest at each cuInit/cuDeviceGet/
+cuCtxCreate stage. Initial run from a self-dump inside the
+process suggested guest had an *extra* 4KB `r--s` mapping on
+`/dev/nvidiactl` that the host didn't. **This turned out to be
+a measurement artifact**: reading /proc/self/maps from a child
+process via `/proc/<parent_pid>/maps` reveals the host DOES have
+the same 4KB `r--s` nvidiactl mapping. The self-read in dump_nv()
+was just stopping short for some kernel-side reason.
+
+**Verified**: at AFTER_CUINIT, both host and guest have:
+- `-w-s 64KB /dev/nvidia0` (doorbell)
+- `r--s  4KB /dev/nvidiactl` (info page)
+Inodes and VAs differ (expected). PROT/FLAGS/OFFSET/SIZE match.
+
+**Conclusion**: `/proc/self/maps` for nvidia mappings is NOT the
+divergence source. The byte-136 field in UVM_INITIALIZE's input
+buffer must come from something else libcuda touches — possibly
+an earlier ioctl response, a sysfs read, or an env var. The
+maps-as-cause theory in §6b should be considered dead until
+re-validated; the strings `/proc/self/maps` / `%zx-` /
+`cuda00001800007` in the buffer might just be format-string
+constants libcuda has loaded statically, not evidence that the
+file is being parsed in this specific code path.
+
+Direction for next attempt: focus on what other early input
+diverges between host and guest. Candidates: sysfs reads,
+`/proc/driver/nvidia/params`, env vars (CUDA_*), output of
+early CTL ioctls (NV_ESC_REGISTER_FD, NV_ESC_NUMA_INFO).
+
 **Recommendation for next session**: revert dedupe and trace
 WITHOUT it with smarter normalization (mask all handles + addresses).
 The first ioctl whose semantic content differs between host and
