@@ -586,6 +586,64 @@ crosses fd boundaries — and either:
 NOT_deduped: `/dev/nvidia0..N` (each ALLOC_OS_EVENT needs its own
 nvfp), `/dev/nvidia-uvm` (per-mm rule), eventfd (per-event).
 
+### Paranoid-debug root-cause chain (May 2026, end of session)
+
+**Timing falsified** via `tools/diag/ioctl_jitter.so` LD_PRELOAD —
+host bare-metal cumemalloc PASSES with 50ms random jitter on every
+nvidia ioctl. Our multi-layer roundtrip's latency is irrelevant.
+
+**The actual smoking gun** found via cross-run host stability mask
+(3 host runs, mask the per-run-noise bytes via
+`tools/diag/stable_host_diff.py`, then compare guest against the
+mask):
+
+1. Guest's `/proc/self/maps` has FEWER mapping entries for `libc.so`
+   than host. Specifically: host shows a `---p` (PROT_NONE) guard
+   page between libc.so's `r-xp` and `r--p` sections (5 mapping
+   entries total); guest's libc has no guard (4 entries). Different
+   glibc / dynamic-loader version.
+
+2. libcuda PARSES `/proc/self/maps` and SERIALIZES the result into
+   the `UVM_INITIALIZE` ioctl's input buffer. Strings visible in
+   the strace dump confirm: `/proc/self/maps`, `%zx-` (a printf
+   format for parsing the mapping lines), `cuda00001800007`
+   (libcuda's section label it's looking for).
+
+3. **At byte offset 136-143 of that buffer**, host writes NULL
+   (stable across 3 host runs); guest writes a userspace VA
+   (`10 cd b7 c8 ff 7f 00 00` = 0x00007fffc8b7cd10 = a guest VA).
+   This is libcuda's decision: a pointer field is set to NULL on
+   host but to a specific VA in guest because of the mapping
+   layout difference.
+
+4. The kernel's UVM driver processes UVM_INITIALIZE with that
+   pointer set vs NULL → downstream state diverges → eventually
+   surfaces as `NV_ERR_NOT_READY` at GPFIFO_SCHEDULE →
+   `CUDA_ERROR_ILLEGAL_STATE (401)` from cuCtxCreate.
+
+**Fix directions (next session's decision)**:
+- **(a) `/proc/self/maps` rewriter LD_PRELOAD**: intercept libcuda's
+  open/read of `/proc/self/maps` and synthesize a layout that
+  matches the bare-metal host's expectation. Contained, no kernel
+  changes. Most likely the right shape of fix.
+- **(b) libcuda disassembly**: find which condition in libcuda's
+  UVM_INITIALIZE serializer fills the pointer at offset 136-143
+  and what it points to. Fix at the source of libcuda's decision.
+- **(c) Match guest glibc to host's**: brittle, doesn't generalize.
+- **(d) Patch guest libc post-load to insert the PROT_NONE guard**:
+  hacky but precise.
+
+(a) is the right starting point. Build a small library that
+shims `open()` for `/proc/self/maps`, returns a synthesized file
+whose mapping layout matches bare-metal's. Run guest cumemalloc
+under it. If cuCtxCreate succeeds, we've confirmed the chain
+completely and can productionize the fix.
+
+If (a) doesn't fix it, the root cause is elsewhere — but the
+diagnostic methodology (`stable_host_diff.py` against N host
+runs) found a real semantic divergence we hadn't seen with any
+earlier analysis. The tool is reusable for future bugs.
+
 **Recommendation for next session**: revert dedupe and trace
 WITHOUT it with smarter normalization (mask all handles + addresses).
 The first ioctl whose semantic content differs between host and
