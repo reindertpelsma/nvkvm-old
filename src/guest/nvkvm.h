@@ -70,6 +70,55 @@ struct nvkvm_cpu_page {
 	struct list_head list;
 };
 
+/*
+ * Per-fd UVM state for the state-machine refactor (see
+ * docs/STATE_MACHINE_PLAN.md).  Only allocated when dev_id ==
+ * NVKVM_DEV_UVM.  Holds the configuration state libcuda accumulates
+ * via UVM_INITIALIZE / REGISTER_GPU / CREATE_RANGE_GROUP /
+ * ALLOC_SEMAPHORE_POOL / ... ioctls — which we record without
+ * forwarding, then replay in a single REALIZE_UVM_MAPPING when libcuda
+ * mmap's the fd.
+ */
+struct nvkvm_uvm_gpu_reg {
+	struct list_head list;
+	__u8             gpu_uuid[16];
+	__u32            flags;
+};
+struct nvkvm_uvm_vas_reg {
+	struct list_head list;
+	__u8             gpu_uuid[16];
+	__u32            rm_ctrl_fd_handle_id;
+};
+struct nvkvm_uvm_range_group {
+	struct list_head list;
+	__u64            range_group_id;
+};
+struct nvkvm_uvm_mapping_intent {
+	struct list_head list;
+	__u32            mode;        /* NVKVM_UVM_REALIZE_MODE_*   */
+	__u64            base;        /* guest VA the intent covers */
+	__u64            length;
+	void            *params;      /* mode-specific params blob  */
+	size_t           params_size;
+};
+struct nvkvm_uvm_realization {
+	struct list_head list;
+	__u64            realize_token;
+	__u64            gva;
+	__u64            gpa;
+	__u64            length;
+};
+struct nvkvm_uvm_fd_state {
+	struct mutex     lock;
+	bool             initialized;
+	__u64            init_flags;
+	struct list_head registered_gpus;     /* nvkvm_uvm_gpu_reg */
+	struct list_head registered_va_spaces;/* nvkvm_uvm_vas_reg */
+	struct list_head range_groups;        /* nvkvm_uvm_range_group */
+	struct list_head intents;             /* nvkvm_uvm_mapping_intent */
+	struct list_head realizations;        /* nvkvm_uvm_realization */
+};
+
 struct nvkvm_fd_ctx {
 	__u32                  handle_id;   /* QEMU-side nvidia handle ID */
 	int                    dev_id;      /* NVKVM_DEV_*                */
@@ -86,6 +135,9 @@ struct nvkvm_fd_ctx {
 	/* CPU pages migrated to the isolate for userptr access */
 	struct mutex           cpu_pages_lock;
 	struct list_head       cpu_pages;
+
+	/* State-machine state for UVM fds (NULL for non-UVM fds). */
+	struct nvkvm_uvm_fd_state *uvm_state;
 };
 
 /* ── In-flight request tracking ───────────────────────────────────────────── */

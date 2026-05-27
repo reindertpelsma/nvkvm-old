@@ -272,6 +272,22 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	mutex_init(&ctx->cpu_pages_lock);
 	INIT_LIST_HEAD(&ctx->cpu_pages);
 
+	/* State-machine state for UVM fds — see docs/STATE_MACHINE_PLAN.md. */
+	if (dev_id == NVKVM_DEV_UVM) {
+		ctx->uvm_state = kzalloc(sizeof(*ctx->uvm_state), GFP_KERNEL);
+		if (!ctx->uvm_state) {
+			nvkvm_session_put(ctx->session);
+			kfree(ctx);
+			return -ENOMEM;
+		}
+		mutex_init(&ctx->uvm_state->lock);
+		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
+		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
+		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
+		INIT_LIST_HEAD(&ctx->uvm_state->intents);
+		INIT_LIST_HEAD(&ctx->uvm_state->realizations);
+	}
+
 	/*
 	 * Open flow: spawn the isolate (creates the QEMU-side session as
 	 * a side effect) and then open the device via the stub so its
@@ -326,6 +342,34 @@ static int nvkvm_release(struct inode *inode, struct file *filp)
 
 	/* Tear down any mmap regions owned by this FD */
 	nvkvm_mmap_release_fd(ctx);
+
+	/* Free UVM state-machine state if this was a UVM fd. */
+	if (ctx->uvm_state) {
+		struct nvkvm_uvm_gpu_reg *g, *gtmp;
+		struct nvkvm_uvm_vas_reg *v, *vtmp;
+		struct nvkvm_uvm_range_group *r, *rtmp;
+		struct nvkvm_uvm_mapping_intent *i, *itmp;
+		struct nvkvm_uvm_realization *re, *retmp;
+		list_for_each_entry_safe(g, gtmp,
+			&ctx->uvm_state->registered_gpus, list)
+			kfree(g);
+		list_for_each_entry_safe(v, vtmp,
+			&ctx->uvm_state->registered_va_spaces, list)
+			kfree(v);
+		list_for_each_entry_safe(r, rtmp,
+			&ctx->uvm_state->range_groups, list)
+			kfree(r);
+		list_for_each_entry_safe(i, itmp,
+			&ctx->uvm_state->intents, list) {
+			kfree(i->params);
+			kfree(i);
+		}
+		list_for_each_entry_safe(re, retmp,
+			&ctx->uvm_state->realizations, list)
+			kfree(re);
+		mutex_destroy(&ctx->uvm_state->lock);
+		kfree(ctx->uvm_state);
+	}
 
 	nvkvm_session_put(ctx->session);
 	kfree(ctx);
