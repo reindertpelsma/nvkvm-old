@@ -25,19 +25,6 @@ struct nvkvm_handle {
 	uint32_t    session_id;   /* owning session */
 	int         dev_id;       /* for TYPE_NVIDIA: NVKVM_DEV_*         */
 	uint32_t    isolate_refcount;  /* # isolates that hold this handle */
-	uint32_t    guest_refcount;    /* # guest fds aliasing this handle.
-	                                 * For NVKVM_DEV_CTL, multiple guest
-	                                 * opens of /dev/nvidiactl in one
-	                                 * session dedupe onto a single
-	                                 * underlying struct file (and thus
-	                                 * a single nvfp) — required for
-	                                 * strict-validate to match across
-	                                 * libcuda's repeated opens. Starts
-	                                 * at 1 on first open; close_handle
-	                                 * decrements; underlying fd is only
-	                                 * released when this hits 0.
-	                                 * Other dev_ids set this to 1 and
-	                                 * never share. */
 	bool        poll_active;  /* handle is registered for poll        */
 	bool        in_use;
 };
@@ -87,18 +74,8 @@ int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id);
 /* Decrement isolate refcount (called when isolate closes fd). */
 int nvkvm_handle_unref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id);
 
-/* Close the underlying fd. Fails (returns -EBUSY) if isolate_refcount > 0.
- * For deduped CTL handles, decrements guest_refcount; only actually closes
- * when it hits 0. */
+/* Close the underlying fd. Fails (returns -EBUSY) if isolate_refcount > 0. */
 int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id);
-
-/*
- * Look up an existing /dev/nvidiactl handle for a session, if any, and bump
- * its guest_refcount. Returns the handle_id, or 0 if no matching handle.
- * Only NVKVM_DEV_CTL is deduped — events / channels / UVM must not share.
- */
-uint32_t nvkvm_handle_dedupe_ctl(struct nvkvm_handle_table *t,
-				  uint32_t session_id);
 
 /* Close all handles belonging to a session (called on session teardown). */
 void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_id);

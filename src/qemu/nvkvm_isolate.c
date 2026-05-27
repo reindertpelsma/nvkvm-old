@@ -738,18 +738,6 @@ int nvkvm_isolate_close_handle(struct nvkvm_isolate_table *t,
 	if (!valid)
 		return -ENOENT;
 
-	/*
-	 * For deduped handles (multiple guest fds aliasing one struct file),
-	 * the close-on-isolate must wait until the LAST guest fd releases.
-	 * Peek at guest_refcount: if > 1, the stub still has live references
-	 * and we just acknowledge the close without telling the stub.
-	 * (The actual handle_close will be a no-op on guest_refcount > 1
-	 * and the stub keeps the fd open.)
-	 */
-	struct nvkvm_handle *h = nvkvm_handle_get(ht, handle_id);
-	if (h && h->guest_refcount > 1)
-		return 0;
-
 	struct isolate_cmd_close_fd cmd = {
 		.type      = ISOLATE_CMD_CLOSE_FD,
 		.handle_id = handle_id,
