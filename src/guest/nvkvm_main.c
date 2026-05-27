@@ -860,9 +860,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 */
 		nvkvm_cpu_pages_writeback(ctx);
 	} else {
-		/* Legacy path (no isolate): ioctl runs in QEMU thread directly */
-		ret = nvkvm_virtio_ioctl(ctx, cmd, params_buf, param_size,
-					 aux_buf, aux_size);
+		/* Open establishes ctx->handle_id and ctx->session->isolate_id;
+		 * an ioctl on a ctx missing either is a logic bug. The legacy
+		 * non-isolate fallback (NVKVM_REQ_IOCTL) was removed in Step 3d. */
+		ret = -EBADF;
 	}
 
 	/*

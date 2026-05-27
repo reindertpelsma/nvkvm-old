@@ -201,34 +201,6 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 		}
 
 		switch (le32_to_cpu(hdr->type)) {
-		case NVKVM_REQ_OPEN: {
-			struct nvkvm_resp_open *resp = (void *)(hdr + 1);
-			inf->status = le32_to_cpu(resp->status);
-			inf->retval = le32_to_cpu(resp->fd_token);
-			break;
-		}
-		case NVKVM_REQ_CLOSE: {
-			struct nvkvm_resp_close *resp = (void *)(hdr + 1);
-			inf->status = le32_to_cpu(resp->status);
-			break;
-		}
-		case NVKVM_REQ_IOCTL: {
-			struct nvkvm_resp_ioctl *resp = (void *)(hdr + 1);
-			inf->retval = le64_to_cpu(resp->retval);
-			inf->status = le32_to_cpu(resp->status);
-			break;
-		}
-		case NVKVM_REQ_MMAP: {
-			struct nvkvm_resp_mmap *resp = (void *)(hdr + 1);
-			inf->retval = le64_to_cpu(resp->gpa_base);
-			inf->status = le32_to_cpu(resp->status);
-			break;
-		}
-		case NVKVM_REQ_MUNMAP: {
-			struct nvkvm_resp_munmap *resp = (void *)(hdr + 1);
-			inf->status = le32_to_cpu(resp->status);
-			break;
-		}
 		case NVKVM_REQ_OPEN_NVIDIA_HANDLE: {
 			struct nvkvm_resp_open_nvidia_handle *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -380,75 +352,10 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
 
-int nvkvm_virtio_open(int dev_id, unsigned int flags, unsigned int session_id,
-		      struct nvkvm_resp_open *resp_out)
-{
-	struct {
-		struct nvkvm_hdr      hdr;
-		struct nvkvm_req_open req;
-	} *msg;
-	struct nvkvm_inflight *inf;
-	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
-	if (txn_id == 0) return -EBUSY;
-	int ret;
-
-	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
-	inf = inflight_alloc_legacy(txn_id);
-	if (!inf) {
-		kfree(msg);
-		return -ENOMEM;
-	}
-
-	msg->hdr.type          = cpu_to_le32(NVKVM_REQ_OPEN);
-	msg->hdr.txn_id        = cpu_to_le32(txn_id);
-	msg->req.dev_id        = cpu_to_le32(dev_id);
-	msg->req.flags         = cpu_to_le32(flags);
-	msg->req.session_id    = cpu_to_le32(session_id);
-
-	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
-	if (ret == 0) {
-		resp_out->fd_token = (__u32)inf->retval;
-		resp_out->status   = inf->status;
-	}
-	inflight_free(&nvkvm, inf);
-	kfree(msg);
-	return ret;
-}
-
-int nvkvm_virtio_close(__u32 fd_token, struct nvkvm_resp_close *resp_out)
-{
-	struct {
-		struct nvkvm_hdr       hdr;
-		struct nvkvm_req_close req;
-	} *msg;
-	struct nvkvm_inflight *inf;
-	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
-	if (txn_id == 0) return -EBUSY;
-	int ret;
-
-	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
-	inf = inflight_alloc_legacy(txn_id);
-	if (!inf) {
-		kfree(msg);
-		return -ENOMEM;
-	}
-
-	msg->hdr.type    = cpu_to_le32(NVKVM_REQ_CLOSE);
-	msg->hdr.txn_id  = cpu_to_le32(txn_id);
-	msg->req.fd_token = cpu_to_le32(fd_token);
-
-	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
-	if (ret == 0)
-		resp_out->status = inf->status;
-	inflight_free(&nvkvm, inf);
-	kfree(msg);
-	return ret;
-}
-
+/* Legacy nvkvm_virtio_open / _close / _ioctl deleted in Step 3d.
+ * The isolate-aware path (OPEN_NVIDIA_HANDLE, CLOSE_HANDLE,
+ * IOCTL_ON_ISOLATE) is the only path live now. */
+#if 0
 long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx,
 			unsigned int cmd,
 			void *params_buf, size_t param_size,
@@ -557,6 +464,7 @@ out:
 	kfree(msg);
 	return ret;
 }
+#endif /* legacy ioctl helper — deleted in Step 3d */
 
 /* ── Version negotiation ──────────────────────────────────────────────────── */
 

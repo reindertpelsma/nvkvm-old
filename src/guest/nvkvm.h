@@ -71,9 +71,8 @@ struct nvkvm_cpu_page {
 };
 
 struct nvkvm_fd_ctx {
-	__u32                  fd_token;    /* opaque host-side FD reference (legacy) */
-	__u32                  handle_id;   /* QEMU-side nvidia handle ID (new)    */
-	int                    dev_id;      /* NVKVM_DEV_*                         */
+	__u32                  handle_id;   /* QEMU-side nvidia handle ID */
+	int                    dev_id;      /* NVKVM_DEV_*                */
 	struct nvkvm_session  *session;
 
 	/* poll support */
@@ -175,15 +174,7 @@ int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
 void nvkvm_virtio_fini(struct nvkvm_state *state);
 int  nvkvm_negotiate_version(struct nvkvm_state *state);
 
-/* Legacy (kept for compat; will be removed) */
-int  nvkvm_virtio_open(int dev_id, unsigned int flags, unsigned int session_id,
-		       struct nvkvm_resp_open *resp_out);
-int  nvkvm_virtio_close(__u32 fd_token, struct nvkvm_resp_close *resp_out);
-long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
-			void *params_buf, size_t param_size,
-			void *aux_buf, size_t aux_size);
-
-/* New isolate-aware API */
+/* Isolate-aware API */
 int  nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
 				     unsigned int session_id,
 				     __u32 *handle_id_out);
