@@ -497,6 +497,33 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 * (libcuda calls it but the kernel-side channel is already
 		 * known via RM handles — recording is for parity, not
 		 * correctness). */
+		case UVM_ALLOC_SEMAPHORE_POOL:
+			if (param_size >=
+			    sizeof(struct uvm_alloc_semaphore_pool_params)) {
+				struct uvm_alloc_semaphore_pool_params *p = params_buf;
+				struct nvkvm_uvm_mapping_intent *m =
+					kzalloc(sizeof(*m), GFP_KERNEL);
+				if (m) {
+					m->mode  = 1;  /* NVKVM_UVM_REALIZE_MODE_SEM_POOL */
+					m->base  = p->base;
+					m->length = p->length;
+					/* Snapshot the per-GPU attributes — these go
+					 * into the REALIZE message at mmap time
+					 * (Step E).  Copy only as much as the
+					 * struct guarantees so we never read past
+					 * what the guest wrote. */
+					m->params_size = sizeof(*p);
+					m->params = kmemdup(p, sizeof(*p), GFP_KERNEL);
+					if (!m->params) {
+						kfree(m);
+					} else {
+						mutex_lock(&st->lock);
+						list_add_tail(&m->list, &st->intents);
+						mutex_unlock(&st->lock);
+					}
+				}
+			}
+			break;
 		default:
 			break;
 		}
