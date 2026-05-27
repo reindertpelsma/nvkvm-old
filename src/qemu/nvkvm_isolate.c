@@ -118,27 +118,48 @@ static void reader_signal_sync(struct nvkvm_isolate *iso, int err,
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
+/* Variant for OPEN_DEVICE: also carries the SCM_RIGHTS fd. */
+static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
+{
+	pthread_mutex_lock(&iso->sync_lock);
+	iso->sync_error    = err;
+	iso->sync_open_fd  = fd;
+	iso->sync_done     = true;
+	pthread_cond_signal(&iso->sync_cond);
+	pthread_mutex_unlock(&iso->sync_lock);
+}
+
 static void *isolate_reader_fn(void *arg)
 {
 	struct nvkvm_isolate *iso = arg;
 
 	union {
-		uint32_t                       type;
-		struct isolate_resp_ok         ok;
-		struct isolate_resp_error      err;
-		struct isolate_resp_ioctl      ioctl;
-		struct isolate_resp_mmap       mmap;
-		struct isolate_resp_poll_event poll_event;
+		uint32_t                            type;
+		struct isolate_resp_ok              ok;
+		struct isolate_resp_error           err;
+		struct isolate_resp_ioctl           ioctl;
+		struct isolate_resp_mmap            mmap;
+		struct isolate_resp_poll_event      poll_event;
+		struct isolate_resp_open_device     open_dev;
 	} u;
 
 	for (;;) {
 		/*
-		 * For SOCK_SEQPACKET one recv() reads exactly one message.
+		 * For SOCK_SEQPACKET one recvmsg() reads exactly one message.
 		 * A buffer larger than the message is fine; excess bytes are
-		 * discarded. A buffer smaller would truncate — our union is
-		 * sized to the largest response struct, so we're safe.
+		 * discarded. Use recvmsg + cmsg buffer so the OPEN_DEVICE
+		 * response can deliver its SCM_RIGHTS fd in the same call —
+		 * other response types simply ignore the cmsg slot.
 		 */
-		ssize_t n = recv(iso->sock_fd, &u, sizeof(u), 0);
+		char cmsg_buf[CMSG_SPACE(sizeof(int))];
+		struct iovec iov = { .iov_base = &u, .iov_len = sizeof(u) };
+		struct msghdr msg = {
+			.msg_iov        = &iov,
+			.msg_iovlen     = 1,
+			.msg_control    = cmsg_buf,
+			.msg_controllen = sizeof(cmsg_buf),
+		};
+		ssize_t n = recvmsg(iso->sock_fd, &msg, 0);
 		if (n <= 0)
 			break;
 
@@ -220,6 +241,27 @@ static void *isolate_reader_fn(void *arg)
 			/* TODO: forward to virtio EVT queue */
 			break;
 
+		case ISOLATE_RESP_OPEN_DEVICE: {
+			int got_fd = -1;
+			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+			     cm; cm = CMSG_NXTHDR(&msg, cm)) {
+				if (cm->cmsg_level == SOL_SOCKET &&
+				    cm->cmsg_type  == SCM_RIGHTS &&
+				    cm->cmsg_len   == CMSG_LEN(sizeof(int))) {
+					memcpy(&got_fd, CMSG_DATA(cm), sizeof(int));
+				}
+			}
+			int err = u.open_dev.retval;
+			if (err && got_fd >= 0) {
+				/* Stub claimed failure but still sent a fd — be
+				 * defensive: close the orphan so we don't leak. */
+				close(got_fd);
+				got_fd = -1;
+			}
+			reader_signal_sync_open(iso, err, got_fd);
+			break;
+		}
+
 		default:
 			fprintf(stderr,
 				"nvkvm_isolate: unknown response type 0x%x\n",
@@ -295,6 +337,7 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->pending_head = NULL;
 			iso->next_txn_id  = 1;
 			iso->sync_done    = false;
+			iso->sync_open_fd = -1;
 			iso->reader_started = false;
 			*id_out = id;
 			return iso;
@@ -614,6 +657,71 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	if (ret == 0)
 		nvkvm_handle_ref_isolate(ht, handle_id);
 	return ret;
+}
+
+int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id, uint32_t handle_id,
+			      uint32_t dev_id, uint32_t flags,
+			      int *fd_out)
+{
+	if (fd_out)
+		*fd_out = -1;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	uint32_t txn_id = iso->next_txn_id++;
+	if (iso->next_txn_id == 0)
+		iso->next_txn_id = 1;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_open_device cmd = {
+		.type      = ISOLATE_CMD_OPEN_DEVICE,
+		.handle_id = handle_id,
+		.dev_id    = dev_id,
+		.flags     = flags,
+		.txn_id    = txn_id,
+	};
+
+	/* Inline sync_send_recv pattern; we also need the received fd, which
+	 * the reader stashes in iso->sync_open_fd before signaling. */
+	pthread_mutex_lock(&iso->sync_lock);
+	iso->sync_done    = false;
+	iso->sync_error   = 0;
+	iso->sync_open_fd = -1;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->sync_lock);
+		return (int)sr;
+	}
+
+	while (!iso->sync_done)
+		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
+	int err = iso->sync_error;
+	int fd  = iso->sync_open_fd;
+	iso->sync_open_fd = -1;
+	pthread_mutex_unlock(&iso->sync_lock);
+
+	if (err) {
+		if (fd >= 0)
+			close(fd);
+		return err;
+	}
+	if (fd < 0)
+		return -EPROTO;   /* stub said success but sent no fd */
+
+	if (fd_out)
+		*fd_out = fd;
+	else
+		close(fd);
+	return 0;
 }
 
 int nvkvm_isolate_close_handle(struct nvkvm_isolate_table *t,

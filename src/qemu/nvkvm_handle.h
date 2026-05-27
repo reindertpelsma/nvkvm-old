@@ -43,6 +43,22 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 			     uint32_t session_id, int dev_id, int flags,
 			     uint32_t *handle_id_out);
 
+/*
+ * Allocate a handle slot WITHOUT opening anything (fd = -1, in_use = true).
+ * Used by the stub-opens-the-fd path: QEMU reserves the slot, hands the
+ * handle_id to the stub via ISOLATE_CMD_OPEN_DEVICE, and on success
+ * attaches the SCM_RIGHTS-received fd via nvkvm_handle_attach_fd. If
+ * anything fails between alloc and attach, nvkvm_handle_abort_open
+ * releases the slot cleanly (no close — there's no fd yet).
+ */
+int  nvkvm_handle_alloc_pending(struct nvkvm_handle_table *t,
+				 uint32_t session_id, int dev_id,
+				 uint32_t *handle_id_out);
+int  nvkvm_handle_attach_fd(struct nvkvm_handle_table *t,
+			    uint32_t handle_id, int fd);
+void nvkvm_handle_abort_open(struct nvkvm_handle_table *t,
+			     uint32_t handle_id);
+
 /* Allocate a new memory handle (creates memfd in QEMU). */
 int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 			     uint32_t session_id, uint64_t size,

@@ -146,6 +146,59 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 	return 0;
 }
 
+int nvkvm_handle_alloc_pending(struct nvkvm_handle_table *t,
+				uint32_t session_id, int dev_id,
+				uint32_t *handle_id_out)
+{
+	pthread_mutex_lock(&t->lock);
+	uint32_t id;
+	struct nvkvm_handle *h = alloc_slot(t, &id);
+	if (!h) {
+		pthread_mutex_unlock(&t->lock);
+		return -EMFILE;
+	}
+	h->type       = NVKVM_HANDLE_TYPE_NVIDIA;
+	h->fd         = -1;
+	h->session_id = session_id;
+	h->dev_id     = dev_id;
+	*handle_id_out = id;
+	pthread_mutex_unlock(&t->lock);
+	return 0;
+}
+
+int nvkvm_handle_attach_fd(struct nvkvm_handle_table *t,
+			   uint32_t handle_id, int fd)
+{
+	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX || fd < 0)
+		return -EINVAL;
+	pthread_mutex_lock(&t->lock);
+	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
+	if (!h->in_use || h->id != handle_id) {
+		pthread_mutex_unlock(&t->lock);
+		return -EBADF;
+	}
+	if (h->fd >= 0) {
+		pthread_mutex_unlock(&t->lock);
+		return -EEXIST;   /* attach is one-shot */
+	}
+	h->fd = fd;
+	pthread_mutex_unlock(&t->lock);
+	return 0;
+}
+
+void nvkvm_handle_abort_open(struct nvkvm_handle_table *t, uint32_t handle_id)
+{
+	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
+		return;
+	pthread_mutex_lock(&t->lock);
+	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
+	if (h->in_use && h->id == handle_id && h->fd < 0) {
+		h->in_use = false;
+		/* No close: fd was never attached. */
+	}
+	pthread_mutex_unlock(&t->lock);
+}
+
 int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 			     uint32_t session_id, uint64_t size,
 			     uint32_t *handle_id_out)

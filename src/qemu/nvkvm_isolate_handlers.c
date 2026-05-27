@@ -122,16 +122,114 @@ int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
 
 /* ── Handle open ─────────────────────────────────────────────────────────── */
 
+/*
+ * Look up the (first) isolate for a session. Sessions may eventually carry
+ * multiple isolates (post-fork); Step 6 handles that lazily — for now the
+ * guest opens one isolate per session before any /dev/nvidia* open and the
+ * first slot is the active one.
+ */
+static uint32_t session_first_isolate(VirtIONvgpu *nv, uint32_t session_id)
+{
+	uint32_t iso_id = 0;
+	pthread_mutex_lock(&nv->sessions_lock);
+	struct nvkvm_session *s = nvkvm_session_find(nv, session_id);
+	if (s) {
+		pthread_mutex_lock(&s->lock);
+		if (s->nisolates > 0)
+			iso_id = s->isolate_ids[0];
+		pthread_mutex_unlock(&s->lock);
+	}
+	pthread_mutex_unlock(&nv->sessions_lock);
+	return iso_id;
+}
+
 int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
 				  struct nvkvm_req_open_nvidia_handle *req,
 				  struct nvkvm_resp_open_nvidia_handle *resp)
 {
 	uint32_t handle_id = 0;
-	int ret = nvkvm_handle_open_nvidia(&nv->handles,
-					   req->session_id,
-					   (int)req->dev_id,
-					   (int)req->flags,
-					   &handle_id);
+	int ret;
+
+	/*
+	 * UVM stays opened in QEMU (driver enforces opener-does-mmap, and
+	 * mmap is done in QEMU for KVM region installation). The other
+	 * devices — /dev/nvidiactl, /dev/nvidia0..N, and the eventfd that
+	 * stands in for the guest's libcuda eventfd — open inside the
+	 * isolate so nvfp/mm lineage matches the process that runs RM
+	 * ioctls. See docs/REFACTOR_PLAN.md §1 open-ownership table.
+	 */
+	if ((int)req->dev_id == NVKVM_DEV_UVM) {
+		ret = nvkvm_handle_open_nvidia(&nv->handles,
+					       req->session_id,
+					       (int)req->dev_id,
+					       (int)req->flags,
+					       &handle_id);
+		if (ret < 0)
+			goto out;
+		/*
+		 * Stub swaps the SCM_RIGHTS-received UVM fd for one of its
+		 * own pre-opened local UVM fds (file-owner-mm match for
+		 * UVM_MM_INITIALIZE). We still need to send a RECEIVE_FD so
+		 * the stub knows about the handle_id → local-fd mapping.
+		 * If the session has no isolate yet, this is deferred until
+		 * the guest creates one and re-issues COPY_HANDLE_TO_ISOLATE
+		 * (legacy compat — Step 3d removes that fallback).
+		 */
+		{
+			uint32_t iso = session_first_isolate(nv, req->session_id);
+			if (iso != 0)
+				nvkvm_isolate_send_handle(&nv->isolates,
+							   &nv->handles,
+							   iso, handle_id);
+		}
+		goto out;
+	}
+
+	uint32_t iso_id = session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		/*
+		 * No isolate yet. Guest must call CREATE_ISOLATE before the
+		 * first non-UVM open. Returned to the guest so it can either
+		 * reorder or fail the open syscall.
+		 */
+		ret = -ENOENT;
+		goto out;
+	}
+
+	ret = nvkvm_handle_alloc_pending(&nv->handles, req->session_id,
+					 (int)req->dev_id, &handle_id);
+	if (ret < 0)
+		goto out;
+
+	int fd_from_scm = -1;
+	ret = nvkvm_isolate_open_device(&nv->isolates, iso_id, handle_id,
+					req->dev_id, req->flags,
+					&fd_from_scm);
+	if (ret < 0) {
+		nvkvm_handle_abort_open(&nv->handles, handle_id);
+		handle_id = 0;
+		goto out;
+	}
+
+	ret = nvkvm_handle_attach_fd(&nv->handles, handle_id, fd_from_scm);
+	if (ret < 0) {
+		/* Shouldn't happen on a fresh slot; clean up if it does. */
+		close(fd_from_scm);
+		nvkvm_handle_abort_open(&nv->handles, handle_id);
+		handle_id = 0;
+		goto out;
+	}
+
+	/*
+	 * Bump the isolate refcount to mirror what nvkvm_isolate_send_handle
+	 * did in the legacy COPY_HANDLE_TO_ISOLATE flow: the stub now holds
+	 * one copy of this fd (the original); QEMU holds the SCM_RIGHTS copy
+	 * as qemu_fd. Close-handle must refuse until the isolate releases.
+	 */
+	nvkvm_handle_ref_isolate(&nv->handles, handle_id);
+	ret = 0;
+
+out:
 	if (ret < 0) {
 		resp->handle_id = 0;
 		resp->status    = (uint32_t)-ret;

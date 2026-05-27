@@ -70,7 +70,8 @@ struct nvkvm_isolate {
 	bool        sync_done;
 	int         sync_error;     /* -errno or 0 */
 	int         sync_mmap_retval;
-
+	int         sync_open_fd;   /* fd received via SCM_RIGHTS for OPEN_DEVICE;
+	                             * -1 if none. Reader fills before signaling. */
 };
 
 struct nvkvm_isolate_table {
@@ -104,6 +105,21 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 			      struct nvkvm_handle_table *ht,
 			      uint32_t isolate_id, uint32_t handle_id);
+
+/*
+ * Ask the isolate to open /dev/nvidia* (or eventfd) on QEMU's behalf so the
+ * file's nvfp/mm lineage is the stub process. On success the stub stores
+ * the fd under handle_id and replies with a SCM_RIGHTS-attached copy of
+ * the same fd; that copy is returned via *fd_out — caller owns it and
+ * typically attaches it as the qemu_fd in the handle table.
+ *
+ * dev_id values match the NVKVM_DEV_* constants from nvkvm_proto.h. UVM
+ * and memfd are NOT supported here; both stay opened in QEMU directly.
+ */
+int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id, uint32_t handle_id,
+			      uint32_t dev_id, uint32_t flags,
+			      int *fd_out);
 
 /*
  * Tell the isolate to close a handle's fd.

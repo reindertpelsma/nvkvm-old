@@ -292,11 +292,22 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	ctx->fd_token = resp.fd_token;
 
 	/*
-	 * New isolate path: open a QEMU-side handle, ensure the session has an
-	 * isolate, and distribute the handle to it.
+	 * Isolate path: the stub now opens /dev/nvidia* in its own process
+	 * (correct nvfp/mm lineage) and ships the fd back via SCM_RIGHTS in
+	 * the OPEN_NVIDIA_HANDLE reply. The isolate must therefore exist
+	 * before the open. UVM still opens in QEMU; for it the order doesn't
+	 * matter but we keep one path for simplicity.
 	 */
 	{
 		__u32 handle_id = 0;
+
+		ret = nvkvm_ensure_isolate(ctx->session);
+		if (ret) {
+			pr_warn("nvkvm: create_isolate failed %d, using legacy\n",
+				ret);
+			goto done;
+		}
+
 		ret = nvkvm_virtio_open_nvidia_handle(dev_id, filp->f_flags,
 						      (unsigned int)ctx->session->id,
 						      &handle_id);
@@ -306,23 +317,10 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 			goto done;
 		}
 		ctx->handle_id = handle_id;
-
-		ret = nvkvm_ensure_isolate(ctx->session);
-		if (ret) {
-			pr_warn("nvkvm: create_isolate failed %d, using legacy\n",
-				ret);
-			nvkvm_virtio_close_handle(handle_id);
-			ctx->handle_id = 0;
-			goto done;
-		}
-
-		ret = nvkvm_virtio_copy_handle_to_isolate(handle_id,
-							  ctx->session->isolate_id);
-		if (ret) {
-			pr_warn("nvkvm: copy_handle_to_isolate failed %d\n", ret);
-			nvkvm_virtio_close_handle(handle_id);
-			ctx->handle_id = 0;
-		}
+		/*
+		 * No COPY_HANDLE_TO_ISOLATE: the open response already
+		 * placed the fd in both the stub and QEMU's qemu_fd slot.
+		 */
 	}
 
 done:
