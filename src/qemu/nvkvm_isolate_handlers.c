@@ -301,6 +301,30 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 			    struct nvkvm_resp_kill_isolate *resp)
 {
 	int ret = nvkvm_isolate_kill(&nv->isolates, req->isolate_id);
+
+	/*
+	 * Walk every session and prune the killed isolate from its
+	 * isolate_ids[] list. Without this, session_first_isolate
+	 * later returns a stale (dead) isolate_id and the OPEN_DEVICE
+	 * round-trip fails — the session can outlive its isolate in
+	 * the test-cycle case (session_id is reused after the guest
+	 * idr_remove + new alloc lands the same id).
+	 */
+	pthread_mutex_lock(&nv->sessions_lock);
+	struct nvkvm_session *s;
+	TAILQ_FOREACH(s, &nv->sessions, link) {
+		pthread_mutex_lock(&s->lock);
+		int dst = 0;
+		for (int i = 0; i < s->nisolates; i++) {
+			if (s->isolate_ids[i] != req->isolate_id) {
+				s->isolate_ids[dst++] = s->isolate_ids[i];
+			}
+		}
+		s->nisolates = dst;
+		pthread_mutex_unlock(&s->lock);
+	}
+	pthread_mutex_unlock(&nv->sessions_lock);
+
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
 	return 0;
 }
