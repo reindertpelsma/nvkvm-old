@@ -604,3 +604,47 @@ Each commit small, each compileable, each shippable.
 
 **See also**: `[[gpfifo-schedule-runlist-bug]]`, `[[dma-copy-class-alloc-params]]`,
 `[[writeback-bug-pattern]]`.
+
+## 12. Session ending state (2026-05-28)
+
+Landed and verified on `nvkvm-tables-refactor`:
+
+- **Step A** (6dcc36f) — `nvkvm_uvm_fd_state` scaffolding.  Allocated
+  in `nvkvm_open` for UVM fds, freed in `nvkvm_release`.
+- **Step B** (aa32a26) — `UVM_INITIALIZE` flags recorded into
+  `uvm_state->init_flags`.  Forwarding kept (additive).
+- **Step C** (6a665b4) — `UVM_REGISTER_GPU` / `_GPU_VASPACE` /
+  `_CREATE_RANGE_GROUP` recorded into per-fd lists.  Forwarding kept.
+- **Step D** (b25de6a) — `UVM_ALLOC_SEMAPHORE_POOL` recorded as a
+  `nvkvm_uvm_mapping_intent { mode=SEM_POOL, base, length, params }`.
+  Forwarding kept.
+- **Step E (1/4)** (b1228e3) — `NVKVM_REQ_REALIZE_UVM_MAPPING` wire
+  protocol in `src/common/nvkvm_proto.h`:
+  request, response, state snapshot, mode constants, caps.
+
+In-flight (3 commits left for Step E):
+
+- **Step E (2/4)** — stub-side `ISOLATE_CMD_REALIZE_UVM_FD` handler:
+  open fresh UVM fd, replay `UVM_INITIALIZE`+`UVM_REGISTER_GPU(*)`+
+  `UVM_REGISTER_GPU_VASPACE(*)`+`UVM_CREATE_RANGE_GROUP(*)`+
+  the mode-specific intent, then `mmap(2)` and return host VA +
+  realize_token.
+- **Step E (3/4)** — QEMU-side handler: validate strictly per §8a
+  (size, fields, flags, pointer translation, allowlist), allocate
+  GPA from the session GPA window, install KVM region after stub
+  returns host VA.
+- **Step E (4/4)** — guest module dispatch: in
+  `nvkvm_mmap_request_isolate` for UVM fds, look up matching intent
+  in `uvm_state->intents`, call new `nvkvm_virtio_realize_uvm_mapping`
+  instead of the standard `mmap_on_isolate`.  `remap_pfn_range` the
+  returned GPA.  Record into `uvm_state->realizations` for teardown.
+
+Note on the immediate-unblock alternative: a much smaller change in
+the stub (pre-`UVM_INITIALIZE` each `uvm_local_fds[]` pool slot at
+boot) would unblock the `EBADFD` mmap right now, without the full
+state-machine refactor.  I attempted this but the stub uses
+`-nostdlib` and its `syscall()` linkage needs the larger
+QEMU-build pipeline to verify.  Decision: skip the transitional
+fix; land Step E proper in the next session.  The protocol contract
+is committed (b1228e3), the recording layer is committed, only the
+realize execution path remains.
