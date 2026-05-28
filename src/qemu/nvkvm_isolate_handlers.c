@@ -762,3 +762,169 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
 	}
 	return 0;
 }
+
+/* ── REALIZE_UVM_MAPPING ─────────────────────────────────────────────────────
+ *
+ * STATE_MACHINE_PLAN §8a — strict validation.  This handler runs in QEMU
+ * (privileged) on behalf of a guest that we treat as adversarial.
+ *
+ * Threat model: any field can be attacker-controlled.  We must:
+ *   1. Bound every count / size against caps defined in nvkvm_proto.h.
+ *   2. Sanitize flags — strip everything outside the allowlist.
+ *   3. Sanitize prot — strip everything outside R/W (no exec on GPU mmaps).
+ *   4. For mode SEM_POOL: validate intent_size == sizeof(SEM_POOL_PARAMS).
+ *   5. Validate the intent struct's base/length match req.length so a
+ *      malicious guest can't trick the kernel into mapping the wrong VA.
+ *   6. Allocate a fresh KVM GPA window — never trust offsets.
+ *   7. Forward exact validated state+intent to the stub.
+ */
+extern int nvkvm_kvm_vm_fd;
+struct nvkvm_kvm_mem_region_rl {
+	uint32_t slot;
+	uint32_t flags;
+	uint64_t guest_phys_addr;
+	uint64_t memory_size;
+	uint64_t userspace_addr;
+};
+#define NVKVM_KVMIO_RL  0xAE
+#define KVM_SET_USER_MEMORY_REGION_RL \
+	_IOW(NVKVM_KVMIO_RL, 0x46, struct nvkvm_kvm_mem_region_rl)
+
+#define NVKVM_REALIZE_PROT_MASK    (PROT_READ | PROT_WRITE)
+#define NVKVM_REALIZE_FLAGS_MASK   (MAP_SHARED | MAP_PRIVATE)
+/* Cap intent blob: SEM_POOL is 9248 bytes; allow a small margin. */
+#define NVKVM_REALIZE_INTENT_MAX   (64u * 1024u)
+
+static uint32_t realize_kvm_slot_counter = 1100;
+
+int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
+				   struct nvkvm_req_realize_uvm_mapping *req,
+				   struct nvkvm_resp_realize_uvm_mapping *resp,
+				   void *state_buf, void *intent_buf)
+{
+	memset(resp, 0, sizeof(*resp));
+
+	/* §8a.1 — pointer presence. */
+	if (!state_buf || !intent_buf) {
+		resp->status = (uint32_t)-EINVAL;
+		return 0;
+	}
+
+	/* §8a.1 — state size is a fixed cap-bound struct. */
+	const size_t state_size =
+		sizeof(struct nvkvm_uvm_state_snapshot);
+
+	/* §8a.4 — intent size bound + mode-specific exact match. */
+	if (req->intent_size == 0 ||
+	    req->intent_size > NVKVM_REALIZE_INTENT_MAX) {
+		resp->status = (uint32_t)-EINVAL;
+		return 0;
+	}
+
+	/* §8a.5 — validate per-mode intent shape. */
+	struct nvkvm_uvm_state_snapshot *snap = state_buf;
+	if (snap->n_gpus > NVKVM_UVM_MAX_REG_GPUS ||
+	    snap->n_va_spaces > NVKVM_UVM_MAX_VA_SPACES ||
+	    snap->n_range_groups > NVKVM_UVM_MAX_RANGE_GROUPS) {
+		resp->status = (uint32_t)-EINVAL;
+		return 0;
+	}
+
+	switch (req->mode) {
+	case NVKVM_UVM_REALIZE_MODE_SEM_POOL: {
+		/* SEM_POOL intent is exactly the kernel's params struct. */
+		if (req->intent_size !=
+		    sizeof(struct uvm_alloc_semaphore_pool_params)) {
+			resp->status = (uint32_t)-EINVAL;
+			return 0;
+		}
+		struct uvm_alloc_semaphore_pool_params *p = intent_buf;
+		/* base/length must match the GVA window the guest is mmaping. */
+		if (p->length != req->length || p->base != req->gva) {
+			resp->status = (uint32_t)-EINVAL;
+			return 0;
+		}
+		/* QEMU normalizes status fields to 0; kernel fills outputs. */
+		p->rm_status = 0;
+		break;
+	}
+	default:
+		resp->status = (uint32_t)-ENOTSUP;
+		return 0;
+	}
+
+	/* §8a.2/3 — sanitize prot+flags.  Strip anything outside allowlist. */
+	uint32_t prot      = req->prot      & (uint32_t)NVKVM_REALIZE_PROT_MASK;
+	uint32_t map_flags = req->map_flags & (uint32_t)NVKVM_REALIZE_FLAGS_MASK;
+	if (prot == 0)
+		prot = PROT_READ | PROT_WRITE;
+	if ((map_flags & (MAP_SHARED | MAP_PRIVATE)) == 0)
+		map_flags |= MAP_SHARED;
+
+	/* Length must be page-aligned and within sane bounds. */
+	uint64_t len = req->length;
+	if (len == 0 || len > (1ULL << 40) || (len & 4095ULL)) {
+		resp->status = (uint32_t)-EINVAL;
+		return 0;
+	}
+
+	/* §8a.6 — allocate a fresh GPA window. */
+	uint64_t gpa = 0;
+	nvkvm_mmap_win_alloc(nv, (size_t)len, &gpa);
+	if (gpa == 0) {
+		resp->status = (uint32_t)-ENOMEM;
+		return 0;
+	}
+
+	/* §8a.7 — send to stub.  Stub does the actual /dev/nvidia-uvm work
+	 * inside the isolate's mm. */
+	uint64_t host_va = 0, out_len = 0, token = 0;
+	uint32_t rm_status = 0;
+	int ret = nvkvm_isolate_realize_uvm_fd(&nv->isolates,
+					       req->isolate_id,
+					       req->mode,
+					       state_buf, (uint32_t)state_size,
+					       intent_buf, req->intent_size,
+					       prot, map_flags,
+					       len, /*host_va_hint=*/0,
+					       /*offset=*/0,
+					       &host_va, &out_len,
+					       &token, &rm_status);
+	if (ret < 0 || host_va == 0) {
+		resp->status    = (uint32_t)-ret;
+		resp->rm_status = rm_status;
+		return 0;
+	}
+	if (rm_status != 0) {
+		/* Kernel rejected the intent — host_va may still be set if the
+		 * mmap succeeded but a later step failed.  Treat as failure. */
+		resp->rm_status = rm_status;
+		resp->status    = (uint32_t)-EIO;
+		return 0;
+	}
+
+	/* §8a.6 — install KVM region: GPA window ↔ stub's host VA. */
+	if (nvkvm_kvm_vm_fd >= 0) {
+		struct nvkvm_kvm_mem_region_rl mr = {
+			.slot            = realize_kvm_slot_counter++,
+			.flags           = 0,
+			.guest_phys_addr = gpa,
+			.memory_size     = len,
+			.userspace_addr  = host_va,
+		};
+		if (ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION_RL,
+			  &mr) < 0) {
+			fprintf(stderr,
+				"nvkvm: realize KVM_SET_USER_MEMORY_REGION: %s\n",
+				strerror(errno));
+			/* Non-fatal — guest will see EFAULT on first deref. */
+		}
+	}
+
+	resp->gpa_base      = gpa;
+	resp->length        = len;
+	resp->realize_token = token;
+	resp->rm_status     = 0;
+	resp->status        = 0;
+	return 0;
+}

@@ -72,6 +72,11 @@ struct nvkvm_isolate {
 	int         sync_mmap_retval;
 	int         sync_open_fd;   /* fd received via SCM_RIGHTS for OPEN_DEVICE;
 	                             * -1 if none. Reader fills before signaling. */
+	/* REALIZE_UVM_FD response slots — reader fills before signaling. */
+	uint64_t    sync_realize_host_va;
+	uint64_t    sync_realize_length;
+	uint64_t    sync_realize_token;
+	uint32_t    sync_realize_rm_status;
 };
 
 struct nvkvm_isolate_table {
@@ -157,6 +162,28 @@ int nvkvm_isolate_mmap(struct nvkvm_isolate_table *t,
  */
 int nvkvm_isolate_munmap(struct nvkvm_isolate_table *t,
 			 uint32_t isolate_id, uint64_t gva, uint64_t length);
+
+/*
+ * Send REALIZE_UVM_FD: stub opens /dev/nvidia-uvm, replays the recorded
+ * state, runs the mode-specific intent ioctl, and mmaps the result.
+ *
+ * The cmd header is sent first; then `state` (state_size bytes); then
+ * `intent` (intent_size bytes), all on the same SEQPACKET socket.
+ *
+ * On success returns 0 and fills *host_va_out / *length_out / *token_out /
+ * *rm_status_out.  rm_status != 0 means the kernel rejected the intent
+ * but the transport succeeded.
+ */
+int nvkvm_isolate_realize_uvm_fd(struct nvkvm_isolate_table *t,
+				 uint32_t isolate_id,
+				 uint32_t mode,
+				 const void *state, uint32_t state_size,
+				 const void *intent, uint32_t intent_size,
+				 uint32_t prot, uint32_t map_flags,
+				 uint64_t length, uint64_t host_va_hint,
+				 uint64_t offset,
+				 uint64_t *host_va_out, uint64_t *length_out,
+				 uint64_t *token_out, uint32_t *rm_status_out);
 
 /*
  * Register/deregister poll on a handle in the isolate.

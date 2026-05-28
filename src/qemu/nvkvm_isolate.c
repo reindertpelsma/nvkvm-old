@@ -141,6 +141,7 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_mmap            mmap;
 		struct isolate_resp_poll_event      poll_event;
 		struct isolate_resp_open_device     open_dev;
+		struct isolate_resp_realize_uvm     realize;
 	} u;
 
 	for (;;) {
@@ -240,6 +241,19 @@ static void *isolate_reader_fn(void *arg)
 		case ISOLATE_RESP_POLL_EVENT:
 			/* TODO: forward to virtio EVT queue */
 			break;
+
+		case ISOLATE_RESP_REALIZE_UVM: {
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_realize_host_va   = u.realize.host_va;
+			iso->sync_realize_length    = u.realize.length;
+			iso->sync_realize_token     = u.realize.realize_token;
+			iso->sync_realize_rm_status = u.realize.rm_status;
+			iso->sync_error             = u.realize.retval;
+			iso->sync_done              = true;
+			pthread_cond_signal(&iso->sync_cond);
+			pthread_mutex_unlock(&iso->sync_lock);
+			break;
+		}
 
 		case ISOLATE_RESP_OPEN_DEVICE: {
 			int got_fd = -1;
@@ -885,6 +899,80 @@ int nvkvm_isolate_munmap(struct nvkvm_isolate_table *t,
 		.length = length,
 	};
 	return sync_send_recv(iso, &cmd, sizeof(cmd));
+}
+
+/* ── REALIZE_UVM_FD ─────────────────────────────────────────────────────── */
+
+int nvkvm_isolate_realize_uvm_fd(struct nvkvm_isolate_table *t,
+				 uint32_t isolate_id,
+				 uint32_t mode,
+				 const void *state, uint32_t state_size,
+				 const void *intent, uint32_t intent_size,
+				 uint32_t prot, uint32_t map_flags,
+				 uint64_t length, uint64_t host_va_hint,
+				 uint64_t offset,
+				 uint64_t *host_va_out, uint64_t *length_out,
+				 uint64_t *token_out, uint32_t *rm_status_out)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_realize_uvm_fd cmd = {
+		.type         = ISOLATE_CMD_REALIZE_UVM_FD,
+		.mode         = mode,
+		.state_size   = state_size,
+		.intent_size  = intent_size,
+		.prot         = prot,
+		.map_flags    = map_flags,
+		.length       = length,
+		.host_va_hint = host_va_hint,
+		.offset       = offset,
+	};
+
+	pthread_mutex_lock(&iso->sync_lock);
+	iso->sync_done              = false;
+	iso->sync_error             = 0;
+	iso->sync_realize_host_va   = 0;
+	iso->sync_realize_length    = 0;
+	iso->sync_realize_token     = 0;
+	iso->sync_realize_rm_status = 0;
+
+	/* All three writes (header + state + intent) must reach the stub
+	 * atomically wrt other senders — hold write_lock across them. */
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	if (sr >= 0 && state_size > 0)
+		sr = sock_send_full(iso->sock_fd, state, state_size);
+	if (sr >= 0 && intent_size > 0)
+		sr = sock_send_full(iso->sock_fd, intent, intent_size);
+	pthread_mutex_unlock(&iso->write_lock);
+
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->sync_lock);
+		return (int)sr;
+	}
+
+	while (!iso->sync_done)
+		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
+	int err           = iso->sync_error;
+	uint64_t host_va  = iso->sync_realize_host_va;
+	uint64_t out_len  = iso->sync_realize_length;
+	uint64_t token    = iso->sync_realize_token;
+	uint32_t rm_st    = iso->sync_realize_rm_status;
+	pthread_mutex_unlock(&iso->sync_lock);
+
+	if (host_va_out)   *host_va_out   = host_va;
+	if (length_out)    *length_out    = out_len;
+	if (token_out)     *token_out     = token;
+	if (rm_status_out) *rm_status_out = rm_st;
+	return err;
 }
 
 /* ── Poll / unpoll ──────────────────────────────────────────────────────── */

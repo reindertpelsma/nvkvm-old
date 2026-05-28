@@ -659,6 +659,26 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			break;
 		}
 
+		case NVKVM_REQ_REALIZE_UVM_MAPPING: {
+			struct nvkvm_req_realize_uvm_mapping  req  = {0};
+			struct nvkvm_resp_realize_uvm_mapping resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			void *sb = slot_valid(nv, req.state_shm_slot) ?
+				   slot_ptr(nv, req.state_shm_slot) : NULL;
+			void *ib = (req.intent_size > 0 &&
+				    slot_valid(nv, req.intent_shm_slot)) ?
+				   slot_ptr(nv, req.intent_shm_slot) : NULL;
+			nvkvm_req_realize_uvm_mapping(nv, &req, &resp, sb, ib);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_realize_uvm_mapping r; } rout;
+			rout.h = hdr; rout.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &rout, sizeof(rout));
+			virtqueue_push(vq, elem, sizeof(rout));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
 #undef ISOLATE_REQ
 
 		default:
