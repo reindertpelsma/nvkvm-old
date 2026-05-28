@@ -38,7 +38,20 @@
  * each guest process sees only its own GPU contexts.
  */
 struct nvkvm_session {
-	pid_t   tgid;
+	/*
+	 * Sessions are keyed by `mm` (address-space identity), not by tgid.
+	 * Linux reuses tgids after a process exits; if a previous tgid-keyed
+	 * session lingered (refcount race) the new process with the same tgid
+	 * would inherit the stale session, isolate, and handle table — a
+	 * cross-uid info-leak path inside one VM.  `mm_struct *` is a strong
+	 * identity (refcounted, never reused while alive), so equal-mm means
+	 * same process; threads share an mm so they share a session (correct);
+	 * fork creates a new mm so the child gets a new session (correct).
+	 * We hold a refcount on the mm via mmget() in get_or_create and drop
+	 * it in put.  Audit H2.
+	 */
+	struct mm_struct *mm;
+	pid_t   tgid;           /* for logging/diagnostics only           */
 	int     id;             /* IDR key                                */
 	int     refcount;       /* protected by nvkvm_state.sessions_lock */
 	__u32   isolate_id;     /* QEMU isolate process ID (0 = not yet created) */
@@ -297,7 +310,8 @@ int  nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 				   __u64 gva, __u64 len, unsigned long prot);
 
 /* nvkvm_session.c */
-struct nvkvm_session *nvkvm_session_get_or_create(pid_t tgid);
+struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
+						  pid_t tgid);
 void                  nvkvm_session_put(struct nvkvm_session *session);
 
 /* Shared memory slot helpers (nvkvm_virtio.c) */

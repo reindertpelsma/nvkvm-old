@@ -48,6 +48,57 @@ static const unsigned char *stub_elf     = NULL;
 static unsigned int         stub_elf_len = 0;
 #endif
 
+/*
+ * Close every inherited fd from STDERR+1 up to RLIMIT_NOFILE in the just-
+ * forked child, before fexecve/execl.  Without this the stub inherits
+ * QEMU's KVM vm fd, the memory-backend fds, every other isolate's socket-
+ * pair, and so on — turning any stub RCE into "set arbitrary host memory
+ * region visible to the guest" via KVM_SET_USER_MEMORY_REGION.  Audit M6.
+ *
+ * We prefer the close_range(2) syscall (Linux 5.9+, ~always present on
+ * vast.ai kernels) because it's O(1) at the kernel level and atomically
+ * closes a range without needing to readdir /proc/self/fd.  Falls back
+ * to the classic dirent loop if close_range isn't available.
+ */
+#ifndef CLOSE_RANGE_UNSHARE
+#define CLOSE_RANGE_UNSHARE  (1U << 1)
+#endif
+
+static void nvkvm_isolate_closefrom_3(void)
+{
+	int first = STDERR_FILENO + 1;       /* keep 0/1/2 */
+	long r = syscall(__NR_close_range, first, ~0U, 0);
+	if (r == 0)
+		return;
+	/* Fallback: iterate /proc/self/fd.  We can't use opendir here
+	 * (allocates), so dump a getdents64 buffer.  Best-effort. */
+	int dfd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0)
+		return;
+	char buf[4096];
+	while (1) {
+		long n = syscall(__NR_getdents64, dfd, buf, sizeof(buf));
+		if (n <= 0)
+			break;
+		for (long off = 0; off < n; ) {
+			struct linux_dirent64 {
+				unsigned long  d_ino;
+				long           d_off;
+				unsigned short d_reclen;
+				unsigned char  d_type;
+				char           d_name[];
+			} *de = (void *)(buf + off);
+			off += de->d_reclen;
+			if (de->d_name[0] == '.')
+				continue;
+			int fd = atoi(de->d_name);
+			if (fd >= first && fd != dfd)
+				close(fd);
+		}
+	}
+	close(dfd);
+}
+
 /* ── In-flight IOCTL request (lives on the caller's stack) ──────────────── */
 
 struct nvkvm_pending_ioctl {
@@ -404,10 +455,14 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		pid = fork();
 		if (pid == 0) {
 			dup2(sv[1], STDIN_FILENO);
-			close(sv[0]);
-			close(sv[1]);
+			/* Close every inherited fd above stderr — including
+			 * QEMU's KVM vm fd, the memory backend fds, other
+			 * isolates' socketpairs, etc.  Without this an
+			 * RCE in the stub has direct access to KVM_SET_-
+			 * USER_MEMORY_REGION on the host VM (M6). */
+			nvkvm_isolate_closefrom_3();
 			const char *argv[] = { "nvkvm_stub", NULL };
-			const char *envp[] = { NULL };
+			const char *envp[] = { NULL };  /* M6: drop QEMU env */
 			fexecve(mfd, (char *const *)argv, (char *const *)envp);
 			_exit(127);
 		}
@@ -417,23 +472,18 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		if (!stub_path)
 			stub_path = "/usr/lib/nvkvm/nvkvm_stub";
 
+		/* M6: in NVKVM_STUB_DEBUG=1 mode, keep the parent's environment
+		 * so LD_PRELOAD-based instrumentation still works.  Production
+		 * runs clear everything. */
+		const char *dbg_mode = getenv("NVKVM_STUB_DEBUG");
+		bool keep_env = (dbg_mode && *dbg_mode == '1');
+
 		pid = fork();
 		if (pid == 0) {
 			dup2(sv[1], STDIN_FILENO);
-			close(sv[0]);
-			close(sv[1]);
-			/* DEBUG: inject ioctl-dump LD_PRELOAD if requested */
-			const char *dbg = getenv("NVKVM_STUB_LD_PRELOAD");
-			if (dbg && *dbg) {
-				setenv("LD_PRELOAD", dbg, 1);
-				/* If TRACE_FILE env vars exist for stub, override
-				 * the inherited QEMU ones so the stub writes to
-				 * its own file. */
-				const char *stf = getenv("NVKVM_STUB_TRACE_FILE");
-				const char *stt = getenv("NVKVM_STUB_TRACE_TAG");
-				if (stf) setenv("TRACE_FILE", stf, 1);
-				if (stt) setenv("TRACE_TAG", stt, 1);
-			}
+			nvkvm_isolate_closefrom_3();
+			if (!keep_env)
+				clearenv();
 			execl(stub_path, "nvkvm_stub", NULL);
 			_exit(127);
 		}

@@ -265,7 +265,7 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 		return -ENOMEM;
 
 	ctx->dev_id  = dev_id;
-	ctx->session = nvkvm_session_get_or_create(current->tgid);
+	ctx->session = nvkvm_session_get_or_create(current->mm, current->tgid);
 	if (IS_ERR(ctx->session)) {
 		ret = PTR_ERR(ctx->session);
 		kfree(ctx);
