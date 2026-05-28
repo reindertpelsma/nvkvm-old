@@ -527,19 +527,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						mutex_unlock(&st->lock);
 					}
 				}
-				/* MAPPING_INTENT — short-circuit (Step E).  The
-				 * actual SEM_POOL ioctl runs on the stub's fresh
-				 * /dev/nvidia-uvm fd at mmap-realize time; here
-				 * we just stash the intent and tell libcuda
-				 * everything is fine. */
-				p->rm_status = 0;
-				if (uparams &&
-				    copy_to_user(uparams, params_buf, param_size)) {
-					kfree(params_buf);
-					return -EFAULT;
-				}
-				kfree(params_buf);
-				return 0;
+				/* Step E plan was to short-circuit here and
+				 * replay on a fresh UVM fd at mmap time.  That
+				 * model loses the kernel-side RM↔UVM bindings
+				 * built on the original fd (NV_ERR_PAGE_TABLE_-
+				 * NOT_AVAIL).  Until realize-on-existing-fd is
+				 * implemented, keep recording but still forward
+				 * SEM_POOL so the original fd is the live one. */
 			}
 			break;
 		default:

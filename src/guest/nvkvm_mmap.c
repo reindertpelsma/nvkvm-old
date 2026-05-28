@@ -170,9 +170,10 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	if (!ctx->handle_id || !ctx->session->isolate_id)
 		return -EBADF;
 
-	/* UVM mmap goes through the state-machine REALIZE path. */
-	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state)
-		return nvkvm_mmap_request_uvm_realize(ctx, vma);
+	/* Step E plan: UVM mmap → REALIZE path.  Disabled until the
+	 * realize-on-existing-fd refactor lands (the current fresh-fd
+	 * design loses the RM↔UVM bindings the original fd built up). */
+	(void)nvkvm_mmap_request_uvm_realize;
 
 	return nvkvm_mmap_request_isolate(ctx, vma);
 }
