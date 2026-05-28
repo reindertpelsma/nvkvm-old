@@ -64,9 +64,8 @@ static unsigned int         stub_elf_len = 0;
 #define CLOSE_RANGE_UNSHARE  (1U << 1)
 #endif
 
-static void nvkvm_isolate_closefrom_3(void)
+static void nvkvm_isolate_closefrom(int first)
 {
-	int first = STDERR_FILENO + 1;       /* keep 0/1/2 */
 	long r = syscall(__NR_close_range, first, ~0U, 0);
 	if (r == 0)
 		return;
@@ -455,12 +454,16 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		pid = fork();
 		if (pid == 0) {
 			dup2(sv[1], STDIN_FILENO);
-			/* Close every inherited fd above stderr — including
-			 * QEMU's KVM vm fd, the memory backend fds, other
-			 * isolates' socketpairs, etc.  Without this an
-			 * RCE in the stub has direct access to KVM_SET_-
-			 * USER_MEMORY_REGION on the host VM (M6). */
-			nvkvm_isolate_closefrom_3();
+			/* Park the memfd at fd 3 so closefrom(4) preserves it.
+			 * fexecve(mfd) below needs mfd to still be valid. */
+			if (mfd != 3) {
+				dup2(mfd, 3);
+				close(mfd);
+				mfd = 3;
+			}
+			/* Close every other inherited fd — KVM vm fd, memory-
+			 * backend fds, other isolates' socketpairs, etc.  M6. */
+			nvkvm_isolate_closefrom(4);
 			const char *argv[] = { "nvkvm_stub", NULL };
 			const char *envp[] = { NULL };  /* M6: drop QEMU env */
 			fexecve(mfd, (char *const *)argv, (char *const *)envp);
@@ -481,7 +484,7 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		pid = fork();
 		if (pid == 0) {
 			dup2(sv[1], STDIN_FILENO);
-			nvkvm_isolate_closefrom_3();
+			nvkvm_isolate_closefrom(STDERR_FILENO + 1);
 			if (!keep_env)
 				clearenv();
 			execl(stub_path, "nvkvm_stub", NULL);
