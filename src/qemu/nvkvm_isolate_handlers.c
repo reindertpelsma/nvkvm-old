@@ -32,6 +32,7 @@
 
 struct nvkvm_iso_mmap_entry {
 	bool     used;
+	bool     stub_mirrored; /* true if isolate-side mmap was also installed */
 	uint32_t isolate_id;
 	uint64_t gva;        /* GVA mapped in the isolate */
 	void    *qva;        /* QEMU host VA from mmap()  */
@@ -45,20 +46,22 @@ static uint32_t iso_mmap_seq = 1;
 static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
-				size_t len, int kvm_slot, uint64_t gpa)
+				size_t len, int kvm_slot, uint64_t gpa,
+				bool stub_mirrored)
 {
 	pthread_mutex_lock(&iso_mmap_lock);
 	for (uint32_t i = 0; i < NVKVM_ISO_MMAP_MAX - 1; i++) {
 		uint32_t tok = iso_mmap_seq;
 		iso_mmap_seq = (iso_mmap_seq % (NVKVM_ISO_MMAP_MAX - 1)) + 1;
 		if (!iso_mmap_tbl[tok].used) {
-			iso_mmap_tbl[tok].used       = true;
-			iso_mmap_tbl[tok].isolate_id = isolate_id;
-			iso_mmap_tbl[tok].gva        = gva;
-			iso_mmap_tbl[tok].qva        = qva;
-			iso_mmap_tbl[tok].len        = len;
-			iso_mmap_tbl[tok].kvm_slot   = kvm_slot;
-			iso_mmap_tbl[tok].gpa        = gpa;
+			iso_mmap_tbl[tok].used          = true;
+			iso_mmap_tbl[tok].stub_mirrored = stub_mirrored;
+			iso_mmap_tbl[tok].isolate_id    = isolate_id;
+			iso_mmap_tbl[tok].gva           = gva;
+			iso_mmap_tbl[tok].qva           = qva;
+			iso_mmap_tbl[tok].len           = len;
+			iso_mmap_tbl[tok].kvm_slot      = kvm_slot;
+			iso_mmap_tbl[tok].gpa           = gpa;
 			pthread_mutex_unlock(&iso_mmap_lock);
 			return tok;
 		}
@@ -369,6 +372,71 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				void *param_buf, void *aux_buf)
 {
 	/*
+	 * UVM ioctls run in QEMU's process, not the stub.  UVM binds its
+	 * file's nvfp to the calling task's mm during UVM_INITIALIZE, and
+	 * the matching mmap of /dev/nvidia-uvm must come from the same mm
+	 * — which is QEMU (we install a KVM memory region at the resulting
+	 * host VA so the guest sees the GPU memory at the right GPA).
+	 *
+	 * Command-buffer data is already explicitly copied via shm slots,
+	 * so the kernel's copy_from_user reading param_buf from QEMU's
+	 * address space gives the right bytes regardless of which process
+	 * issues the ioctl.
+	 */
+	{
+		struct nvkvm_handle *h =
+			nvkvm_handle_get(&nv->handles, req->handle_id);
+		if (h && h->dev_id == NVKVM_DEV_UVM && h->fd >= 0) {
+			/* Some UVM ioctls embed a handle_id (translated by the
+			 * guest sanitizer from a guest fd) that the kernel will
+			 * dereference as an fd.  Translate to QEMU's local fd
+			 * for that handle, then restore the handle_id on
+			 * response so libcuda sees the value it sent. */
+			static const struct { uint32_t cmd; uint32_t off; }
+				uvm_embedded_fd[] = {
+				{ 75 /* UVM_MM_INITIALIZE       */, 0  },
+				{ 25 /* UVM_REGISTER_GPU_VASPACE */, 16 },
+			};
+			uint32_t saved_fd_handle = 0;
+			int      saved_off = -1;
+			for (size_t k = 0;
+			     k < sizeof(uvm_embedded_fd) /
+				 sizeof(uvm_embedded_fd[0]); k++) {
+				if (req->cmd != uvm_embedded_fd[k].cmd) continue;
+				uint32_t off = uvm_embedded_fd[k].off;
+				if (!param_buf || req->param_size < off + 4) break;
+				uint32_t hid;
+				memcpy(&hid, (char *)param_buf + off, 4);
+				if (hid == 0 || hid == (uint32_t)-1) break;
+				struct nvkvm_handle *hh =
+					nvkvm_handle_get(&nv->handles, hid);
+				if (!hh || hh->fd < 0) break;
+				saved_fd_handle = hid;
+				saved_off = (int)off;
+				uint32_t fd32 = (uint32_t)hh->fd;
+				memcpy((char *)param_buf + off, &fd32, 4);
+				break;
+			}
+			int r = ioctl(h->fd, (unsigned long)req->cmd, param_buf);
+			int saved_errno = errno;
+			if (saved_off >= 0)
+				memcpy((char *)param_buf + saved_off,
+				       &saved_fd_handle, 4);
+			uint32_t st = 0;
+			/* UVM_*_PARAMS conventionally ends with rmStatus (u32).
+			 * Read the last 4 bytes of the params struct. */
+			if (param_buf && req->param_size >= 4) {
+				memcpy(&st, (char *)param_buf + req->param_size - 4,
+				       sizeof(st));
+			}
+			resp->retval     = (r < 0) ? (uint64_t)(int64_t)(-saved_errno) : 0;
+			resp->status     = 0;
+			resp->nvstatus   = st;
+			resp->fault_addr = 0;
+			return 0;
+		}
+	}
+	/*
 	 * REGISTER_FD now runs inside the isolate (stub) along with every
 	 * other RM ioctl: the stub allocated the pClient (NV01_ROOT_CLIENT)
 	 * when the gpu fd was opened, and rmclientValidate on the open
@@ -615,13 +683,32 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		}
 	}
 
-	/* Step 3: send MMAP command to isolate */
-	int ret = nvkvm_isolate_mmap(&nv->isolates,
-				     req->isolate_id,
-				     req->handle_id,
-				     req->gva, len, req->offset,
-				     (int)req->prot,
-				     (int)req->map_flags);
+	/* Step 3: optionally mirror the mapping into the isolate's mm.
+	 *
+	 * The isolate-side mmap is only useful for the case where an NVIDIA
+	 * ioctl dereferences a user VA pointing into this region while
+	 * executing in the stub's process context.  All command-buffer
+	 * traffic (NVOS54 params, alloc structs, etc) is already explicitly
+	 * copied via shm slots, and the GPU itself reaches the memory via
+	 * the KVM-installed GPA↔hostVA mapping — not through the stub's mm.
+	 *
+	 * For /dev/nvidia-uvm this mmap actively fails (EBADFD): the stub's
+	 * UVM fd is per-process state in the kernel and may not be in the
+	 * right uvm_fd_type when libcuda issues the mmap.  Skipping the
+	 * mirror unblocks cuCtxCreate; if we ever discover an ioctl that
+	 * does require the stub mm to back the VA, we'll mirror it then.
+	 */
+	int ret = 0;
+	struct nvkvm_handle *hd = nvkvm_handle_get(&nv->handles, req->handle_id);
+	int do_stub_mirror = !hd || hd->dev_id != 1 /* NVKVM_DEV_UVM */;
+	if (do_stub_mirror) {
+		ret = nvkvm_isolate_mmap(&nv->isolates,
+					 req->isolate_id,
+					 req->handle_id,
+					 req->gva, len, req->offset,
+					 (int)req->prot,
+					 (int)req->map_flags);
+	}
 
 	if (ret < 0) {
 		if (kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
@@ -636,7 +723,8 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 
 	/* Record for future MUNMAP_ON_ISOLATE */
 	uint32_t token = iso_mmap_alloc(req->isolate_id, req->gva, qva,
-					len, kvm_slot, gpa);
+					len, kvm_slot, gpa,
+					do_stub_mirror);
 	if (token == 0) {
 		fprintf(stderr, "nvkvm: iso_mmap_tbl full\n");
 		token = 0xdeadbeef; /* non-zero; munmap will fail gracefully */
@@ -660,8 +748,11 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	/* Tell the isolate to unmap the GVA range */
-	nvkvm_isolate_munmap(&nv->isolates, e.isolate_id, e.gva, (uint64_t)e.len);
+	/* Tell the isolate to unmap the GVA range, but only if we mirrored
+	 * the mapping there in the first place. */
+	if (e.stub_mirrored)
+		nvkvm_isolate_munmap(&nv->isolates, e.isolate_id, e.gva,
+				     (uint64_t)e.len);
 
 	/* Remove the KVM memory slot */
 	if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
