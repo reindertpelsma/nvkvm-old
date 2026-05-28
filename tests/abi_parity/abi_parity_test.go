@@ -63,7 +63,11 @@ func TestFrontendStructSizes(t *testing.T) {
 		// so libcuda saw status=0 from a different field and OBJECT_NOT_FOUND
 		// silently slipped through.
 		{"nvos46_parameters (RM_MAP_MEMORY_DMA)", Sizes.Nvos46, 56},
-		{"nvos47_parameters (RM_UNMAP_MEMORY_DMA)", Sizes.Nvos47, 32},
+		// nvos47_parameters: 48 bytes — flags @+16, dmaOffset @+24, size @+32,
+		// status @+40. Earlier 20-byte def truncated the writeback and
+		// libcuda read uninitialized stack as the unmap status, often
+		// triggering CONTEXT_IS_DESTROYED on subsequent operations.
+		{"nvos47_parameters (RM_UNMAP_MEMORY_DMA)", Sizes.Nvos47, 48},
 
 		// Card info and system
 		{"nv_ioctl_card_info", Sizes.CardInfo, 80},

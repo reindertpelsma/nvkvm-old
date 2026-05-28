@@ -93,6 +93,19 @@ struct nvb0b5_allocation_parameters {
 #define NV01_CONTEXT_DMA                    0x00000002U
 /* Subcontext */
 #define FERMI_CONTEXT_SHARE_A               0x00009067U
+/* GR debugger — libcuda creates one per context for cuda-gdb / Nsight hooks */
+#define GT200_DEBUGGER                      0x000083DEU
+
+/* NV83DE_ALLOC_PARAMETERS — alloc params for GT200_DEBUGGER.  Missing this
+ * entry in the alloc-params size table caused RM_ALLOC to forward 0 bytes
+ * of params, the kernel rejected with NV_ERR_INVALID_ARGUMENT, libcuda
+ * tore the context down on the next cuMemAlloc → CUDA_ERROR_CONTEXT_IS_-
+ * DESTROYED (709). */
+struct nv83de_alloc_parameters {
+	nvhandle_t h_debugger_client_obsolete;  /* must be 0 */
+	nvhandle_t h_app_client;
+	nvhandle_t h_class_3d_object;
+};
 
 /* ── RS_ACCESS_MASK ──────────────────────────────────────────────────────── */
 
@@ -287,9 +300,11 @@ struct nvos47_parameters {
 	nvhandle_t h_dma;
 	nvhandle_t h_memory;
 	__u32      flags;
-	__u32      dma_offset;
+	__u32      pad0;
+	__u64      dma_offset;  /* [in] from NV04_MAP_MEMORY_DMA */
+	__u64      size;        /* [in] size to unmap (0 = full) */
 	__u32      status;
-	__u32      reserved;
+	__u32      pad1;
 };
 
 /* ── NV_ESC_RM_IDLE_CHANNELS ─────────────────────────────────────────────── */

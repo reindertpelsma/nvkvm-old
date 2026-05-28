@@ -910,7 +910,7 @@ static void *worker_thread(void *arg)
 			case 0x4e: off = 40; break; /* NV_ESC_RM_MAP_MEMORY: nvos33_with_fd 56B status@40, fd@48 */
 			case 0x4f: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY: nvos34 32B status@24 */
 			case 0x57: off = 48; break; /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 56B status@48 */
-			case 0x58: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY_DMA: nvos47 32B status@24 */
+			case 0x58: off = 40; break; /* NV_ESC_RM_UNMAP_MEMORY_DMA: nvos47 48B status@40 (incl pad0+dmaOff+size) */
 			default:
 				/* Fall back to size-based heuristic for ioctls
 				 * we haven't enumerated yet. */

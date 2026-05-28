@@ -149,25 +149,30 @@ static int __init register_devices(void)
 		device_create(nvkvm.class, NULL, devno, NULL, "nvidia%d", i);
 	}
 
-	/* /dev/nvidia-uvm — dynamic major, minor 0 */
-	ret = alloc_chrdev_region(&nvkvm.uvm_devno, 0, 1, "nvidia-uvm");
+	/* /dev/nvidia-uvm (minor 0) + /dev/nvidia-uvm-tools (minor 1) — dynamic
+	 * major, two minors.  libcuda mknods /dev/nvidia-uvm-tools if absent
+	 * and fails with CUDA_ERROR_OPERATING_SYSTEM (304) when mknod is
+	 * denied — the simplest fix is to expose it from the module. */
+	ret = alloc_chrdev_region(&nvkvm.uvm_devno, 0, 2, "nvidia-uvm");
 	if (ret)
 		goto err_gpu;
 	nvkvm.uvm_major = MAJOR(nvkvm.uvm_devno);
 	cdev_init(&nvkvm.uvm_cdev, &nvkvm_fops);
 	nvkvm.uvm_cdev.owner = THIS_MODULE;
-	ret = cdev_add(&nvkvm.uvm_cdev, nvkvm.uvm_devno, 1);
+	ret = cdev_add(&nvkvm.uvm_cdev, nvkvm.uvm_devno, 2);
 	if (ret)
 		goto err_uvm_region;
 	device_create(nvkvm.class, NULL, nvkvm.uvm_devno, NULL, "nvidia-uvm");
+	device_create(nvkvm.class, NULL,
+		      MKDEV(nvkvm.uvm_major, 1), NULL, "nvidia-uvm-tools");
 
-	pr_info("nvkvm: registered nvidiactl (major %u), nvidia0-%d (major %u), nvidia-uvm (major %u)\n",
+	pr_info("nvkvm: registered nvidiactl (major %u), nvidia0-%d (major %u), nvidia-uvm/uvm-tools (major %u)\n",
 		nvkvm.ctl_major, nvkvm.num_gpus - 1, nvkvm.gpu_major,
 		nvkvm.uvm_major);
 	return 0;
 
 err_uvm_region:
-	unregister_chrdev_region(nvkvm.uvm_devno, 1);
+	unregister_chrdev_region(nvkvm.uvm_devno, 2);
 err_gpu:
 	while (--i >= 0) {
 		cdev_del(&nvkvm.gpu_cdevs[i]);
@@ -190,9 +195,10 @@ static void unregister_devices(void)
 {
 	int i;
 
+	device_destroy(nvkvm.class, MKDEV(nvkvm.uvm_major, 1));
 	device_destroy(nvkvm.class, nvkvm.uvm_devno);
 	cdev_del(&nvkvm.uvm_cdev);
-	unregister_chrdev_region(nvkvm.uvm_devno, 1);
+	unregister_chrdev_region(nvkvm.uvm_devno, 2);
 
 	for (i = nvkvm.num_gpus - 1; i >= 0; i--) {
 		device_destroy(nvkvm.class, MKDEV(nvkvm.gpu_major, i));
@@ -891,6 +897,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case BLACKWELL_DMA_COPY_A:
 				ap_size = sizeof(struct nvb0b5_allocation_parameters);
 				break;
+			case GT200_DEBUGGER:
+				ap_size = sizeof(struct nv83de_alloc_parameters);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -963,6 +972,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case HOPPER_DMA_COPY_A:
 				case BLACKWELL_DMA_COPY_A:
 					ap_size = sizeof(struct nvb0b5_allocation_parameters);
+					break;
+				case GT200_DEBUGGER:
+					ap_size = sizeof(struct nv83de_alloc_parameters);
 					break;
 				}
 			}
