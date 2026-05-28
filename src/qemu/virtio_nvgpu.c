@@ -24,6 +24,9 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
+#include "qemu/main-loop.h"
+#include "block/thread-pool.h"
+#include "block/aio.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
 
@@ -495,6 +498,63 @@ send:
 
 /* ── VQ_TX callback ──────────────────────────────────────────────────────── */
 
+/*
+ * Asynchronous IOCTL_ON_ISOLATE dispatch.
+ *
+ * IOCTL_ON_ISOLATE is the hot path: a CUDA process issues thousands of them,
+ * and each blocks until the per-isolate stub round-trip (or a UVM ioctl in
+ * QEMU's own process) completes.  Running it inline in nvkvm_tx_handler would
+ * block the single virtio TX thread, so a second concurrent guest process
+ * whose request sits behind it in the ring is starved — and if one isolate's
+ * stub wedges, every other guest hangs forever in wait_for_completion.
+ *
+ * Instead we offload each IOCTL_ON_ISOLATE to QEMU's thread pool: the worker
+ * runs the (blocking) handler off the main loop, and the completion callback
+ * — which runs back on the device AioContext, BQL held — pushes the response
+ * onto the virtqueue.  The TX handler returns immediately to pop the next
+ * request, so independent isolates run truly in parallel and a wedged isolate
+ * no longer starves the others.  Responses may complete out of order; the
+ * guest demuxes by txn_id (see nvkvm_tx_done_callback), so that is fine.
+ *
+ * Only IOCTL_ON_ISOLATE is offloaded.  MMAP/REALIZE stay synchronous: they
+ * touch KVM memslots (KVM_SET_USER_MEMORY_REGION), which we keep on the main
+ * loop, and they are infrequent (device bring-up, not the compute hot path).
+ */
+struct nvkvm_ioctl_work {
+	VirtIONvgpu                       *nv;
+	VirtQueue                         *vq;
+	VirtQueueElement                  *elem;
+	struct nvkvm_hdr                   hdr;
+	struct nvkvm_req_ioctl_on_isolate  req;
+	void                              *param_buf;   /* shm — stable */
+	void                              *aux_buf;     /* shm — stable */
+	struct nvkvm_resp_ioctl_on_isolate resp;
+};
+
+/* Worker thread: run the blocking ioctl handler off the main loop. */
+static int nvkvm_ioctl_work_fn(void *opaque)
+{
+	struct nvkvm_ioctl_work *w = opaque;
+	nvkvm_req_ioctl_on_isolate(w->nv, &w->req, &w->resp,
+				   w->param_buf, w->aux_buf);
+	return 0;
+}
+
+/* Completion: runs on the device AioContext (BQL held) — ring ops are safe. */
+static void nvkvm_ioctl_work_done(void *opaque, int ret)
+{
+	struct nvkvm_ioctl_work *w = opaque;
+	struct { struct nvkvm_hdr h;
+		 struct nvkvm_resp_ioctl_on_isolate r; } out;
+	out.h = w->hdr;
+	out.r = w->resp;
+	iov_from_buf(w->elem->in_sg, w->elem->in_num, 0, &out, sizeof(out));
+	virtqueue_push(w->vq, w->elem, sizeof(out));
+	virtio_notify(VIRTIO_DEVICE(w->nv), w->vq);
+	g_free(w->elem);
+	g_free(w);
+}
+
 static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
@@ -512,7 +572,6 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			g_free(elem);
 			continue;
 		}
-
 		switch (le32_to_cpu(hdr.type)) {
 
 		/* ── Isolate/handle request types ────────────────────────────────── */
@@ -574,25 +633,33 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_unpoll_on_isolate)
 
 		case NVKVM_REQ_IOCTL_ON_ISOLATE: {
-			struct nvkvm_req_ioctl_on_isolate  req  = {0};
-			struct nvkvm_resp_ioctl_on_isolate resp = {0};
-			iov_to_buf(elem->out_sg, elem->out_num,
-				   sizeof(hdr), &req, sizeof(req));
-			/* param/aux buffers are in shared memory */
-			void *pb = req.param_size > 0 &&
-				   slot_valid(nv, req.shm_slot) ?
-				   slot_ptr(nv, req.shm_slot) : NULL;
-			void *ab = req.aux_size > 0 &&
-				   slot_valid(nv, req.shm_aux_slot) ?
-				   slot_ptr(nv, req.shm_aux_slot) : NULL;
-			nvkvm_req_ioctl_on_isolate(nv, &req, &resp, pb, ab);
-			struct { struct nvkvm_hdr h;
-				 struct nvkvm_resp_ioctl_on_isolate r; } out;
-			out.h = hdr; out.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out));
-			virtqueue_push(vq, elem, sizeof(out));
-			virtio_notify(VIRTIO_DEVICE(nv), vq);
-			break;
+			/*
+			 * Offload to the thread pool so a blocking stub
+			 * round-trip does not stall the single TX thread and
+			 * starve other guests.  The completion callback pushes
+			 * the response.  Ownership of `elem` transfers to the
+			 * work item — do NOT g_free it here (we `continue`).
+			 */
+			struct nvkvm_ioctl_work *w =
+				g_new0(struct nvkvm_ioctl_work, 1);
+			w->nv   = nv;
+			w->vq   = vq;
+			w->elem = elem;
+			w->hdr  = hdr;
+			iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr),
+				   &w->req, sizeof(w->req));
+			/* param/aux buffers live in shared memory; the guest
+			 * keeps the slot reserved until it sees the response,
+			 * so these pointers stay valid for the whole job. */
+			w->param_buf = (w->req.param_size > 0 &&
+					slot_valid(nv, w->req.shm_slot)) ?
+				       slot_ptr(nv, w->req.shm_slot) : NULL;
+			w->aux_buf   = (w->req.aux_size > 0 &&
+					slot_valid(nv, w->req.shm_aux_slot)) ?
+				       slot_ptr(nv, w->req.shm_aux_slot) : NULL;
+			thread_pool_submit_aio(nvkvm_ioctl_work_fn, w,
+					       nvkvm_ioctl_work_done, w);
+			continue;  /* elem now owned by the work item */
 		}
 
 		case NVKVM_REQ_MMAP_ON_ISOLATE: {
@@ -719,6 +786,18 @@ static void nvkvm_get_config(VirtIODevice *vdev, uint8_t *config)
 static uint64_t nvkvm_get_features(VirtIODevice *vdev, uint64_t features,
 				   Error **errp)
 {
+	/*
+	 * Disable VIRTIO_RING_F_EVENT_IDX.  With async out-of-order completions
+	 * (IOCTL_ON_ISOLATE offloaded to the thread pool), EVENT_IDX interrupt
+	 * suppression can strand the last used-ring entry: the guest's TX
+	 * callback (nvkvm_tx_done_callback) drains with virtqueue_get_buf but
+	 * does not use the disable_cb/enable_cb re-check pattern, so a buffer
+	 * pushed in the suppression window never raises an IRQ and the guest
+	 * hangs forever in wait_for_completion.  Without EVENT_IDX the device
+	 * notifies on every push (unless the guest explicitly set NO_INTERRUPT,
+	 * which it does not), so no completion can be lost.
+	 */
+	features &= ~(1ULL << VIRTIO_RING_F_EVENT_IDX);
 	return features;
 }
 
