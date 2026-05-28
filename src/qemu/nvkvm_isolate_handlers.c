@@ -725,6 +725,15 @@ struct nvkvm_kvm_mem_region {
 #endif
 
 /*
+ * Sentinel kvm_slot value meaning "this mapping lives inside the single
+ * pre-installed 128 GiB sparse window — there is NO per-mmap KVM memslot to
+ * remove on teardown; instead the device backing is restored to anonymous
+ * pages so the window stays fully mapped for KVM."  Distinct from -1, which
+ * means "legacy path, memslot install was attempted but failed/absent."
+ */
+#define NVKVM_IN_WINDOW_SLOT  (-2)
+
+/*
  * KVM slot allocator is centralised in nvkvm_mmap_host.c via the
  * nvkvm_kvm_slot_alloc/release prototypes in virtio_nvgpu.h, shared with
  * nvkvm_mmap_create().  The stale `iso_kvm_slot_counter` monotonic
@@ -748,64 +757,100 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	size_t len = (size_t)req->length;
 	len = (len + 4095UL) & ~4095UL;  /* page-align */
 
-	/* Step 1: mmap in QEMU.  For UVM the kernel requires
+	/*
+	 * Place the mapping inside the single pre-installed 128 GiB sparse
+	 * window instead of allocating a fresh KVM memslot per mmap.  A single
+	 * cuCtxCreate issues >1500 tiny (4 KB) device mmaps; one memslot each
+	 * blows past both our pool and any sane slot count.  By MAP_FIXED'ing
+	 * the device fd into the sparse window's VA range we reuse the one
+	 * memslot nvkvm_sparse_init() already installed — zero per-mmap KVM
+	 * ioctls.  Sparse/holey device regions inside one big prereserved KVM
+	 * memory region are fully supported by KVM (per-page gup on fault).
+	 *
+	 * /dev/nvidia-uvm is the exception: its kernel mmap handler requires
 	 *   vm_start == (vm_pgoff << PAGE_SHIFT)
-	 * (see uvm_mmap in kernel-open/nvidia-uvm/uvm.c) — i.e., MAP_FIXED
-	 * at the offset address.  For other nvidia devices, NULL is fine.
+	 * so QEMU must map it MAP_FIXED at req->offset, not at an arbitrary
+	 * window VA.  UVM mappings are few, so the legacy per-mmap memslot is
+	 * acceptable for them.
 	 */
-	void  *qva_hint = NULL;
-	int    qva_flags = MAP_SHARED;
-	if (h->dev_id == NVKVM_DEV_UVM) {
-		qva_hint  = (void *)(uintptr_t)req->offset;
-		qva_flags |= MAP_FIXED_NOREPLACE;
-	}
-	void *qva = mmap(qva_hint, len, req->prot,
-			 qva_flags, h->fd, (off_t)req->offset);
-	if (qva == MAP_FAILED) {
-		int saved_errno = errno;
-		fprintf(stderr,
-			"nvkvm: mmap_on_isolate FAIL fd=%d dev_id=%d "
-			"prot=0x%x len=%lu off=0x%lx errno=%d (%s)\n",
-			h->fd, h->dev_id, req->prot, (unsigned long)len,
-			(unsigned long)req->offset, saved_errno,
-			strerror(saved_errno));
-		resp->status = (uint32_t)saved_errno;
-		return 0;
-	}
+	void    *qva       = MAP_FAILED;
+	uint64_t gpa       = 0;
+	int      kvm_slot  = -1;
+	bool     in_window = (h->dev_id != NVKVM_DEV_UVM);
 
-	/* Step 2: allocate GPA from mmap window and register KVM slot */
-	uint64_t gpa = 0;
-	nvkvm_mmap_win_alloc(nv, len, &gpa);
-	if (gpa == 0) {
-		munmap(qva, len);
-		resp->status = ENOMEM;
-		return 0;
-	}
-
-	int kvm_slot = -1;
-	if (nvkvm_kvm_vm_fd >= 0) {
-		kvm_slot = nvkvm_kvm_slot_alloc();
-		if (kvm_slot < 0) {
+	if (in_window) {
+		gpa = nvkvm_sparse_gpa_alloc(nv, len);
+		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
+		if (!target) {
 			fprintf(stderr,
-				"nvkvm: mmap_on_isolate: KVM slot pool "
-				"exhausted (handle=%u gpa=0x%lx)\n",
-				req->handle_id, (unsigned long)gpa);
-		} else {
-			struct nvkvm_kvm_mem_region mr = {
-				.slot            = (uint32_t)kvm_slot,
-				.flags           = 0,
-				.guest_phys_addr = gpa,
-				.memory_size     = len,
-				.userspace_addr  = (uint64_t)(uintptr_t)qva,
-			};
-			if (ioctl(nvkvm_kvm_vm_fd,
-				  KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
-				fprintf(stderr,
-					"nvkvm: KVM_SET_USER_MEMORY_REGION slot=%d "
-					"failed: %s\n",
-					kvm_slot, strerror(errno));
-				nvkvm_kvm_slot_release(kvm_slot);
-				kvm_slot = -1;
+				"nvkvm: mmap_on_isolate: sparse window full "
+				"(handle=%u len=%lu)\n",
+				req->handle_id, (unsigned long)len);
+			resp->status = ENOMEM;
+			return 0;
+		}
+		qva = mmap(target, len, req->prot,
+			   MAP_SHARED | MAP_FIXED, h->fd, (off_t)req->offset);
+		if (qva == MAP_FAILED) {
+			int se = errno;
+			fprintf(stderr,
+				"nvkvm: mmap_on_isolate(window) FAIL fd=%d "
+				"dev_id=%d prot=0x%x len=%lu off=0x%lx "
+				"gpa=0x%llx errno=%d (%s)\n",
+				h->fd, h->dev_id, req->prot, (unsigned long)len,
+				(unsigned long)req->offset,
+				(unsigned long long)gpa, se, strerror(se));
+			/* Restore the anonymous backing we just clobbered so the
+			 * window stays fully mapped for KVM. */
+			mmap(target, len, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
+			     MAP_FIXED, -1, 0);
+			resp->status = (uint32_t)se;
+			return 0;
+		}
+		/* No KVM ioctl: the sparse window's single memslot already maps
+		 * [gpa, gpa+len) → this VA range. */
+		kvm_slot = NVKVM_IN_WINDOW_SLOT;
+	} else {
+		/* Legacy UVM path: MAP_FIXED at req->offset + per-mmap memslot. */
+		qva = mmap((void *)(uintptr_t)req->offset, len, req->prot,
+			   MAP_SHARED | MAP_FIXED_NOREPLACE, h->fd,
+			   (off_t)req->offset);
+		if (qva == MAP_FAILED) {
+			int se = errno;
+			fprintf(stderr,
+				"nvkvm: mmap_on_isolate(uvm) FAIL fd=%d prot=0x%x "
+				"len=%lu off=0x%lx errno=%d (%s)\n",
+				h->fd, req->prot, (unsigned long)len,
+				(unsigned long)req->offset, se, strerror(se));
+			resp->status = (uint32_t)se;
+			return 0;
+		}
+		nvkvm_mmap_win_alloc(nv, len, &gpa);
+		if (gpa == 0) {
+			munmap(qva, len);
+			resp->status = ENOMEM;
+			return 0;
+		}
+		if (nvkvm_kvm_vm_fd >= 0) {
+			kvm_slot = nvkvm_kvm_slot_alloc();
+			if (kvm_slot >= 0) {
+				struct nvkvm_kvm_mem_region mr = {
+					.slot            = (uint32_t)kvm_slot,
+					.flags           = 0,
+					.guest_phys_addr = gpa,
+					.memory_size     = len,
+					.userspace_addr  = (uint64_t)(uintptr_t)qva,
+				};
+				if (ioctl(nvkvm_kvm_vm_fd,
+					  KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
+					fprintf(stderr,
+						"nvkvm: KVM_SET_USER_MEMORY_REGION "
+						"slot=%d failed: %s\n",
+						kvm_slot, strerror(errno));
+					nvkvm_kvm_slot_release(kvm_slot);
+					kvm_slot = -1;
+				}
 			}
 		}
 	}
@@ -838,13 +883,22 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	}
 
 	if (ret < 0) {
-		if (kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
-			struct nvkvm_kvm_mem_region mr = { .slot = (uint32_t)kvm_slot,
-							   .memory_size = 0 };
-			ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
-			nvkvm_kvm_slot_release(kvm_slot);
+		if (kvm_slot == NVKVM_IN_WINDOW_SLOT) {
+			/* Restore anon backing inside the window (no munmap — that
+			 * would punch a hole in the sparse VMA). */
+			mmap(qva, len, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
+			     MAP_FIXED, -1, 0);
+		} else {
+			if (kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
+				struct nvkvm_kvm_mem_region mr = {
+					.slot = (uint32_t)kvm_slot,
+					.memory_size = 0 };
+				ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
+				nvkvm_kvm_slot_release(kvm_slot);
+			}
+			munmap(qva, len);
 		}
-		munmap(qva, len);
 		resp->status = (uint32_t)-ret;
 		return 0;
 	}
@@ -882,19 +936,28 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 		nvkvm_isolate_munmap(&nv->isolates, e.isolate_id, e.gva,
 				     (uint64_t)e.len);
 
-	/* Remove the KVM memory slot and return it to the pool. */
-	if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
-		struct nvkvm_kvm_mem_region mr = {
-			.slot        = (uint32_t)e.kvm_slot,
-			.memory_size = 0,
-		};
-		ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
-		nvkvm_kvm_slot_release(e.kvm_slot);
+	if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT) {
+		/* In-window mapping: restore anonymous backing so the sparse
+		 * window stays fully mapped (the single memslot covers it).
+		 * Do NOT munmap — that would punch a hole in the sparse VMA. */
+		if (e.qva)
+			mmap(e.qva, e.len, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
+			     MAP_FIXED, -1, 0);
+	} else {
+		/* Legacy path: remove the per-mmap KVM memslot, return it to the
+		 * pool, and unmap the standalone QEMU host VA. */
+		if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
+			struct nvkvm_kvm_mem_region mr = {
+				.slot        = (uint32_t)e.kvm_slot,
+				.memory_size = 0,
+			};
+			ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
+			nvkvm_kvm_slot_release(e.kvm_slot);
+		}
+		if (e.qva)
+			munmap(e.qva, e.len);
 	}
-
-	/* Unmap the QEMU host VA */
-	if (e.qva)
-		munmap(e.qva, e.len);
 
 	resp->status = 0;
 	return 0;
@@ -1159,9 +1222,12 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	/* §8a.6 — allocate a fresh GPA window. */
-	uint64_t gpa = 0;
-	nvkvm_mmap_win_alloc(nv, (size_t)len, &gpa);
+	/* §8a.6 — allocate a fresh GPA from the single sparse window so the
+	 * guest (which validates every returned GPA against that window)
+	 * accepts it.  No per-mmap memslot is installed for realize — see the
+	 * note below; the GPA rides the sparse window's pre-installed memslot
+	 * (anonymous backing), matching the proven v0.1 behaviour. */
+	uint64_t gpa = nvkvm_sparse_gpa_alloc(nv, (size_t)len);
 	if (gpa == 0) {
 		resp->status = (uint32_t)-ENOMEM;
 		return 0;
@@ -1194,30 +1260,10 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	/* §8a.6 — install KVM region: GPA window ↔ stub's host VA. */
-	if (nvkvm_kvm_vm_fd >= 0) {
-		int rl_slot = nvkvm_kvm_slot_alloc();
-		if (rl_slot < 0) {
-			fprintf(stderr,
-				"nvkvm: realize KVM slot pool exhausted\n");
-			/* Non-fatal — guest sees EFAULT on first deref. */
-		} else {
-			struct nvkvm_kvm_mem_region_rl mr = {
-				.slot            = (uint32_t)rl_slot,
-				.flags           = 0,
-				.guest_phys_addr = gpa,
-				.memory_size     = len,
-				.userspace_addr  = host_va,
-			};
-			if (ioctl(nvkvm_kvm_vm_fd,
-				  KVM_SET_USER_MEMORY_REGION_RL, &mr) < 0) {
-				fprintf(stderr,
-					"nvkvm: realize KVM_SET_USER_MEMORY_REGION "
-					"slot=%d: %s\n", rl_slot, strerror(errno));
-				nvkvm_kvm_slot_release(rl_slot);
-			}
-		}
-	}
+	/* §8a.6 — NO per-mmap KVM memslot: host_va is a stub-process VA,
+	 * invalid as a QEMU KVM userspace_addr.  See security-fixes commit.
+	 * Master masked this via slot=1100 > KVM cap (install failed). */
+	(void)host_va;
 
 	resp->gpa_base      = gpa;
 	resp->length        = len;

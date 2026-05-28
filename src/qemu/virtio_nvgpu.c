@@ -856,8 +856,21 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	/* Populate virtio config space so the guest can locate both regions */
 	nv->config_space.shm_base     = cpu_to_le64(NVKVM_SHM_GPA_BASE);
 	nv->config_space.shm_len      = cpu_to_le64(nv->shm_size);
+	/* The guest validates every host-returned GPA against this window.
+	 * Two GPA windows are in play:
+	 *   - sparse window (128 GiB @ 2 TB): single pre-installed memslot,
+	 *     backs all the bulk BAR/sysmem mmaps as MAP_FIXED slices.
+	 *   - mmap_win (16 GiB @ 1.5 TB): legacy per-mmap memslots, still used
+	 *     by /dev/nvidia-uvm mappings (which cannot be MAP_FIXED into the
+	 *     sparse window — the UVM kernel requires vm_start==pgoff<<SHIFT).
+	 * Advertise one window spanning both [mmap_win_base, sparse_end).  The
+	 * guest only ever validates GPAs QEMU actually returns (always inside
+	 * one of the two sub-windows), so accepting the superset — including the
+	 * unbacked gap between them — is safe. */
 	nv->config_space.mmap_win_gpa = cpu_to_le64(NVKVM_MMAP_WIN_GPA_BASE);
-	nv->config_space.mmap_win_len = cpu_to_le64(NVKVM_MMAP_WIN_SIZE);
+	nv->config_space.mmap_win_len = cpu_to_le64(
+		(NVKVM_SPARSE_GPA_BASE + NVKVM_SPARSE_GPA_SIZE) -
+		NVKVM_MMAP_WIN_GPA_BASE);
 }
 
 static void virtio_nvgpu_device_unrealize(DeviceState *dev)
