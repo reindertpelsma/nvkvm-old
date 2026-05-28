@@ -216,6 +216,14 @@ struct nvkvm_state {
 #define NVKVM_MAX_INFLIGHT 4096
 	spinlock_t              inflight_lock;
 	struct list_head        inflight_list;
+	/*
+	 * Serializes all access to vq_tx (virtqueue_add_sgs/kick on the submit
+	 * side and virtqueue_get_buf on the completion side).  Linux virtqueues
+	 * are NOT thread-safe; without this, two guest processes submitting on
+	 * different vCPUs corrupt the split-ring (double-popped/skipped
+	 * descriptors → a request is stranded → wait_for_completion hangs).
+	 */
+	spinlock_t              vq_tx_lock;
 	atomic_t                next_txn_id;        /* monotonic seed */
 	unsigned long           txn_inflight_bm[NVKVM_MAX_INFLIGHT / BITS_PER_LONG];
 

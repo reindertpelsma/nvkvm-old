@@ -175,11 +175,21 @@ static void inflight_dequeue(struct nvkvm_state *state,
  */
 static void nvkvm_tx_done_callback(struct virtqueue *vq)
 {
+	struct nvkvm_state *state = vq->vdev->priv;
 	struct nvkvm_inflight *inf;
 	unsigned int len;
+	unsigned long flags;
 
-	while ((inf = virtqueue_get_buf(vq, &len)) != NULL) {
-		struct nvkvm_hdr *hdr = inf->resp_buf;
+	for (;;) {
+		struct nvkvm_hdr *hdr;
+
+		/* Serialize ring access against concurrent submitters. */
+		spin_lock_irqsave(&state->vq_tx_lock, flags);
+		inf = virtqueue_get_buf(vq, &len);
+		spin_unlock_irqrestore(&state->vq_tx_lock, flags);
+		if (!inf)
+			break;
+		hdr = inf->resp_buf;
 
 		if (!hdr) {
 			pr_warn("nvkvm: tx_done: null resp_buf\n");
@@ -346,15 +356,25 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 	/*
 	 * Pass inf as the data cookie so virtqueue_get_buf() in the TX-done
 	 * callback returns the inflight record directly.
+	 *
+	 * vq_tx_lock serializes the ring against concurrent submitters and the
+	 * completion callback — virtqueues are not thread-safe.  GFP_ATOMIC
+	 * because we hold a spinlock (the buffer is tiny; no indirect descs).
 	 */
-	ret = virtqueue_add_sgs(state->vq_tx, sgs, 1, 1, inf, GFP_KERNEL);
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&state->vq_tx_lock, flags);
+		ret = virtqueue_add_sgs(state->vq_tx, sgs, 1, 1, inf, GFP_ATOMIC);
+		if (!ret)
+			virtqueue_kick(state->vq_tx);
+		spin_unlock_irqrestore(&state->vq_tx_lock, flags);
+	}
 	if (ret) {
 		inflight_dequeue(state, inf);
 		kfree(inf->resp_buf);
 		inf->resp_buf = NULL;
 		return ret;
 	}
-	virtqueue_kick(state->vq_tx);
 
 	wait_for_completion(&inf->done);
 	inflight_dequeue(state, inf);
@@ -536,6 +556,7 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	state->vdev = vdev;
 
 	spin_lock_init(&state->inflight_lock);
+	spin_lock_init(&state->vq_tx_lock);
 	INIT_LIST_HEAD(&state->inflight_list);
 	atomic_set(&state->next_txn_id, 0);
 	bitmap_zero(state->txn_inflight_bm, NVKVM_MAX_INFLIGHT);
