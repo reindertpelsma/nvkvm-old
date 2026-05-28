@@ -67,6 +67,13 @@ case "$cmd" in
             gcc -O0 -g -o /tmp/cuinit_test /mnt/nvkvm/tests/integration/cuinit_test.c -ldl
             sudo cp /mnt/nvkvm/host-libs/libcuda.so.575.51.03 /usr/lib/x86_64-linux-gnu/ 2>/dev/null
             sudo ln -sf libcuda.so.575.51.03 /usr/lib/x86_64-linux-gnu/libcuda.so.1
+            # nvidia-smi: NVML refuses to init unless libnvidia-ml matches the
+            # driver version the guest module reports (575.51.03).  The guest
+            # image ships 580.x as the default libnvidia-ml.so.1 -> repoint it,
+            # and install the version-matched nvidia-smi binary.
+            sudo cp /mnt/nvkvm/host-libs/libnvidia-ml.so.575.51.03 /usr/lib/x86_64-linux-gnu/ 2>/dev/null
+            sudo ln -sf libnvidia-ml.so.575.51.03 /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+            [ -f /mnt/nvkvm/host-libs/nvidia-smi-575 ] && sudo cp /mnt/nvkvm/host-libs/nvidia-smi-575 /usr/local/bin/nvidia-smi && sudo chmod +x /usr/local/bin/nvidia-smi
             echo READY
         '"
         ;;
