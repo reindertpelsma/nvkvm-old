@@ -10,11 +10,12 @@ XXD     ?= xxd
 
 CFLAGS  := -O2 -g -std=c11 \
            -nostdlib -static -fPIE \
+           -ffreestanding -fno-stack-protector -fno-builtin \
            -Wall -Wextra -Wno-unused-parameter \
            -I../.. \
            -I../../src
 
-LDFLAGS := -static -pie -Wl,-z,relro,-z,now
+LDFLAGS := -nostdlib -static -pie -Wl,-z,relro,-z,now
 
 TARGET  := nvkvm_stub
 BIN_H   := nvkvm_stub_bin.h
@@ -23,8 +24,10 @@ BIN_H   := nvkvm_stub_bin.h
 
 all: $(TARGET) $(BIN_H)
 
-$(TARGET): nvkvm_stub.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lgcc
+# Build the C sources and the clone3 asm trampoline together so the link
+# resolves fs_clone3_run.  -lgcc supplies softfloat/divmod helpers if needed.
+$(TARGET): nvkvm_stub.c stub_clone3.S stub_freestanding.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ nvkvm_stub.c stub_clone3.S -lgcc
 
 $(BIN_H): $(TARGET)
 	$(STRIP) --strip-all $(TARGET)
