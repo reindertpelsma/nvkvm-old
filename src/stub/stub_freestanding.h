@@ -195,4 +195,157 @@ struct clone_args {
 extern long fs_clone3_run(struct clone_args *args, size_t args_sz,
 			  void (*entry)(void *arg), void *arg);
 
+/* ── Tiny formatted output (no libc) ────────────────────────────────────────
+ *
+ * Supports just the conversions the stub actually uses:
+ *   %d   signed int
+ *   %u   unsigned int
+ *   %x   unsigned int, lowercase hex
+ *   %lx  unsigned long, lowercase hex
+ *   %ld  signed long
+ *   %lu  unsigned long
+ *   %llx unsigned long long, lowercase hex
+ *   %lld signed long long
+ *   %llu unsigned long long
+ *   %p   pointer (printed as 0x%lx)
+ *   %s   const char *
+ *   %c   single character
+ *   %%   literal '%'
+ * Width / precision are not supported — keep call sites simple.
+ */
+
+struct fs_fmt_sink {
+	char  *buf;     /* may be NULL for "discard" sink (count-only) */
+	size_t cap;     /* total bytes in buf incl. terminator */
+	size_t pos;     /* bytes written so far excl. terminator */
+};
+
+static inline void fs__emit(struct fs_fmt_sink *s, char c)
+{
+	if (s->buf && s->pos + 1 < s->cap)
+		s->buf[s->pos] = c;
+	s->pos++;
+}
+
+static inline void fs__emit_str(struct fs_fmt_sink *s, const char *p)
+{
+	if (!p) p = "(null)";
+	while (*p) fs__emit(s, *p++);
+}
+
+static inline void fs__emit_u64(struct fs_fmt_sink *s, unsigned long long v,
+				unsigned base, int upper)
+{
+	char tmp[32];
+	int n = 0;
+	if (v == 0) { fs__emit(s, '0'); return; }
+	while (v && n < (int)sizeof(tmp)) {
+		unsigned d = (unsigned)(v % base);
+		tmp[n++] = (d < 10) ? (char)('0' + d) :
+			   (char)((upper ? 'A' : 'a') + (d - 10));
+		v /= base;
+	}
+	while (n--) fs__emit(s, tmp[n]);
+}
+
+static inline void fs__emit_i64(struct fs_fmt_sink *s, long long v)
+{
+	if (v < 0) { fs__emit(s, '-'); v = -v; }
+	fs__emit_u64(s, (unsigned long long)v, 10, 0);
+}
+
+static inline size_t fs_vformat(struct fs_fmt_sink *s, const char *fmt,
+				__builtin_va_list ap)
+{
+	const char *p = fmt;
+	while (*p) {
+		if (*p != '%') { fs__emit(s, *p++); continue; }
+		p++;
+		int lng = 0;
+		while (*p == 'l') { lng++; p++; }
+		switch (*p) {
+		case 'd':
+			if (lng >= 2) fs__emit_i64(s,
+				__builtin_va_arg(ap, long long));
+			else if (lng == 1) fs__emit_i64(s,
+				(long long)__builtin_va_arg(ap, long));
+			else fs__emit_i64(s,
+				(long long)__builtin_va_arg(ap, int));
+			break;
+		case 'u':
+			if (lng >= 2) fs__emit_u64(s,
+				__builtin_va_arg(ap, unsigned long long), 10, 0);
+			else if (lng == 1) fs__emit_u64(s,
+				(unsigned long long)__builtin_va_arg(ap, unsigned long),
+				10, 0);
+			else fs__emit_u64(s,
+				(unsigned long long)__builtin_va_arg(ap, unsigned),
+				10, 0);
+			break;
+		case 'x':
+			if (lng >= 2) fs__emit_u64(s,
+				__builtin_va_arg(ap, unsigned long long), 16, 0);
+			else if (lng == 1) fs__emit_u64(s,
+				(unsigned long long)__builtin_va_arg(ap, unsigned long),
+				16, 0);
+			else fs__emit_u64(s,
+				(unsigned long long)__builtin_va_arg(ap, unsigned),
+				16, 0);
+			break;
+		case 'p': {
+			void *v = __builtin_va_arg(ap, void *);
+			fs__emit(s, '0'); fs__emit(s, 'x');
+			fs__emit_u64(s, (unsigned long long)(uintptr_t)v, 16, 0);
+			break;
+		}
+		case 's':
+			fs__emit_str(s, __builtin_va_arg(ap, const char *));
+			break;
+		case 'c':
+			fs__emit(s, (char)__builtin_va_arg(ap, int));
+			break;
+		case '%':
+			fs__emit(s, '%');
+			break;
+		default:
+			fs__emit(s, '%');
+			if (*p) fs__emit(s, *p);
+			break;
+		}
+		if (*p) p++;
+	}
+	if (s->buf && s->cap > 0) {
+		size_t term = (s->pos < s->cap) ? s->pos : (s->cap - 1);
+		s->buf[term] = '\0';
+	}
+	return s->pos;
+}
+
+__attribute__((format(printf, 3, 4)))
+static inline int fs_snprintf(char *buf, size_t cap, const char *fmt, ...)
+{
+	__builtin_va_list ap;
+	struct fs_fmt_sink s = { .buf = buf, .cap = cap, .pos = 0 };
+	__builtin_va_start(ap, fmt);
+	size_t n = fs_vformat(&s, fmt, ap);
+	__builtin_va_end(ap);
+	return (int)n;
+}
+
+/* fs_dprintf(fd, fmt, ...) — writes formatted output to fd via SYS_write.
+ * Uses a fixed 512-byte stack buffer; longer messages are truncated. */
+__attribute__((format(printf, 2, 3)))
+static inline int fs_dprintf(int fd, const char *fmt, ...)
+{
+	char buf[512];
+	__builtin_va_list ap;
+	struct fs_fmt_sink s = { .buf = buf, .cap = sizeof(buf), .pos = 0 };
+	__builtin_va_start(ap, fmt);
+	(void)fs_vformat(&s, fmt, ap);
+	__builtin_va_end(ap);
+	size_t out = (s.pos < sizeof(buf) - 1) ? s.pos : (sizeof(buf) - 1);
+	long r = sc3(1 /*SYS_write*/, (long)fd, (long)buf, (long)out);
+	return (int)r;
+}
+
 #endif /* NVKVM_STUB_FREESTANDING_H */
