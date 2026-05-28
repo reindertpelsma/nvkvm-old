@@ -29,6 +29,7 @@
 #define ISOLATE_CMD_UNPOLL       7   /* fd; stop background poll             */
 #define ISOLATE_CMD_EXIT         8   /* clean shutdown                       */
 #define ISOLATE_CMD_OPEN_DEVICE  9   /* stub opens /dev/nvidia*, replies w/ SCM_RIGHTS fd */
+#define ISOLATE_CMD_REALIZE_UVM_FD 10 /* full UVM realize: init+register+intent+mmap */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -38,6 +39,7 @@
 #define ISOLATE_RESP_MMAP        0x13  /* mmap result                        */
 #define ISOLATE_RESP_POLL_EVENT  0x14  /* async: fd became ready             */
 #define ISOLATE_RESP_OPEN_DEVICE 0x15  /* open result + fd via SCM_RIGHTS    */
+#define ISOLATE_RESP_REALIZE_UVM 0x16  /* realize result: host VA + rmStatus */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -183,6 +185,44 @@ struct isolate_resp_open_device {
 	int32_t  retval;      /* 0 on success; -errno on failure (no SCM)   */
 	uint32_t reserved;
 	/* On success: one fd attached via SCM_RIGHTS in the same sendmsg.  */
+};
+
+/* ── REALIZE_UVM_FD ──────────────────────────────────────────────────────────
+ * QEMU sends this to spin up a fully-configured UVM fd in the stub:
+ *   open /dev/nvidia-uvm
+ *   UVM_INITIALIZE(flags = state.init_flags)
+ *   UVM_REGISTER_GPU(uuid)         for each registered gpu
+ *   UVM_REGISTER_GPU_VASPACE(...)  for each registered vas
+ *   UVM_CREATE_RANGE_GROUP(id)     for each range group
+ *   mode-specific intent ioctl (e.g. UVM_ALLOC_SEMAPHORE_POOL)
+ *   mmap(2) at host_va_hint (or NULL for stub-chosen) with prot+flags
+ *
+ * The cmd carries the state snapshot + intent inline as two follow-up
+ * SEQPACKET messages (sent by QEMU as: cmd header, then state bytes,
+ * then intent bytes — sizes in the header).
+ */
+struct isolate_cmd_realize_uvm_fd {
+	uint32_t type;        /* ISOLATE_CMD_REALIZE_UVM_FD */
+	uint32_t txn_id;
+	uint32_t mode;        /* NVKVM_UVM_REALIZE_MODE_* */
+	uint32_t state_size;  /* bytes of snapshot to follow */
+	uint32_t intent_size; /* bytes of intent to follow   */
+	uint32_t prot;
+	uint32_t map_flags;   /* MAP_FIXED added by stub if host_va_hint != 0 */
+	uint32_t _pad;
+	uint64_t length;
+	uint64_t host_va_hint;/* 0 = let stub choose */
+	uint64_t offset;      /* file offset for mmap */
+};
+
+struct isolate_resp_realize_uvm {
+	uint32_t type;        /* ISOLATE_RESP_REALIZE_UVM */
+	uint32_t txn_id;
+	int32_t  retval;      /* 0 on success; -errno on failure            */
+	uint32_t rm_status;   /* NV_STATUS from the realize ioctl(s)        */
+	uint64_t host_va;     /* mmap result address                        */
+	uint64_t length;      /* echo                                       */
+	uint64_t realize_token;/* opaque (currently == host_va for now)     */
 };
 
 #endif /* NVKVM_ISOLATE_PROTO_H */

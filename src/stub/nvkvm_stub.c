@@ -1081,6 +1081,229 @@ static void handle_munmap_cmd(struct isolate_cmd_munmap *cmd)
 	send_ok();
 }
 
+/* ── REALIZE_UVM_FD handler ─────────────────────────────────────────────────
+ * Replay the per-fd UVM state recorded by the guest module, then run the
+ * mode-specific intent ioctl and mmap.  Returns host VA on success.
+ *
+ * Kernel struct shapes are hand-pinned here (no headers in the -nostdlib
+ * stub).  Sizes match src/abi/uvm.h and the kernel-open UVM headers.
+ */
+#define STUB_UVM_INITIALIZE              0x30000001
+#define STUB_UVM_REGISTER_GPU                    37
+#define STUB_UVM_REGISTER_GPU_VASPACE            25
+#define STUB_UVM_CREATE_RANGE_GROUP              23
+#define STUB_UVM_ALLOC_SEMAPHORE_POOL            68
+
+struct stub_uvm_init { uint64_t flags; uint32_t rm_status; uint32_t _pad; };
+struct stub_uvm_uuid16 { uint8_t b[16]; };
+struct stub_uvm_register_gpu {
+	struct stub_uvm_uuid16 uuid;
+	uint8_t  numa_enabled;
+	uint8_t  _pad0[3];
+	int32_t  numa_node_id;
+	uint32_t rm_status;
+	uint32_t _pad1;
+};
+struct stub_uvm_register_vas {
+	struct stub_uvm_uuid16 uuid;
+	uint32_t rm_ctrl_fd;
+	uint32_t h_client;
+	uint32_t h_va_space;
+	uint32_t rm_status;
+};
+struct stub_uvm_range_group {
+	uint64_t range_group_id;
+	uint32_t rm_status;
+	uint32_t _pad;
+};
+
+/* State snapshot layout — must match nvkvm_uvm_state_snapshot in
+ * src/common/nvkvm_proto.h.  Kept inline to avoid pulling that header
+ * into the stub. */
+#define STUB_MAX_REG_GPUS      16
+#define STUB_MAX_VA_SPACES     16
+#define STUB_MAX_RANGE_GROUPS  16
+struct stub_state_snapshot {
+	uint64_t init_flags;
+	uint32_t n_gpus;
+	uint32_t n_va_spaces;
+	uint32_t n_range_groups;
+	uint32_t _pad0;
+	struct { uint8_t uuid[16]; } gpus[STUB_MAX_REG_GPUS];
+	struct { uint8_t uuid[16]; uint32_t rm_ctrl_fd_handle_id; uint32_t _pad; }
+		va_spaces[STUB_MAX_VA_SPACES];
+	uint64_t range_group_ids[STUB_MAX_RANGE_GROUPS];
+};
+
+static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
+{
+	struct isolate_resp_realize_uvm resp = {
+		.type = ISOLATE_RESP_REALIZE_UVM,
+		.txn_id = cmd->txn_id,
+	};
+
+	/* 1. Recv the state snapshot. */
+	struct stub_state_snapshot state;
+	if (cmd->state_size != sizeof(state)) {
+		resp.retval = -EINVAL;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+	if (recv_full(&state, sizeof(state)) < 0) {
+		resp.retval = -EIO;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+	if (state.n_gpus > STUB_MAX_REG_GPUS ||
+	    state.n_va_spaces > STUB_MAX_VA_SPACES ||
+	    state.n_range_groups > STUB_MAX_RANGE_GROUPS) {
+		resp.retval = -EINVAL;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	/* 2. Recv the intent blob (mode-specific).  Allocate a page-rounded
+	 *    buffer; the SEM_POOL intent is 9248 bytes so we need ~3 pages. */
+	if (cmd->intent_size == 0 || cmd->intent_size > 64 * 1024) {
+		resp.retval = -EINVAL;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+	size_t intent_aligned = (cmd->intent_size + 4095) & ~4095UL;
+	void *intent_buf = stub_mmap(NULL, intent_aligned,
+				     PROT_READ | PROT_WRITE,
+				     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (intent_buf == MAP_FAILED) {
+		resp.retval = -ENOMEM;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+	if (recv_full(intent_buf, cmd->intent_size) < 0) {
+		stub_munmap(intent_buf, intent_aligned);
+		resp.retval = -EIO;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	/* 3. Open a fresh /dev/nvidia-uvm in the stub's mm. */
+	int uvm_fd = (int)stub_openat(AT_FDCWD, "/dev/nvidia-uvm",
+				      O_RDWR | O_CLOEXEC);
+	if (uvm_fd < 0) {
+		stub_munmap(intent_buf, intent_aligned);
+		resp.retval = -errno;
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	/* 4. UVM_INITIALIZE with recorded flags. */
+	struct stub_uvm_init init = { .flags = state.init_flags };
+	if (stub_ioctl(uvm_fd, STUB_UVM_INITIALIZE, &init) < 0 ||
+	    init.rm_status != 0) {
+		resp.retval = init.rm_status ? 0 : -errno;
+		resp.rm_status = init.rm_status;
+		goto cleanup;
+	}
+
+	/* 5. Replay each REGISTER_GPU. */
+	for (uint32_t i = 0; i < state.n_gpus; i++) {
+		struct stub_uvm_register_gpu rg = {0};
+		__builtin_memcpy(rg.uuid.b, state.gpus[i].uuid, 16);
+		rg.numa_node_id = -1;
+		if (stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU, &rg) < 0 ||
+		    rg.rm_status != 0) {
+			resp.rm_status = rg.rm_status;
+			resp.retval = rg.rm_status ? 0 : -errno;
+			goto cleanup;
+		}
+	}
+
+	/* 6. Replay each REGISTER_GPU_VASPACE.
+	 * NOTE: rm_ctrl_fd_handle_id is the guest's RM handle.  Translate
+	 * to the stub's local nvidiactl fd via handle_lookup. */
+	for (uint32_t i = 0; i < state.n_va_spaces; i++) {
+		struct stub_uvm_register_vas rv = {0};
+		__builtin_memcpy(rv.uuid.b, state.va_spaces[i].uuid, 16);
+		int local_fd = handle_lookup(state.va_spaces[i].rm_ctrl_fd_handle_id);
+		if (local_fd < 0) {
+			resp.retval = -EBADF;
+			goto cleanup;
+		}
+		rv.rm_ctrl_fd = (uint32_t)local_fd;
+		/* h_client / h_va_space the kernel reads from RM via the fd;
+		 * leave as 0 — the kernel resolves them from rm_ctrl_fd. */
+		if (stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU_VASPACE, &rv) < 0 ||
+		    rv.rm_status != 0) {
+			resp.rm_status = rv.rm_status;
+			resp.retval = rv.rm_status ? 0 : -errno;
+			goto cleanup;
+		}
+	}
+
+	/* 7. Replay each CREATE_RANGE_GROUP. */
+	for (uint32_t i = 0; i < state.n_range_groups; i++) {
+		struct stub_uvm_range_group rgg = {0};
+		rgg.range_group_id = state.range_group_ids[i];
+		if (stub_ioctl(uvm_fd, STUB_UVM_CREATE_RANGE_GROUP, &rgg) < 0 ||
+		    rgg.rm_status != 0) {
+			resp.rm_status = rgg.rm_status;
+			resp.retval = rgg.rm_status ? 0 : -errno;
+			goto cleanup;
+		}
+	}
+
+	/* 8. Mode-specific intent ioctl.  Currently only SEM_POOL = 1. */
+	if (cmd->mode == 1 /* NVKVM_UVM_REALIZE_MODE_SEM_POOL */) {
+		if (stub_ioctl(uvm_fd, STUB_UVM_ALLOC_SEMAPHORE_POOL,
+			       intent_buf) < 0) {
+			resp.retval = -errno;
+			/* rm_status is the LAST u32 of the params struct */
+			uint32_t *st = (uint32_t *)((char *)intent_buf +
+						    cmd->intent_size -
+						    sizeof(uint32_t));
+			resp.rm_status = *st;
+			goto cleanup;
+		}
+		uint32_t *st = (uint32_t *)((char *)intent_buf +
+					    cmd->intent_size -
+					    sizeof(uint32_t));
+		if (*st != 0) {
+			resp.rm_status = *st;
+			resp.retval = 0;
+			goto cleanup;
+		}
+	} else {
+		resp.retval = -ENOTSUP;
+		goto cleanup;
+	}
+
+	/* 9. mmap(2) at the requested host VA. */
+	uint32_t mmap_flags = cmd->map_flags;
+	if (cmd->host_va_hint)
+		mmap_flags |= MAP_FIXED;
+	void *host_va = stub_mmap((void *)(uintptr_t)cmd->host_va_hint,
+				  (size_t)cmd->length,
+				  (int)cmd->prot, (int)mmap_flags,
+				  uvm_fd, (off_t)cmd->offset);
+	if (host_va == MAP_FAILED) {
+		resp.retval = -errno;
+		goto cleanup;
+	}
+
+	resp.retval = 0;
+	resp.host_va = (uint64_t)(uintptr_t)host_va;
+	resp.length = cmd->length;
+	resp.realize_token = resp.host_va;   /* simplistic: VA is the token */
+	/* Keep uvm_fd open — subsequent SIDE_EFFECT ioctls route to it.
+	 * For now leak; a future commit will add a realize-token → fd map. */
+
+cleanup:
+	stub_munmap(intent_buf, intent_aligned);
+	if (resp.retval != 0 || resp.rm_status != 0) {
+		stub_close(uvm_fd);
+	}
+	locked_send(&resp, sizeof(resp));
+}
+
 /* ── Seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -1241,6 +1464,7 @@ int main(void)
 			struct isolate_cmd_poll             poll_cmd;
 			struct isolate_cmd_unpoll           unpoll_cmd;
 			struct isolate_cmd_open_device      open_dev;
+			struct isolate_cmd_realize_uvm_fd   realize;
 		} cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
@@ -1316,6 +1540,11 @@ int main(void)
 		case ISOLATE_CMD_OPEN_DEVICE:
 			handle_open_device(&cmd.open_dev);
 			break;
+		case ISOLATE_CMD_REALIZE_UVM_FD: {
+			struct isolate_cmd_realize_uvm_fd *r = (void *)&cmd;
+			handle_realize_uvm_fd(r);
+			break;
+		}
 		case ISOLATE_CMD_EXIT:
 			goto done;
 		default:
