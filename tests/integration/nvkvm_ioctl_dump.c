@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <stdint.h>
 
 static int (*real_ioctl)(int, unsigned long, ...);
 static FILE *out;
@@ -99,6 +100,22 @@ int ioctl(int fd, unsigned long req, ...)
 		hexdump(arg, sz, buf_post, sizeof(buf_post));
 		fprintf(out, "post ioctl[%lu] fd=%d cmd=0x%lx ret=%d size=%zu: %s\n",
 			seq, fd, req, r, sz, buf_post);
+		/* For RM_CONTROL (NV_ESC_RM_CONTROL = 0x2a), the inner param
+		 * buffer is pointed to by NVOS54.params (offset 16, 8 bytes);
+		 * NVOS54.params_size at offset 24 (4 bytes).  Dump up to 128
+		 * bytes of that buffer so we can see what the kernel wrote. */
+		if (_IOC_TYPE(req) == 'F' && _IOC_NR(req) == 0x2a && sz >= 32) {
+			const uint8_t *b = arg;
+			uintptr_t pp;  uint32_t ps;
+			memcpy(&pp, b + 16, sizeof(pp));
+			memcpy(&ps, b + 24, sizeof(ps));
+			if (pp != 0 && ps > 0 && ps <= 256) {
+				char aux[1024] = {0};
+				hexdump((const void *)pp, ps, aux, sizeof(aux));
+				fprintf(out, "      ctrl[%lu] inner-params (%u B): %s\n",
+					seq, ps, aux);
+			}
+		}
 		pthread_mutex_unlock(&out_lock);
 	}
 	return r;
