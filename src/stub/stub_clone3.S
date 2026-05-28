@@ -19,6 +19,26 @@
  * sigaltstack, no SIGSYS, no futex wait between parent and child.
  */
 	.text
+	/*
+	 * _start — process entry point.  No libc, so we set up the call to
+	 * main() ourselves: zero the frame pointer (so unwinders stop here)
+	 * and call main.  On return, exit_group(main's return value).
+	 *
+	 * The kernel sets rsp to argc, then argv[0..argc-1], NULL, envp[]...
+	 * We ignore them — main() takes no args.
+	 */
+	.globl	_start
+	.type	_start, @function
+_start:
+	xorq	%rbp, %rbp		/* clear frame pointer */
+	andq	$-16, %rsp		/* 16-byte align stack */
+	callq	main
+	movq	%rax, %rdi		/* exit code = main's return */
+	movq	$231, %rax		/* SYS_exit_group */
+	syscall
+	ud2
+	.size	_start, .-_start
+
 	.globl	fs_clone3_run
 	.type	fs_clone3_run, @function
 fs_clone3_run:
