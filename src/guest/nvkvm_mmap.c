@@ -336,8 +336,8 @@ err_unlock:
  * mapped in the isolate.  Subsequent accesses to the same page_gva are no-ops
  * (the mapping is already live).
  */
-static int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
-				   unsigned long page_gva, unsigned long prot)
+int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
+			   unsigned long page_gva, unsigned long prot)
 {
 	struct nvkvm_cpu_page *cp;
 	struct page *page = NULL;
@@ -360,8 +360,11 @@ static int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 
 	/* Pin the physical page (write access so writeback can update it). */
 	ret = get_user_pages_fast(page_gva, 1, FOLL_WRITE, &page);
-	if (ret != 1)
+	if (ret != 1) {
+		pr_warn("nvkvm: cpu_page_migrate gup gva=0x%lx ret=%d\n",
+			page_gva, ret);
 		return (ret < 0) ? ret : -EFAULT;
+	}
 
 	/* Copy page content into a shared memory slot. */
 	shm_slot = nvkvm_slot_alloc(&nvkvm);
@@ -383,13 +386,19 @@ static int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	/* Create a QEMU-side memfd for this page. */
 	ret = nvkvm_virtio_open_memory_handle((unsigned int)ctx->session->id,
 					      PAGE_SIZE, &handle_id);
-	if (ret)
+	if (ret) {
+		pr_warn("nvkvm: cpu_page_migrate open_memory_handle gva=0x%lx ret=%d\n",
+			page_gva, ret);
 		goto err_slot;
+	}
 
 	/* Upload the page content to the memfd. */
 	ret = nvkvm_virtio_write_memory_handle(handle_id, 0, shm_slot, PAGE_SIZE);
-	if (ret)
+	if (ret) {
+		pr_warn("nvkvm: cpu_page_migrate write_memory_handle gva=0x%lx ret=%d\n",
+			page_gva, ret);
 		goto err_handle;
+	}
 
 	nvkvm_slot_free(&nvkvm, shm_slot);
 	shm_slot = -1;
@@ -397,16 +406,27 @@ static int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	/* Send the handle to the isolate and map it at page_gva. */
 	ret = nvkvm_virtio_copy_handle_to_isolate(handle_id,
 						  ctx->session->isolate_id);
-	if (ret)
+	if (ret) {
+		pr_warn("nvkvm: cpu_page_migrate copy_handle_to_isolate gva=0x%lx isolate=%u ret=%d\n",
+			page_gva, ctx->session->isolate_id, ret);
 		goto err_handle;
+	}
 
 	ret = nvkvm_virtio_mmap_on_isolate(ctx->session->isolate_id, handle_id,
 					   page_gva, 0, PAGE_SIZE,
 					   prot, MAP_SHARED,
 					   (unsigned int)ctx->session->id,
 					   &gpa_base, &mmap_token);
-	if (ret)
+	if (ret) {
+		pr_warn("nvkvm: cpu_page_migrate mmap_on_isolate gva=0x%lx isolate=%u ret=%d\n",
+			page_gva, ctx->session->isolate_id, ret);
 		goto err_handle;
+	}
+
+	/* Stash the GPA on the tracking node so a later range-swap can install
+	 * it into libcuda's VMA in one shot.  Per-page VM_PFNMAP toggling on a
+	 * VMA that still holds anon pages breaks gup_fast for the unmigrated
+	 * neighbours, so we don't touch the guest VMA here. */
 
 	/* Track the migration for writeback and cleanup at fd close. */
 	cp = kzalloc(sizeof(*cp), GFP_KERNEL);
@@ -416,6 +436,7 @@ static int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	}
 	cp->page        = page;
 	cp->gva         = page_gva;
+	cp->gpa         = gpa_base;
 	cp->handle_id   = handle_id;
 	cp->mmap_token  = mmap_token;
 	cp->prot        = (__u32)prot;
@@ -635,4 +656,101 @@ bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len)
 	if (gpa_base + len < gpa_base)   /* overflow check */
 		return false;
 	return true;
+}
+
+/*
+ * nvkvm_cpu_pages_migrate_range — migrate every guest page covering
+ * [gva, gva+len) onto memfds shared with the isolate.  Pages already
+ * migrated are skipped (cpu_page_migrate dedupes by gva).  Used to set
+ * up the OS_DESCRIPTOR backing before forwarding NV_ESC_RM_ALLOC_MEMORY
+ * so the kernel pin_user_pages call on the stub's task finds the same
+ * physical pages libcuda is writing to in the guest.
+ */
+int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
+				  __u64 gva, __u64 len, unsigned long prot)
+{
+	unsigned long start = (unsigned long)gva & PAGE_MASK;
+	unsigned long end   = ((unsigned long)gva + len + PAGE_SIZE - 1) &
+			      PAGE_MASK;
+	unsigned long off;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	int ret;
+
+	if (!len)
+		return 0;
+	if (end < start)   /* overflow */
+		return -EINVAL;
+	if (end - start > (16ULL << 20))   /* sanity: 16 MB max per call */
+		return -E2BIG;
+
+	/*
+	 * Step 1: per-page migrate.  Pin each guest anon page, ship its
+	 * content into a memfd in QEMU, MAP_FIXED the memfd at the same
+	 * VA in the stub's mm, and record the (gva, gpa) in ctx->cpu_pages.
+	 * Pages already migrated are no-ops.  No VMA mutation in the guest
+	 * yet — that has to wait until every page has been gup'd, otherwise
+	 * the first VM_PFNMAP toggle would block gup_fast on the remainder.
+	 */
+	for (off = start; off < end; off += PAGE_SIZE) {
+		ret = nvkvm_cpu_page_migrate(ctx, off, prot);
+		if (ret) {
+			pr_warn("nvkvm: migrate_range pin gva=0x%lx ret=%d\n",
+				off, ret);
+			return ret;
+		}
+	}
+
+	/*
+	 * Step 2: single VMA swap.  Drop the anonymous PTEs in [start, end),
+	 * mark the VMA VM_PFNMAP|VM_IO, and remap each page onto its memfd-
+	 * backed GPA in our mmap window.  After this libcuda writes hit the
+	 * memfd, which the stub already has mapped at the same VA via the
+	 * step-1 MAP_FIXED — single physical backing across both processes
+	 * and across the host kernel's pin_user_pages on the stub's mm.
+	 */
+	mmap_write_lock(mm);
+	vma = find_vma(mm, start);
+	if (!vma || vma->vm_start > start || vma->vm_end < end) {
+		mmap_write_unlock(mm);
+		pr_warn("nvkvm: migrate_range no VMA covering [%lx, %lx)\n",
+			start, end);
+		return -EFAULT;
+	}
+
+	zap_page_range_single(vma, start, end - start, NULL);
+	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+	for (off = start; off < end; off += PAGE_SIZE) {
+		struct nvkvm_cpu_page *cp;
+		__u64 page_gpa = 0;
+
+		mutex_lock(&ctx->cpu_pages_lock);
+		list_for_each_entry(cp, &ctx->cpu_pages, list) {
+			if (cp->gva == off) {
+				page_gpa = cp->gpa;
+				break;
+			}
+		}
+		mutex_unlock(&ctx->cpu_pages_lock);
+		if (!page_gpa) {
+			mmap_write_unlock(mm);
+			pr_warn("nvkvm: migrate_range no GPA for gva=0x%lx\n",
+				off);
+			return -EFAULT;
+		}
+
+		ret = remap_pfn_range(vma, off,
+				      (unsigned long)(page_gpa >> PAGE_SHIFT),
+				      PAGE_SIZE, vma->vm_page_prot);
+		if (ret) {
+			mmap_write_unlock(mm);
+			pr_warn("nvkvm: migrate_range remap_pfn_range gva=0x%lx gpa=0x%llx ret=%d\n",
+				off, page_gpa, ret);
+			return ret;
+		}
+	}
+	mmap_write_unlock(mm);
+	return 0;
 }

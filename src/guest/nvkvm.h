@@ -64,6 +64,7 @@ struct nvkvm_mmap_region {
 struct nvkvm_cpu_page {
 	struct page    *page;      /* pinned guest physical page                */
 	unsigned long   gva;       /* page-aligned GVA mapped in the isolate    */
+	__u64           gpa;       /* GPA the memfd page lives at in our window */
 	__u32           handle_id; /* QEMU memory handle wrapping the memfd     */
 	__u32           mmap_token;/* token for MUNMAP_ON_ISOLATE cleanup       */
 	__u32           prot;      /* PROT_* flags (read/write)                 */
@@ -288,6 +289,12 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx);
 int  nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr);
 void nvkvm_cpu_pages_writeback(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
+/* Eagerly migrate every guest page in [gva, gva+len) onto memfds shared with
+ * the isolate.  Used by NV_ESC_RM_ALLOC_MEMORY hClass=NV01_MEMORY_SYSTEM_OS_-
+ * DESCRIPTOR so the kernel's pin_user_pages on the stub's mm finds memfd
+ * pages that alias libcuda's guest userspace pages. */
+int  nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
+				   __u64 gva, __u64 len, unsigned long prot);
 
 /* nvkvm_session.c */
 struct nvkvm_session *nvkvm_session_get_or_create(pid_t tgid);

@@ -748,82 +748,17 @@ static void *worker_thread(void *arg)
 		}
 
 		/*
-		 * NV_ESC_RM_ALLOC_MEMORY + hClass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR:
-		 * the kernel calls os_lock_user_pages() on pMemory to pin pages
-		 * of the calling task.  Guest sanitizer zeroes pMemory, so the
-		 * kernel pins nothing, the resource fails to register, and a
-		 * later RM_MAP_MEMORY_DMA returns NV_ERR_OBJECT_NOT_FOUND.
-		 *
-		 * Allocate a stub-local anonymous range of size limit+1 and pass
-		 * that as pMemory.  The kernel pins our pages; the GPU later
-		 * DMAs through those.  Mirrors gVisor's rmAllocOSDescriptor.
-		 * We leak the mapping for now — it gets unpinned when the
-		 * driver frees the OsDescMem resource, but the stub VA stays
-		 * reserved.  Acceptable for cuCtxCreate's small descriptors.
+		 * NV_ESC_RM_ALLOC_MEMORY + hClass==NV01_MEMORY_SYSTEM_OS_DESCRIPTOR
+		 * needs the kernel to pin libcuda's guest pages.  The guest module
+		 * now migrates those pages onto memfds and MAP_FIXED-installs them
+		 * at the same VA in our mm before forwarding the ioctl, so by the
+		 * time we hit the kernel pin_user_pages walks our pagetables and
+		 * finds tmpfs pages that alias libcuda's guest userspace.  No
+		 * stub-local backing allocation is needed here.
 		 */
-		void *os_desc_mem = NULL;
-		uint64_t os_desc_len = 0;
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    (job.cmd & 0xff) == 0x27 &&
-		    job.param_size >= 56) {
-			uint32_t hclass = 0;
-			__builtin_memcpy(&hclass,
-					 (char *)job.param_buf + 12, 4);
-			dprintf(2, "nvkvm_stub: cmd=0x27 entered hclass=0x%x param_size=%u\n",
-				hclass, (unsigned)job.param_size);
-			if (hclass == 0x71 /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */) {
-				uint64_t limit = 0;
-				__builtin_memcpy(&limit,
-						 (char *)job.param_buf + 32, 8);
-				uint64_t arLen = limit + 1;
-				/* Page-round up. */
-				arLen = (arLen + 4095) & ~(uint64_t)4095;
-				void *m = stub_mmap(NULL, arLen,
-						    PROT_READ | PROT_WRITE,
-						    MAP_PRIVATE | MAP_ANONYMOUS,
-						    -1, 0);
-				if ((long)m < 0 && (long)m > -4096) {
-					dprintf(2,
-						"nvkvm_stub: OS_DESCRIPTOR mmap len=0x%llx failed: %ld\n",
-						(unsigned long long)arLen, (long)m);
-					resp.retval = -ENOMEM;
-					goto send_resp;
-				}
-				os_desc_mem = m;
-				os_desc_len = arLen;
-				/* Fault pages in.  gVisor uses MADV_POPULATE_WRITE
-				 * because pin_user_pages(FOLL_LONGTERM) can stall
-				 * concurrent mmap_lock acquirers otherwise. */
-				syscall(SYS_madvise, m, arLen,
-					22 /* MADV_POPULATE_WRITE */);
-				uint64_t pmem64 = (uint64_t)(uintptr_t)m;
-				__builtin_memcpy((char *)job.param_buf + 24,
-						 &pmem64, 8);
-				dprintf(2,
-					"nvkvm_stub: OS_DESCRIPTOR allocated stub_va=%p len=0x%llx for cmd=0x%x\n",
-					m, (unsigned long long)arLen, job.cmd);
-			}
-		}
-
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
 		int  err  = (ret < 0) ? errno : 0;
-
-		/* Restore pMemory to 0 so the guest sees what its sanitizer set
-		 * (we don't want to leak stub VAs back into the guest). */
-		if (os_desc_mem && job.param_size >= 56) {
-			uint64_t zero = 0;
-			__builtin_memcpy((char *)job.param_buf + 24, &zero, 8);
-			/* Note: if the alloc failed, free the mapping to avoid
-			 * leaks.  On success we leave it pinned; the kernel
-			 * holds refs to our pages until OsDescMem is freed. */
-			uint32_t status = 0;
-			__builtin_memcpy(&status,
-					 (char *)job.param_buf + 40, 4);
-			if (ret < 0 || status != 0) {
-				stub_munmap(os_desc_mem, os_desc_len);
-			}
-		}
 
 		/* Restore embedded fd so the guest sees its own handle_id back. */
 		if (uvm_has_embedded_fd &&

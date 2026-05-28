@@ -319,7 +319,6 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 
 	case NV_ESC_RM_ALLOC_MEMORY: {
 		struct nv_ioctl_nvos02_parameters_with_fd *p = buf;
-		p->p_memory = 0;             /* host fills this in */
 		/*
 		 * Embedded fd: libcuda uses 0 or -1 as "no associated fd"
 		 * sentinels.  Only translate a STRICTLY positive value (real
@@ -330,6 +329,41 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 			if (hid < 0)
 				return -EBADF;
 			p->fd = hid;
+		}
+
+		/*
+		 * hClass=NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (0x71) pins user
+		 * pages of *the calling task*.  In our forwarding model that
+		 * task is the stub, not libcuda, so the kernel would pin
+		 * stub-owned anon memory and the GPU would DMA against pages
+		 * that have no relation to what libcuda touches.  Solution:
+		 * migrate every guest page in [p_memory, p_memory+limit+1)
+		 * onto memfds shared with the stub via the existing CPU-page
+		 * migration path.  The stub already maps those memfds at the
+		 * same VA (MAP_FIXED), so the kernel's pin_user_pages call
+		 * finds tmpfs pages that alias libcuda's guest userspace —
+		 * GPU DMA, libcuda memcpy, and host kernel all touch the
+		 * same physical pages.
+		 *
+		 * After migration we keep p->p_memory unchanged so the kernel
+		 * sees the same VA the stub has mapped.
+		 */
+		if (p->h_class == 0x71 && p->p_memory && p->limit > 0) {
+			int mret = nvkvm_cpu_pages_migrate_range(
+				ctx,
+				(__u64)p->p_memory,
+				(__u64)p->limit + 1,
+				0x1 | 0x2 /* PROT_READ | PROT_WRITE */);
+			if (mret) {
+				pr_warn("nvkvm: OS_DESCRIPTOR migrate %llx+%llx failed: %d\n",
+					(unsigned long long)p->p_memory,
+					(unsigned long long)p->limit + 1,
+					mret);
+				return mret;
+			}
+			/* leave p_memory alone — pages now alias stub VA */
+		} else {
+			p->p_memory = 0;     /* legacy path: kernel-allocated */
 		}
 		break;
 	}
