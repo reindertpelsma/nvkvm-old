@@ -185,7 +185,15 @@ static long stub_sigaction(int sig, const struct sigaction *act,
 
 #define SOCK_FD          STDIN_FILENO
 #define NVKVM_STUB_WORKERS   16
-#define MAX_HANDLES      4096
+/*
+ * Handle IDs in QEMU are a global monotonic counter that never resets, so
+ * after a few thousand cumulative opens across multiple CUDA processes
+ * within one VM boot they can exceed 4 K.  Sized to 64 K to outlast any
+ * realistic workload before a VM restart.  Each entry is 4 bytes ⇒ 256 KB
+ * per stub address-space, which is fine.  When the counter ever wraps
+ * past this we'll redesign the lookup as a hash; until then, blow it up.
+ */
+#define MAX_HANDLES      65536
 #define MAX_PARAM_SIZE   (256 * 1024)
 #define MAX_INFLIGHT     64   /* max concurrent IOCTL jobs */
 
