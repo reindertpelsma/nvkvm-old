@@ -1476,7 +1476,33 @@ int main(void)
 						"/dev/nvidia-uvm",
 						O_RDWR | O_CLOEXEC);
 
-	/* apply_seccomp(); — disabled for debugging, per user 2026-05-26 */
+	/*
+	 * Apply the seccomp allowlist before entering the main loop.  After
+	 * this point only the explicitly-allowed syscalls work; anything
+	 * else returns -EPERM (or, for the arch-mismatch case, kills the
+	 * process).  Audit C6: re-enabled after the debug period; until
+	 * tightening lands (the openat/mprotect-PROT_EXEC arg filters), the
+	 * coarse allowlist still blocks execve, ptrace, fork, prctl, init_-
+	 * module, etc. — the actually-dangerous escape primitives.
+	 *
+	 * Set NVKVM_STUB_NO_SECCOMP=1 in the QEMU environment (only honoured
+	 * when NVKVM_STUB_DEBUG=1 is also set, see nvkvm_isolate.c) to bypass
+	 * for debugging — useful when LD_PRELOAD instrumentation triggers
+	 * extra syscalls.
+	 */
+	{
+		const char *bypass_env = getenv("NVKVM_STUB_NO_SECCOMP");
+		bool bypass = bypass_env && *bypass_env == '1';
+		if (!bypass) {
+			long sr = apply_seccomp();
+			if (sr < 0) {
+				dprintf(2,
+					"nvkvm_stub: apply_seccomp failed: %ld\n",
+					sr);
+				stub_exit(1);
+			}
+		}
+	}
 
 	/*
 	 * Reader loop — reads ONE complete SEQPACKET message per iteration.
