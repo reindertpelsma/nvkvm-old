@@ -1,8 +1,10 @@
 /*
  * nvkvm_stub.c — nvkvm isolate stub process (multi-threaded)
  *
- * Minimal static binary: no libc, Linux syscalls via syscall(3) (from
- * sys/syscall.h only — no libc linked), seccomp allowlist, SIGSEGV handler.
+ * Freestanding static binary — built with -nostdlib -static -fPIE and linked
+ * against -lgcc only.  No libc, no pthread; all primitives come from
+ * stub_freestanding.h (futex-based mutex/cond, raw syscall wrappers,
+ * clone3 trampoline, tiny printf).  See audit C7.
  *
  * Threading model
  * ===============
@@ -22,25 +24,159 @@
  * code that touches global data runs (constructor priority 101).
  */
 
-#define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
-#include <sys/syscall.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <poll.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
-#include <signal.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <elf.h>
-#include <stdio.h>
+#include <linux/futex.h>
+#include <linux/elf.h>
+#include <asm/unistd.h>
 
+#include "stub_freestanding.h"
 #include "../common/nvkvm_isolate_proto.h"
+
+/* ── Constants we'd otherwise pull from libc headers ─────────────────────── */
+
+/* From <asm-generic/errno-base.h> — the kernel UAPI errno values we use. */
+#ifndef EPERM
+#define EPERM     1
+#define EIO       5
+#define EBADF     9
+#define ENOMEM   12
+#define EFAULT   14
+#define EINVAL   22
+#define ENOSYS   38
+#endif
+#ifndef ENOTSUP
+#define ENOTSUP  95  /* EOPNOTSUPP */
+#endif
+
+/* From <asm-generic/fcntl.h> + <linux/fcntl.h>. */
+#ifndef O_RDWR
+#define O_RDWR    00000002
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 02000000
+#endif
+#ifndef AT_FDCWD
+#define AT_FDCWD  -100
+#endif
+
+/* From <asm-generic/mman-common.h> / <linux/mman.h>. */
+#ifndef PROT_READ
+#define PROT_READ      0x1
+#define PROT_WRITE     0x2
+#endif
+#ifndef MAP_PRIVATE
+#define MAP_PRIVATE    0x02
+#define MAP_FIXED      0x10
+#define MAP_ANONYMOUS  0x20
+#define MAP_GROWSDOWN  0x0100
+#endif
+#define MAP_FAILED ((void *)-1L)
+
+/* From <linux/eventfd.h>. */
+#define EFD_SEMAPHORE 1
+#define EFD_CLOEXEC   O_CLOEXEC
+#define EFD_NONBLOCK  04000  /* O_NONBLOCK */
+
+/* From <linux/sched.h> — CLONE_* flags. */
+#define CLONE_VM       0x00000100
+#define CLONE_FS       0x00000200
+#define CLONE_FILES    0x00000400
+#define CLONE_SIGHAND  0x00000800
+#define CLONE_THREAD   0x00010000
+#define CLONE_SYSVSEM  0x00040000
+
+/* Signal numbers + sigaction shape (kernel ABI, not glibc-augmented). */
+#define SIGSEGV     11
+#define SA_SIGINFO  0x00000004
+#define SA_RESTORER 0x04000000
+
+/* STDIN_FILENO / STDERR_FILENO are libc macros; we'd rather not pull
+ * <unistd.h>.  Define directly. */
+#define STDIN_FD   0
+#define STDERR_FD  2
+
+/* prctl op: from <linux/prctl.h>. */
+#define PR_SET_NO_NEW_PRIVS 38
+
+/* socket cmsg / msghdr — kernel UAPI exposes the data but the userland
+ * struct shapes are normally defined in <bits/socket.h>.  Hand-roll them. */
+typedef unsigned int  socklen_t;
+typedef long          ssize_t;
+typedef long          off_t;
+
+struct iovec {
+	void  *iov_base;
+	size_t iov_len;
+};
+
+struct msghdr {
+	void           *msg_name;
+	socklen_t       msg_namelen;
+	struct iovec   *msg_iov;
+	size_t          msg_iovlen;
+	void           *msg_control;
+	size_t          msg_controllen;
+	int             msg_flags;
+};
+
+struct cmsghdr {
+	size_t   cmsg_len;
+	int      cmsg_level;
+	int      cmsg_type;
+};
+
+#define SOL_SOCKET   1
+#define SCM_RIGHTS   1
+
+/* CMSG_* alignment helpers — same definitions glibc uses, derived from the
+ * kernel ABI.  Aligns on sizeof(size_t) boundaries. */
+#define _CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_LEN(len)   (_CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
+#define CMSG_SPACE(len) (_CMSG_ALIGN(sizeof(struct cmsghdr)) + _CMSG_ALIGN(len))
+#define CMSG_DATA(cmsg) ((unsigned char *)((struct cmsghdr *)(cmsg) + 1))
+#define CMSG_FIRSTHDR(mhdr) \
+	((size_t)(mhdr)->msg_controllen >= sizeof(struct cmsghdr) ? \
+	 (struct cmsghdr *)(mhdr)->msg_control : (struct cmsghdr *)0)
+
+/* siginfo_t + sigaction (kernel layout — what rt_sigaction actually expects).
+ *
+ * The kernel's struct sigaction is much smaller than glibc's libc-side one;
+ * what we register is `struct kernel_sigaction` which has 4 fields. */
+typedef struct {
+	int       si_signo;
+	int       si_errno;
+	int       si_code;
+	int       _pad0;
+	/* Real siginfo_t has a union here covering ~112 bytes.  For SIGSEGV
+	 * the field we care about is si_addr at offset 16 (after the three
+	 * ints + 4-byte pad).  Use the kernel's _sifields._sigfault layout. */
+	void     *si_addr;
+	char      _pad1[112 - 16 - sizeof(void *)];
+} siginfo_t;
+
+typedef struct { unsigned long sig[1]; } sigset_t;
+
+struct kernel_sigaction {
+	void   (*sa_handler_fn)(int, siginfo_t *, void *);
+	unsigned long sa_flags;
+	void   (*sa_restorer)(void);
+	sigset_t sa_mask;
+};
+
+/* ELF types for self-relocation come from <linux/elf.h> (included above);
+ * the DT_/R_X86_64_RELATIVE constants live in <linux/elf.h> too. */
+#ifdef NVKVM_STUB_EMBEDDED
+#  ifndef R_X86_64_RELATIVE
+#    define R_X86_64_RELATIVE 8
+#  endif
+#endif
+
+/* sched_setaffinity etc. are not used.  We also need MAP_FAILED already defined
+ * above.  poll.h-style structs unused in the stub (POLL handler is a stub). */
 
 /*
  * UVM ioctl struct layouts.  We need just enough to find the embedded fd
@@ -103,87 +239,105 @@ struct nvkvm_stub_uvm_register_channel_params {
 #define NVKVM_STUB_UVM_LOCAL_POOL_SIZE 2
 static int  uvm_local_fds[NVKVM_STUB_UVM_LOCAL_POOL_SIZE];
 static int  uvm_local_next_idx = 0;
-static pthread_mutex_t uvm_local_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct fs_mutex uvm_local_lock = FS_MUTEX_INIT;
 
-/* ── Syscall wrappers ────────────────────────────────────────────────────── */
+/* ── Syscall wrappers (freestanding — return negative -errno) ───────────── */
 
 static __attribute__((noreturn)) void stub_exit(int code)
 {
-	syscall(SYS_exit_group, code);
+	sc1(__NR_exit_group, code);
 	__builtin_unreachable();
 }
 
 static long stub_read(int fd, void *buf, size_t n)
 {
-	return syscall(SYS_read, fd, buf, n);
+	return sc3(__NR_read, fd, (long)buf, (long)n);
 }
 
 static long stub_write(int fd, const void *buf, size_t n)
 {
-	return syscall(SYS_write, fd, buf, n);
+	return sc3(__NR_write, fd, (long)buf, (long)n);
 }
 
 static long stub_recvmsg(int fd, struct msghdr *m, int fl)
 {
-	return syscall(SYS_recvmsg, fd, m, fl);
+	return sc3(__NR_recvmsg, fd, (long)m, fl);
 }
 
 static long stub_sendmsg(int fd, const struct msghdr *m, int fl)
 {
-	return syscall(SYS_sendmsg, fd, m, fl);
+	return sc3(__NR_sendmsg, fd, (long)m, fl);
 }
 
 static long stub_openat(int dfd, const char *path, int flags)
 {
-	return syscall(SYS_openat, dfd, path, flags);
+	return sc3(__NR_openat, dfd, (long)path, flags);
 }
 
-#ifndef SYS_eventfd2
-#define SYS_eventfd2 290   /* x86-64 */
+#ifndef __NR_eventfd2
+#define __NR_eventfd2 290   /* x86-64 */
 #endif
 
 static int stub_eventfd2(unsigned int initval, int flags)
 {
-	return (int)syscall(SYS_eventfd2, initval, flags);
+	return (int)sc2(__NR_eventfd2, initval, flags);
 }
 
 static long stub_ioctl(int fd, unsigned long req, void *arg)
 {
-	return syscall(SYS_ioctl, fd, req, arg);
+	return sc3(__NR_ioctl, fd, (long)req, (long)arg);
 }
 
 static void *stub_mmap(void *a, size_t l, int p, int f, int fd, off_t o)
 {
-	return (void *)syscall(SYS_mmap, a, l, p, f, fd, o);
+	long r = sc6(__NR_mmap, (long)a, (long)l, p, f, fd, (long)o);
+	/* Kernel returns -errno in [-4095, -1] on failure; map to MAP_FAILED
+	 * so callers can compare against it the same way they would with
+	 * the libc mmap(2). */
+	if ((unsigned long)r >= (unsigned long)-4095L)
+		return MAP_FAILED;
+	return (void *)r;
 }
 
 static long stub_munmap(void *a, size_t l)
 {
-	return syscall(SYS_munmap, a, l);
+	return sc2(__NR_munmap, (long)a, (long)l);
 }
 
-static long stub_close(int fd) { return syscall(SYS_close, fd); }
+static long stub_close(int fd) { return sc1(__NR_close, fd); }
 
 static long stub_prctl(int op, unsigned long a2, unsigned long a3,
 		       unsigned long a4, unsigned long a5)
 {
-	return syscall(SYS_prctl, op, a2, a3, a4, a5);
+	return sc5(__NR_prctl, op, (long)a2, (long)a3, (long)a4, (long)a5);
 }
 
 static long stub_seccomp(unsigned int op, unsigned int fl, const void *arg)
 {
-	return syscall(SYS_seccomp, op, fl, arg);
+	return sc3(__NR_seccomp, op, fl, (long)arg);
 }
 
-static long stub_sigaction(int sig, const struct sigaction *act,
-			   struct sigaction *oact)
+/* Restorer trampoline for rt_sigaction.  The kernel requires SA_RESTORER on
+ * x86_64 — if absent, returning from a signal handler delivers SIGSEGV.
+ * We point sa_restorer at this 4-byte stub: `mov $15, %eax; syscall`
+ * (SYS_rt_sigreturn). */
+__attribute__((naked,unused)) static void stub_sigreturn_trampoline(void)
 {
-	return syscall(SYS_rt_sigaction, sig, act, oact, sizeof(sigset_t));
+	__asm__ volatile (
+		"movl $15, %eax\n\t"   /* SYS_rt_sigreturn */
+		"syscall\n\t");
+}
+
+static long stub_sigaction(int sig, const struct kernel_sigaction *act,
+			   struct kernel_sigaction *oact)
+{
+	return sc4(__NR_rt_sigaction, sig, (long)act, (long)oact,
+		   sizeof(sigset_t));
 }
 
 /* ── Constants ────────────────────────────────────────────────────────────── */
 
-#define SOCK_FD          STDIN_FILENO
+#define SOCK_FD          STDIN_FD
 #define NVKVM_STUB_WORKERS   16
 /*
  * Handle IDs in QEMU are a global monotonic counter that never resets, so
@@ -197,10 +351,10 @@ static long stub_sigaction(int sig, const struct sigaction *act,
 #define MAX_PARAM_SIZE   (256 * 1024)
 #define MAX_INFLIGHT     64   /* max concurrent IOCTL jobs */
 
-/* ── Mutex helpers (use pthread, which is available statically) ──────────── */
+/* ── Mutex helpers (futex-based, see stub_freestanding.h) ───────────────── */
 
-static pthread_mutex_t write_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t fd_mutex     = PTHREAD_MUTEX_INITIALIZER;
+static struct fs_mutex write_mutex  = FS_MUTEX_INIT;
+static struct fs_mutex fd_mutex     = FS_MUTEX_INIT;
 
 
 /* ── Handle fd table ─────────────────────────────────────────────────────── */
@@ -258,9 +412,9 @@ static int recv_full(void *buf, size_t len)
 
 static int locked_send(const void *buf, size_t len)
 {
-	pthread_mutex_lock(&write_mutex);
+	fs_mutex_lock(&write_mutex);
 	int r = send_full(buf, len);
-	pthread_mutex_unlock(&write_mutex);
+	fs_mutex_unlock(&write_mutex);
 	return r;
 }
 
@@ -279,32 +433,51 @@ static int send_error(int err)
 
 /* ── SIGSEGV handler ──────────────────────────────────────────────────────── */
 
-/* Per-thread fault address — pthread TLS key */
-static pthread_key_t  fault_addr_key;
-static pthread_once_t fault_key_once = PTHREAD_ONCE_INIT;
+/*
+ * Per-worker fault address slot indexed by worker id.
+ *
+ * Each worker gets a unique slot id in [0, NVKVM_STUB_WORKERS); the id is
+ * stashed in a thread-local-ish way via a syscall-safe lookup: workers call
+ * worker_self() which reads the gettid() syscall return and matches it
+ * against worker_tids[].  Set once at worker spawn time.  This avoids glibc
+ * TLS (no __thread, no tcbhead_t) — the stub has no TLS image.
+ *
+ * Slot 0 is reserved for the main/reader thread (it can also fault on
+ * stub_ioctl).
+ */
+#define WORKER_SLOT_MAX (NVKVM_STUB_WORKERS + 1)
+static volatile int       worker_tids[WORKER_SLOT_MAX];      /* tid → slot */
+static volatile uint64_t  worker_fault_addr[WORKER_SLOT_MAX];
 
-static void init_fault_key(void)
+static int stub_gettid(void)
 {
-	pthread_key_create(&fault_addr_key, NULL);
+	return (int)sc0(__NR_gettid);
+}
+
+static int worker_self_slot(void)
+{
+	int tid = stub_gettid();
+	for (int i = 0; i < WORKER_SLOT_MAX; i++)
+		if (worker_tids[i] == tid)
+			return i;
+	return 0;  /* fall back to reader-thread slot if unregistered */
 }
 
 static void sigsegv_handler(int sig, siginfo_t *info, void *ctx)
 {
 	(void)sig; (void)ctx;
-	pthread_once(&fault_key_once, init_fault_key);
-	/* Store fault address in TLS so each worker thread has its own */
-	pthread_setspecific(fault_addr_key,
-			    (void *)(uintptr_t)info->si_addr);
+	int slot = worker_self_slot();
+	worker_fault_addr[slot] = (uint64_t)(uintptr_t)info->si_addr;
 }
 
 static uint64_t get_fault_addr(void)
 {
-	return (uint64_t)(uintptr_t)pthread_getspecific(fault_addr_key);
+	return worker_fault_addr[worker_self_slot()];
 }
 
 static void clear_fault_addr(void)
 {
-	pthread_setspecific(fault_addr_key, NULL);
+	worker_fault_addr[worker_self_slot()] = 0;
 }
 
 /* ── Thread pool ──────────────────────────────────────────────────────────── */
@@ -324,10 +497,10 @@ struct ioctl_job {
 
 static void *blob_alloc(size_t size);
 
-static struct ioctl_job     job_queue[MAX_INFLIGHT];
-static pthread_mutex_t      queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t       queue_cond  = PTHREAD_COND_INITIALIZER;
-static volatile int         stub_exiting = 0;
+static struct ioctl_job   job_queue[MAX_INFLIGHT];
+static struct fs_mutex    queue_mutex = FS_MUTEX_INIT;
+static struct fs_cond     queue_cond  = FS_COND_INIT;
+static volatile int       stub_exiting = 0;
 
 static void job_queue_init(void)
 {
@@ -337,45 +510,51 @@ static void job_queue_init(void)
 
 static void enqueue_job(const struct ioctl_job *job)
 {
-	pthread_mutex_lock(&queue_mutex);
+	fs_mutex_lock(&queue_mutex);
 	for (int i = 0; i < MAX_INFLIGHT; i++) {
 		if (!job_queue[i].valid) {
 			job_queue[i] = *job;
 			job_queue[i].valid = 1;
-			pthread_cond_signal(&queue_cond);
+			fs_cond_signal(&queue_cond);
 			break;
 		}
 	}
-	pthread_mutex_unlock(&queue_mutex);
+	fs_mutex_unlock(&queue_mutex);
 }
 
 static int dequeue_job(struct ioctl_job *out)
 {
-	pthread_mutex_lock(&queue_mutex);
+	fs_mutex_lock(&queue_mutex);
 	while (!stub_exiting) {
 		for (int i = 0; i < MAX_INFLIGHT; i++) {
 			if (job_queue[i].valid) {
 				*out = job_queue[i];
 				job_queue[i].valid = 0;
-				pthread_mutex_unlock(&queue_mutex);
+				fs_mutex_unlock(&queue_mutex);
 				return 1;
 			}
 		}
-		pthread_cond_wait(&queue_cond, &queue_mutex);
+		fs_cond_wait(&queue_cond, &queue_mutex);
 	}
-	pthread_mutex_unlock(&queue_mutex);
+	fs_mutex_unlock(&queue_mutex);
 	return 0;
 }
 
-static void *worker_thread(void *arg)
+static void worker_thread(void *arg)
 {
-	(void)arg;
+	/* arg = (void *)(uintptr_t)(slot_id + 1) — non-zero so we can
+	 * distinguish from a NULL/default.  Register our slot ourselves so
+	 * SIGSEGV from the very first ioctl correctly routes to our slot
+	 * (the parent's worker_tids[] write may race the first ioctl call). */
+	int slot = (int)(uintptr_t)arg;
+	if (slot > 0 && slot < WORKER_SLOT_MAX)
+		worker_tids[slot] = stub_gettid();
 	struct ioctl_job job;
 
 	while (dequeue_job(&job)) {
-		pthread_mutex_lock(&fd_mutex);
+		fs_mutex_lock(&fd_mutex);
 		int fd = handle_lookup(job.handle_id);
-		pthread_mutex_unlock(&fd_mutex);
+		fs_mutex_unlock(&fd_mutex);
 
 		struct isolate_resp_ioctl resp = {
 			.type     = ISOLATE_RESP_IOCTL,
@@ -556,7 +735,8 @@ static void *worker_thread(void *arg)
 			saved_uvm_embedded_fd = hid;
 			int local_fd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
 			if (local_fd < 0) {
-				dprintf(2, "nvkvm_stub: UVM cmd=0x%x: handle_id=%d not in stub table\n",
+				fs_dprintf(STDERR_FD,
+					"nvkvm_stub: UVM cmd=0x%x: handle_id=%d not in stub table\n",
 					job.cmd, hid);
 				resp.retval = -EBADF;
 				goto send_resp;
@@ -617,7 +797,8 @@ static void *worker_thread(void *arg)
 			if (hid > 0) {
 				int local_fd = handle_lookup((uint32_t)hid);
 				if (local_fd < 0) {
-					dprintf(2, "nvkvm_stub: FE cmd=0x%x: "
+					fs_dprintf(STDERR_FD,
+						"nvkvm_stub: FE cmd=0x%x: "
 						"embedded handle_id=%d not in "
 						"stub table\n", job.cmd, hid);
 					resp.retval = -EBADF;
@@ -680,9 +861,10 @@ static void *worker_thread(void *arg)
 			const uint8_t *p = (const uint8_t *)job.param_buf;
 			char hex[64] = {0};
 			for (int i = 0; i < 16; i++)
-				snprintf(hex + i*3, sizeof(hex) - i*3,
+				fs_snprintf(hex + i*3, sizeof(hex) - i*3,
 					 "%02x ", p[i]);
-			dprintf(2, "nvkvm_stub: pre-ioctl 0x%x param[16]=%s\n",
+			fs_dprintf(STDERR_FD,
+				"nvkvm_stub: pre-ioctl 0x%x param[16]=%s\n",
 				job.cmd & 0xff, hex);
 		}
 		if (((job.cmd >> 8) & 0xff) == 'F' &&
@@ -695,14 +877,16 @@ static void *worker_thread(void *arg)
 				const uint8_t *a = (const uint8_t *)job.aux_buf;
 				char hex_p[160] = {0}, hex_a[80] = {0};
 				for (uint32_t i = 0; i < job.param_size && i < 48; i++)
-					snprintf(hex_p + i*3, sizeof(hex_p) - i*3,
+					fs_snprintf(hex_p + i*3, sizeof(hex_p) - i*3,
 						 "%02x ", p[i]);
 				for (uint32_t i = 0; i < 24; i++)
-					snprintf(hex_a + i*3, sizeof(hex_a) - i*3,
+					fs_snprintf(hex_a + i*3, sizeof(hex_a) - i*3,
 						 "%02x ", a[i]);
-				dprintf(2, "nvkvm_stub: pre-ioctl 0x79 param[%u]=%s\n",
+				fs_dprintf(STDERR_FD,
+					"nvkvm_stub: pre-ioctl 0x79 param[%u]=%s\n",
 					job.param_size, hex_p);
-				dprintf(2, "nvkvm_stub: pre-ioctl 0x79 aux[24]  =%s\n",
+				fs_dprintf(STDERR_FD,
+					"nvkvm_stub: pre-ioctl 0x79 aux[24]  =%s\n",
 					hex_a);
 			}
 		}
@@ -720,12 +904,14 @@ static void *worker_thread(void *arg)
 			__builtin_memcpy(&fdval, (char *)job.param_buf + 8, 4);
 			__builtin_memcpy(&st,    (char *)job.param_buf + 12, 4);
 			char path[64];
-			int n = snprintf(path, sizeof(path),
+			int n = fs_snprintf(path, sizeof(path),
 					 "/proc/self/fd/%u", fdval);
 			char link[128] = {0};
-			long lret = syscall(SYS_readlinkat, AT_FDCWD,
-					    path, link, sizeof(link)-1);
-			dprintf(2, "nvkvm_stub: pre-ioctl 0x%x hClient=0x%x fd=%u status=0x%x /proc/self/fd/%u=%s (ret=%ld)\n",
+			long lret = sc4(__NR_readlinkat, AT_FDCWD,
+					(long)path, (long)link,
+					(long)(sizeof(link)-1));
+			fs_dprintf(STDERR_FD,
+				"nvkvm_stub: pre-ioctl 0x%x hClient=0x%x fd=%u status=0x%x /proc/self/fd/%u=%s (ret=%ld)\n",
 				job.cmd & 0xff, hc, fdval, st, fdval,
 				lret > 0 ? link : "<none>", lret);
 			(void)hd; (void)n;
@@ -744,11 +930,13 @@ static void *worker_thread(void *arg)
 				__builtin_memcpy(&data,  (char *)job.aux_buf + 16, 8);
 				uint32_t fdval = (uint32_t)data;
 				char path[64], link[128] = {0};
-				snprintf(path, sizeof(path),
+				fs_snprintf(path, sizeof(path),
 					 "/proc/self/fd/%u", fdval);
-				long lret = syscall(SYS_readlinkat, AT_FDCWD,
-						    path, link, sizeof(link)-1);
-				dprintf(2, "nvkvm_stub: pre-ioctl NV01_EVENT_OS_EVENT hPC=0x%x hSR=0x%x data=%u /proc/self/fd/%u=%s (ret=%ld)\n",
+				long lret = sc4(__NR_readlinkat, AT_FDCWD,
+						(long)path, (long)link,
+						(long)(sizeof(link)-1));
+				fs_dprintf(STDERR_FD,
+					"nvkvm_stub: pre-ioctl NV01_EVENT_OS_EVENT hPC=0x%x hSR=0x%x data=%u /proc/self/fd/%u=%s (ret=%ld)\n",
 					hpc, hsr, fdval, fdval,
 					lret > 0 ? link : "<none>", lret);
 				(void)hcl;
@@ -766,7 +954,9 @@ static void *worker_thread(void *arg)
 		 */
 		clear_fault_addr();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
-		int  err  = (ret < 0) ? errno : 0;
+		/* sc*: negative return is -errno, matching kernel convention. */
+		int  err  = (ret < 0) ? (int)(-ret) : 0;
+		if (ret < 0) ret = -1;  /* normalise to (-1, errno) for callers */
 
 		/* Restore embedded fd so the guest sees its own handle_id back. */
 		if (uvm_has_embedded_fd &&
@@ -793,7 +983,8 @@ static void *worker_thread(void *arg)
 				uint8_t valid = *((uint8_t *)job.param_buf + i * entry_sz);
 				if (valid) n++;
 			}
-			dprintf(2, "nvkvm_stub: CARD_INFO ret=%ld err=%d param_size=%u valid_entries=%d\n",
+			fs_dprintf(STDERR_FD,
+				"nvkvm_stub: CARD_INFO ret=%ld err=%d param_size=%u valid_entries=%d\n",
 				ret, err, job.param_size, n);
 		}
 
@@ -886,13 +1077,13 @@ static void *worker_thread(void *arg)
 		resp.aux_size   = job.aux_size;
 
 	send_resp:
-		pthread_mutex_lock(&write_mutex);
+		fs_mutex_lock(&write_mutex);
 		send_full(&resp, sizeof(resp));
 		if (resp.param_size > 0 && job.param_buf)
 			send_full(job.param_buf, resp.param_size);
 		if (resp.aux_size > 0 && job.aux_buf)
 			send_full(job.aux_buf, resp.aux_size);
-		pthread_mutex_unlock(&write_mutex);
+		fs_mutex_unlock(&write_mutex);
 
 		/* Use stub_munmap to free blobs (allocated from anonymous mmap) */
 		if (job.param_buf)
@@ -902,7 +1093,8 @@ static void *worker_thread(void *arg)
 			stub_munmap(job.aux_buf,
 				    (job.aux_size + 4095) & ~4095UL);
 	}
-	return NULL;
+	/* Falling through here means dequeue saw stub_exiting=1 — let the
+	 * clone3 trampoline call SYS_exit on our behalf. */
 }
 
 /* Allocate a blob buffer via anonymous mmap (no heap/libc needed). */
@@ -978,9 +1170,9 @@ static int send_open_device_resp(uint32_t txn_id, int retval, int fd)
 		__builtin_memcpy(CMSG_DATA(cm), &fd, sizeof(int));
 		msg_hdr.msg_controllen = cm->cmsg_len;
 	}
-	pthread_mutex_lock(&write_mutex);
+	fs_mutex_lock(&write_mutex);
 	long r = stub_sendmsg(SOCK_FD, &msg_hdr, 0);
-	pthread_mutex_unlock(&write_mutex);
+	fs_mutex_unlock(&write_mutex);
 	return r < 0 ? -1 : 0;
 }
 
@@ -1007,11 +1199,11 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 	}
 
 	if (fd < 0) {
-		send_open_device_resp(cmd->txn_id, -errno, -1);
+		send_open_device_resp(cmd->txn_id, fd, -1);
 		return;
 	}
 
-	pthread_mutex_lock(&fd_mutex);
+	fs_mutex_lock(&fd_mutex);
 	if (cmd->handle_id < MAX_HANDLES &&
 	    handle_fds[cmd->handle_id] >= 0) {
 		/* QEMU reused an id we already had. Close the prior holder
@@ -1019,23 +1211,23 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 		stub_close(handle_fds[cmd->handle_id]);
 	}
 	handle_store(cmd->handle_id, fd);
-	pthread_mutex_unlock(&fd_mutex);
+	fs_mutex_unlock(&fd_mutex);
 
 	if (send_open_device_resp(cmd->txn_id, 0, fd) < 0) {
 		/* sendmsg failure: QEMU socket gone. The fd has been stored
 		 * locally but the SCM copy never made it; clean up so we
 		 * don't leak. Caller (reader loop) will tear down anyway. */
-		pthread_mutex_lock(&fd_mutex);
+		fs_mutex_lock(&fd_mutex);
 		handle_remove(cmd->handle_id);
-		pthread_mutex_unlock(&fd_mutex);
+		fs_mutex_unlock(&fd_mutex);
 	}
 }
 
 static void handle_close_fd(uint32_t handle_id)
 {
-	pthread_mutex_lock(&fd_mutex);
+	fs_mutex_lock(&fd_mutex);
 	handle_remove(handle_id);
-	pthread_mutex_unlock(&fd_mutex);
+	fs_mutex_unlock(&fd_mutex);
 	send_ok();
 }
 
@@ -1097,9 +1289,9 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 
 static void handle_mmap(struct isolate_cmd_mmap *cmd)
 {
-	pthread_mutex_lock(&fd_mutex);
+	fs_mutex_lock(&fd_mutex);
 	int fd = handle_lookup(cmd->handle_id);
-	pthread_mutex_unlock(&fd_mutex);
+	fs_mutex_unlock(&fd_mutex);
 
 	struct isolate_resp_mmap r = { .type = ISOLATE_RESP_MMAP };
 	if (fd < 0) { r.retval = -EBADF; locked_send(&r, sizeof(r)); return; }
@@ -1230,7 +1422,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 				      O_RDWR | O_CLOEXEC);
 	if (uvm_fd < 0) {
 		stub_munmap(intent_buf, intent_aligned);
-		resp.retval = -errno;
+		resp.retval = uvm_fd;  /* already -errno from sc* */
 		locked_send(&resp, sizeof(resp));
 		return;
 	}
@@ -1239,7 +1431,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 	struct stub_uvm_init init = { .flags = state.init_flags };
 	long ir = stub_ioctl(uvm_fd, STUB_UVM_INITIALIZE, &init);
 	if (ir < 0 || init.rm_status != 0) {
-		resp.retval = init.rm_status ? 0 : -errno;
+		resp.retval = init.rm_status ? 0 : (int32_t)ir;
 		resp.rm_status = init.rm_status;
 		goto cleanup;
 	}
@@ -1252,7 +1444,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		long r = stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU, &rg);
 		if (r < 0 || rg.rm_status != 0) {
 			resp.rm_status = rg.rm_status;
-			resp.retval = rg.rm_status ? 0 : -errno;
+			resp.retval = rg.rm_status ? 0 : (int32_t)r;
 			goto cleanup;
 		}
 	}
@@ -1274,7 +1466,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		long r = stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU_VASPACE, &rv);
 		if (r < 0 || rv.rm_status != 0) {
 			resp.rm_status = rv.rm_status;
-			resp.retval = rv.rm_status ? 0 : -errno;
+			resp.retval = rv.rm_status ? 0 : (int32_t)r;
 			goto cleanup;
 		}
 	}
@@ -1286,7 +1478,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		long r = stub_ioctl(uvm_fd, STUB_UVM_CREATE_RANGE_GROUP, &rgg);
 		if (r < 0 || rgg.rm_status != 0) {
 			resp.rm_status = rgg.rm_status;
-			resp.retval = rgg.rm_status ? 0 : -errno;
+			resp.retval = rgg.rm_status ? 0 : (int32_t)r;
 			goto cleanup;
 		}
 	}
@@ -1296,7 +1488,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		long r = stub_ioctl(uvm_fd, STUB_UVM_ALLOC_SEMAPHORE_POOL,
 			       intent_buf);
 		if (r < 0) {
-			resp.retval = -errno;
+			resp.retval = (int32_t)r;
 			uint32_t *st = (uint32_t *)((char *)intent_buf +
 						    cmd->intent_size -
 						    sizeof(uint32_t));
@@ -1325,7 +1517,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 				  (int)cmd->prot, (int)mmap_flags,
 				  uvm_fd, (off_t)cmd->offset);
 	if (host_va == MAP_FAILED) {
-		resp.retval = -errno;
+		resp.retval = -ENOMEM;
 		goto cleanup;
 	}
 
@@ -1372,27 +1564,31 @@ static long apply_seccomp(void)
 	/* Load nr */
 	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, nr)));
 
-	ALLOW_IF(SYS_read);
-	ALLOW_IF(SYS_write);
-	ALLOW_IF(SYS_recvmsg);
-	ALLOW_IF(SYS_sendmsg);
-	ALLOW_IF(SYS_ioctl);
-	ALLOW_IF(SYS_mmap);
-	ALLOW_IF(SYS_mprotect);
-	ALLOW_IF(SYS_munmap);
-	ALLOW_IF(SYS_ppoll);
-	ALLOW_IF(SYS_close);
-	ALLOW_IF(SYS_exit_group);
-	ALLOW_IF(SYS_rt_sigaction);
-	ALLOW_IF(SYS_rt_sigreturn);
-	ALLOW_IF(SYS_futex);
-	ALLOW_IF(SYS_clone);
-	ALLOW_IF(SYS_set_robust_list);
-	ALLOW_IF(SYS_madvise);
-	ALLOW_IF(SYS_lseek);
-	ALLOW_IF(SYS_pread64);
-	ALLOW_IF(SYS_openat);
-	ALLOW_IF(SYS_eventfd2);
+	ALLOW_IF(__NR_read);
+	ALLOW_IF(__NR_write);
+	ALLOW_IF(__NR_recvmsg);
+	ALLOW_IF(__NR_sendmsg);
+	ALLOW_IF(__NR_ioctl);
+	ALLOW_IF(__NR_mmap);
+	ALLOW_IF(__NR_mprotect);
+	ALLOW_IF(__NR_munmap);
+	ALLOW_IF(__NR_ppoll);
+	ALLOW_IF(__NR_close);
+	ALLOW_IF(__NR_exit);
+	ALLOW_IF(__NR_exit_group);
+	ALLOW_IF(__NR_rt_sigaction);
+	ALLOW_IF(__NR_rt_sigreturn);
+	ALLOW_IF(__NR_futex);
+	ALLOW_IF(__NR_clone);
+	ALLOW_IF(__NR_clone3);
+	ALLOW_IF(__NR_set_robust_list);
+	ALLOW_IF(__NR_madvise);
+	ALLOW_IF(__NR_lseek);
+	ALLOW_IF(__NR_pread64);
+	ALLOW_IF(__NR_openat);
+	ALLOW_IF(__NR_eventfd2);
+	ALLOW_IF(__NR_gettid);
+	ALLOW_IF(__NR_readlinkat);
 
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
 
@@ -1403,31 +1599,38 @@ static long apply_seccomp(void)
 		.len    = (unsigned short)n,
 		.filter = filter,
 	};
-	stub_prctl(38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0);
-	long r = stub_seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
-	if (r < 0) return -errno;
-	return 0;
+	stub_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	return stub_seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
 }
 
 /* ── Self-relocation ─────────────────────────────────────────────────────── */
 
 /*
- * apply_relocations() is only needed when the stub binary is loaded via
- * fexecve() from a memfd (embedded/NVKVM_STUB_EMBEDDED build).  In that
- * scenario there is no dynamic linker to process RELA entries, so we do it
- * ourselves in a constructor.  When the stub is executed normally from disk
- * the kernel dynamic linker already handles all relocations before constructors
- * run, so applying them again would corrupt global-pointer state.
+ * apply_relocations() processes R_X86_64_RELATIVE entries in the dynamic
+ * section.  Only needed for the NVKVM_STUB_EMBEDDED build path, where the
+ * stub binary is loaded via fexecve() from a memfd and there is no dynamic
+ * linker to handle RELA entries.  Disk-loaded execution lets the kernel
+ * dynamic linker handle relocations before we run.
+ *
+ * In freestanding mode there are no C runtime constructors, so we call this
+ * from main() before any global-data access matters.
  */
 #ifdef NVKVM_STUB_EMBEDDED
 extern char __ehdr_start[];
-extern char _DYNAMIC[];
+extern char _DYNAMIC[] __attribute__((weak));
 
-__attribute__((constructor(101)))
+__attribute__((no_sanitize_address))
 static void apply_relocations(void)
 {
+	/* If the linker resolved the weak _DYNAMIC, it points at our dynamic
+	 * section.  If unresolved (-no-pie build with no DT_*), it is 0 — but
+	 * the compiler "knows" the symbol exists, so we route through a
+	 * volatile pointer to defeat the constant-fold and produce a real
+	 * load that may legitimately return 0. */
+	Elf64_Dyn *volatile dynp = (Elf64_Dyn *)_DYNAMIC;
+	if (!dynp) return;
 	unsigned long base = (unsigned long)__ehdr_start;
-	Elf64_Dyn *dyn = (Elf64_Dyn *)_DYNAMIC;
+	Elf64_Dyn *dyn = dynp;
 	Elf64_Rela *rela = NULL;
 	size_t rela_sz = 0, rela_ent = sizeof(Elf64_Rela);
 
@@ -1451,28 +1654,66 @@ static void apply_relocations(void)
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+#define WORKER_STACK_SIZE (128 * 1024)  /* 128 KiB per worker */
+
 int main(void)
 {
+#ifdef NVKVM_STUB_EMBEDDED
+	apply_relocations();
+#endif
 	handle_table_init();
 	job_queue_init();
-	pthread_once(&fault_key_once, init_fault_key);
 
-	/* SIGSEGV handler — per-thread fault address via TLS */
-	struct sigaction sa = { .sa_sigaction = sigsegv_handler,
-				.sa_flags = SA_SIGINFO };
+	/* Reader thread reserves slot 0 in worker_tids[] so SIGSEGV from
+	 * inline (non-worker) ioctls is captured against the right slot. */
+	worker_tids[0] = stub_gettid();
+
+	/* SIGSEGV handler — per-worker fault address via worker_fault_addr[] */
+	struct kernel_sigaction sa = {
+		.sa_handler_fn = sigsegv_handler,
+		.sa_flags      = SA_SIGINFO | SA_RESTORER,
+		.sa_restorer   = stub_sigreturn_trampoline,
+	};
 	stub_sigaction(SIGSEGV, &sa, NULL);
 
-	/* Spawn worker threads */
-	pthread_t workers[NVKVM_STUB_WORKERS];
-	for (int i = 0; i < NVKVM_STUB_WORKERS; i++)
-		pthread_create(&workers[i], NULL, worker_thread, NULL);
+	/* Spawn worker threads via clone3.  Each worker gets a fresh stack
+	 * and a slot id stashed in worker_tids[] for fault-addr indexing.
+	 * We don't pthread_join — workers exit via SYS_exit when dequeue
+	 * returns NULL (stub_exiting flag set by reader on EXIT). */
+	for (int i = 0; i < NVKVM_STUB_WORKERS; i++) {
+		void *stack = stub_mmap(NULL, WORKER_STACK_SIZE,
+					PROT_READ | PROT_WRITE,
+					MAP_PRIVATE | MAP_ANONYMOUS |
+					MAP_GROWSDOWN, -1, 0);
+		if (stack == MAP_FAILED) {
+			fs_dprintf(STDERR_FD,
+				"nvkvm_stub: worker stack mmap failed\n");
+			stub_exit(1);
+		}
+		struct clone_args ca = {
+			.flags = CLONE_VM | CLONE_FS | CLONE_FILES |
+				 CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
+			.stack      = (uint64_t)(uintptr_t)stack,
+			.stack_size = WORKER_STACK_SIZE,
+		};
+		long tid = fs_clone3_run(&ca, sizeof(ca), worker_thread,
+					 (void *)(uintptr_t)(i + 1));
+		if (tid < 0) {
+			fs_dprintf(STDERR_FD,
+				"nvkvm_stub: clone3 worker %d failed: %ld\n",
+				i, tid);
+			stub_exit(1);
+		}
+		/* Slot 0 reserved for reader; workers occupy [1..N]. */
+		worker_tids[i + 1] = (int)tid;
+	}
 
 	/* Pre-open /dev/nvidia-uvm so the stub itself owns the file's mm
 	 * context.  UVM_MM_INITIALIZE only links files whose owner mm matches
 	 * the calling task; without this, fds passed via SCM_RIGHTS from
 	 * QEMU get rejected with NV_ERR_INVALID_ARGUMENT. */
 	for (int i = 0; i < NVKVM_STUB_UVM_LOCAL_POOL_SIZE; i++)
-		uvm_local_fds[i] = (int)syscall(SYS_openat, AT_FDCWD,
+		uvm_local_fds[i] = (int)stub_openat(AT_FDCWD,
 						"/dev/nvidia-uvm",
 						O_RDWR | O_CLOEXEC);
 
@@ -1485,22 +1726,17 @@ int main(void)
 	 * coarse allowlist still blocks execve, ptrace, fork, prctl, init_-
 	 * module, etc. — the actually-dangerous escape primitives.
 	 *
-	 * Set NVKVM_STUB_NO_SECCOMP=1 in the QEMU environment (only honoured
-	 * when NVKVM_STUB_DEBUG=1 is also set, see nvkvm_isolate.c) to bypass
-	 * for debugging — useful when LD_PRELOAD instrumentation triggers
-	 * extra syscalls.
+	 * The NVKVM_STUB_NO_SECCOMP env hatch was dropped along with libc:
+	 * the parent calls clearenv() before exec so there is no environment
+	 * to inspect anyway.  Re-add via argv if a debug hatch is ever needed.
 	 */
 	{
-		const char *bypass_env = getenv("NVKVM_STUB_NO_SECCOMP");
-		bool bypass = bypass_env && *bypass_env == '1';
-		if (!bypass) {
-			long sr = apply_seccomp();
-			if (sr < 0) {
-				dprintf(2,
-					"nvkvm_stub: apply_seccomp failed: %ld\n",
-					sr);
-				stub_exit(1);
-			}
+		long sr = apply_seccomp();
+		if (sr < 0) {
+			fs_dprintf(STDERR_FD,
+				"nvkvm_stub: apply_seccomp failed: %ld\n",
+				sr);
+			stub_exit(1);
 		}
 	}
 
@@ -1562,23 +1798,23 @@ int main(void)
 			 * pre-opened local fds whose owning mm is the stub. */
 			if (n >= (long)sizeof(struct isolate_cmd_receive_fd) &&
 			    cmd.recv_fd.dev_id == 1 /* NVKVM_DEV_UVM */) {
-				pthread_mutex_lock(&uvm_local_lock);
+				fs_mutex_lock(&uvm_local_lock);
 				int local = -1;
 				if (uvm_local_next_idx <
 				    NVKVM_STUB_UVM_LOCAL_POOL_SIZE)
 					local = uvm_local_fds[uvm_local_next_idx++];
-				pthread_mutex_unlock(&uvm_local_lock);
+				fs_mutex_unlock(&uvm_local_lock);
 				if (local >= 0) {
 					stub_close(fd);
 					fd = local;
 				}
 			}
-			pthread_mutex_lock(&fd_mutex);
+			fs_mutex_lock(&fd_mutex);
 			if (cmd.recv_fd.handle_id < MAX_HANDLES &&
 			    handle_fds[cmd.recv_fd.handle_id] >= 0)
 				stub_close(handle_fds[cmd.recv_fd.handle_id]);
 			handle_store(cmd.recv_fd.handle_id, fd);
-			pthread_mutex_unlock(&fd_mutex);
+			fs_mutex_unlock(&fd_mutex);
 			send_ok();
 			break;
 		}
@@ -1619,8 +1855,9 @@ int main(void)
 
 done:
 	stub_exiting = 1;
-	pthread_cond_broadcast(&queue_cond);
-	for (int i = 0; i < NVKVM_STUB_WORKERS; i++)
-		pthread_join(workers[i], NULL);
+	fs_cond_broadcast(&queue_cond);
+	/* No pthread_join — workers and the main thread share an mm, so the
+	 * exit_group(0) below tears down all of them atomically.  Any
+	 * in-flight ioctl completes before the kernel reaps the worker. */
 	stub_exit(0);
 }
