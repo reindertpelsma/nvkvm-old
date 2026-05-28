@@ -778,7 +778,6 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
  *   6. Allocate a fresh KVM GPA window — never trust offsets.
  *   7. Forward exact validated state+intent to the stub.
  */
-extern int nvkvm_kvm_vm_fd;
 struct nvkvm_kvm_mem_region_rl {
 	uint32_t slot;
 	uint32_t flags;
@@ -832,19 +831,16 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 
 	switch (req->mode) {
 	case NVKVM_UVM_REALIZE_MODE_SEM_POOL: {
-		/* SEM_POOL intent is exactly the kernel's params struct. */
 		if (req->intent_size !=
 		    sizeof(struct uvm_alloc_semaphore_pool_params)) {
 			resp->status = (uint32_t)-EINVAL;
 			return 0;
 		}
 		struct uvm_alloc_semaphore_pool_params *p = intent_buf;
-		/* base/length must match the GVA window the guest is mmaping. */
 		if (p->length != req->length || p->base != req->gva) {
 			resp->status = (uint32_t)-EINVAL;
 			return 0;
 		}
-		/* QEMU normalizes status fields to 0; kernel fills outputs. */
 		p->rm_status = 0;
 		break;
 	}

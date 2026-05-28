@@ -204,7 +204,7 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
  * ioctls that go through the isolate path — the embedded fd needs to be a
  * handle_id so the stub can look up its own local fd.
  */
-static __s32 guest_fd_to_handle_id(int guest_fd)
+__s32 guest_fd_to_handle_id(int guest_fd)
 {
 	struct file *f = fget(guest_fd);
 	__s32 handle_id;

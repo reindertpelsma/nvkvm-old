@@ -947,13 +947,15 @@ int nvkvm_isolate_realize_uvm_fd(struct nvkvm_isolate_table *t,
 	/* All three writes (header + state + intent) must reach the stub
 	 * atomically wrt other senders — hold write_lock across them. */
 	pthread_mutex_lock(&iso->write_lock);
-	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
-	if (sr >= 0 && state_size > 0)
-		sr = sock_send_full(iso->sock_fd, state, state_size);
-	if (sr >= 0 && intent_size > 0)
-		sr = sock_send_full(iso->sock_fd, intent, intent_size);
+	ssize_t sr1 = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	ssize_t sr2 = 0, sr3 = 0;
+	if (sr1 >= 0 && state_size > 0)
+		sr2 = sock_send_full(iso->sock_fd, state, state_size);
+	if (sr1 >= 0 && sr2 >= 0 && intent_size > 0)
+		sr3 = sock_send_full(iso->sock_fd, intent, intent_size);
 	pthread_mutex_unlock(&iso->write_lock);
 
+	ssize_t sr = (sr1 < 0) ? sr1 : ((sr2 < 0) ? sr2 : sr3);
 	if (sr < 0) {
 		pthread_mutex_unlock(&iso->sync_lock);
 		return (int)sr;

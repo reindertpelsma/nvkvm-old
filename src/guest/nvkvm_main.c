@@ -471,8 +471,18 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				struct nvkvm_uvm_vas_reg *v =
 					kzalloc(sizeof(*v), GFP_KERNEL);
 				if (v) {
+					/* p->rm_ctrl_fd is the guest userspace fd.
+					 * Translate to QEMU-side handle_id so the
+					 * stub can resolve it via handle_lookup at
+					 * realize time. */
+					__s32 hid = ((int32_t)p->rm_ctrl_fd >= 0)
+						? guest_fd_to_handle_id((int)p->rm_ctrl_fd)
+						: -1;
 					memcpy(v->gpu_uuid, p->gpu_uuid.uuid, 16);
-					v->rm_ctrl_fd_handle_id = p->rm_ctrl_fd;
+					v->rm_ctrl_fd_handle_id =
+						(hid >= 0) ? (__u32)hid : 0;
+					v->h_client    = p->h_client;
+					v->h_va_space  = p->h_va_space;
 					mutex_lock(&st->lock);
 					list_add_tail(&v->list,
 						      &st->registered_va_spaces);

@@ -252,6 +252,8 @@ static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
 		memcpy(snap->va_spaces[n_vas].gpu_uuid, v->gpu_uuid, 16);
 		snap->va_spaces[n_vas].rm_ctrl_fd_handle_id =
 			cpu_to_le32(v->rm_ctrl_fd_handle_id);
+		snap->va_spaces[n_vas].h_client   = cpu_to_le32(v->h_client);
+		snap->va_spaces[n_vas].h_va_space = cpu_to_le32(v->h_va_space);
 		n_vas++;
 	}
 	snap->n_va_spaces = cpu_to_le32(n_vas);

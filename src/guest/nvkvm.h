@@ -88,6 +88,8 @@ struct nvkvm_uvm_vas_reg {
 	struct list_head list;
 	__u8             gpu_uuid[16];
 	__u32            rm_ctrl_fd_handle_id;
+	__u32            h_client;
+	__u32            h_va_space;
 };
 struct nvkvm_uvm_range_group {
 	struct list_head list;
@@ -271,6 +273,7 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd);
 int    nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				   unsigned int cmd,
 				   void *params_buf, size_t param_size);
+__s32  guest_fd_to_handle_id(int guest_fd);
 
 /* nvkvm_mmap.c */
 extern const struct vm_operations_struct nvkvm_vm_ops;

@@ -1130,7 +1130,11 @@ struct stub_state_snapshot {
 	uint32_t n_range_groups;
 	uint32_t _pad0;
 	struct { uint8_t uuid[16]; } gpus[STUB_MAX_REG_GPUS];
-	struct { uint8_t uuid[16]; uint32_t rm_ctrl_fd_handle_id; uint32_t _pad; }
+	struct { uint8_t uuid[16];
+		 uint32_t rm_ctrl_fd_handle_id;
+		 uint32_t h_client;
+		 uint32_t h_va_space;
+		 uint32_t _pad; }
 		va_spaces[STUB_MAX_VA_SPACES];
 	uint64_t range_group_ids[STUB_MAX_RANGE_GROUPS];
 };
@@ -1197,8 +1201,8 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 
 	/* 4. UVM_INITIALIZE with recorded flags. */
 	struct stub_uvm_init init = { .flags = state.init_flags };
-	if (stub_ioctl(uvm_fd, STUB_UVM_INITIALIZE, &init) < 0 ||
-	    init.rm_status != 0) {
+	long ir = stub_ioctl(uvm_fd, STUB_UVM_INITIALIZE, &init);
+	if (ir < 0 || init.rm_status != 0) {
 		resp.retval = init.rm_status ? 0 : -errno;
 		resp.rm_status = init.rm_status;
 		goto cleanup;
@@ -1209,8 +1213,8 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		struct stub_uvm_register_gpu rg = {0};
 		__builtin_memcpy(rg.uuid.b, state.gpus[i].uuid, 16);
 		rg.numa_node_id = -1;
-		if (stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU, &rg) < 0 ||
-		    rg.rm_status != 0) {
+		long r = stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU, &rg);
+		if (r < 0 || rg.rm_status != 0) {
 			resp.rm_status = rg.rm_status;
 			resp.retval = rg.rm_status ? 0 : -errno;
 			goto cleanup;
@@ -1229,10 +1233,10 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 			goto cleanup;
 		}
 		rv.rm_ctrl_fd = (uint32_t)local_fd;
-		/* h_client / h_va_space the kernel reads from RM via the fd;
-		 * leave as 0 — the kernel resolves them from rm_ctrl_fd. */
-		if (stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU_VASPACE, &rv) < 0 ||
-		    rv.rm_status != 0) {
+		rv.h_client   = state.va_spaces[i].h_client;
+		rv.h_va_space = state.va_spaces[i].h_va_space;
+		long r = stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU_VASPACE, &rv);
+		if (r < 0 || rv.rm_status != 0) {
 			resp.rm_status = rv.rm_status;
 			resp.retval = rv.rm_status ? 0 : -errno;
 			goto cleanup;
@@ -1243,8 +1247,8 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 	for (uint32_t i = 0; i < state.n_range_groups; i++) {
 		struct stub_uvm_range_group rgg = {0};
 		rgg.range_group_id = state.range_group_ids[i];
-		if (stub_ioctl(uvm_fd, STUB_UVM_CREATE_RANGE_GROUP, &rgg) < 0 ||
-		    rgg.rm_status != 0) {
+		long r = stub_ioctl(uvm_fd, STUB_UVM_CREATE_RANGE_GROUP, &rgg);
+		if (r < 0 || rgg.rm_status != 0) {
 			resp.rm_status = rgg.rm_status;
 			resp.retval = rgg.rm_status ? 0 : -errno;
 			goto cleanup;
@@ -1253,10 +1257,10 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 
 	/* 8. Mode-specific intent ioctl.  Currently only SEM_POOL = 1. */
 	if (cmd->mode == 1 /* NVKVM_UVM_REALIZE_MODE_SEM_POOL */) {
-		if (stub_ioctl(uvm_fd, STUB_UVM_ALLOC_SEMAPHORE_POOL,
-			       intent_buf) < 0) {
+		long r = stub_ioctl(uvm_fd, STUB_UVM_ALLOC_SEMAPHORE_POOL,
+			       intent_buf);
+		if (r < 0) {
 			resp.retval = -errno;
-			/* rm_status is the LAST u32 of the params struct */
 			uint32_t *st = (uint32_t *)((char *)intent_buf +
 						    cmd->intent_size -
 						    sizeof(uint32_t));
@@ -1481,7 +1485,6 @@ int main(void)
 			break;
 		if (n < (long)sizeof(uint32_t))
 			goto done;
-
 		switch (cmd.type) {
 		case ISOLATE_CMD_RECEIVE_FD: {
 			struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);

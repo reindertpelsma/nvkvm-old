@@ -482,6 +482,8 @@ struct nvkvm_uvm_state_snapshot {
 	struct {
 		__u8   gpu_uuid[16];
 		__le32 rm_ctrl_fd_handle_id;
+		__le32 h_client;
+		__le32 h_va_space;
 		__le32 _pad;
 	} va_spaces[NVKVM_UVM_MAX_VA_SPACES];
 	__le64 range_group_ids[NVKVM_UVM_MAX_RANGE_GROUPS];
