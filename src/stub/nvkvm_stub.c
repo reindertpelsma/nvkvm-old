@@ -516,10 +516,31 @@ static void enqueue_job(const struct ioctl_job *job)
 			job_queue[i] = *job;
 			job_queue[i].valid = 1;
 			fs_cond_signal(&queue_cond);
-			break;
+			fs_mutex_unlock(&queue_mutex);
+			return;
 		}
 	}
 	fs_mutex_unlock(&queue_mutex);
+
+	/*
+	 * Queue full.  NEVER drop silently — a dropped IOCTL job means no
+	 * ISOLATE_RESP_IOCTL is ever sent, so the guest blocks forever in
+	 * wait_for_completion (uninterruptible D state, wedging the GPU
+	 * context).  Send an explicit error response so the caller fails
+	 * cleanly, and free the job's blobs (the worker would have freed them).
+	 */
+	struct isolate_resp_ioctl resp = {
+		.type   = ISOLATE_RESP_IOCTL,
+		.txn_id = job->txn_id,
+		.retval = -ENOMEM,
+	};
+	locked_send(&resp, sizeof(resp));
+	if (job->param_buf)
+		stub_munmap(job->param_buf,
+			    (job->param_size + 4095) & ~4095UL);
+	if (job->aux_buf)
+		stub_munmap(job->aux_buf,
+			    (job->aux_size + 4095) & ~4095UL);
 }
 
 static int dequeue_job(struct ioctl_job *out)
