@@ -280,9 +280,7 @@ void nvkvm_kvm_slot_release(int slot)
 	pthread_mutex_unlock(&kvm_slot_lock);
 }
 
-/* Diagnostic — exposed for QEMU-side periodic prints. */
-void nvkvm_kvm_slot_stats(int *in_use, int *peak,
-			  uint64_t *allocs, uint64_t *frees);
+/* Diagnostic — declared in virtio_nvgpu.h, exposed for QEMU-side prints. */
 void nvkvm_kvm_slot_stats(int *in_use, int *peak,
 			  uint64_t *allocs, uint64_t *frees)
 {

@@ -373,6 +373,17 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
 VirtIONvgpu *nvkvm_get_global_device(void);
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
+
+/*
+ * KVM memory-slot pool — one freelist+watermark shared by every code path
+ * that registers a region (mmap_create, mmap_on_isolate, realize-UVM).
+ * alloc returns -1 on exhaustion; release is a no-op for invalid slots.
+ * Defined in nvkvm_mmap_host.c.
+ */
+int  nvkvm_kvm_slot_alloc(void);
+void nvkvm_kvm_slot_release(int slot);
+void nvkvm_kvm_slot_stats(int *in_use, int *peak,
+			  uint64_t *allocs, uint64_t *frees);
 int  nvkvm_mmap_create(VirtIONvgpu *nv, struct nvkvm_host_fd *hfd,
 		       uint64_t offset, size_t length,
 		       int prot, int flags,

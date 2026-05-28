@@ -725,15 +725,13 @@ struct nvkvm_kvm_mem_region {
 #endif
 
 /*
- * KVM slot allocator is now centralised in nvkvm_mmap_host.c so this
- * handler shares one freelist + watermark with nvkvm_mmap_create().  The
- * stale `iso_kvm_slot_counter` monotonic counter — which used to overlap
- * with the mmap_host counter's range past 100 and never recycled — has
- * been removed.  Audit L5 follow-up.
+ * KVM slot allocator is centralised in nvkvm_mmap_host.c via the
+ * nvkvm_kvm_slot_alloc/release prototypes in virtio_nvgpu.h, shared with
+ * nvkvm_mmap_create().  The stale `iso_kvm_slot_counter` monotonic
+ * counter that used to live here — which overlapped with the mmap_host
+ * counter's range past 100 and never recycled — has been removed.
+ * Audit L5 follow-up.
  */
-int  nvkvm_kvm_slot_alloc(void);                         /* nvkvm_mmap_host.c */
-void nvkvm_kvm_slot_release(int slot);                   /* nvkvm_mmap_host.c */
-extern int nvkvm_kvm_vm_fd;
 
 int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			       struct nvkvm_req_mmap_on_isolate *req,
