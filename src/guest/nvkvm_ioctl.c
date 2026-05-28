@@ -321,12 +321,11 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		struct nv_ioctl_nvos02_parameters_with_fd *p = buf;
 		p->p_memory = 0;             /* host fills this in */
 		/*
-		 * Embedded fd is the handle_id of the target /dev/nvidia*
-		 * object; the stub translates handle_id → its local fd
-		 * before calling the kernel. -1 means "no fd" and passes
-		 * through unchanged.
+		 * Embedded fd: libcuda uses 0 or -1 as "no associated fd"
+		 * sentinels.  Only translate a STRICTLY positive value (real
+		 * file descriptor on the calling process).
 		 */
-		if (p->fd >= 0) {
+		if (p->fd > 0) {
 			__s32 hid = guest_fd_to_handle_id(p->fd);
 			if (hid < 0)
 				return -EBADF;

@@ -496,6 +496,100 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	resp->nvstatus   = nvstatus;
 	resp->fault_addr = fault_addr;
 
+	/*
+	 * Path α — explicit DUP_OBJECT grant for cross-process duplication.
+	 *
+	 * The kernel's default share policy is `RS_SHARE_TYPE_PID` which
+	 * grants DUP_OBJECT only when the calling task's PID matches the
+	 * resource owner's ProcID.  In our split-process model (libcuda's
+	 * RM client allocated by the stub, UVM ioctls called from QEMU)
+	 * the PIDs don't match, so UVM's kernel-internal client can't dup
+	 * libcuda's VA space → NV_ERR_INSUFFICIENT_PERMISSIONS.
+	 *
+	 * Fix: right after the stub successfully allocates a class that we
+	 * know UVM will need to dup, issue an NV_ESC_RM_SHARE on the new
+	 * handle granting DUP_OBJECT to all clients (TYPE_ALL).  The share
+	 * runs on the stub fd so the owner check inside _serverShareResource
+	 * matches (caller process == resource owner).
+	 *
+	 * Classes we share: FERMI_VASPACE_A (0x90f1) for now; add others as
+	 * we hit further duplications.
+	 */
+	if (ret == 0 && nvstatus == 0 &&
+	    _IOC_TYPE(req->cmd) == 'F' &&
+	    (_IOC_NR(req->cmd) == NV_ESC_RM_ALLOC ||
+	     _IOC_NR(req->cmd) == NV_ESC_RM_ALLOC_MEMORY) &&
+	    param_buf && req->param_size >= 16) {
+		uint32_t hClient = 0, hObjNew = 0, hClass = 0;
+		memcpy(&hClient, (char *)param_buf +  0, sizeof(uint32_t));
+		memcpy(&hObjNew, (char *)param_buf +  8, sizeof(uint32_t));
+		if (_IOC_NR(req->cmd) == NV_ESC_RM_ALLOC) {
+			memcpy(&hClass,  (char *)param_buf + 12, sizeof(uint32_t));
+		} else {
+			/* RM_ALLOC_MEMORY always allocates NV01_MEMORY_LOCAL_USER */
+			hClass = 0x40;
+		}
+
+		/* Grant DUP_OBJECT on every successful RM_ALLOC.  UVM duplicates
+		 * VA spaces (0x90f1), memory objects (0x40 = NV01_MEMORY_LOCAL_-
+		 * USER), channels, and more — granting universally is simpler
+		 * than maintaining a class allowlist, and harmless: the share
+		 * only adds DUP_OBJECT, which RM-allocated resources have for
+		 * their owner anyway.  Skip RM client objects (hObjNew == hClient
+		 * AND hClass == NV01_ROOT_CLIENT) since rmapiAllocClient already
+		 * REVOKEs DUP from TYPE_ALL on those for security. */
+		int is_client_obj = (hObjNew == hClient && hClass == 0x0);
+		int needs_share = !is_client_obj && hClass != 0;
+
+		if (needs_share && hClient && hObjNew) {
+			/* NVOS57_PARAMETERS layout (24 bytes):
+			 *   u32 hClient
+			 *   u32 hObject
+			 *   u32 sharePolicy.target
+			 *   u32 sharePolicy.accessMask (1 limb)
+			 *   u16 sharePolicy.type
+			 *   u8  sharePolicy.action
+			 *   u8  pad
+			 *   u32 status
+			 * cmd = _IOWR('F', NV_ESC_RM_SHARE=0x35, 24) = 0xc0184635.
+			 */
+			struct {
+				uint32_t hClient;
+				uint32_t hObject;
+				uint32_t target;
+				uint32_t accessMask;
+				uint16_t type;
+				uint8_t  action;
+				uint8_t  _pad;
+				uint32_t status;
+			} share = {
+				.hClient    = hClient,
+				.hObject    = hObjNew,
+				.target     = 0,
+				.accessMask = 0x1,   /* RS_ACCESS_DUP_OBJECT */
+				.type       = 1,     /* RS_SHARE_TYPE_ALL */
+				.action     = 0,     /* grant (no REVOKE/REQUIRE/COMPOSE) */
+				.status     = 0,
+			};
+			uint32_t share_nvstatus = 0;
+			uint64_t share_fault    = 0;
+			int sret = nvkvm_isolate_ioctl(&nv->isolates,
+						       req->isolate_id,
+						       req->handle_id,
+						       0xc0184635u,
+						       &share, sizeof(share),
+						       NULL, 0,
+						       0,
+						       &share_nvstatus,
+						       &share_fault);
+			fprintf(stderr,
+				"nvkvm: post-alloc SHARE hClass=0x%x hObj=0x%x "
+				"ret=%d nvstatus=0x%x status=0x%x\n",
+				hClass, hObjNew, sret, share_nvstatus,
+				share.status);
+		}
+	}
+
 	/* For RM_CONTROL, also extract the inner cmd at param offset 8 so we
 	 * can see which control specifically returned a non-zero nvstatus. */
 	uint32_t inner_cmd = 0;
@@ -649,11 +743,28 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	size_t len = (size_t)req->length;
 	len = (len + 4095UL) & ~4095UL;  /* page-align */
 
-	/* Step 1: mmap in QEMU at any address */
-	void *qva = mmap(NULL, len, req->prot,
-			 MAP_SHARED, h->fd, (off_t)req->offset);
+	/* Step 1: mmap in QEMU.  For UVM the kernel requires
+	 *   vm_start == (vm_pgoff << PAGE_SHIFT)
+	 * (see uvm_mmap in kernel-open/nvidia-uvm/uvm.c) — i.e., MAP_FIXED
+	 * at the offset address.  For other nvidia devices, NULL is fine.
+	 */
+	void  *qva_hint = NULL;
+	int    qva_flags = MAP_SHARED;
+	if (h->dev_id == NVKVM_DEV_UVM) {
+		qva_hint  = (void *)(uintptr_t)req->offset;
+		qva_flags |= MAP_FIXED_NOREPLACE;
+	}
+	void *qva = mmap(qva_hint, len, req->prot,
+			 qva_flags, h->fd, (off_t)req->offset);
 	if (qva == MAP_FAILED) {
-		resp->status = (uint32_t)errno;
+		int saved_errno = errno;
+		fprintf(stderr,
+			"nvkvm: mmap_on_isolate FAIL fd=%d dev_id=%d "
+			"prot=0x%x len=%lu off=0x%lx errno=%d (%s)\n",
+			h->fd, h->dev_id, req->prot, (unsigned long)len,
+			(unsigned long)req->offset, saved_errno,
+			strerror(saved_errno));
+		resp->status = (uint32_t)saved_errno;
 		return 0;
 	}
 

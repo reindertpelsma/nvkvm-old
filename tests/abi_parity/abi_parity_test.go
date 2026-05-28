@@ -58,7 +58,11 @@ func TestFrontendStructSizes(t *testing.T) {
 		{"nvos55_parameters (RM_DUP_OBJECT)", Sizes.Nvos55, 36},
 		{"nvos57_parameters (RM_SHARE)", Sizes.Nvos57, 16},
 		{"nvos32_parameters (RM_VID_HEAP_CONTROL)", Sizes.Nvos32, 88},
-		{"nvos46_parameters (RM_MAP_MEMORY_DMA)", Sizes.Nvos46, 40},
+		// nvos46_parameters: must be 56 — includes DmaOffset (out) at +40
+		// and Status at +48. Earlier 40-byte def truncated the writeback,
+		// so libcuda saw status=0 from a different field and OBJECT_NOT_FOUND
+		// silently slipped through.
+		{"nvos46_parameters (RM_MAP_MEMORY_DMA)", Sizes.Nvos46, 56},
 		{"nvos47_parameters (RM_UNMAP_MEMORY_DMA)", Sizes.Nvos47, 32},
 
 		// Card info and system
@@ -74,7 +78,11 @@ func TestFrontendStructSizes(t *testing.T) {
 		// Memory management
 		{"nv_ioctl_nvos33_parameters_with_fd (MAP_MEMORY)", Sizes.MapMemFd, 56},
 		{"nv_ioctl_nvos34_parameters (UNMAP_MEMORY)", Sizes.UnmapMem, 32},
-		{"nv_ioctl_nvos02_parameters_with_fd (ALLOC_MEMORY)", Sizes.AllocMemFd, 48},
+		// nv_ioctl_nvos02_parameters_with_fd: must be 56 — NVOS02_PARAMETERS
+		// is 48 bytes (with Status at +40, Pad1 at +44), then FD (+48) and
+		// Pad0 (+52). Earlier 48-byte def put FD at +44, overlapping Pad1
+		// and reading kernel zero as the user's fd field.
+		{"nv_ioctl_nvos02_parameters_with_fd (ALLOC_MEMORY)", Sizes.AllocMemFd, 56},
 		{"nv_ioctl_idle_channels", Sizes.IdleCh, 40},
 		{"nv_ioctl_alloc_context_dma2", Sizes.AllocCtx, 56},
 		{"nv_ioctl_export_to_dmabuf_fd", Sizes.ExportDma, 40},

@@ -814,24 +814,40 @@ static void *worker_thread(void *arg)
 		 */
 		uint32_t nvstatus = 0;
 		if (((job.cmd >> 8) & 0xff) == 'F') {
-			/* Frontend ioctls: nvstatus is at a fixed offset
-			 * inside the params struct.  Sizes seen:
-			 *   16: nv_ioctl_alloc_os_event_t / free_os_event_t
-			 *       (hClient, hDevice, fd, Status@12)
-			 *   32: nvos21 (RM_ALLOC v1) / nvos54 (RM_CONTROL) /
-			 *       nvos00 etc — Status at offset 28
-			 *   48: nvos64 (RM_ALLOC v2) — Status at offset 40 */
-			if (job.param_size == 48)
+			/* Frontend ioctls: nvstatus offset depends on the
+			 * specific NVOS* struct, not just total size — multiple
+			 * structs share the same byte length but place Status
+			 * at different offsets.  Dispatch by _IOC_NR. */
+			unsigned nr = job.cmd & 0xff;
+			int off = -1;
+			switch (nr) {
+			case 0x27: off = 40; break; /* NV_ESC_RM_ALLOC_MEMORY: NVOS02 status at +40, fd at +48 */
+			case 0x29: off = 12; break; /* NV_ESC_RM_FREE: nvos00 status at +12 */
+			case 0x2a: off = 28; break; /* NV_ESC_RM_CONTROL: nvos54 status at +28 */
+			case 0x2b: /* NV_ESC_RM_ALLOC: nvos21=32B status@28, nvos64=48B status@40 */
+				off = (job.param_size == 48) ? 40 : 28;
+				break;
+			case 0x34: off = 28; break; /* NV_ESC_RM_DUP_OBJECT: nvos55 36B status@28 */
+			case 0x35: off = 20; break; /* NV_ESC_RM_SHARE: nvos57 24B status@20 */
+			case 0x4a: off = job.param_size - 4; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@end */
+			case 0x4e: off = 40; break; /* NV_ESC_RM_MAP_MEMORY: nvos33_with_fd 56B status@40, fd@48 */
+			case 0x4f: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY: nvos34 32B status@24 */
+			case 0x57: off = 48; break; /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 56B status@48 */
+			case 0x58: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY_DMA: nvos47 32B status@24 */
+			default:
+				/* Fall back to size-based heuristic for ioctls
+				 * we haven't enumerated yet. */
+				if (job.param_size == 48)
+					off = 40;
+				else if (job.param_size >= 32)
+					off = 28;
+				else if (job.param_size == 16)
+					off = 12;
+				break;
+			}
+			if (off >= 0 && (uint32_t)(off + 4) <= job.param_size)
 				__builtin_memcpy(&nvstatus,
-						 (char *)job.param_buf + 40,
-						 sizeof(uint32_t));
-			else if (job.param_size >= 32)
-				__builtin_memcpy(&nvstatus,
-						 (char *)job.param_buf + 28,
-						 sizeof(uint32_t));
-			else if (job.param_size == 16)
-				__builtin_memcpy(&nvstatus,
-						 (char *)job.param_buf + 12,
+						 (char *)job.param_buf + off,
 						 sizeof(uint32_t));
 		} else if (job.param_size >= 4) {
 			/* UVM ioctls (TYPE == 0): rm_status is the last

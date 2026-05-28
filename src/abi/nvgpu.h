@@ -194,7 +194,9 @@ struct nv_ioctl_nvos02_parameters_with_fd {
 	nvp64_t    p_memory;     /* host VA returned by driver           */
 	__u64      limit;
 	__u32      status;
+	__u32      pad1;
 	__s32      fd;           /* fd to associate with allocation      */
+	__u32      pad0;
 };
 
 /* ── NV_ESC_RM_MAP_MEMORY ────────────────────────────────────────────────── */
@@ -271,7 +273,10 @@ struct nvos46_parameters {
 	__u64      offset;
 	__u64      length;
 	__u32      flags;
+	__u32      pad0;
+	__u64      dma_offset;   /* [out] GPU DMA address of the mapping */
 	__u32      status;
+	__u32      pad1;
 };
 
 /* ── NV_ESC_RM_UNMAP_MEMORY_DMA ──────────────────────────────────────────── */
