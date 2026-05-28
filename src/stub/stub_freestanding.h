@@ -181,4 +181,18 @@ struct clone_args {
 /* SYS_clone3 = 435 on x86_64; stack provided by caller. */
 #define FS_CLONE3_NR 435
 
+/*
+ * fs_clone3_run — spawn a worker thread that runs `entry(arg)` on the
+ * supplied stack.  Implemented in stub_clone3.S.  Returns child tid in
+ * the parent.  Entry function must end with SYS_exit; if it returns the
+ * trampoline calls SYS_exit for it.
+ *
+ * args->stack must point at the BASE of the allocated region; the kernel
+ * sets the child's RSP to (stack + stack_size) on x86_64.
+ * Required flags (caller-supplied): CLONE_VM | CLONE_FS | CLONE_FILES |
+ *   CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM.
+ */
+extern long fs_clone3_run(struct clone_args *args, size_t args_sz,
+			  void (*entry)(void *arg), void *arg);
+
 #endif /* NVKVM_STUB_FREESTANDING_H */
