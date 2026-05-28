@@ -724,9 +724,16 @@ struct nvkvm_kvm_mem_region {
 #define KVM_SET_USER_MEMORY_REGION _IOW(NVKVM_KVMIO, 0x46, struct nvkvm_kvm_mem_region)
 #endif
 
-/* KVM slot counter for double-mmap registrations (starts at 100 to avoid
- * conflicts with QEMU's own slots which start at 0). */
-static uint32_t iso_kvm_slot_counter = 100;
+/*
+ * KVM slot allocator is now centralised in nvkvm_mmap_host.c so this
+ * handler shares one freelist + watermark with nvkvm_mmap_create().  The
+ * stale `iso_kvm_slot_counter` monotonic counter — which used to overlap
+ * with the mmap_host counter's range past 100 and never recycled — has
+ * been removed.  Audit L5 follow-up.
+ */
+int  nvkvm_kvm_slot_alloc(void);                         /* nvkvm_mmap_host.c */
+void nvkvm_kvm_slot_release(int slot);                   /* nvkvm_mmap_host.c */
+extern int nvkvm_kvm_vm_fd;
 
 int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			       struct nvkvm_req_mmap_on_isolate *req,
@@ -779,18 +786,29 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 
 	int kvm_slot = -1;
 	if (nvkvm_kvm_vm_fd >= 0) {
-		kvm_slot = (int)iso_kvm_slot_counter;
-		struct nvkvm_kvm_mem_region mr = {
-			.slot            = iso_kvm_slot_counter++,
-			.flags           = 0,
-			.guest_phys_addr = gpa,
-			.memory_size     = len,
-			.userspace_addr  = (uint64_t)(uintptr_t)qva,
-		};
-		if (ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
-			fprintf(stderr, "nvkvm: KVM_SET_USER_MEMORY_REGION: %s\n",
-				strerror(errno));
-			kvm_slot = -1; /* non-fatal */
+		kvm_slot = nvkvm_kvm_slot_alloc();
+		if (kvm_slot < 0) {
+			fprintf(stderr,
+				"nvkvm: mmap_on_isolate: KVM slot pool "
+				"exhausted (handle=%u gpa=0x%lx)\n",
+				req->handle_id, (unsigned long)gpa);
+		} else {
+			struct nvkvm_kvm_mem_region mr = {
+				.slot            = (uint32_t)kvm_slot,
+				.flags           = 0,
+				.guest_phys_addr = gpa,
+				.memory_size     = len,
+				.userspace_addr  = (uint64_t)(uintptr_t)qva,
+			};
+			if (ioctl(nvkvm_kvm_vm_fd,
+				  KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
+				fprintf(stderr,
+					"nvkvm: KVM_SET_USER_MEMORY_REGION slot=%d "
+					"failed: %s\n",
+					kvm_slot, strerror(errno));
+				nvkvm_kvm_slot_release(kvm_slot);
+				kvm_slot = -1;
+			}
 		}
 	}
 
@@ -826,6 +844,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			struct nvkvm_kvm_mem_region mr = { .slot = (uint32_t)kvm_slot,
 							   .memory_size = 0 };
 			ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
+			nvkvm_kvm_slot_release(kvm_slot);
 		}
 		munmap(qva, len);
 		resp->status = (uint32_t)-ret;
@@ -865,13 +884,14 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 		nvkvm_isolate_munmap(&nv->isolates, e.isolate_id, e.gva,
 				     (uint64_t)e.len);
 
-	/* Remove the KVM memory slot */
+	/* Remove the KVM memory slot and return it to the pool. */
 	if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
 		struct nvkvm_kvm_mem_region mr = {
 			.slot        = (uint32_t)e.kvm_slot,
 			.memory_size = 0,
 		};
 		ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
+		nvkvm_kvm_slot_release(e.kvm_slot);
 	}
 
 	/* Unmap the QEMU host VA */
@@ -1071,7 +1091,7 @@ struct nvkvm_kvm_mem_region_rl {
 /* Cap intent blob: SEM_POOL is 9248 bytes; allow a small margin. */
 #define NVKVM_REALIZE_INTENT_MAX   (64u * 1024u)
 
-static uint32_t realize_kvm_slot_counter = 1100;
+/* realize_kvm_slot_counter superseded by nvkvm_kvm_slot_alloc().  Audit L5. */
 
 int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 				   struct nvkvm_req_realize_uvm_mapping *req,
@@ -1178,19 +1198,26 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 
 	/* §8a.6 — install KVM region: GPA window ↔ stub's host VA. */
 	if (nvkvm_kvm_vm_fd >= 0) {
-		struct nvkvm_kvm_mem_region_rl mr = {
-			.slot            = realize_kvm_slot_counter++,
-			.flags           = 0,
-			.guest_phys_addr = gpa,
-			.memory_size     = len,
-			.userspace_addr  = host_va,
-		};
-		if (ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION_RL,
-			  &mr) < 0) {
+		int rl_slot = nvkvm_kvm_slot_alloc();
+		if (rl_slot < 0) {
 			fprintf(stderr,
-				"nvkvm: realize KVM_SET_USER_MEMORY_REGION: %s\n",
-				strerror(errno));
-			/* Non-fatal — guest will see EFAULT on first deref. */
+				"nvkvm: realize KVM slot pool exhausted\n");
+			/* Non-fatal — guest sees EFAULT on first deref. */
+		} else {
+			struct nvkvm_kvm_mem_region_rl mr = {
+				.slot            = (uint32_t)rl_slot,
+				.flags           = 0,
+				.guest_phys_addr = gpa,
+				.memory_size     = len,
+				.userspace_addr  = host_va,
+			};
+			if (ioctl(nvkvm_kvm_vm_fd,
+				  KVM_SET_USER_MEMORY_REGION_RL, &mr) < 0) {
+				fprintf(stderr,
+					"nvkvm: realize KVM_SET_USER_MEMORY_REGION "
+					"slot=%d: %s\n", rl_slot, strerror(errno));
+				nvkvm_kvm_slot_release(rl_slot);
+			}
 		}
 	}
 

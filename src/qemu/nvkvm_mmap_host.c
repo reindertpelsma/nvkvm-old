@@ -108,6 +108,12 @@ static uint64_t alloc_gpa(VirtIONvgpu *nv, size_t length)
 
 	gpa = nv->mmap_win_gpa + nv->mmap_win_cur;
 	nv->mmap_win_cur += length;
+	/* every 64 MB consumed, print where we are */
+	if ((nv->mmap_win_cur & ((64UL << 20) - 1)) < length)
+		fprintf(stderr,
+			"nvkvm: mmap_win used=%llu MB / %llu MB\n",
+			(unsigned long long)(nv->mmap_win_cur >> 20),
+			(unsigned long long)(nv->mmap_win_size >> 20));
 	pthread_mutex_unlock(&nv->mmap_win_lock);
 	return gpa;
 }
@@ -191,6 +197,11 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 		return 0;
 	}
 	nv->sparse_cur = off + size;
+	if ((nv->sparse_cur & ((256UL << 20) - 1)) < size)
+		fprintf(stderr,
+			"nvkvm: sparse_win used=%llu MB / %llu MB\n",
+			(unsigned long long)(nv->sparse_cur >> 20),
+			(unsigned long long)(nv->sparse_size >> 20));
 	pthread_mutex_unlock(&nv->sparse_lock);
 	return nv->sparse_gpa_base + off;
 }
@@ -207,17 +218,102 @@ void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size)
 /* ── KVM memory slot management ───────────────────────────────────────────── */
 
 /*
- * next_slot_id: KVM memory slots are numbered from 0. We use slots from
- * NVKVM_KVM_SLOT_BASE upward to avoid conflicts with QEMU's own slots.
+ * KVM memory slot pool.
+ *
+ * KVM_CAP_NR_MEMSLOTS is typically 512 on x86_64.  We carve out slots
+ * [NVKVM_KVM_SLOT_BASE, NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT) for
+ * dynamic GPU mappings; below the base is reserved for QEMU's static
+ * regions (RAM, BIOS, virtio bars, etc.).
+ *
+ * Until 2026-05-28 this was a monotonic counter `next_kvm_slot++` that
+ * never recycled — after a few CUDA processes the pool was exhausted,
+ * KVM_SET_USER_MEMORY_REGION started returning -EINVAL, and the guest
+ * wedged on the next mmap.  Now: a freelist of recycled slots + a
+ * watermark for never-used slots.  Allocation prefers the freelist so
+ * KVM's internal LRU has a chance to age out stale EPT entries before
+ * the same slot number is reused.
  */
-#define NVKVM_KVM_SLOT_BASE  64
-static int next_kvm_slot = NVKVM_KVM_SLOT_BASE;
+#define NVKVM_KVM_SLOT_BASE   64
+#define NVKVM_KVM_SLOT_COUNT  448      /* 64..511 inclusive */
+
+static pthread_mutex_t kvm_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             kvm_slot_water = NVKVM_KVM_SLOT_BASE; /* next never-used */
+static int             kvm_slot_free_head;                   /* freelist top  */
+static int             kvm_slot_free_stack[NVKVM_KVM_SLOT_COUNT];
+
+/* Diagnostics — read+printed under kvm_slot_lock. */
+static int             kvm_slot_in_use;        /* live slots */
+static int             kvm_slot_in_use_peak;   /* watermark of live slots */
+static uint64_t        kvm_slot_alloc_count;   /* lifetime allocs */
+static uint64_t        kvm_slot_free_count;    /* lifetime frees  */
+
+int nvkvm_kvm_slot_alloc(void)
+{
+	int slot = -1;
+	pthread_mutex_lock(&kvm_slot_lock);
+	if (kvm_slot_free_head > 0) {
+		slot = kvm_slot_free_stack[--kvm_slot_free_head];
+	} else if (kvm_slot_water <
+		   NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT) {
+		slot = kvm_slot_water++;
+	}
+	if (slot >= 0) {
+		kvm_slot_alloc_count++;
+		if (++kvm_slot_in_use > kvm_slot_in_use_peak)
+			kvm_slot_in_use_peak = kvm_slot_in_use;
+	}
+	pthread_mutex_unlock(&kvm_slot_lock);
+	return slot;
+}
+
+void nvkvm_kvm_slot_release(int slot)
+{
+	if (slot < NVKVM_KVM_SLOT_BASE ||
+	    slot >= NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT)
+		return;
+	pthread_mutex_lock(&kvm_slot_lock);
+	if (kvm_slot_free_head < NVKVM_KVM_SLOT_COUNT)
+		kvm_slot_free_stack[kvm_slot_free_head++] = slot;
+	kvm_slot_free_count++;
+	if (kvm_slot_in_use > 0)
+		kvm_slot_in_use--;
+	pthread_mutex_unlock(&kvm_slot_lock);
+}
+
+/* Diagnostic — exposed for QEMU-side periodic prints. */
+void nvkvm_kvm_slot_stats(int *in_use, int *peak,
+			  uint64_t *allocs, uint64_t *frees);
+void nvkvm_kvm_slot_stats(int *in_use, int *peak,
+			  uint64_t *allocs, uint64_t *frees)
+{
+	pthread_mutex_lock(&kvm_slot_lock);
+	if (in_use) *in_use = kvm_slot_in_use;
+	if (peak)   *peak   = kvm_slot_in_use_peak;
+	if (allocs) *allocs = kvm_slot_alloc_count;
+	if (frees)  *frees  = kvm_slot_free_count;
+	pthread_mutex_unlock(&kvm_slot_lock);
+}
 
 static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 				 bool readonly, int *slot_out)
 {
+	int slot = nvkvm_kvm_slot_alloc();
+	if (slot < 0) {
+		int in_use, peak;
+		uint64_t allocs, frees;
+		nvkvm_kvm_slot_stats(&in_use, &peak, &allocs, &frees);
+		fprintf(stderr,
+			"nvkvm: KVM slot pool EXHAUSTED — in_use=%d peak=%d "
+			"lifetime alloc/free=%llu/%llu (cap=%d)\n",
+			in_use, peak,
+			(unsigned long long)allocs,
+			(unsigned long long)frees,
+			NVKVM_KVM_SLOT_COUNT);
+		return -ENOSPC;
+	}
+
 	struct nvkvm_kvm_mem_region region = {
-		.slot            = next_kvm_slot++,
+		.slot            = (uint32_t)slot,
 		.flags           = readonly ? (uint32_t)KVM_MEM_READONLY : 0,
 		.guest_phys_addr = gpa,
 		.memory_size     = length,
@@ -227,16 +323,30 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 		fprintf(stderr,
 			"nvkvm: kvm_vm_fd not set; GPU mmap will not be "
 			"directly accessible in guest\n");
+		nvkvm_kvm_slot_release(slot);
 		*slot_out = -1;
 		return 0;  /* non-fatal for initial bring-up */
 	}
 	if (ioctl(kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
 		fprintf(stderr,
-			"nvkvm: KVM_SET_USER_MEMORY_REGION failed: %s\n",
-			strerror(errno));
+			"nvkvm: KVM_SET_USER_MEMORY_REGION slot=%d failed: %s\n",
+			slot, strerror(errno));
+		nvkvm_kvm_slot_release(slot);
 		return -errno;
 	}
-	*slot_out = (int)region.slot;
+
+	/* Light per-100-slots progress print so we can spot exhaustion
+	 * trends in real time during multi-process testing. */
+	pthread_mutex_lock(&kvm_slot_lock);
+	int in_use_now = kvm_slot_in_use;
+	pthread_mutex_unlock(&kvm_slot_lock);
+	if (in_use_now % 100 == 0)
+		fprintf(stderr,
+			"nvkvm: kvm slot watermark in_use=%d peak=%d cap=%d\n",
+			in_use_now, kvm_slot_in_use_peak,
+			NVKVM_KVM_SLOT_COUNT);
+
+	*slot_out = slot;
 	return 0;
 }
 
@@ -248,6 +358,7 @@ static void kvm_remove_memory_region(int slot)
 	};
 	if (kvm_vm_fd >= 0)
 		ioctl(kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &region);
+	nvkvm_kvm_slot_release(slot);
 }
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
