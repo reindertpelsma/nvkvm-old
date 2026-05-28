@@ -812,47 +812,35 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		 * [gpa, gpa+len) → this VA range. */
 		kvm_slot = NVKVM_IN_WINDOW_SLOT;
 	} else {
-		/* Legacy UVM path: MAP_FIXED at req->offset + per-mmap memslot. */
-		qva = mmap((void *)(uintptr_t)req->offset, len, req->prot,
-			   MAP_SHARED | MAP_FIXED_NOREPLACE, h->fd,
-			   (off_t)req->offset);
-		if (qva == MAP_FAILED) {
-			int se = errno;
+		/*
+		 * /dev/nvidia-uvm.  The old approach mmap'd the UVM fd MAP_FIXED at
+		 * req->offset in QEMU's address space and installed a per-mmap
+		 * memslot.  That collides across concurrent processes: libcuda
+		 * picks the same UVM VA in every process, and QEMU's single address
+		 * space can only hold one mapping there, so the second process hits
+		 * MAP_FIXED_NOREPLACE → EEXIST → cuCtxCreate fails (304).  (UVM also
+		 * cannot be MAP_FIXED into the sparse window: its kernel mmap
+		 * requires vm_start == (vm_pgoff<<PAGE_SHIFT).)
+		 *
+		 * Instead allocate the GPA from the sparse window and let it ride
+		 * the window's anonymous backing — no QEMU-side device mmap, no
+		 * per-mmap memslot, no cross-process VA collision (same model as the
+		 * realize path).  The stub owns the real UVM mapping in its own
+		 * per-process address space; the GPU reaches the memory via DMA, not
+		 * a QEMU CPU memslot.
+		 */
+		gpa = nvkvm_sparse_gpa_alloc(nv, len);
+		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
+		if (!target) {
 			fprintf(stderr,
-				"nvkvm: mmap_on_isolate(uvm) FAIL fd=%d prot=0x%x "
-				"len=%lu off=0x%lx errno=%d (%s)\n",
-				h->fd, req->prot, (unsigned long)len,
-				(unsigned long)req->offset, se, strerror(se));
-			resp->status = (uint32_t)se;
-			return 0;
-		}
-		nvkvm_mmap_win_alloc(nv, len, &gpa);
-		if (gpa == 0) {
-			munmap(qva, len);
+				"nvkvm: mmap_on_isolate(uvm): sparse window full "
+				"(handle=%u len=%lu)\n",
+				req->handle_id, (unsigned long)len);
 			resp->status = ENOMEM;
 			return 0;
 		}
-		if (nvkvm_kvm_vm_fd >= 0) {
-			kvm_slot = nvkvm_kvm_slot_alloc();
-			if (kvm_slot >= 0) {
-				struct nvkvm_kvm_mem_region mr = {
-					.slot            = (uint32_t)kvm_slot,
-					.flags           = 0,
-					.guest_phys_addr = gpa,
-					.memory_size     = len,
-					.userspace_addr  = (uint64_t)(uintptr_t)qva,
-				};
-				if (ioctl(nvkvm_kvm_vm_fd,
-					  KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
-					fprintf(stderr,
-						"nvkvm: KVM_SET_USER_MEMORY_REGION "
-						"slot=%d failed: %s\n",
-						kvm_slot, strerror(errno));
-					nvkvm_kvm_slot_release(kvm_slot);
-					kvm_slot = -1;
-				}
-			}
-		}
+		qva      = target;             /* sparse-window VA (anon-backed) */
+		kvm_slot = NVKVM_IN_WINDOW_SLOT;
 	}
 
 	/* Step 3: optionally mirror the mapping into the isolate's mm.
