@@ -1450,12 +1450,15 @@ static int __init nvkvm_init(void)
 		return ret;
 	}
 
+	nvkvm_hostfile_init();
+
 	pr_info("nvkvm: NVIDIA GPU passthrough guest module loaded\n");
 	return 0;
 }
 
 static void __exit nvkvm_exit(void)
 {
+	nvkvm_hostfile_exit();
 	unregister_devices();
 	unregister_virtio_driver(&nvkvm_virtio_driver);
 	idr_destroy(&nvkvm.sessions_idr);

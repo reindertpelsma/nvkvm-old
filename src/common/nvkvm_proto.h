@@ -111,6 +111,7 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_WRITE_MEMORY_HANDLE    23  /* shm_slot → memfd (page upload) */
 #define NVKVM_REQ_READ_MEMORY_HANDLE     24  /* memfd → shm_slot (writeback)   */
 #define NVKVM_REQ_REALIZE_UVM_MAPPING    25  /* state-machine mmap-realize     */
+#define NVKVM_REQ_READ_HOST_FILE         26  /* read live host proc/sys file   */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -515,6 +516,41 @@ struct nvkvm_resp_realize_uvm_mapping {
 	__le64 realize_token;          /* for teardown / side-effect routing */
 	__le32 rm_status;              /* NV_STATUS from the kernel realize  */
 	__le32 status;                 /* 0 on success, -errno otherwise     */
+};
+
+/* ── READ_HOST_FILE ────────────────────────────────────────────────────────
+ *
+ * Live read of a host-side proc/sys file the NVIDIA driver creates but the
+ * guest doesn't have (no real nvidia.ko loaded in the VM).  libcuda probes
+ * these paths during initialization and bails into CUDA_ERROR_UNKNOWN if
+ * any are missing.
+ *
+ * The file is selected by an enum (explicit whitelist on QEMU); the guest
+ * never names a path.  QEMU does a fresh open+read on each call so the
+ * content is always current.
+ */
+enum nvkvm_host_file {
+	NVKVM_HFILE_NVIDIA_PARAMS         = 1, /* /proc/driver/nvidia/params       */
+	NVKVM_HFILE_NVIDIA_INITSTATE      = 2, /* /sys/module/nvidia/initstate     */
+	NVKVM_HFILE_NVIDIA_UVM_INITSTATE  = 3, /* /sys/module/nvidia_uvm/initstate */
+	NVKVM_HFILE_NVIDIA_NUMA_STATUS    = 4, /* /proc/driver/nvidia/gpus/<bdf>/numa_status */
+	NVKVM_HFILE_NVIDIA_INFORMATION    = 5, /* /proc/driver/nvidia/gpus/<bdf>/information */
+	NVKVM_HFILE_NVIDIA_REG_BASE       = 6, /* /proc/driver/nvidia/gpus/<bdf>/registry */
+	NVKVM_HFILE_MAX                   = 7,
+};
+
+#define NVKVM_HFILE_MAX_SIZE   8192
+
+struct nvkvm_req_read_host_file {
+	__le32 file_id;        /* enum nvkvm_host_file */
+	__le32 shm_slot;       /* dest slot; content written starting at offset 0 */
+	__le32 max_len;        /* cap (must be <= NVKVM_HFILE_MAX_SIZE)            */
+	__le32 reserved;
+};
+
+struct nvkvm_resp_read_host_file {
+	__le32 status;         /* 0 success, errno on failure  */
+	__le32 nbytes;         /* bytes actually written to shm */
 };
 
 #define NVKVM_MAX_REQ_PAYLOAD  sizeof(struct nvkvm_req_ioctl_on_isolate)

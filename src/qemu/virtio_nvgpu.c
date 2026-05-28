@@ -659,6 +659,23 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			break;
 		}
 
+		case NVKVM_REQ_READ_HOST_FILE: {
+			struct nvkvm_req_read_host_file  req  = {0};
+			struct nvkvm_resp_read_host_file resp = {0};
+			iov_to_buf(elem->out_sg, elem->out_num,
+				   sizeof(hdr), &req, sizeof(req));
+			void *db = slot_valid(nv, req.shm_slot) ?
+				   slot_ptr(nv, req.shm_slot) : NULL;
+			nvkvm_req_read_host_file(nv, &req, &resp, db);
+			struct { struct nvkvm_hdr h;
+				 struct nvkvm_resp_read_host_file r; } hout;
+			hout.h = hdr; hout.r = resp;
+			iov_from_buf(elem->in_sg, elem->in_num, 0, &hout, sizeof(hout));
+			virtqueue_push(vq, elem, sizeof(hout));
+			virtio_notify(VIRTIO_DEVICE(nv), vq);
+			break;
+		}
+
 		case NVKVM_REQ_REALIZE_UVM_MAPPING: {
 			struct nvkvm_req_realize_uvm_mapping  req  = {0};
 			struct nvkvm_resp_realize_uvm_mapping resp = {0};

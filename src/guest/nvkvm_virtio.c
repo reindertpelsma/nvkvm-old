@@ -270,6 +270,12 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->status = le32_to_cpu(resp->status);
 			break;
 		}
+		case NVKVM_REQ_READ_HOST_FILE: {
+			struct nvkvm_resp_read_host_file *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			inf->retval = le32_to_cpu(resp->nbytes);
+			break;
+		}
 		case NVKVM_REQ_REALIZE_UVM_MAPPING: {
 			struct nvkvm_resp_realize_uvm_mapping *resp = (void *)(hdr + 1);
 			inf->retval     = le64_to_cpu(resp->gpa_base);
@@ -1102,6 +1108,43 @@ int nvkvm_virtio_realize_uvm_mapping(__u32 isolate_id, __u32 fd_handle_id,
 			if (realize_token_out) *realize_token_out = inf->fault_addr;
 			if (rm_status_out)     *rm_status_out     = inf->nvstatus;
 		}
+	}
+	inflight_free(&nvkvm, inf);
+	kfree(msg);
+	return ret;
+}
+
+/* ── READ_HOST_FILE ─────────────────────────────────────────────────────── */
+
+int nvkvm_virtio_read_host_file(__u32 file_id, __u32 shm_slot,
+				__u32 max_len, __u32 *nbytes_out)
+{
+	struct {
+		struct nvkvm_hdr                   hdr;
+		struct nvkvm_req_read_host_file    req;
+	} *msg;
+	struct nvkvm_inflight *inf;
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	int ret;
+
+	if (txn_id == 0) return -EBUSY;
+	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+	if (!msg) { nvkvm_txn_id_free(&nvkvm, txn_id); return -ENOMEM; }
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) { kfree(msg); nvkvm_txn_id_free(&nvkvm, txn_id); return -ENOMEM; }
+
+	msg->hdr.type    = cpu_to_le32(NVKVM_REQ_READ_HOST_FILE);
+	msg->hdr.txn_id  = cpu_to_le32(txn_id);
+	msg->req.file_id = cpu_to_le32(file_id);
+	msg->req.shm_slot = cpu_to_le32(shm_slot);
+	msg->req.max_len  = cpu_to_le32(max_len);
+
+	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
+	if (ret == 0) {
+		if (inf->status)
+			ret = -(int)inf->status;
+		else if (nbytes_out)
+			*nbytes_out = (__u32)inf->retval;
 	}
 	inflight_free(&nvkvm, inf);
 	kfree(msg);

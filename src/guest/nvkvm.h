@@ -261,6 +261,12 @@ int  nvkvm_virtio_realize_uvm_mapping(__u32 isolate_id, __u32 fd_handle_id,
 				      __u64 *gpa_base_out,
 				      __u64 *realize_token_out,
 				      __u32 *rm_status_out);
+int  nvkvm_virtio_read_host_file(__u32 file_id, __u32 shm_slot,
+				 __u32 max_len, __u32 *nbytes_out);
+
+/* nvkvm_hostfile.c — proc/sys entries fronting host files */
+int  nvkvm_hostfile_init(void);
+void nvkvm_hostfile_exit(void);
 int  nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,

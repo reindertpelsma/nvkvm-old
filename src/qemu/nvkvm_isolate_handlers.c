@@ -763,6 +763,81 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
 	return 0;
 }
 
+/* ── READ_HOST_FILE ──────────────────────────────────────────────────────────
+ *
+ * Live read of a host-side proc/sys file the guest doesn't have because
+ * the real nvidia.ko isn't loaded in the VM.  File selection is by enum;
+ * QEMU never trusts a guest-supplied path.
+ *
+ * The path table is the security boundary.  Files are read fresh on every
+ * call so callers see live state.
+ */
+static const char *nvkvm_hfile_path(uint32_t id)
+{
+	switch (id) {
+	case NVKVM_HFILE_NVIDIA_PARAMS:
+		return "/proc/driver/nvidia/params";
+	case NVKVM_HFILE_NVIDIA_INITSTATE:
+		return "/sys/module/nvidia/initstate";
+	case NVKVM_HFILE_NVIDIA_UVM_INITSTATE:
+		return "/sys/module/nvidia_uvm/initstate";
+	case NVKVM_HFILE_NVIDIA_NUMA_STATUS:
+		return "/proc/driver/nvidia/gpus/0000:00:07.0/numa_status";
+	case NVKVM_HFILE_NVIDIA_INFORMATION:
+		return "/proc/driver/nvidia/gpus/0000:00:07.0/information";
+	case NVKVM_HFILE_NVIDIA_REG_BASE:
+		return "/proc/driver/nvidia/gpus/0000:00:07.0/registry";
+	default:
+		return NULL;
+	}
+}
+
+int nvkvm_req_read_host_file(VirtIONvgpu *nv,
+			      struct nvkvm_req_read_host_file *req,
+			      struct nvkvm_resp_read_host_file *resp,
+			      void *shm_buf)
+{
+	(void)nv;
+	memset(resp, 0, sizeof(*resp));
+
+	if (!shm_buf || req->max_len == 0 ||
+	    req->max_len > NVKVM_HFILE_MAX_SIZE) {
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	const char *path = nvkvm_hfile_path(req->file_id);
+	if (!path) {
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		resp->status = (uint32_t)errno;
+		return 0;
+	}
+
+	uint32_t total = 0;
+	while (total < req->max_len) {
+		ssize_t n = read(fd, (char *)shm_buf + total,
+				 (size_t)(req->max_len - total));
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			resp->status = (uint32_t)errno;
+			close(fd);
+			return 0;
+		}
+		if (n == 0) break;
+		total += (uint32_t)n;
+	}
+	close(fd);
+
+	resp->status = 0;
+	resp->nbytes = total;
+	return 0;
+}
+
 /* ── REALIZE_UVM_MAPPING ─────────────────────────────────────────────────────
  *
  * STATE_MACHINE_PLAN §8a — strict validation.  This handler runs in QEMU

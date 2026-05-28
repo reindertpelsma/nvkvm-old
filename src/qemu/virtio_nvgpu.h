@@ -330,6 +330,10 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 				   struct nvkvm_req_realize_uvm_mapping *req,
 				   struct nvkvm_resp_realize_uvm_mapping *resp,
 				   void *state_buf, void *intent_buf);
+int nvkvm_req_read_host_file(VirtIONvgpu *nv,
+			      struct nvkvm_req_read_host_file *req,
+			      struct nvkvm_resp_read_host_file *resp,
+			      void *shm_buf);
 
 /* nvkvm_objects.c */
 struct nvkvm_client *nvkvm_client_alloc(uint32_t handle);
