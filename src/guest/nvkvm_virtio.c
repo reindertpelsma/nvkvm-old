@@ -270,6 +270,14 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->status = le32_to_cpu(resp->status);
 			break;
 		}
+		case NVKVM_REQ_REALIZE_UVM_MAPPING: {
+			struct nvkvm_resp_realize_uvm_mapping *resp = (void *)(hdr + 1);
+			inf->retval     = le64_to_cpu(resp->gpa_base);
+			inf->status     = le32_to_cpu(resp->status);
+			inf->nvstatus   = le32_to_cpu(resp->rm_status);
+			inf->fault_addr = le64_to_cpu(resp->realize_token);
+			break;
+		}
 		default:
 			pr_warn("nvkvm: tx_done: unknown type %u\n",
 				le32_to_cpu(hdr->type));
@@ -1022,6 +1030,77 @@ int nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
 		} else {
 			if (gpa_base_out)   *gpa_base_out   = inf->retval;
 			if (mmap_token_out) *mmap_token_out = inf->nvstatus;
+		}
+	}
+	inflight_free(&nvkvm, inf);
+	kfree(msg);
+	return ret;
+}
+
+/* ── REALIZE_UVM_MAPPING ─────────────────────────────────────────────────────
+ *
+ * State-machine model: instead of sending a raw mmap, the guest module
+ * uploads the recorded UVM state + intent into two shm slots and asks
+ * QEMU to realize the whole mapping atomically.  See
+ * docs/STATE_MACHINE_PLAN.md.
+ */
+int nvkvm_virtio_realize_uvm_mapping(__u32 isolate_id, __u32 fd_handle_id,
+				     __u32 mode, unsigned int session_id,
+				     __u64 gva, __u64 length, __u64 offset_hint,
+				     __u32 prot, __u32 map_flags,
+				     __u32 state_shm_slot,
+				     __u32 intent_shm_slot,
+				     __u32 intent_size,
+				     __u64 *gpa_base_out,
+				     __u64 *realize_token_out,
+				     __u32 *rm_status_out)
+{
+	struct {
+		struct nvkvm_hdr                       hdr;
+		struct nvkvm_req_realize_uvm_mapping   req;
+	} *msg;
+	struct nvkvm_inflight *inf;
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	int ret;
+
+	if (txn_id == 0)
+		return -EBUSY;
+	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+	if (!msg) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(msg);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+
+	msg->hdr.type            = cpu_to_le32(NVKVM_REQ_REALIZE_UVM_MAPPING);
+	msg->hdr.txn_id          = cpu_to_le32(txn_id);
+	msg->req.isolate_id      = cpu_to_le32(isolate_id);
+	msg->req.fd_handle_id    = cpu_to_le32(fd_handle_id);
+	msg->req.mode            = cpu_to_le32(mode);
+	msg->req.session_id      = cpu_to_le32(session_id);
+	msg->req.gva             = cpu_to_le64(gva);
+	msg->req.length          = cpu_to_le64(length);
+	msg->req.offset_hint     = cpu_to_le64(offset_hint);
+	msg->req.prot            = cpu_to_le32(prot);
+	msg->req.map_flags       = cpu_to_le32(map_flags);
+	msg->req.state_shm_slot  = cpu_to_le32(state_shm_slot);
+	msg->req.intent_shm_slot = cpu_to_le32(intent_shm_slot);
+	msg->req.intent_size     = cpu_to_le32(intent_size);
+
+	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
+	if (ret == 0) {
+		if (inf->status) {
+			ret = -(int)inf->status;
+			if (rm_status_out) *rm_status_out = inf->nvstatus;
+		} else {
+			if (gpa_base_out)      *gpa_base_out      = inf->retval;
+			if (realize_token_out) *realize_token_out = inf->fault_addr;
+			if (rm_status_out)     *rm_status_out     = inf->nvstatus;
 		}
 	}
 	inflight_free(&nvkvm, inf);

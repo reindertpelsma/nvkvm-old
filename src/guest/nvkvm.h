@@ -249,6 +249,16 @@ int  nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
 				  __u64 *gpa_base_out,
 				  __u32 *mmap_token_out);
 int  nvkvm_virtio_munmap_on_isolate(__u32 isolate_id, __u32 mmap_token);
+int  nvkvm_virtio_realize_uvm_mapping(__u32 isolate_id, __u32 fd_handle_id,
+				      __u32 mode, unsigned int session_id,
+				      __u64 gva, __u64 length, __u64 offset_hint,
+				      __u32 prot, __u32 map_flags,
+				      __u32 state_shm_slot,
+				      __u32 intent_shm_slot,
+				      __u32 intent_size,
+				      __u64 *gpa_base_out,
+				      __u64 *realize_token_out,
+				      __u32 *rm_status_out);
 int  nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,

@@ -504,14 +504,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				struct nvkvm_uvm_mapping_intent *m =
 					kzalloc(sizeof(*m), GFP_KERNEL);
 				if (m) {
-					m->mode  = 1;  /* NVKVM_UVM_REALIZE_MODE_SEM_POOL */
+					m->mode  = NVKVM_UVM_REALIZE_MODE_SEM_POOL;
 					m->base  = p->base;
 					m->length = p->length;
-					/* Snapshot the per-GPU attributes — these go
-					 * into the REALIZE message at mmap time
-					 * (Step E).  Copy only as much as the
-					 * struct guarantees so we never read past
-					 * what the guest wrote. */
 					m->params_size = sizeof(*p);
 					m->params = kmemdup(p, sizeof(*p), GFP_KERNEL);
 					if (!m->params) {
@@ -522,6 +517,19 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						mutex_unlock(&st->lock);
 					}
 				}
+				/* MAPPING_INTENT — short-circuit (Step E).  The
+				 * actual SEM_POOL ioctl runs on the stub's fresh
+				 * /dev/nvidia-uvm fd at mmap-realize time; here
+				 * we just stash the intent and tell libcuda
+				 * everything is fine. */
+				p->rm_status = 0;
+				if (uparams &&
+				    copy_to_user(uparams, params_buf, param_size)) {
+					kfree(params_buf);
+					return -EFAULT;
+				}
+				kfree(params_buf);
+				return 0;
 			}
 			break;
 		default:

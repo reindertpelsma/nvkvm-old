@@ -150,6 +150,9 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 	return 0;
 }
 
+static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
+					  struct vm_area_struct *vma);
+
 int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 {
 	unsigned long vma_len = vma->vm_end - vma->vm_start;
@@ -167,7 +170,159 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	if (!ctx->handle_id || !ctx->session->isolate_id)
 		return -EBADF;
 
+	/* UVM mmap goes through the state-machine REALIZE path. */
+	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state)
+		return nvkvm_mmap_request_uvm_realize(ctx, vma);
+
 	return nvkvm_mmap_request_isolate(ctx, vma);
+}
+
+/*
+ * UVM realize path (state-machine Step E).
+ *
+ * Build a state snapshot from ctx->uvm_state, pick the matching intent
+ * by (gva, length), upload both into shm slots, and issue a single
+ * REALIZE_UVM_MAPPING request.  QEMU does the privileged work and
+ * returns a GPA we map into the VMA with remap_pfn_range.
+ */
+static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
+					  struct vm_area_struct *vma)
+{
+	struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+	struct nvkvm_uvm_mapping_intent *m, *match = NULL;
+	struct nvkvm_uvm_gpu_reg *g;
+	struct nvkvm_uvm_vas_reg *v;
+	struct nvkvm_uvm_range_group *r;
+	struct nvkvm_uvm_state_snapshot *snap = NULL;
+	struct nvkvm_uvm_realization *real = NULL;
+	void *intent_slot_ptr = NULL;
+	int state_slot = -1, intent_slot = -1;
+	unsigned long vma_len = vma->vm_end - vma->vm_start;
+	__u64 gva    = vma->vm_start;
+	__u32 prot   = (vma->vm_flags & VM_READ  ? PROT_READ  : 0) |
+		       (vma->vm_flags & VM_WRITE ? PROT_WRITE : 0);
+	__u32 map_flags = MAP_SHARED;
+	__u64 gpa_base = 0, realize_token = 0;
+	__u32 rm_status = 0;
+	__u32 intent_size = 0;
+	int ret;
+
+	mutex_lock(&st->lock);
+	list_for_each_entry(m, &st->intents, list) {
+		if (m->base == gva && m->length == vma_len) {
+			match = m;
+			break;
+		}
+	}
+	if (!match) {
+		mutex_unlock(&st->lock);
+		pr_warn("nvkvm: UVM mmap %llx+%lx without matching intent\n",
+			gva, vma_len);
+		return -EINVAL;
+	}
+
+	state_slot = nvkvm_slot_alloc(&nvkvm);
+	if (state_slot < 0) { ret = -ENOSPC; goto err_unlock; }
+	intent_slot = nvkvm_slot_alloc(&nvkvm);
+	if (intent_slot < 0) { ret = -ENOSPC; goto err_unlock; }
+
+	snap = nvkvm_slot_addr(&nvkvm, state_slot);
+	intent_slot_ptr = nvkvm_slot_addr(&nvkvm, intent_slot);
+	if (!snap || !intent_slot_ptr ||
+	    nvkvm.slot_size < sizeof(*snap) ||
+	    nvkvm.slot_size < match->params_size) {
+		ret = -ENOMEM;
+		goto err_unlock;
+	}
+
+	memset(snap, 0, sizeof(*snap));
+	snap->init_flags = cpu_to_le64(st->init_flags);
+
+	__u32 n_gpus = 0;
+	list_for_each_entry(g, &st->registered_gpus, list) {
+		if (n_gpus >= NVKVM_UVM_MAX_REG_GPUS) break;
+		memcpy(snap->gpus[n_gpus].gpu_uuid, g->gpu_uuid, 16);
+		n_gpus++;
+	}
+	snap->n_gpus = cpu_to_le32(n_gpus);
+
+	__u32 n_vas = 0;
+	list_for_each_entry(v, &st->registered_va_spaces, list) {
+		if (n_vas >= NVKVM_UVM_MAX_VA_SPACES) break;
+		memcpy(snap->va_spaces[n_vas].gpu_uuid, v->gpu_uuid, 16);
+		snap->va_spaces[n_vas].rm_ctrl_fd_handle_id =
+			cpu_to_le32(v->rm_ctrl_fd_handle_id);
+		n_vas++;
+	}
+	snap->n_va_spaces = cpu_to_le32(n_vas);
+
+	__u32 n_rgs = 0;
+	list_for_each_entry(r, &st->range_groups, list) {
+		if (n_rgs >= NVKVM_UVM_MAX_RANGE_GROUPS) break;
+		snap->range_group_ids[n_rgs] = cpu_to_le64(r->range_group_id);
+		n_rgs++;
+	}
+	snap->n_range_groups = cpu_to_le32(n_rgs);
+
+	memcpy(intent_slot_ptr, match->params, match->params_size);
+	intent_size = (__u32)match->params_size;
+	wmb();
+	mutex_unlock(&st->lock);
+
+	ret = nvkvm_virtio_realize_uvm_mapping(ctx->session->isolate_id,
+					       ctx->handle_id,
+					       NVKVM_UVM_REALIZE_MODE_SEM_POOL,
+					       (unsigned int)ctx->session->id,
+					       gva, vma_len, 0,
+					       prot, map_flags,
+					       (__u32)state_slot,
+					       (__u32)intent_slot,
+					       intent_size,
+					       &gpa_base, &realize_token,
+					       &rm_status);
+
+	nvkvm_slot_free(&nvkvm, state_slot);
+	state_slot = -1;
+	nvkvm_slot_free(&nvkvm, intent_slot);
+	intent_slot = -1;
+
+	if (ret) {
+		pr_warn("nvkvm: REALIZE_UVM_MAPPING failed: %d rm_status=0x%x\n",
+			ret, rm_status);
+		return ret;
+	}
+	if (!nvkvm_gpa_in_mmap_window((unsigned long)gpa_base, vma_len)) {
+		pr_warn("nvkvm: REALIZE returned GPA %llx outside window\n",
+			gpa_base);
+		return -EIO;
+	}
+
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+
+	ret = remap_pfn_range(vma, vma->vm_start,
+			      (unsigned long)(gpa_base >> PAGE_SHIFT),
+			      vma_len, vma->vm_page_prot);
+	if (ret)
+		return ret;
+
+	real = kzalloc(sizeof(*real), GFP_KERNEL);
+	if (real) {
+		real->realize_token = realize_token;
+		real->gva    = gva;
+		real->gpa    = gpa_base;
+		real->length = vma_len;
+		mutex_lock(&st->lock);
+		list_add_tail(&real->list, &st->realizations);
+		mutex_unlock(&st->lock);
+	}
+	return 0;
+
+err_unlock:
+	if (state_slot  >= 0) nvkvm_slot_free(&nvkvm, state_slot);
+	if (intent_slot >= 0) nvkvm_slot_free(&nvkvm, intent_slot);
+	mutex_unlock(&st->lock);
+	return ret;
 }
 
 /*
