@@ -174,14 +174,20 @@ struct nvos54_parameters {
 
 /* ── NV_ESC_RM_DUP_OBJECT ────────────────────────────────────────────────── */
 
+/*
+ * NVOS55_PARAMETERS — verified against the 575 open kernel module SDK
+ * (src/common/sdk/nvidia/inc/nvos.h): 7 fields, 28 bytes.  An earlier version
+ * of this struct had 9 fields (36 B) with phantom h_parent_client/h_src_parent
+ * — wrong, but never caught because DUP_OBJECT is unexercised by matmul. The
+ * Phase-4 DUP gate and the cross-process PoC depend on hClientSrc being at the
+ * correct offset (12), so this layout matters.
+ */
 struct nvos55_parameters {
-	nvhandle_t h_client;
-	nvhandle_t h_parent_client;
-	nvhandle_t h_parent;
-	nvhandle_t h_object;
-	nvhandle_t h_client_src;
-	nvhandle_t h_src_parent;
-	nvhandle_t h_src_object;
+	nvhandle_t h_client;       /* [IN]    destination client handle      */
+	nvhandle_t h_parent;       /* [IN]    parent of new object           */
+	nvhandle_t h_object;       /* [INOUT] destination (new) object handle */
+	nvhandle_t h_client_src;   /* [IN]    source client handle           */
+	nvhandle_t h_src_object;   /* [IN]    source (old) object handle      */
 	__u32      flags;
 	__u32      status;
 };

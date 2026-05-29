@@ -55,7 +55,7 @@ func TestFrontendStructSizes(t *testing.T) {
 		{"nvos64_parameters (RM_ALLOC v2)", Sizes.Nvos64, 48},
 		{"nvos00_parameters (RM_FREE)", Sizes.Nvos00, 16},
 		{"nvos54_parameters (RM_CONTROL)", Sizes.Nvos54, 32},
-		{"nvos55_parameters (RM_DUP_OBJECT)", Sizes.Nvos55, 36},
+		{"nvos55_parameters (RM_DUP_OBJECT)", Sizes.Nvos55, 28}, // 575 SDK: 7 fields
 		{"nvos57_parameters (RM_SHARE)", Sizes.Nvos57, 16},
 		{"nvos32_parameters (RM_VID_HEAP_CONTROL)", Sizes.Nvos32, 88},
 		// nvos46_parameters: must be 56 — includes DmaOffset (out) at +40
@@ -119,7 +119,7 @@ func TestUVMStructSizes(t *testing.T) {
 		{"uvm_register_gpu_vaspace_params", Sizes.UvmRegGv, 32},
 		{"uvm_unregister_gpu_vaspace_params", Sizes.UvmUnregGv, 20},
 		{"uvm_register_channel_params", Sizes.UvmRegCh, 48},
-		{"uvm_unregister_channel_params", Sizes.UvmUnregCh, 36},
+		{"uvm_unregister_channel_params", Sizes.UvmUnregCh, 28}, // GPUUUID+HClient+HChannel+RMStatus (gvisor/575)
 		{"uvm_create_range_group_params", Sizes.UvmCreateRg, 16},
 		{"uvm_destroy_range_group_params", Sizes.UvmDestRg, 16},
 		{"uvm_set_range_group_params", Sizes.UvmSetRg, 32},
@@ -133,7 +133,7 @@ func TestUVMStructSizes(t *testing.T) {
 		{"uvm_create_external_range_params", Sizes.UvmExtRng, 24},
 		{"uvm_validate_va_range_params", Sizes.UvmValVa, 24},
 		{"uvm_pageable_mem_access_params", Sizes.UvmPageable, 8},
-		{"uvm_alloc_semaphore_pool_params", Sizes.UvmSema, 32},
+		{"uvm_alloc_semaphore_pool_params", Sizes.UvmSema, 9248}, // base+len+PerGPUAttributes[UVM_MAX_GPUS]+count+status
 	})
 }
 

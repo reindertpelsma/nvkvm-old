@@ -628,18 +628,19 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	}
 
 	/*
-	 * Phase 4 gate — DUP_OBJECT cross-VM defense.  NVOS55 (our 36-byte
-	 * layout): h_client@0, h_client_src@16.  The source client must be one
-	 * THIS VM allocated; otherwise a guest (whose objects carry the Path-α
-	 * TYPE_ALL DUP grant) could dup another VM's object by naming its
-	 * (h_client_src, h_src_object).  h_client itself is the caller's own
-	 * client (recorded post-success below), so we only need to vet the src.
+	 * Phase 4 gate — DUP_OBJECT cross-VM defense.  NVOS55 (verified 28-byte
+	 * layout): h_client@0, h_parent@4, h_object@8, h_client_src@12,
+	 * h_src_object@16.  The source client must be one THIS VM allocated;
+	 * otherwise a guest (whose objects carry the Path-α TYPE_ALL DUP grant)
+	 * could dup another VM's object by naming its (h_client_src,
+	 * h_src_object).  h_client itself is the caller's own client (recorded
+	 * post-success below), so we only need to vet the src.
 	 */
 	if (_IOC_TYPE(req->cmd) == 'F' &&
 	    _IOC_NR(req->cmd) == NV_ESC_RM_DUP_OBJECT &&
-	    param_buf && req->param_size >= 20) {
+	    param_buf && req->param_size >= 16) {
 		uint32_t h_client_src = 0;
-		memcpy(&h_client_src, (char *)param_buf + 16, 4);
+		memcpy(&h_client_src, (char *)param_buf + 12, 4);
 		if (h_client_src != 0 && h_client_src != (uint32_t)-1 &&
 		    !nvkvm_client_allow_has(nv, h_client_src)) {
 			fprintf(stderr,
@@ -704,9 +705,11 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 *
 	 * Fix: right after the stub successfully allocates a class that we
 	 * know UVM will need to dup, issue an NV_ESC_RM_SHARE on the new
-	 * handle granting DUP_OBJECT to all clients (TYPE_ALL).  The share
-	 * runs on the stub fd so the owner check inside _serverShareResource
-	 * matches (caller process == resource owner).
+	 * handle granting DUP_OBJECT scoped to QEMU's pid (RS_SHARE_TYPE_PID,
+	 * see the share initializer below — was TYPE_ALL, host-wide, which let
+	 * any host process dup a guessed handle).  The share runs on the stub
+	 * fd so the owner check inside _serverShareResource matches (caller
+	 * process == resource owner).
 	 *
 	 * Classes we share: FERMI_VASPACE_A (0x90f1) for now; add others as
 	 * we hit further duplications.
@@ -761,6 +764,19 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			} share = {
 				.hClient    = hClient,
 				.hObject    = hObjNew,
+				/* Phase 4 step 3 — STILL TYPE_ALL pending a proper
+				 * narrowing.  EXPERIMENT (reverted): TYPE_PID
+				 * targeted at QEMU's getpid() broke cuCtxCreate
+				 * (=800), proving the dup consumer is NOT QEMU's
+				 * task pid but the UVM KERNEL-internal client.  The
+				 * correct narrowing is TYPE_CLIENT targeted at that
+				 * UVM kernel client's handle, which must first be
+				 * discovered (kernel-internal; ~0xc1d00001 but it
+				 * drifts) — e.g. via a printk in the open driver's
+				 * dup access path.  Until then TYPE_ALL remains the
+				 * known host-process exposure; the per-VM hClient
+				 * gate (above) still blocks the guest-driven path.
+				 * TODO(phase4-step3): TYPE_CLIENT(uvm_kernel_client). */
 				.target     = 0,
 				.accessMask = 0x1,   /* RS_ACCESS_DUP_OBJECT */
 				.type       = 1,     /* RS_SHARE_TYPE_ALL */
@@ -779,9 +795,9 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 						       &share_nvstatus,
 						       &share_fault);
 			fprintf(stderr,
-				"nvkvm: post-alloc SHARE hClass=0x%x hObj=0x%x "
-				"ret=%d nvstatus=0x%x status=0x%x\n",
-				hClass, hObjNew, sret, share_nvstatus,
+				"nvkvm: post-alloc SHARE hClient=0x%x hClass=0x%x "
+				"hObj=0x%x ret=%d nvstatus=0x%x status=0x%x\n",
+				hClient, hClass, hObjNew, sret, share_nvstatus,
 				share.status);
 		}
 	}
