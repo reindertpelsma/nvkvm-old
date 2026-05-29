@@ -34,6 +34,7 @@
 #include <linux/slab.h>
 #include <linux/idr.h>
 #include <linux/mutex.h>
+#include <linux/pid.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/mm.h>
@@ -424,11 +425,25 @@ static int nvkvm_synth_get_pids(void *params_buf, __u32 param_size)
 	if (!gp)
 		return 0;   /* fall through to forwarding on OOM */
 
-	/* The guest's GPU processes = the tgids holding nvkvm sessions. */
+	/*
+	 * The guest's GPU processes = the processes holding nvkvm sessions,
+	 * rendered in the *caller's* pid namespace.  pid_vnr() returns the
+	 * number the calling task's active pid ns uses for that pid, or 0 if
+	 * the process is not visible from that namespace.  Skipping the 0
+	 * cases means a process inside a guest container only ever sees the
+	 * GPU processes within its own ns (Docker-on-guest isolation), and
+	 * the init-ns querier sees the global guest pids — exactly mirroring
+	 * how the real nvidia driver scopes GET_PIDS by current's pid ns.
+	 */
 	mutex_lock(&nvkvm.sessions_lock);
 	idr_for_each_entry(&nvkvm.sessions_idr, s, id) {
-		if (s->tgid && n < NVKVM_GET_PIDS_MAX)
-			gp->pid_tbl[n++] = (__u32)s->tgid;
+		pid_t vnr;
+
+		if (n >= NVKVM_GET_PIDS_MAX || !s->tgid_pid)
+			continue;
+		vnr = pid_vnr(s->tgid_pid);   /* in current's pid ns */
+		if (vnr)
+			gp->pid_tbl[n++] = (__u32)vnr;
 	}
 	mutex_unlock(&nvkvm.sessions_lock);
 	gp->pid_tbl_count = n;

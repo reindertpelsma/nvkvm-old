@@ -20,6 +20,7 @@
 #include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/sched/mm.h>
+#include <linux/pid.h>
 
 #include "nvkvm.h"
 
@@ -52,6 +53,9 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 	mmgrab(mm);                /* pin the mm — drop in nvkvm_session_put */
 	session->mm         = mm;
 	session->tgid       = tgid;
+	/* Pin the tgid pid so GET_PIDS can later translate it into whatever
+	 * pid namespace the querying process lives in (Docker-on-guest). */
+	session->tgid_pid   = get_task_pid(current, PIDTYPE_TGID);
 	session->refcount   = 1;
 	session->isolate_id = 0;
 	mutex_init(&session->isolate_lock);
@@ -74,6 +78,7 @@ void nvkvm_session_put(struct nvkvm_session *session)
 	bool last;
 	__u32 isolate_id = 0;
 	struct mm_struct *mm = NULL;
+	struct pid *tgid_pid = NULL;
 
 	mutex_lock(&nvkvm.sessions_lock);
 	last = --session->refcount == 0;
@@ -83,6 +88,8 @@ void nvkvm_session_put(struct nvkvm_session *session)
 		session->isolate_id = 0;
 		mm = session->mm;
 		session->mm = NULL;
+		tgid_pid = session->tgid_pid;
+		session->tgid_pid = NULL;
 	}
 	mutex_unlock(&nvkvm.sessions_lock);
 
@@ -92,6 +99,8 @@ void nvkvm_session_put(struct nvkvm_session *session)
 			nvkvm_virtio_kill_isolate(isolate_id);
 		if (mm)
 			mmdrop(mm);
+		if (tgid_pid)
+			put_pid(tgid_pid);
 		mutex_destroy(&session->isolate_lock);
 		kfree(session);
 	}

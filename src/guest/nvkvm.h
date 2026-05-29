@@ -52,6 +52,17 @@ struct nvkvm_session {
 	 */
 	struct mm_struct *mm;
 	pid_t   tgid;           /* for logging/diagnostics only           */
+	/*
+	 * Refcounted pid of the owning thread-group leader, captured at
+	 * session creation.  Stored as `struct pid *` (not a raw number) so
+	 * that process enumeration (NV2080_CTRL_CMD_GPU_GET_PIDS synthesis)
+	 * can render it in the *caller's* pid namespace via pid_vnr() — this
+	 * makes nvidia-smi work correctly inside guest containers (Docker on
+	 * the guest VM): a caller sees only the GPU processes visible in its
+	 * own pid ns, numbered as that ns sees them.  A raw tgid would be a
+	 * root-ns number, meaningless (and a cross-ns leak) inside a container.
+	 */
+	struct pid *tgid_pid;
 	int     id;             /* IDR key                                */
 	int     refcount;       /* protected by nvkvm_state.sessions_lock */
 	__u32   isolate_id;     /* QEMU isolate process ID (0 = not yet created) */
