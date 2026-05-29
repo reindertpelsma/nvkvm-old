@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 
 #include "virtio_nvgpu.h"
+#include "nvkvm_ctrl_allowlist.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -491,6 +492,25 @@ static void nvkvm_client_allow_add(VirtIONvgpu *nv, uint32_t hc)
 	pthread_mutex_unlock(&nv->client_allow_lock);
 }
 
+/*
+ * #76 — is this RM control command allowed?  Default-deny (nvproxy parity):
+ * the static allowlist covers the CUDA-compute surface; two rule-based
+ * passthroughs cover GSP-routed cmds with no app pointers (legacy mask + the
+ * NV2081_BINAPI class).  Everything else is denied.  This is a host/cross-VM
+ * attack-surface control, so it lives in QEMU (the guest module is untrusted).
+ */
+static bool nvkvm_ctrl_cmd_allowed(uint32_t cmd)
+{
+	if (cmd & 0x8000u)                       /* RM_GSS_LEGACY_MASK */
+		return true;
+	if (((cmd >> 16) & 0xffffu) == 0x2081u)  /* NV2081_BINAPI class */
+		return true;
+	for (size_t i = 0; i < NVKVM_CTRL_ALLOWLIST_N; i++)
+		if (nvkvm_ctrl_allowlist[i] == cmd)
+			return true;
+	return false;
+}
+
 static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
 {
 	bool found = false;
@@ -786,6 +806,29 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],
 				a[8],a[9],a[10],a[11],a[12],a[13],a[14],a[15],
 				a[16],a[17],a[18],a[19],a[20],a[21],a[22],a[23]);
+		}
+	}
+
+	/*
+	 * #76 default-deny RM control-command allowlist (nvproxy parity).  Reject
+	 * any control cmd outside the CUDA-compute surface before it reaches the
+	 * host driver — closes reg-ops / HWPM / debug / fabric / power surfaces a
+	 * guest could otherwise drive on any client it owns.  Also bound the inner
+	 * params size (1 MiB) as nvproxy does (our 64K slots already cap it, but be
+	 * explicit).
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL &&
+	    param_buf && req->param_size >= 12) {
+		uint32_t cc = 0;
+		memcpy(&cc, (char *)param_buf + 8, 4);
+		if (!nvkvm_ctrl_cmd_allowed(cc) || req->aux_size > (1u << 20)) {
+			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
+				"(not in allowlist / oversize)\n", cc);
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
 		}
 	}
 
