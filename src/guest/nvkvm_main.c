@@ -1025,6 +1025,19 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					aux_size = ext;
 				}
 			}
+
+			/*
+			 * #79: NV0000_CTRL_CMD_GPU_GET_ID_INFO (0x202) has an
+			 * output pointer szName@16 (a guest VA the host driver
+			 * can't write).  The name is optional — cuInit doesn't
+			 * need it and nvidia-smi gets the model elsewhere — so
+			 * zero the pointer rather than forward a raw guest VA the
+			 * stub would deref (the driver null-checks szName).  This
+			 * closes the last unsanitized embedded pointer among the
+			 * allowlisted control cmds.
+			 */
+			if (ctrl->cmd == 0x00000202u && ctrl->params_size >= 24)
+				*(__u64 *)((char *)aux_buf + 16) = 0;
 		}
 	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
 		   param_size == sizeof(struct nvos21_parameters) && params_buf) {
