@@ -56,19 +56,20 @@ Split of responsibility (SYNTHESIZED — refined from the original split):
 Sub-steps (each is a deploy+test cycle on vast.ai; test = single matmul + 2/4
 concurrent + nvidia-smi must all still pass):
 
-- [ ] **0.0 Stub build decision.** The committed `security-fixes` stub is
+- [x] **0.0 Stub build decision.** DONE — no-libc seccomp-ON stub builds + passes single/2/4-conc/nvidia-smi end-to-end. The committed `security-fixes` stub is
   no-libc (C7). Recent integration testing used the *libc* stub (master-based
   /tmp/nvkvm-slot) with seccomp OFF. FIRST: build the security-fixes no-libc
   stub (`make -C src/stub`), deploy it, confirm single matmul + 2/4 concurrent
   + nvidia-smi pass with seccomp ON. This de-risks the foundation. If no-libc
   build/integration is broken, decide: fix it, or consolidate on libc stub.
   Update deploy scripts to build the chosen stub.
-- [ ] **0.1 seccomp ON + allowlist audit.** Confirm apply_seccomp is actually
+- [x] **0.1 seccomp ON + allowlist audit.** DONE — seccomp called unconditionally; no SIGSYS across full run, allowlist sufficient. Confirm apply_seccomp is actually
   called (not gated off). Run with strace/seccomp-log to enumerate every
   syscall the stub needs (ioctl, mmap, recvmsg/sendmsg, futex, clone3, openat,
   close_range, memfd, etc.) and the new lockdown syscalls (unshare, mount,
   pivot_root, capset, prctl, openat). Widen allowlist as needed. Verify pass.
-- [ ] **0.2 no_new_privs + dumpable=0 + drop all caps** (stub, after opening
+- [x] **0.2+0.3+0.4(net/ipc/uts) DONE (A1, commit pending).** userns(rootless 0->euid)+net/ipc/uts ns+no_new_privs+dumpable=0+all-caps-dropped, in QEMU child, fail-closed. Verified: CapEff=0, NoNewPrivs=1, user/net/ipc/uts isolated; single/2/4-conc/nvidia-smi pass. REMAINING in 0.4: pid ns (needs fork-for-PID1 + host-pid reporting).
+- [ ] **0.2b (superseded label) no_new_privs + dumpable=0 + drop all caps** (stub, after opening
   device handles). Test.
 - [ ] **0.3 user namespace** (QEMU child: unshare(CLONE_NEWUSER), write
   uid_map/gid_map mapping 0→vmm_uid, deny setgroups). Test rootless spawn.

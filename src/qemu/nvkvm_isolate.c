@@ -24,6 +24,79 @@
 #include <stdio.h>
 #include <poll.h>
 #include <signal.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <linux/capability.h>
+
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT            47
+#define PR_CAP_AMBIENT_CLEAR_ALL  4
+#endif
+
+/*
+ * Isolate lockdown (audit C6/hardening, HARDENING_PLAN.md Phase 0).
+ *
+ * Run in the just-forked child, before exec, while still privileged enough to
+ * create namespaces.  Turns the stub into a rootless, namespaced, capability-
+ * less sandbox so a stub RCE cannot reach the host.  Sequence (this commit,
+ * step A1 — no pid/mount ns yet):
+ *   1. CLONE_NEWUSER + map ns-root 0 -> our euid/egid (rootless; we get full
+ *      caps INSIDE the userns, none on the host).
+ *   2. CLONE_NEWNET|NEWIPC|NEWUTS (kills network/SysV-IPC/hostname reach).
+ *   3. PR_SET_NO_NEW_PRIVS + PR_SET_DUMPABLE=0.
+ *   4. Drop every capability: bounding set, effective/permitted/inheritable,
+ *      and ambient.  After this the stub is fully unprivileged.
+ * Returns 0 on success, -1 on any failure (caller fail-closes unless the
+ * NVKVM_ISOLATE_NO_HARDEN escape hatch is set).
+ */
+static int nvkvm_harden_write_proc(const char *path, const char *val)
+{
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	size_t len = strlen(val);
+	ssize_t n = write(fd, val, len);
+	close(fd);
+	return (n == (ssize_t)len) ? 0 : -1;
+}
+
+static int nvkvm_isolate_harden_child(void)
+{
+	char map[64];
+	unsigned uid = (unsigned)geteuid();
+	unsigned gid = (unsigned)getegid();
+
+	if (unshare(CLONE_NEWUSER) < 0)
+		return -1;
+	/* setgroups must be denied before writing gid_map (kernel rule). */
+	if (nvkvm_harden_write_proc("/proc/self/setgroups", "deny") < 0)
+		return -1;
+	snprintf(map, sizeof(map), "0 %u 1\n", uid);
+	if (nvkvm_harden_write_proc("/proc/self/uid_map", map) < 0)
+		return -1;
+	snprintf(map, sizeof(map), "0 %u 1\n", gid);
+	if (nvkvm_harden_write_proc("/proc/self/gid_map", map) < 0)
+		return -1;
+
+	if (unshare(CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) < 0)
+		return -1;
+
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+		return -1;
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+
+	/* Drop the capability bounding set (so caps can't be regained on exec). */
+	for (int c = 0; c <= 63; c++)
+		prctl(PR_CAPBSET_DROP, c, 0, 0, 0);  /* EINVAL past last cap: ok */
+	/* Zero effective/permitted/inheritable. */
+	struct __user_cap_header_struct hdr = {
+		.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
+	struct __user_cap_data_struct data[2] = { {0,0,0}, {0,0,0} };
+	syscall(SYS_capset, &hdr, data);
+	/* Clear ambient set. */
+	prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+	return 0;
+}
 
 /* memfd_create may not be in older glibc headers; use syscall directly. */
 #ifndef MFD_CLOEXEC
@@ -464,6 +537,11 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			/* Close every other inherited fd — KVM vm fd, memory-
 			 * backend fds, other isolates' socketpairs, etc.  M6. */
 			nvkvm_isolate_closefrom(4);
+			/* Phase 0 lockdown: namespaces + caps drop.  Fail closed
+			 * unless explicitly disabled — never run un-sandboxed. */
+			if (!getenv("NVKVM_ISOLATE_NO_HARDEN") &&
+			    nvkvm_isolate_harden_child() < 0)
+				_exit(126);
 			const char *argv[] = { "nvkvm_stub", NULL };
 			const char *envp[] = { NULL };  /* M6: drop QEMU env */
 			fexecve(mfd, (char *const *)argv, (char *const *)envp);
@@ -485,6 +563,9 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		if (pid == 0) {
 			dup2(sv[1], STDIN_FILENO);
 			nvkvm_isolate_closefrom(STDERR_FILENO + 1);
+			if (!getenv("NVKVM_ISOLATE_NO_HARDEN") &&
+			    nvkvm_isolate_harden_child() < 0)
+				_exit(126);  /* fail closed */
 			if (!keep_env)
 				clearenv();
 			execl(stub_path, "nvkvm_stub", NULL);
