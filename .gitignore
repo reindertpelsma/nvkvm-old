@@ -38,3 +38,5 @@ gvisor/
 *.iso
 *.img
 tools/diag/nvioctl_trace
+src/stub/nvkvm_stub
+src/stub/nvkvm_stub_bin.h

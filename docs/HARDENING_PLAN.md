@@ -174,6 +174,22 @@ Move every movable QEMU-direct cmd into the stub. Genuine exceptions (UVM binds
 to mm; mmap/KVM-region installs) keep explicit schemas.
 
 ## Phase 4 — Access-model simulation  [~] IN PROGRESS
+
+### STATUS 2026-05-29 (pushed 6788fe2):
+- DONE: per-VM hClient allowlist + DUP_OBJECT gate (h_client_src must be VM-local);
+  matmul green, gate inert for matmul (no guest dup).
+- DONE: nvos55 ABI corrected to real 28-byte/7-field layout (575 SDK ground truth);
+  gate reads h_client_src@12; stub status@24; abi_parity green.
+- FINDING: handles are globally sequential/guessable (PoC: attacker client landed 12
+  after victim). TYPE_ALL is the real exposure.
+- BLOCKED: grant narrowing. TYPE_PID(QEMU pid) tried + reverted — broke cuCtxCreate
+  (=800), proving the dup consumer is the UVM KERNEL-internal client, not QEMU's task.
+  Correct fix = TYPE_CLIENT(uvm_kernel_client_handle), which must be DISCOVERED
+  (kernel-internal; ~0xc1d00001 but drifts) via an open-driver printk in the dup
+  access path (/root/open-gpu-kernel-modules on host). Grant stays TYPE_ALL w/ TODO.
+- PoC (tests/security/poc_cross_proc_dup.c) stops at NV_ERR_INVALID_OBJECT_PARENT;
+  turnkey exploit needs the attacker to alloc a device/subdevice parent first.
+
 KEY INSIGHT (see memory [[hclient_not_fd_scoped]]): nvidia hClient/handle ids are
 a GLOBAL access-gated namespace, NOT fd- or namespace-scoped. The real driver's
 default RS_SHARE_TYPE_PID policy contains objects to the owning PID (global pid),
