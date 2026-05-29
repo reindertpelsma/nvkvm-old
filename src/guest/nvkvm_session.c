@@ -32,12 +32,23 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 
 	mutex_lock(&nvkvm.sessions_lock);
 
-	/* Look up by mm — strong identity, never reused while alive.
-	 * tgid match alone is unsafe because Linux recycles tgids and a
-	 * stale-refcount session would leak across processes that share a
-	 * tgid value across time (audit H2). */
+	/*
+	 * The security PRINCIPAL is the address space (mm), not the tgid.  This is
+	 * deliberate and matches the only sane boundary: nvidia keys access on the
+	 * tgid (RS_SHARE_TYPE_PID = current->tgid) and a thread group always has
+	 * exactly one mm, so for every normal process mm and tgid are 1:1.  The
+	 * only way they diverge is CLONE_VM without CLONE_THREAD (two tgids sharing
+	 * one address space — vfork's transient window, or hand-rolled clone).
+	 * Those tasks can already read/write each other's memory directly, so they
+	 * are ONE security domain; folding them into a single mm-keyed session is
+	 * correct, not a weakening.  We do NOT support sub-dividing a session by
+	 * tgid.  (mm is also the robust key: tgids get recycled — audit H2.)
+	 */
 	idr_for_each_entry(&nvkvm.sessions_idr, session, id) {
 		if (session->mm == mm) {
+			if (session->tgid != tgid)
+				pr_warn_once("nvkvm: tgid %d shares mm with session tgid %d (CLONE_VM w/o CLONE_THREAD); treating as one principal\n",
+					     tgid, session->tgid);
 			session->refcount++;
 			mutex_unlock(&nvkvm.sessions_lock);
 			return session;
