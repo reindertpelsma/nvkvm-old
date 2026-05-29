@@ -18,7 +18,16 @@ nvidia ioctls. We must contain the stub so a stub RCE cannot escape to the host.
 
 ---
 
-## Phase 0 — Isolate lockdown (FOUNDATION, do first)
+## Phase 0 — Isolate lockdown (FOUNDATION) — ✅ COMPLETE (0.0–0.5; 0.6 optional polish)
+>
+> DONE + verified on vast.ai + pushed (commits 1391b23, 759e35c, c92aad6): the stub
+> runs rootless (userns 0->euid), in ALL SIX namespaces (user/pid/net/ipc/uts/mnt),
+> PID 1 in its pid ns, with an EMPTY read-only tmpfs root (no host FS), zero
+> capabilities (bounding+eff+amb), NoNewPrivs=1, seccomp filter mode, fail-closed
+> (NVKVM_ISOLATE_NO_HARDEN to disable). single+2/4-concurrent matmul + nvidia-smi all
+> pass. 0.6 (two-phase seccomp tighten + built-in self-test) is OPTIONAL polish —
+> low marginal value since all privileged setup is in QEMU's child before the stub
+> starts. NEXT: Phase 1 (inventory).
 
 Target: a stub that is namespaced, capability-less, seccomp-filtered, and
 chrooted into an empty read-only tmpfs — far stronger than today (seccomp was
