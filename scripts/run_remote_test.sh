@@ -44,13 +44,14 @@ case "$cmd" in
         $HOST_SSH '
             cp /workspace/nvkvm/src/qemu/*.c /workspace/nvkvm/src/qemu/*.h /opt/qemu-src/hw/misc/ 2>/dev/null
             cd /opt/qemu-src/build && ninja qemu-system-x86_64 2>&1 | tail -3
-            cd /workspace/nvkvm/src/stub && gcc -O2 -g -std=c11 -fPIE -Wall -Wextra \
-                -Wno-unused-parameter -pie -Wl,-z,relro,-z,now \
-                -o /tmp/nvkvm_stub_new nvkvm_stub.c -lpthread 2>&1 | tail -3
+            # Canonical stub is freestanding (no libc); build via its Makefile so
+            # stub_clone3.S links (resolves fs_clone3_run).  Plain "gcc nvkvm_stub.c"
+            # fails to link since the C7 freestanding migration.
+            make -C /workspace/nvkvm/src/stub nvkvm_stub 2>&1 | tail -3
             kill -9 $(pgrep qemu-system) $(pgrep nvkvm_stub) 2>/dev/null
             sleep 2
             cp /opt/qemu-src/build/qemu-system-x86_64 /opt/qemu-nvkvm/bin/qemu-system-x86_64
-            cp /tmp/nvkvm_stub_new /usr/lib/nvkvm/nvkvm_stub
+            [ -x /workspace/nvkvm/src/stub/nvkvm_stub ] && cp /workspace/nvkvm/src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
             rm -f /tmp/qemu.log
             nohup bash /workspace/nvkvm/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!
         '
