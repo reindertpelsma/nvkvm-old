@@ -681,6 +681,55 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		}
 	}
 
+	/*
+	 * Audit H-3: make the per-VM hClient allowlist authoritative for EVERY
+	 * forwarded RM 'F' ioctl that carries an hClient at param offset 0
+	 * (ALLOC/ALLOC_MEMORY/CONTROL/FREE/DUP/SHARE/MAP[_DMA]/UNMAP[_DMA]/
+	 * VID_HEAP_CONTROL), not just DUP_OBJECT's source.  A guest must not be
+	 * able to make the privileged stub name another VM's RM client.  Every
+	 * client this VM creates is recorded at its root-client alloc (above), so
+	 * a legitimate reference is always in the set; the only exemption is that
+	 * client-creating alloc itself (param[0]=h_root=0, new client in hObjNew).
+	 * Layered defense-in-depth on top of eliminating host-wide TYPE_ALL (H-2).
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F' && param_buf && req->param_size >= 4 &&
+	    nv->client_allow_n > 0) {
+		unsigned nr = _IOC_NR(req->cmd);
+		int hclient_at_0 =
+			nr == NV_ESC_RM_ALLOC || nr == NV_ESC_RM_ALLOC_MEMORY ||
+			nr == NV_ESC_RM_CONTROL || nr == NV_ESC_RM_FREE ||
+			nr == NV_ESC_RM_DUP_OBJECT || nr == 0x35 /* SHARE */ ||
+			nr == 0x4e /* MAP_MEMORY */ || nr == 0x4f /* UNMAP_MEMORY */ ||
+			nr == 0x57 /* MAP_MEMORY_DMA */ ||
+			nr == 0x58 /* UNMAP_MEMORY_DMA */ ||
+			nr == 0x4a /* VID_HEAP_CONTROL */;
+		if (hclient_at_0) {
+			uint32_t hc = 0;
+			memcpy(&hc, (char *)param_buf, 4);
+			int is_root_alloc = 0;
+			if (nr == NV_ESC_RM_ALLOC && req->param_size >= 16) {
+				uint32_t hObjNew = 0, hClass = 0;
+				memcpy(&hObjNew, (char *)param_buf + 8, 4);
+				memcpy(&hClass,  (char *)param_buf + 12, 4);
+				is_root_alloc = (hObjNew == hc &&
+						 (hClass == 0 || hClass == 0x41)) ||
+						(hc == 0 &&
+						 (hClass == 0 || hClass == 0x41));
+			}
+			if (!is_root_alloc && hc != 0 && hc != (uint32_t)-1 &&
+			    !nvkvm_client_allow_has(nv, hc)) {
+				fprintf(stderr,
+					"nvkvm: DENY ioctl NR=0x%x foreign hClient=0x%x "
+					"(not a client of this VM)\n", nr, hc);
+				resp->retval     = (uint64_t)(int64_t)(-EACCES);
+				resp->status     = 0;
+				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
+				resp->fault_addr = 0;
+				return 0;
+			}
+		}
+	}
+
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
@@ -716,7 +765,21 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		    nr == NV_ESC_RM_DUP_OBJECT || nr == 0x35 /* RM_SHARE */) {
 			uint32_t hc = 0;
 			memcpy(&hc, (char *)param_buf, 4);
-			nvkvm_client_allow_add(nv, hc);
+			nvkvm_client_allow_add(nv, hc);   /* owning client (param[0]) */
+			/* A root-client alloc (NV01_ROOT class 0, or 0x41
+			 * NV01_ROOT_CLIENT) creates a NEW client whose
+			 * kernel-assigned handle is written back to hObjNew
+			 * (param[8]); h_root (param[0]) is 0 for that alloc.
+			 * Record the new client now so the H-3 gate accepts the
+			 * client's very first subsequent ioctl (which references
+			 * it at param[0]). */
+			if (nr == NV_ESC_RM_ALLOC && req->param_size >= 16) {
+				uint32_t hObjNew = 0, hClass = 0;
+				memcpy(&hObjNew, (char *)param_buf + 8, 4);
+				memcpy(&hClass,  (char *)param_buf + 12, 4);
+				if (hClass == 0 || hClass == 0x41)
+					nvkvm_client_allow_add(nv, hObjNew);
+			}
 		}
 	}
 
