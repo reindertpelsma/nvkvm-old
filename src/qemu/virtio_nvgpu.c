@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio.h"
 #include "hw/qdev-properties.h"
+#include "hw/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
@@ -980,6 +981,22 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	 * regions that don't yet have backing.  Lazy via MAP_NORESERVE +
 	 * a single big KVM region. */
 	nv->sparse_kvm_slot = -1;
+	/*
+	 * #55 interim safety: the GPA windows (shm @1TB, mmap @1.5TB, sparse
+	 * @2TB) squat on fixed GPAs above guest RAM.  That holds for any normal
+	 * config, but a guest configured with >=1 TB RAM would overlap the shm
+	 * window and silently corrupt — fail loudly instead.  The real fix is to
+	 * expose the window as a 64-bit PCI BAR so guest firmware assigns/reserves
+	 * the range (docs/design/gpa_window_pci_bar.md).
+	 */
+	if (current_machine && current_machine->ram_size >= NVKVM_SHM_GPA_BASE) {
+		error_setg(errp,
+			"nvkvm: guest RAM (0x%" PRIx64 ") overlaps the fixed GPA "
+			"windows at 0x%llx; reduce RAM or migrate to the PCI-BAR "
+			"window (#55)", (uint64_t)current_machine->ram_size,
+			(unsigned long long)NVKVM_SHM_GPA_BASE);
+		return;
+	}
 	if (nvkvm_sparse_init(nv) < 0)
 		fprintf(stderr, "nvkvm: sparse window unavailable; "
 			"memory-ioctl path will degrade\n");
