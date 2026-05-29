@@ -955,6 +955,12 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	nvkvm_handle_table_init(&nv->handles);
 	nvkvm_isolate_table_init(&nv->isolates);
 
+	/* #66 admin subdevice (lazy; for GET_PID_INFO per-process VRAM) */
+	pthread_mutex_init(&nv->admin_lock, NULL);
+	nv->admin_ctl_fd = -1;
+	nv->admin_gpu_fd = -1;
+	nv->admin_state  = 0;
+
 	/* Register shared memory as a KVM memory region at NVKVM_SHM_GPA_BASE.
 	 * The guest reads shm_base/shm_len from the virtio config space and maps
 	 * this region to access ioctl parameter slots with zero virtio copies. */
@@ -1005,6 +1011,12 @@ static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 	/* Tear down isolates and handles before shared memory */
 	nvkvm_isolate_table_fini(&nv->isolates);
 	nvkvm_handle_table_fini(&nv->handles);
+
+	/* #66 admin subdevice: closing the fds frees its RM objects. */
+	if (nv->admin_ctl_fd >= 0) close(nv->admin_ctl_fd);
+	if (nv->admin_gpu_fd >= 0) close(nv->admin_gpu_fd);
+	nv->admin_ctl_fd = nv->admin_gpu_fd = -1;
+	nv->admin_state = -1;
 
 	if (nv->shm_mr_registered) {
 		memory_region_del_subregion(get_system_memory(), &nv->shm_mr);

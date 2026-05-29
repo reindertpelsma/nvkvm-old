@@ -560,119 +560,146 @@ static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
  * 575 open-driver SDK headers. */
 #define NVKVM_PIDINFO_STRIDE 72u
 
-/*
- * Read the innermost-namespace tid for a host tid from /proc/<tid>/status.
+/* ── #66: per-process VRAM via QEMU's own init-ns admin subdevice ─────────────
  *
- * nvidia attributes per-process GPU memory to the creating thread's pid as seen
- * in the *caller's* pid namespace, and our stub runs in its own PID namespace
- * (CLONE_NEWPID).  The "NSpid:" line lists the tid at each namespace level from
- * the reader's ns (host root, first field) down to the innermost (the stub's
- * ns, last field).  We must query GET_PID_INFO with that innermost value,
- * because the stub worker thread that executes the forwarded query resolves
- * pid_vnr() in the stub's ns.  Returns the innermost ns tid, or 0 on failure.
+ * The stub services GET_PID_INFO from inside CLONE_NEWPID/NEWUSER, where the
+ * driver attributes 0 bytes (caller-context). QEMU runs in the host init ns,
+ * where GET_PID_INFO returns the real per-process VRAM (proven: host nvidia-smi
+ * uses exactly this). So we keep a small admin RM client+device+subdevice in
+ * QEMU's process and answer GET_PID_INFO from there, querying the validated
+ * isolate's own host tids (never an arbitrary guest-named pid).
  */
-static uint32_t nvkvm_proc_innermost_nspid(pid_t host_tid)
+#define NVADM_IOWR(nr, sz) \
+	((unsigned long)(0xc0000000UL | ((unsigned long)(sz) << 16) | \
+			 (0x46UL << 8) | (unsigned long)(nr)))
+#define NV2080_CTRL_CMD_GPU_GET_PID_INFO 0x2080018eU
+
+static int admin_rm_alloc(int fd, uint32_t h_root, uint32_t h_parent,
+			  uint32_t h_new, uint32_t h_class, void *parms,
+			  uint32_t *out)
 {
-	char path[64];
-	snprintf(path, sizeof(path), "/proc/%d/status", (int)host_tid);
-	FILE *f = fopen(path, "r");
-	if (!f)
-		return 0;
-	char line[256];
-	uint32_t ns_tid = 0;
-	while (fgets(line, sizeof(line), f)) {
-		if (strncmp(line, "NSpid:", 6) != 0)
-			continue;
-		/* Take the LAST whitespace-separated integer on the line. */
-		char *p = line + 6;
-		char *tok = strtok(p, " \t\n");
-		while (tok) {
-			ns_tid = (uint32_t)strtoul(tok, NULL, 10);
-			tok = strtok(NULL, " \t\n");
-		}
-		break;
-	}
-	fclose(f);
-	return ns_tid;
+	struct nvos21_parameters a = {
+		.h_root = h_root, .h_object_parent = h_parent,
+		.h_object_new = h_new, .h_class = h_class,
+		.p_alloc_parms = (nvp64_t)(uintptr_t)parms,
+	};
+	if (ioctl(fd, NVADM_IOWR(NV_ESC_RM_ALLOC, sizeof a), &a) < 0)
+		return -errno;
+	if (a.status != 0)
+		return -1;
+	*out = a.h_object_new;
+	return 0;
+}
+
+/* Lazily build QEMU's admin client→device→subdevice on GPU0.  admin_lock held. */
+static int nvkvm_admin_ensure(VirtIONvgpu *nv)
+{
+	if (nv->admin_state != 0)
+		return nv->admin_state == 1 ? 0 : -1;
+
+	int ctl = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+	int gpu = open("/dev/nvidia0",  O_RDWR | O_CLOEXEC);
+	uint32_t client = 0, dev = 0, sub = 0;
+	struct nv0080_alloc_parameters dp = { .device_id = 0 };
+	struct nv2080_alloc_parameters sp = { .sub_device_id = 0 };
+
+	if (ctl < 0 || gpu < 0)
+		goto fail;
+	if (admin_rm_alloc(ctl, 0, 0, 0xad000001u, NV01_ROOT, NULL, &client))
+		goto fail;
+	if (admin_rm_alloc(ctl, client, client, 0xad000d00u,
+			   NV01_DEVICE_0, &dp, &dev))
+		goto fail;
+	if (admin_rm_alloc(ctl, client, dev, 0xad002080u,
+			   NV20_SUBDEVICE_0, &sp, &sub))
+		goto fail;
+
+	nv->admin_ctl_fd = ctl;
+	nv->admin_gpu_fd = gpu;
+	nv->admin_hclient = client;
+	nv->admin_hsubdev = sub;
+	nv->admin_state = 1;
+	return 0;
+fail:
+	if (ctl >= 0) close(ctl);
+	if (gpu >= 0) close(gpu);
+	nv->admin_state = -1;
+	return -1;
 }
 
 /*
- * GET_PID_INFO (#66) helper — sum a per-pid GPU metric across all worker
- * threads of an isolate's stub process.
- *
- * nvidia attributes per-process GPU memory to the *kernel tid* (in the caller's
- * pid ns) that created the owning RM client.  Our stub services an isolate's
- * ioctls from a shared worker pool inside its own PID namespace, so a single
- * isolate's clients are spread across several stub-ns worker tids.  We enumerate
- * /proc/<tgid>/task, map each host tid to its stub-ns tid (NSpid innermost), and
- * run a 1-entry GET_PID_INFO against each, summing the metric.  `tmpl_aux` is
- * the original full-size aux buffer; we copy it (so param_size/aux_size stay
- * ABI-exact) and only rewrite count=1 and entry0.pid/index.  Returns the summed
- * metric; *any_out is set if at least one thread reported it (result==NV_OK).
- *
- * Security: tgid is the validated isolate's own process (from
- * nvkvm_isolate_host_pid); we only ever query tids under that tgid, never an
- * arbitrary host pid the guest could name.
+ * Sum a per-pid VRAM metric (memPrivate + memSharedOwned) for the host process
+ * group `tgid`, queried from QEMU's init-ns admin subdevice.  `index` selects
+ * the metric (VIDEO_MEMORY_USAGE).  *any_out set if >=1 tid returned NV_OK.
+ * Security: tgid is the validated isolate's own process; we only query tids
+ * under it, never an arbitrary guest-named pid.
  */
-static uint64_t nvkvm_get_pid_info_sum(struct nvkvm_isolate_table *t,
-				       uint32_t isolate_id, uint32_t handle_id,
-				       unsigned int cmd,
-				       void *param_buf, size_t param_size,
-				       void *tmpl_aux, size_t aux_size,
-				       pid_t tgid, uint32_t index, int *any_out)
+static uint64_t nvkvm_admin_get_pid_mem(VirtIONvgpu *nv, pid_t tgid,
+					uint32_t index, int *any_out)
 {
-	uint64_t sum = 0;
-	int any = 0;
-	char path[64];
-
 	if (any_out)
 		*any_out = 0;
-	if (aux_size < 8 + NVKVM_PIDINFO_STRIDE)
+
+	pthread_mutex_lock(&nv->admin_lock);
+	if (nvkvm_admin_ensure(nv) != 0) {
+		pthread_mutex_unlock(&nv->admin_lock);
 		return 0;
+	}
+	int ctl = nv->admin_ctl_fd;
+	uint32_t hcli = nv->admin_hclient, hsub = nv->admin_hsubdev;
+
+	char path[64];
 	snprintf(path, sizeof(path), "/proc/%d/task", (int)tgid);
 	DIR *d = opendir(path);
-	if (!d)
+	if (!d) {
+		pthread_mutex_unlock(&nv->admin_lock);
 		return 0;
+	}
 
-	void *aux = g_malloc(aux_size);
+	uint64_t sum = 0;
+	int any = 0;
 	struct dirent *de;
 	while ((de = readdir(d)) != NULL) {
 		if (de->d_name[0] < '0' || de->d_name[0] > '9')
 			continue;
-		long host_tid = strtol(de->d_name, NULL, 10);
-		if (host_tid <= 0)
-			continue;
-		uint32_t ns_tid = nvkvm_proc_innermost_nspid((pid_t)host_tid);
-		if (ns_tid == 0)
+		long tid = strtol(de->d_name, NULL, 10);
+		if (tid <= 0)
 			continue;
 
-		memcpy(aux, tmpl_aux, aux_size);
-		uint32_t one = 1;
-		memcpy(aux, &one, 4);                    /* pidInfoListCount = 1 */
-		memcpy((char *)aux + 8 + 0, &ns_tid, 4); /* entry0.pid (stub ns) */
-		memcpy((char *)aux + 8 + 4, &index, 4);  /* entry0.index        */
+		/* The driver's NV2080_CTRL_GPU_GET_PID_INFO_PARAMS is a FIXED-size
+		 * struct: pidInfoListCount@0, then pidInfoList[200]@8 inline
+		 * (200 * 72 = 14400 → 14408 total).  A short buffer fails the
+		 * kernel's paramsSize check (status != 0).  Send the full size with
+		 * count=1 and only entry[0] populated. */
+		uint8_t p[8 + 200 * NVKVM_PIDINFO_STRIDE];
+		memset(p, 0, sizeof(p));
+		uint32_t one = 1, t32 = (uint32_t)tid;
+		memcpy(p + 0, &one, 4);
+		memcpy(p + 8 + 0, &t32, 4);     /* entry.pid (init-ns host tid) */
+		memcpy(p + 8 + 4, &index, 4);   /* entry.index                 */
 
-		uint32_t ns = 0;
-		uint64_t fa = 0;
-		int r = nvkvm_isolate_ioctl(t, isolate_id, handle_id, cmd,
-					    param_buf, param_size,
-					    aux, aux_size, 0, &ns, &fa);
-		if (r != 0 || ns != 0)
+		struct nvos54_parameters c = {
+			.h_client = hcli, .h_object = hsub,
+			.cmd = NV2080_CTRL_CMD_GPU_GET_PID_INFO,
+			.params = (nvp64_t)(uintptr_t)p,
+			.params_size = (uint32_t)sizeof(p),
+		};
+		int r = ioctl(ctl, NVADM_IOWR(NV_ESC_RM_CONTROL, sizeof c), &c);
+		if (r < 0 || c.status != 0)
 			continue;
+
 		uint32_t result = 0;
 		uint64_t priv = 0, shOwned = 0;
-		memcpy(&result,  (char *)aux + 8 + 8,  4);
-		memcpy(&priv,    (char *)aux + 8 + 16, 8);  /* memPrivate     */
-		memcpy(&shOwned, (char *)aux + 8 + 24, 8);  /* memSharedOwned */
-		if (result == 0) {                          /* NV_OK */
-			/* Count owned memory only; shared-duped would double-count
-			 * across the clients that duped the same descriptor. */
+		memcpy(&result,  p + 8 + 8,  4);
+		memcpy(&priv,    p + 8 + 16, 8);
+		memcpy(&shOwned, p + 8 + 24, 8);
+		if (result == 0) {              /* NV_OK */
 			sum += priv + shOwned;
 			any = 1;
 		}
 	}
-	g_free(aux);
 	closedir(d);
+	pthread_mutex_unlock(&nv->admin_lock);
 	if (any_out)
 		*any_out = any;
 	return sum;
@@ -1057,10 +1084,9 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			uint32_t index = 0;
 			memcpy(&index, (char *)aux_buf + off + 4, 4);
 			int any = 0;
-			uint64_t sum = nvkvm_get_pid_info_sum(
-				&nv->isolates, req->isolate_id, req->handle_id,
-				req->cmd, param_buf, req->param_size,
-				aux_buf, req->aux_size, tgid, index, &any);
+			/* #66: query from QEMU's init-ns admin subdevice — the
+			 * stub's pid-ns caller-context attributes 0 bytes. */
+			uint64_t sum = nvkvm_admin_get_pid_mem(nv, tgid, index, &any);
 			uint32_t result = any ? 0u : 0xffffu; /* NV_OK / NOT_FOUND */
 			memcpy((char *)aux_buf + off + 8, &result, 4);
 			memcpy((char *)aux_buf + off + 16, &sum, 8);

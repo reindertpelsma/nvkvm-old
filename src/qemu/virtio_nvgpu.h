@@ -248,6 +248,20 @@ typedef struct VirtIONvgpu {
 
 	/* Host NVIDIA driver version (read at init) */
 	char                driver_version[64];
+
+	/*
+	 * #66 — QEMU's own init-ns admin RM subdevice, used only to answer
+	 * GET_PID_INFO (per-process VRAM for nvidia-smi).  The stub queries from
+	 * inside CLONE_NEWPID/NEWUSER, where the driver attributes 0 bytes; QEMU
+	 * is in the host init ns, where GET_PID_INFO returns the real value.
+	 * Lazily allocated on first use; freed when the device's fd closes.
+	 */
+	pthread_mutex_t     admin_lock;
+	int                 admin_ctl_fd;   /* /dev/nvidiactl (QEMU's process) */
+	int                 admin_gpu_fd;   /* /dev/nvidia0                    */
+	uint32_t            admin_hclient;
+	uint32_t            admin_hsubdev;
+	int                 admin_state;    /* 0 untried, 1 ready, -1 failed   */
 } VirtIONvgpu;
 
 #define TYPE_VIRTIO_NVGPU  "virtio-nvgpu-device"
