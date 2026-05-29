@@ -512,7 +512,7 @@ static void *isolate_reader_fn(void *arg)
 		}
 
 		default:
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm_isolate: unknown response type 0x%x\n",
 				u.type);
 			break;
@@ -771,7 +771,7 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	*isolate_id_out = id;
 
-	fprintf(stderr,
+	NVKVM_DBG(
 		"nvkvm_isolate: created isolate %u pid=%d sock=%d\n",
 		id, stub_pid, sv[0]);
 	return 0;
@@ -852,7 +852,7 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	iso->in_use = false;
 	pthread_mutex_unlock(&iso->lock);
 
-	fprintf(stderr, "nvkvm_isolate: killed isolate %u\n", isolate_id);
+	NVKVM_DBG( "nvkvm_isolate: killed isolate %u\n", isolate_id);
 	return 0;
 }
 

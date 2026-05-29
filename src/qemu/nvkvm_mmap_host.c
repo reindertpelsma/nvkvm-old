@@ -110,7 +110,7 @@ static uint64_t alloc_gpa(VirtIONvgpu *nv, size_t length)
 	nv->mmap_win_cur += length;
 	/* every 64 MB consumed, print where we are */
 	if ((nv->mmap_win_cur & ((64UL << 20) - 1)) < length)
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: mmap_win used=%llu MB / %llu MB\n",
 			(unsigned long long)(nv->mmap_win_cur >> 20),
 			(unsigned long long)(nv->mmap_win_size >> 20));
@@ -148,7 +148,7 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 			MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
 			-1, 0);
 	if (va == MAP_FAILED) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm_sparse_init: mmap %llu GiB failed: %s\n",
 			(unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
 			strerror(errno));
@@ -169,7 +169,7 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 	nv->sparse_vmm_va   = va;
 	nv->sparse_cur      = 0;
 	nv->sparse_kvm_slot = slot;
-	fprintf(stderr,
+	NVKVM_DBG(
 		"nvkvm_sparse_init: %llu GiB at GPA=0x%llx VMM=%p slot=%d\n",
 		(unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
 		(unsigned long long)NVKVM_SPARSE_GPA_BASE, va, slot);
@@ -198,7 +198,7 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 	}
 	nv->sparse_cur = off + size;
 	if ((nv->sparse_cur & ((256UL << 20) - 1)) < size)
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: sparse_win used=%llu MB / %llu MB\n",
 			(unsigned long long)(nv->sparse_cur >> 20),
 			(unsigned long long)(nv->sparse_size >> 20));
@@ -300,7 +300,7 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 		int in_use, peak;
 		uint64_t allocs, frees;
 		nvkvm_kvm_slot_stats(&in_use, &peak, &allocs, &frees);
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: KVM slot pool EXHAUSTED — in_use=%d peak=%d "
 			"lifetime alloc/free=%llu/%llu (cap=%d)\n",
 			in_use, peak,
@@ -318,7 +318,7 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 		.userspace_addr  = (uint64_t)(uintptr_t)hva,
 	};
 	if (kvm_vm_fd < 0) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: kvm_vm_fd not set; GPU mmap will not be "
 			"directly accessible in guest\n");
 		nvkvm_kvm_slot_release(slot);
@@ -326,7 +326,7 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 		return 0;  /* non-fatal for initial bring-up */
 	}
 	if (ioctl(kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: KVM_SET_USER_MEMORY_REGION slot=%d failed: %s\n",
 			slot, strerror(errno));
 		nvkvm_kvm_slot_release(slot);
@@ -339,7 +339,7 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 	int in_use_now = kvm_slot_in_use;
 	pthread_mutex_unlock(&kvm_slot_lock);
 	if (in_use_now % 100 == 0)
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: kvm slot watermark in_use=%d peak=%d cap=%d\n",
 			in_use_now, kvm_slot_in_use_peak,
 			NVKVM_KVM_SLOT_COUNT);
@@ -374,7 +374,7 @@ int nvkvm_mmap_create(VirtIONvgpu *nv, struct nvkvm_host_fd *hfd,
 
 	hva = mmap(NULL, length, prot, flags, hfd->fd, (off_t)offset);
 	if (hva == MAP_FAILED) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: host mmap fd=%d offset=0x%llx len=%zu: %s\n",
 			hfd->fd, (unsigned long long)offset, length,
 			strerror(errno));

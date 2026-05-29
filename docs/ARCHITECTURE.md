@@ -1,228 +1,180 @@
 # nvkvm Architecture
 
-This document describes the current architecture of nvkvm — a project that
-forwards CUDA workloads from a KVM guest VM out to the host's real NVIDIA
-GPU, without disabling the host's GPU usage. It records the *current*
-shape of the system, the constraints that drove it, the things we know
-are wrong and need to change, and the things we know are right but
-haven't built yet.
+nvkvm forwards CUDA workloads from an **untrusted KVM guest VM** out to the
+host's real NVIDIA GPU, WSL2-style, without disabling the host's own GPU use
+and without a vendor SR-IOV/vGPU licence — the moat is *multi-tenant isolation
+on commodity KVM*. This document records the *current* runtime shape of the
+system. For the trust model and the default-deny security surface, read
+[`SECURITY_MODEL.md`](SECURITY_MODEL.md) — this file is the data-flow/component
+companion to it.
 
-If you are reading this to onboard, start here, then read
-`docs/CUINIT_BLOCKER.md` for the deepest known issue.
+## Status (2026-05-30)
 
-## Goal
-
-Run unmodified CUDA workloads (ultimately, ChatGPT-scale model inference)
-inside a KVM guest VM, while the host process tree continues to use the
-GPU for display + other apps. The host's nvidia driver remains loaded
-and unmodified.
+The goal is met: unmodified CUDA runs in the guest on the host GPU.
+Empirically green through the forwarder:
+- `cuInit` → `cuCtxCreate` → `cuMemAlloc`/HtoD/DtoH → `cuLaunchKernel`;
+  `tests/integration/test_ioctl_fwd` 48/48; vector_add; 1024² fp32 matmul.
+- **7B LLM inference** (Qwen2.5-7B-Instruct, all layers on GPU) at ~20 tok/s —
+  `tests/integration/run_llm_7b.sh` (the headline milestone).
+- `nvidia-smi` in the guest; the NVIDIA container toolkit (`docker --gpus`).
+- Multiple concurrent CUDA processes in one VM; SIGKILL/exit cleanup; signal-
+  interruptible forwarded ioctls (#73); cross-VM/host isolation proven
+  (`tests/security/poc_cross_proc_dup.c`).
 
 ## Three-tier process model
 
 ```
   ┌─────────────────────────────────────────────────────────────────────┐
-  │ guest VM (Linux + nvkvm-guest.ko + libcuda)                          │
-  │                                                                       │
+  │ guest VM (Linux + nvkvm-guest.ko + libcuda)            UNTRUSTED      │
   │   libcuda → /dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm               │
-  │     │                                                                  │
-  │     │  ioctl/mmap                                                      │
+  │     │ ioctl/mmap                                                       │
   │     ▼                                                                  │
-  │   nvkvm-guest.ko ── virtio-nvgpu ── (TX/RX queues, shm slots) ─┐     │
-  │                                                                  │     │
-  └──────────────────────────────────────────────────────────────────│─────┘
-                                                                     │
-  ┌──────────────────────────────────────────────────────────────────┴─────┐
-  │ host: QEMU process (one per VM)                                          │
-  │                                                                          │
-  │   virtio_nvgpu device                                                    │
-  │     │  dispatch: nvkvm_req_*                                             │
-  │     ▼                                                                    │
-  │   nvkvm_isolate_handlers.c ────────────────┐                            │
-  │                                              │                            │
-  │   KVM_SET_USER_MEMORY_REGION (QEMU's mm     │ SOCK_SEQPACKET             │
-  │   only — kernel enforces kvm->mm equality)  │ + SCM_RIGHTS               │
-  │                                              ▼                            │
-  └──────────────────────────────────────────────│────────────────────────────┘
-                                                 │
-                                                 │  per-isolate
-                                                 │
-  ┌──────────────────────────────────────────────┴────────────────────────────┐
-  │ host: stub process (one per guest mm/isolate)                              │
-  │                                                                            │
-  │   nvkvm_stub (sandboxed)                                                   │
-  │     │  ioctl/mmap on locally-opened nvidia fds                             │
-  │     ▼                                                                      │
-  │   /dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm (real nvidia driver)         │
-  │                                                                            │
-  │   Stub's VA layout deliberately mirrors the guest's userspace VAs so       │
-  │   pointer fields in nvidia ioctl structs (e.g. nvos54.params,              │
-  │   UVM_MAP_EXTERNAL_ALLOCATION.base) dereference correctly inside the       │
-  │   nvidia driver.                                                           │
-  └────────────────────────────────────────────────────────────────────────────┘
+  │   nvkvm-guest.ko ── virtio-nvgpu (TX/RX queues, shm slots) ───┐       │
+  └───────────────────────────────────────────────────────────────│──────┘
+                                                                   │
+  ┌────────────────────────────────────────────────────────────────┴─────┐
+  │ host: QEMU process (one per VM)                        TRUSTED VMM      │
+  │   virtio_nvgpu device → dispatch nvkvm_req_*                            │
+  │   • owns the cross-VM/host policy (default-deny allowlists)             │
+  │   • owns KVM (KVM_SET_USER_MEMORY_REGION — kvm->mm==current->mm)        │
+  │   • owns the global handle table + UVM lifecycle                        │
+  │     │  SOCK_SEQPACKET + SCM_RIGHTS, one socket per isolate              │
+  └──────────────────────────────────────────────────────────────│────────┘
+                                                                  │ per guest mm
+  ┌────────────────────────────────────────────────────────────────┴─────┐
+  │ host: stub / "isolate" process (one per guest mm)     SANDBOXED        │
+  │   nvkvm_stub → ioctl/mmap on locally-opened nvidia fds                  │
+  │   /dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm (real nvidia driver)      │
+  │   VA layout mirrors the guest's userspace VAs so pointer fields in      │
+  │   nvidia ioctl structs dereference correctly inside the driver.         │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 The stub is *the* talker to the nvidia kernel driver. QEMU is the trusted
-boundary that owns KVM and orchestrates the stub. The guest never talks
-to nvidia directly — it talks to a virtio device that looks like nvidia.
+boundary that owns KVM and orchestrates the stub. The guest never talks to
+nvidia directly — it talks to a virtio device that looks like nvidia.
+
+**Principal = the address space (`mm`)**, not the tgid: an isolate is keyed on
+`current->mm`. nvidia keys access on tgid and a thread group has one mm, so
+they are 1:1 for every normal process (see SECURITY_MODEL.md §1).
 
 ## Constraint table (verified)
 
-| Operation | mm enforcement | Where it has to run |
+| Operation | mm enforcement | Where it must run |
 |-----------|----------------|---------------------|
-| `KVM_SET_USER_MEMORY_REGION` | Strict `kvm->mm == current->mm` (verified by `tests/integration/kvm_sparse_test.c`) | QEMU |
-| RM ioctls (`nvidiactl`, `nvidia0`: NV_ESC_*) | None observed | Anywhere |
-| RM mmap on `nvidia0` | None observed (probably) | Anywhere |
-| UVM_INITIALIZE | None (NO_INIT_CHECK macro). va_space.mm is set to current->mm here. | Same process throughout the UVM lifetime |
-| UVM_MM_INITIALIZE | None on calling task; uses va_space.mm | Optional — returns NV_WARN_NOTHING_TO_DO (0x10006) on this driver build, libcuda handles it |
-| Other UVM ioctls (INIT_CHECK) | Just need uvm_fd_va_space(filp) non-null | Same process that ran UVM_INITIALIZE |
-| UVM VA-based ioctls (UVM_CREATE_EXTERNAL_RANGE, UVM_MAP_EXTERNAL_ALLOCATION, UVM_FREE, UVM_MIGRATE…) | base/length is interpreted in current->mm | Same process that mmap'd the VA |
-| UVM mmap | If MM tracking enabled: strict `va_space.mm == current->mm`. On this build: not enforced. | Same process that ran UVM_INITIALIZE (recommended) |
+| `KVM_SET_USER_MEMORY_REGION` | Strict `kvm->mm == current->mm` (`tests/integration/kvm_sparse_test.c`) | QEMU |
+| RM ioctls (`nvidiactl`/`nvidia0` NV_ESC_*) | None observed | stub |
+| RM mmap on `nvidia0` | None observed | stub (VA mirrors guest) |
+| UVM_INITIALIZE | Binds `va_space.mm = current->mm` | one process for the whole UVM lifetime → **QEMU** |
+| UVM VA-based ioctls (MAP_EXTERNAL_ALLOCATION, FREE, MIGRATE, REGISTER_*) | base/length interpreted in `va_space.mm` | same process as INITIALIZE → **QEMU** |
+| UVM mmap | strict when MM tracking on; binds to `va_space.mm` | **QEMU** |
 
-The hard constraints are: KVM regions in QEMU's mm; UVM lifecycle in one
-task. Everything else is flexible.
+Hard constraints: KVM regions in QEMU's mm; the **entire UVM lifecycle in one
+task** (QEMU). RM allocations run in the stub. The split is reconciled by the
+REALIZE_UVM_MAPPING RPC (below) and a handle/fd-translation layer.
 
-## Two key invariants (verified by integration tests)
+## Two KVM invariants (verified)
 
-1. **KVM accepts sparse memory regions**.
-   `tests/integration/kvm_sparse_test.c` allocates 8 GiB `MAP_NORESERVE`,
-   calls `KVM_SET_USER_MEMORY_REGION` on it, and runs a tiny VM that touches
-   one page. The host kernel demand-faults each accessed page; the guest
-   never sees a fault. **Consequence**: UVM-managed memory (lazy pages
-   via HMM/mmu_notifier or just sparse anon) can be installed as a KVM
-   region without pre-faulting.
+1. **KVM accepts sparse memory regions** — `kvm_sparse_test.c` maps 8 GiB
+   `MAP_NORESERVE`, installs it as a region, and the host demand-faults each
+   touched page. So a big sparse GPA window can be installed once and sliced.
+2. **`kvm->mm == current->mm` is enforced with `-EIO`** — a `clone(CLONE_FILES)`
+   child sharing the kvm_fd but with its own mm is rejected. So the stub cannot
+   install KVM regions via a seccomp trap; region installs go through a
+   stub→QEMU RPC.
 
-2. **`kvm->mm == current->mm` is enforced with `-EIO`**.
-   Same test: a `clone(CLONE_FILES)` child sharing the kvm_fd but with
-   its own mm gets EIO from KVM_SET_USER_MEMORY_REGION. **Consequence**:
-   the stub cannot call this syscall via seccomp `USER_NOTIF | CONTINUE`
-   — the syscall runs in the stub's task whose mm differs from QEMU's.
-   KVM region installs must go through a stub→QEMU RPC, not a syscall
-   trap.
+## What QEMU does
 
-## What the stub does today
+- Listens on virtio queues; dispatches `NVKVM_REQ_*` (`virtio_nvgpu.c`).
+- **Default-deny gate** on everything reaching the host driver — UVM schema,
+  RM-control allowlist, frontend NR allowlist, alloc-class allowlist
+  (`nvkvm_ctrl_allowlist.h`, `nvkvm_fe_alloc_allowlist.h`; see SECURITY_MODEL.md
+  §2). Denials log `nvkvm: DENY …` and return NV_ERR_NOT_SUPPORTED/EACCES.
+- **Global handle table** (`nvkvm_handle.c`): handle_id → the host fd QEMU holds
+  (always a copy, via SCM_RIGHTS from the stub-opener). Lifetime = the guest
+  struct-file refcount; closed via the CLOSE_HANDLE path. A *separate* per-
+  isolate refcount tracks which isolates hold a handle; killing an isolate
+  prunes per-isolate refs only and never touches the global table.
+- **UVM lifecycle**: opens `/dev/nvidia-uvm`, runs the whole UVM ioctl sequence
+  and UVM mmap in QEMU's own process/mm (it binds fd→mm at INITIALIZE). The
+  stub does the RM allocations; `REALIZE_UVM_MAPPING` replays the recorded UVM
+  state on a QEMU-side fd and installs the mapping.
+- **GPA memory**: a single large sparse GPA window is pre-installed as one KVM
+  memslot; per-mmap slices are placed with `MAP_FIXED` inside it (no per-mmap
+  memslot). `nvkvm_mmap_host.c` / `nvkvm_sparse_gpa_alloc`.
+- **Embedded-field translation**: every guest pointer/fd/pid/handle in a
+  forwarded ioctl is sanitized or translated before the host driver sees it
+  (info-lists, BUILD_VERSION strings, REGISTER_FD/OS_EVENT/MAP_MEMORY fds,
+  GET_PIDS) — audit `docs/audits/embedded_field_translation.md`.
+- Spawns/kills per-mm isolates; routes `NVKVM_REQ_INTERRUPT` to interrupt an
+  in-flight forwarded ioctl (#73).
 
-- Forks from QEMU at first isolate-create. Inherits no nvidia fds.
-- Pre-opens `/dev/nvidia-uvm` a few times before seccomp (`uvm_local_fds[]`)
-  so the stub's mm owns the UVM file when ioctls run on it.
-- Receives `nvidiactl` / `nvidia0` fds via SCM_RIGHTS from QEMU (legacy —
-  these would ideally also be stub-opened; see "Known wrong" below).
-- Applies a seccomp allow-list filter; everything outside the list returns
-  EPERM. The list is small (read, write, recvmsg, sendmsg, ioctl, mmap,
-  mprotect, munmap, ppoll, close, exit_group, sigaction, sigreturn, futex,
-  clone, set_robust_list, madvise, lseek, pread64, openat for the UVM
-  pre-opens, plus a few others).
-- Workers dequeue ioctl jobs from a queue, look up fd by handle_id,
-  patch embedded fd fields in UVM ioctls (UVM_MM_INITIALIZE.uvm_fd,
-  UVM_REGISTER_GPU_VASPACE.rm_ctrl_fd, etc.) from handle_id to local fd,
-  call `ioctl()`, send the response.
-- Worker threads do mmap on nvidia fds when the stub gets an
-  `ISOLATE_CMD_MMAP` from QEMU. Currently these are at QEMU-chosen GVAs
-  via `MAP_FIXED`.
+## What the stub (isolate) does
 
-## What QEMU does today
+- One per guest mm, spawned by QEMU. **Sandboxed** (SECURITY_MODEL.md §4):
+  freestanding static-PIE (no libc), `pivot_root` into a tmpfs holding only the
+  bound `/dev/nvidia*` nodes, `CLONE_NEWUSER|NEWPID|NEWNET|NEWIPC|NEWUTS|NEWNS`,
+  all caps dropped, `no_new_privs`, and a seccomp allow-list whose `mmap`/
+  `mprotect` deny `PROT_EXEC` outright.
+- Opens nvidia device nodes itself (so the file's owning mm is the stub's) and
+  SCM_RIGHTS a copy *up* to QEMU for the global handle table.
+- A reader thread frames commands; a worker pool runs the blocking `ioctl()`s.
+  Workers translate embedded `handle_id`→local-fd, wire aux buffers, extract
+  NvStatus, and reply with the echoed `txn_id`.
+- On `ISOLATE_CMD_INTERRUPT` the reader posts `SIGUSR1` (no `SA_RESTART`) to the
+  worker running that txn so its blocking ioctl returns `-EINTR` (#73).
+- Verbose per-op tracing is gated behind `NVKVM_DEBUG` (`nvkvm_log.h`, QEMU
+  side); the stub keeps only error diagnostics. Set `NVKVM_DEBUG=1` in the QEMU
+  environment to re-enable QEMU traces.
 
-- Listens on virtio queues; dispatches `NVKVM_REQ_*` messages.
-- Holds a handle table (`struct nvkvm_handle_table`) mapping handle_id to
-  the host-side fd it opened on the guest's behalf.
-- For session/isolate management, spawns/kills stubs.
-- For *mmap* on `nvidia0` only: opens the fd, mmaps it into QEMU's mm,
-  calls `KVM_SET_USER_MEMORY_REGION(QEMU_VA → GPA)`, then asks the stub
-  to ALSO mmap at the guest VA so the nvidia driver knows about the
-  mapping. This is the "double mmap" model; it stays as-is for nvidia0
-  for now.
+## Request/response flow (an RM ioctl)
 
-## Known wrong (we know it, we just haven't fixed it)
+1. Guest libcuda issues `ioctl(/dev/nvidia0, NV_ESC_RM_CONTROL, &p)`.
+2. `nvkvm-guest.ko` sanitizes embedded pointers into shm slots, allocates a
+   `txn_id` + inflight record, sends `NVKVM_REQ_IOCTL_ON_ISOLATE` on VQ_TX and
+   blocks (interruptibly) on completion.
+3. QEMU validates against the allowlists, copies the slot blobs, and hands an
+   `ISOLATE_CMD_IOCTL` to the owning isolate's socket.
+4. The stub worker runs the real `ioctl()`, writes back params/aux/NvStatus.
+5. QEMU's per-isolate reader thread matches the `txn_id`, writes the response
+   into the guest's IN buffer, and returns the virtqueue descriptor.
+6. The guest copies results back to userspace. A guest signal mid-flight routes
+   `NVKVM_REQ_INTERRUPT` (step 3 in reverse) to cut the host ioctl short.
 
-These are the items we'd fix in the next refactor:
+## Remaining work (tracked)
 
-1. **QEMU opens `nvidia0`, `nvidiactl`, `nvidia-uvm` first and SCM_RIGHTS them to the stub.**
-   This was the original design. We've since established that the stub
-   should be the opener (so the file's owning mm matches the calling
-   task, which is important for UVM and conjecturally for some RM
-   operations on future drivers). The stub-local UVM pool is a partial
-   fix for UVM specifically. The right answer is: stub opens, stub
-   SCM_RIGHTS *up* to QEMU when QEMU needs the fd (for KVM region
-   installs).
-
-2. **No `nvidia_uvm_mmap` RPC.**
-   Right now the guest's `mmap(/dev/nvidia-uvm, ...)` doesn't really
-   route to UVM. To support managed memory we need a virtio RPC where the
-   guest tells QEMU "mmap this UVM fd at offset X for size Y at GPA Z",
-   QEMU does mmap + KVM_SET_USER_MEMORY_REGION + any required UVM VA
-   ioctls, returns GPA to the guest. The guest module then
-   `vm_insert_pfn`'s the guest VA → GPA.
-
-3. **VA-based UVM ioctls (UVM_MAP_EXTERNAL_ALLOCATION, UVM_FREE,
-   UVM_MIGRATE, UVM_SET_PREFERRED_LOCATION, UVM_CREATE_EXTERNAL_RANGE,
-   UVM_REGISTER_CHANNEL when it includes a VA) need to run in QEMU**,
-   because the `base` VA is a QEMU-mm address once we move UVM mmap to
-   QEMU. Today the stub does these and they only work for the no-VA
-   cases.
-
-4. **No fd-translation layer in QEMU for UVM ioctls' embedded
-   `rm_ctrl_fd`.** When VA-based UVM ioctls move to QEMU, QEMU will see
-   `rm_ctrl_fd = guest_token`. Needs a translation step: token →
-   handle_id → QEMU's local RM fd. (Stub already does the equivalent
-   handle_id→local-fd translation today.)
-
-5. **Stub seccomp filter is permissive.** It's an allow-list, but the
-   list is wider than necessary. Per `isolate_hardening_todo.md`: drop
-   to a minimal set, restrict openat (USER_NOTIF + validator in QEMU,
-   or pre-open O_PATH refs + restrict openat to AT_EMPTY_PATH reopens),
-   namespace isolation (user, mount, pid, net, ipc, uts), drop all caps,
-   no_new_privs, suid_dumpable=0.
-
-## Known *right* but not built yet
-
-These are agreed design decisions that haven't landed:
-
-- **memfd-backed CPU mmap path** for `cuMemHostAlloc`-style shared CPU
-  buffers (your "flow 2"). Future RPC: guest asks for "shared CPU buffer
-  of size N at GPA X", QEMU creates a memfd, mmaps into QEMU's mm, KVM
-  region installed, fd SCM_RIGHTS'd to stub for symmetric access.
-
-- **HMM-mode UVM**. The driver's `UVM_CAN_USE_MMU_NOTIFIERS()` conftest
-  is false because it looks for a renamed kernel callback. Forcing it
-  true via a rebuilt nvidia-uvm.ko would unlock UVM-on-any-mmap (i.e.
-  memfd-backed UVM). Major effort (custom driver build), big payoff
-  (cleaner architecture, smaller fault surface). Out of scope until we
-  hit a real reason to.
-
-## Current cuInit status
-
-- `tests/integration/test_ioctl_fwd`: 48/48 PASS — the RM ioctl
-  forwarding pipeline is solid.
-- `tests/integration/cuinit_test`: returns 1 (cuInit FAILED 100 — no
-  CUDA-capable device detected). cuInit reaches device enumeration but
-  libcuda reports no devices. Investigation pending; see
-  `docs/CUINIT_BLOCKER.md`.
+- **#55** — expose the GPA window as a 64-bit PCI BAR instead of squatting on
+  fixed GPAs (the current single-window heap works but is not BAR-backed).
+- **GET_PID_INFO per-process VRAM** — reads 0 from the stub's pid-ns; needs a
+  QEMU init-ns admin-subdevice query (`docs/.../get_pid_info_findings`).
+- **CUDA-IPC** export/import-fd control cmds are denied pending fd-translation.
+- **M-2 / H-4** — stub aux-writeback tightening; adversarial-teardown reclamp
+  (normal + SIGKILL teardown is verified). See SECURITY_MODEL.md §6.
+- **HMM-mode UVM** — `UVM_CAN_USE_MMU_NOTIFIERS()` is false on this build; a
+  rebuilt nvidia-uvm.ko would unlock UVM-on-any-mmap. Out of scope until needed.
 
 ## Files to know
 
 - `src/abi/` — nvidia ABI structs (ioctl param types, status codes).
-  Mostly transcribed from gVisor's nvgpu package, kept in C.
-- `src/common/` — virtio + isolate protocol headers (request/response
-  structs shared by guest, QEMU, stub).
-- `src/guest/` — `nvkvm-guest.ko` Linux kernel module.
-- `src/qemu/` — patches to QEMU that add `virtio-nvgpu` device.
-- `src/stub/` — sandboxed userspace stub binary that does the actual
-  nvidia ioctls.
-- `tests/integration/test_ioctl_fwd.c` — end-to-end RM ioctl test.
-- `tests/integration/cuinit_test.c` — minimal cuInit / cuDeviceGetCount
-  test; the "is the GPU usable" smoke test.
-- `tests/integration/kvm_sparse_test.c` — host-only test proving KVM
-  sparse-region semantics and the kvm->mm strict requirement.
-- `scripts/run_remote_test.sh` — wrapper that ssh's to the vast.ai host
-  to rebuild + run tests. Single command: `rebuild`, `test_ioctl_fwd`,
-  `cuinit_test`, `both`, `log <pattern>`, `restart`.
+- `src/common/` — virtio + isolate protocol headers (`nvkvm_proto.h`,
+  `nvkvm_isolate_proto.h`).
+- `src/guest/` — `nvkvm-guest.ko` (virtio transport, sanitizers, session/mm
+  keying, signal-interruptible waits).
+- `src/qemu/` — the `virtio-nvgpu` QEMU device: dispatch, handle table, isolate
+  manager, UVM realize, allowlists, mmap/GPA window, `nvkvm_log.h` trace gate.
+- `src/stub/` — the sandboxed freestanding stub binary.
+- `docs/SECURITY_MODEL.md` — trust boundaries + default-deny surface (read this).
+- `docs/audits/` — per-surface justification (full ioctl surface, embedded-field
+  translation, nvproxy gap analysis, control/frontend allowlists).
+- `tests/integration/` — `test_ioctl_fwd.c`, `matmul_test.c`,
+  `sig_interrupt_test.c` (#73), `run_llm_7b.sh` (#27), `kvm_sparse_test.c`.
+- `tests/security/poc_cross_proc_dup.c` — cross-VM/host dup-denial proof.
+- `scripts/run_remote_test.sh` — rebuild/test wrapper for the vast.ai host.
 
 ## Reference setup (vast.ai)
 
-Tested on:
-- Host: vast.ai instance with RTX 3060 + NVIDIA driver 575.51.03 + kernel
-  6.8.0-59-generic
-- Guest: Ubuntu 24.04 cloud image, kernel 6.8.0-117-generic (or
-  whatever's latest; module is rebuilt against the running kernel)
-- The 9p mount tag `nvkvm_src` exposes the repo root to the guest
-
-See `scripts/run_test_vm.sh` for the QEMU command line.
+- Host: vast.ai instance, RTX 3060 + NVIDIA driver 575.51.03 (open kernel
+  modules), recent 6.x kernel; exposes `/dev/kvm`.
+- Guest: Ubuntu 24.04 cloud image; module rebuilt against the running kernel.
+- 9p tag `nvkvm_src` exposes the repo to the guest. (Large model files must be
+  guest-local — a 9p read of a multi-GB GGUF hits EIO.)

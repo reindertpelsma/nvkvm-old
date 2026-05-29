@@ -140,7 +140,7 @@ int nvkvm_handle_open_nvidia(struct nvkvm_handle_table *t,
 	*handle_id_out = id;
 	pthread_mutex_unlock(&t->lock);
 
-	fprintf(stderr, "nvkvm_handle: opened %s handle %u dev_id=%d fd=%d\n",
+	NVKVM_DBG( "nvkvm_handle: opened %s handle %u dev_id=%d fd=%d\n",
 		dev_id == NVKVM_DEV_EVENTFD ? "eventfd" : "nvidia",
 		id, dev_id, fd);
 	return 0;
@@ -228,7 +228,7 @@ int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 	*handle_id_out = id;
 	pthread_mutex_unlock(&t->lock);
 
-	fprintf(stderr, "nvkvm_handle: opened memory handle %u size=%llu fd=%d\n",
+	NVKVM_DBG( "nvkvm_handle: opened memory handle %u size=%llu fd=%d\n",
 		id, (unsigned long long)size, fd);
 	return 0;
 }

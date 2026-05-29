@@ -43,6 +43,7 @@
 
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_isolate_proto.h"
+#include "nvkvm_log.h"
 #include "../../src/abi/nvgpu.h"
 #include "../../src/abi/uvm.h"
 #include "nvkvm_handle.h"

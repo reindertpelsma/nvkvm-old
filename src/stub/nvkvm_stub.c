@@ -806,9 +806,6 @@ static void worker_thread(void *arg)
 			}
 		}
 
-		/* NV_ESC_CARD_INFO: log how many valid entries the driver returned */
-		int is_card_info = ((job.cmd & 0xff) == 0xc8 &&
-				    job.param_size > 0 && job.aux_size == 0);
 
 		/*
 		 * UVM ioctls with embedded fd fields carry a handle_id (assigned
@@ -972,96 +969,6 @@ static void worker_thread(void *arg)
 			}
 		}
 
-		/* DEBUG: dump full struct bytes for ALLOC_OS_EVENT and
-		 * NV01_EVENT_OS_EVENT alloc so we can compare bytes
-		 * exactly.  Per user: corruption is also possible. */
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    ((job.cmd & 0xff) == 0xce || (job.cmd & 0xff) == 0xcf) &&
-		    job.param_size >= 16) {
-			const uint8_t *p = (const uint8_t *)job.param_buf;
-			char hex[64] = {0};
-			for (int i = 0; i < 16; i++)
-				fs_snprintf(hex + i*3, sizeof(hex) - i*3,
-					 "%02x ", p[i]);
-			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: pre-ioctl 0x%x param[16]=%s\n",
-				job.cmd & 0xff, hex);
-		}
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    (job.cmd & 0xff) == 0x2b &&
-		    job.aux_size >= 24 && job.param_size >= 16) {
-			uint32_t hclass;
-			__builtin_memcpy(&hclass, (char *)job.param_buf + 12, 4);
-			if (hclass == 0x79) {
-				const uint8_t *p = (const uint8_t *)job.param_buf;
-				const uint8_t *a = (const uint8_t *)job.aux_buf;
-				char hex_p[160] = {0}, hex_a[80] = {0};
-				for (uint32_t i = 0; i < job.param_size && i < 48; i++)
-					fs_snprintf(hex_p + i*3, sizeof(hex_p) - i*3,
-						 "%02x ", p[i]);
-				for (uint32_t i = 0; i < 24; i++)
-					fs_snprintf(hex_a + i*3, sizeof(hex_a) - i*3,
-						 "%02x ", a[i]);
-				fs_dprintf(STDERR_FD,
-					"nvkvm_stub: pre-ioctl 0x79 param[%u]=%s\n",
-					job.param_size, hex_p);
-				fs_dprintf(STDERR_FD,
-					"nvkvm_stub: pre-ioctl 0x79 aux[24]  =%s\n",
-					hex_a);
-			}
-		}
-		/* DEBUG: dump the exact bytes the driver will see for the
-		 * ALLOC_OS_EVENT family + NV01_EVENT_OS_EVENT alloc, plus
-		 * a snapshot of /proc/self/fd so we can confirm the fd
-		 * value we're handing to the driver actually maps to a
-		 * real nvidia file in this process. */
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    ((job.cmd & 0xff) == 0xce || (job.cmd & 0xff) == 0xcf) &&
-		    job.param_size >= 16) {
-			uint32_t hc, hd, fdval, st;
-			__builtin_memcpy(&hc,    (char *)job.param_buf + 0, 4);
-			__builtin_memcpy(&hd,    (char *)job.param_buf + 4, 4);
-			__builtin_memcpy(&fdval, (char *)job.param_buf + 8, 4);
-			__builtin_memcpy(&st,    (char *)job.param_buf + 12, 4);
-			char path[64];
-			int n = fs_snprintf(path, sizeof(path),
-					 "/proc/self/fd/%u", fdval);
-			char link[128] = {0};
-			long lret = sc4(__NR_readlinkat, AT_FDCWD,
-					(long)path, (long)link,
-					(long)(sizeof(link)-1));
-			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: pre-ioctl 0x%x hClient=0x%x fd=%u status=0x%x /proc/self/fd/%u=%s (ret=%ld)\n",
-				job.cmd & 0xff, hc, fdval, st, fdval,
-				lret > 0 ? link : "<none>", lret);
-			(void)hd; (void)n;
-		}
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    (job.cmd & 0xff) == 0x2b &&
-		    job.aux_size >= 24 && job.param_size >= 16) {
-			uint32_t hclass;
-			__builtin_memcpy(&hclass, (char *)job.param_buf + 12, 4);
-			if (hclass == 0x79) {
-				uint32_t hpc, hsr, hcl;
-				uint64_t data;
-				__builtin_memcpy(&hpc,   (char *)job.aux_buf + 0, 4);
-				__builtin_memcpy(&hsr,   (char *)job.aux_buf + 4, 4);
-				__builtin_memcpy(&hcl,   (char *)job.aux_buf + 8, 4);
-				__builtin_memcpy(&data,  (char *)job.aux_buf + 16, 8);
-				uint32_t fdval = (uint32_t)data;
-				char path[64], link[128] = {0};
-				fs_snprintf(path, sizeof(path),
-					 "/proc/self/fd/%u", fdval);
-				long lret = sc4(__NR_readlinkat, AT_FDCWD,
-						(long)path, (long)link,
-						(long)(sizeof(link)-1));
-				fs_dprintf(STDERR_FD,
-					"nvkvm_stub: pre-ioctl NV01_EVENT_OS_EVENT hPC=0x%x hSR=0x%x data=%u /proc/self/fd/%u=%s (ret=%ld)\n",
-					hpc, hsr, fdval, fdval,
-					lret > 0 ? link : "<none>", lret);
-				(void)hcl;
-			}
-		}
 
 		/*
 		 * NV_ESC_RM_ALLOC_MEMORY + hClass==NV01_MEMORY_SYSTEM_OS_DESCRIPTOR
@@ -1099,19 +1006,6 @@ static void worker_thread(void *arg)
 		    job.param_size >= fe_embedded_fd_off + 4) {
 			__builtin_memcpy((char *)job.param_buf + fe_embedded_fd_off,
 					 &saved_fe_embedded_fd, sizeof(int32_t));
-		}
-
-		if (is_card_info) {
-			int n = 0;
-			size_t entry_sz = 80; /* sizeof(nv_ioctl_card_info) on x86-64 */
-			size_t count = job.param_size / entry_sz;
-			for (size_t i = 0; i < count && i < 32; i++) {
-				uint8_t valid = *((uint8_t *)job.param_buf + i * entry_sz);
-				if (valid) n++;
-			}
-			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: CARD_INFO ret=%ld err=%d param_size=%u valid_entries=%d\n",
-				ret, err, job.param_size, n);
 		}
 
 		/* Zero the embedded pointer field in nvos54 (don't leak host VA) */

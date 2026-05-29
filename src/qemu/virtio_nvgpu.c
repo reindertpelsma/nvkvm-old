@@ -229,7 +229,7 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 
 	resp_msg.resp.fd_token = cpu_to_le32(hfd->token);
 	resp_msg.resp.status   = 0;
-	fprintf(stderr, "nvkvm: open: dev_id=%u session=%u token=%u host_fd=%d\n",
+	NVKVM_DBG( "nvkvm: open: dev_id=%u session=%u token=%u host_fd=%d\n",
 		dev_id, session->id, hfd->token, hfd->fd);
 
 send:
@@ -853,10 +853,16 @@ VirtIONvgpu *nvkvm_get_global_device(void)
 	return g_nvkvm_device;
 }
 
+/* Verbose per-operation tracing gate (nvkvm_log.h). Off unless NVKVM_DEBUG
+ * is set in the environment; errors and security DENY logs are unconditional. */
+int nvkvm_debug_enabled;
+
 static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 {
 	VirtIODevice *vdev = VIRTIO_DEVICE(dev);
 	VirtIONvgpu  *nv   = VIRTIO_NVGPU(dev);
+
+	nvkvm_debug_enabled = (getenv("NVKVM_DEBUG") != NULL);
 
 	g_nvkvm_device = nv;
 
@@ -881,7 +887,7 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 				if (strcmp(link, "anon_inode:kvm-vm") == 0) {
 					int fd = atoi(de->d_name);
 					nvkvm_set_kvm_vm_fd(fd);
-					fprintf(stderr,
+					NVKVM_DBG(
 						"nvkvm: registered KVM vm fd %d\n", fd);
 					break;
 				}

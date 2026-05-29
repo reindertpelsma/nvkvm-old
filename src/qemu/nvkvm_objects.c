@@ -69,7 +69,7 @@ int nvkvm_obj_add(struct nvkvm_client *client, uint32_t handle,
 		return -EINVAL;
 
 	if (client->resources[idx]) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: obj_add: handle 0x%x slot collision\n",
 			handle);
 		return -EEXIST;

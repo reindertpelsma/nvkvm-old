@@ -715,7 +715,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			 * the UVM allowlist; refuse anything not described. */
 			const struct nvkvm_uvm_desc *d = nvkvm_uvm_lookup(req->cmd);
 			if (!d) {
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: DENY unschemaed UVM ioctl cmd=0x%x "
 					"(default-deny)\n", req->cmd);
 				resp->retval     = (uint64_t)(int64_t)(-EPERM);
@@ -726,7 +726,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			}
 			if (req->param_size < d->min_size ||
 			    (d->min_size > 0 && !param_buf)) {
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: DENY UVM cmd=0x%x short param_size=%u "
 					"(<%u)\n", req->cmd, req->param_size,
 					d->min_size);
@@ -812,7 +812,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	    (_IOC_NR(req->cmd) == 0xce || _IOC_NR(req->cmd) == 0xcf) &&
 	    param_buf && req->param_size >= 16) {
 		const uint8_t *p = param_buf;
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm qemu pre 0x%x param[16]= "
 			"%02x %02x %02x %02x %02x %02x %02x %02x "
 			"%02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -827,7 +827,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&hclass, (char *)param_buf + 12, 4);
 		if (hclass == 0x79) {
 			const uint8_t *a = aux_buf;
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm qemu pre 0x79 aux[24]= "
 				"%02x %02x %02x %02x  %02x %02x %02x %02x "
 				"%02x %02x %02x %02x  %02x %02x %02x %02x "
@@ -908,7 +908,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&h_client_src, (char *)param_buf + 12, 4);
 		if (h_client_src != 0 && h_client_src != (uint32_t)-1 &&
 		    !nvkvm_client_allow_has(nv, h_client_src)) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: DENY DUP_OBJECT foreign h_client_src=0x%x "
 				"(not a client of this VM)\n", h_client_src);
 			resp->retval     = (uint64_t)(int64_t)(-EACCES);
@@ -956,7 +956,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			}
 			if (!is_root_alloc && hc != 0 && hc != (uint32_t)-1 &&
 			    !nvkvm_client_allow_has(nv, hc)) {
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: DENY ioctl NR=0x%x foreign hClient=0x%x "
 					"(not a client of this VM)\n", nr, hc);
 				resp->retval     = (uint64_t)(int64_t)(-EACCES);
@@ -1217,7 +1217,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 						       0,
 						       &share_nvstatus,
 						       &share_fault);
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: post-alloc SHARE hClient=0x%x hClass=0x%x "
 				"hObj=0x%x ret=%d nvstatus=0x%x status=0x%x\n",
 				hClient, hClass, hObjNew, sret, share_nvstatus,
@@ -1250,7 +1250,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&mm_status,(char *)param_buf + 40, sizeof(uint32_t));
 		memcpy(&flags,    (char *)param_buf + 44, sizeof(uint32_t));
 		memcpy(&fd,       (char *)param_buf + 48, sizeof(int32_t));
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: RM_MAP_MEMORY: h_client=0x%x h_device=0x%x "
 			"h_memory=0x%x offset=0x%llx length=0x%llx flags=0x%x "
 			"fd=%d -> pLinear=0x%llx status=0x%x\n",
@@ -1273,7 +1273,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		uint32_t aps = 0;
 		if (req->param_size == sizeof(struct nvos64_parameters))
 			memcpy(&aps, (char *)param_buf + 32, sizeof(uint32_t));
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: RM_ALLOC failed: hClient=0x%x hParent=0x%x "
 			"hObjNew=0x%x hClass=0x%x alloc_parms_size=%u aux_size=%u "
 			"nvstatus=0x%x\n",
@@ -1292,13 +1292,13 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	}
 
 	if (inner_cmd) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: ioctl_on_isolate: isolate=%u handle=%u cmd=0x%x "
 			"inner=0x%x ret=%lld nvstatus=0x%x fault=0x%llx\n",
 			req->isolate_id, req->handle_id, req->cmd, inner_cmd,
 			(long long)ret, nvstatus, (unsigned long long)fault_addr);
 	} else {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: ioctl_on_isolate: isolate=%u handle=%u cmd=0x%x "
 			"ret=%lld nvstatus=0x%x fault=0x%llx\n",
 			req->isolate_id, req->handle_id, req->cmd,
@@ -1327,7 +1327,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		    req->param_size >= rm_status_off + 4) {
 			uint32_t rmst = 0;
 			memcpy(&rmst, (char *)param_buf + rm_status_off, 4);
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: ioctl_on_isolate UVM: cmd=0x%x rm_status=0x%x\n",
 				req->cmd, rmst);
 		}
@@ -1431,7 +1431,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		gpa = nvkvm_sparse_gpa_alloc(nv, len);
 		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
 		if (!target) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: mmap_on_isolate: sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);
@@ -1442,7 +1442,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			   MAP_SHARED | MAP_FIXED, h->fd, (off_t)req->offset);
 		if (qva == MAP_FAILED) {
 			int se = errno;
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: mmap_on_isolate(window) FAIL fd=%d "
 				"dev_id=%d prot=0x%x len=%lu off=0x%lx "
 				"gpa=0x%llx errno=%d (%s)\n",
@@ -1481,7 +1481,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		gpa = nvkvm_sparse_gpa_alloc(nv, len);
 		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
 		if (!target) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: mmap_on_isolate(uvm): sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);

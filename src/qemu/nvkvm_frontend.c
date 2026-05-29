@@ -89,7 +89,7 @@ int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx)
 	struct nvkvm_client *client;
 	uint32_t h_client, h_object_new, h_class;
 
-	fprintf(stderr, "nvkvm: rm_alloc: session=%u param_size=%zu hfd=%d\n",
+	NVKVM_DBG( "nvkvm: rm_alloc: session=%u param_size=%zu hfd=%d\n",
 		ctx->session->id, ctx->param_size, ctx->hfd->fd);
 
 	if (ctx->param_size == sizeof(struct nvos64_parameters)) {
@@ -124,7 +124,7 @@ int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx)
 		 */
 		h_object_new = p->h_object_new;
 
-		fprintf(stderr, "nvkvm: rm_alloc64: ret=%d status=0x%x h_object_new_after=0x%x\n",
+		NVKVM_DBG( "nvkvm: rm_alloc64: ret=%d status=0x%x h_object_new_after=0x%x\n",
 			ret, p->status, h_object_new);
 
 		/* Restore zeroed fields before copying back to guest */
@@ -154,7 +154,7 @@ int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx)
 		return -EINVAL;
 	}
 
-	fprintf(stderr, "nvkvm: rm_alloc: h_class=0x%x h_object_new=0x%x ret=%d\n",
+	NVKVM_DBG( "nvkvm: rm_alloc: h_class=0x%x h_object_new=0x%x ret=%d\n",
 		h_class, h_object_new, ret);
 
 	if (ret < 0)
@@ -173,7 +173,7 @@ int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx)
 	    (h_class == NV01_ROOT && h_client == NV01_NULL_OBJECT)) {
 		struct nvkvm_client *c = nvkvm_client_alloc(h_object_new);
 		register_client(ctx->session, c);
-		fprintf(stderr, "nvkvm: rm_alloc: ROOT_CLIENT h_class=0x%x h_object_new=0x%x registered in session=%u\n",
+		NVKVM_DBG( "nvkvm: rm_alloc: ROOT_CLIENT h_class=0x%x h_object_new=0x%x registered in session=%u\n",
 			h_class, h_object_new, ctx->session->id);
 		/* The root client is its own resource entry */
 		pthread_mutex_lock(&c->lock);
@@ -210,7 +210,7 @@ int nvkvm_handle_rm_free(struct nvkvm_req_ctx *ctx)
 	long ret;
 
 	/* Validate client handle */
-	fprintf(stderr, "nvkvm: rm_free: session=%u h_root=0x%x h_object=0x%x nclients=%d\n",
+	NVKVM_DBG( "nvkvm: rm_free: session=%u h_root=0x%x h_object=0x%x nclients=%d\n",
 		ctx->session->id, p->h_root, p->h_object_old, ctx->session->nclients);
 	client = find_client(ctx->session, p->h_root);
 	if (!client) {
@@ -279,13 +279,13 @@ static int nvkvm_ctrl_get_build_version(struct nvkvm_req_ctx *ctx,
 		memcpy(drv, ext, sz < 64 ? sz : 64);
 		memcpy(version, ext + sz, sz < 64 ? sz : 64);
 		memcpy(titl, ext + 2 * sz, sz < 64 ? sz : 64);
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: get_build_version: ret=%ld status=0x%x changelist=%u official=%u sz=%u drv='%s' ver='%s' title='%s'\n",
 			ret, p->status,
 			ver->changelist_number, ver->official_changelist_number,
 			sz, drv, version, titl);
 	} else {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: get_build_version: ret=%ld status=0x%x changelist=%u official=%u sz=%u (no ext)\n",
 			ret, p->status,
 			ver->changelist_number, ver->official_changelist_number, sz);
@@ -307,10 +307,10 @@ int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx)
 	long ret;
 
 	/* Validate that h_client is a known client in this session */
-	fprintf(stderr, "nvkvm: rm_control: session=%u h_client=0x%x h_obj=0x%x cmd=0x%x nclients=%d\n",
+	NVKVM_DBG( "nvkvm: rm_control: session=%u h_client=0x%x h_obj=0x%x cmd=0x%x nclients=%d\n",
 		ctx->session->id, p->h_client, p->h_object, p->cmd, ctx->session->nclients);
 	if (!find_client(ctx->session, p->h_client)) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: rm_control: unknown client 0x%x in session %u (nclients=%d)\n",
 			p->h_client, ctx->session->id, ctx->session->nclients);
 		return -EINVAL;
@@ -323,21 +323,21 @@ int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx)
 	 */
 	if (ctx->aux_buf) {
 		if (p->params_size > ctx->aux_size) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: rm_control: params_size %u > aux_size %zu\n",
 				p->params_size, ctx->aux_size);
 			return -EINVAL;
 		}
 		p->params = (nvp64_t)(uintptr_t)ctx->aux_buf;
 	} else if (p->params_size > 0) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: rm_control: params_size %u but no aux_buf\n",
 			p->params_size);
 		return -EINVAL;
 	}
 
 	/* Dispatch commands with embedded pointer fields to dedicated handlers */
-	fprintf(stderr, "nvkvm: rm_control: cmd=0x%x params_size=%u aux_buf=%p p->params=0x%llx\n",
+	NVKVM_DBG( "nvkvm: rm_control: cmd=0x%x params_size=%u aux_buf=%p p->params=0x%llx\n",
 		p->cmd, p->params_size, ctx->aux_buf, (unsigned long long)p->params);
 	if (p->cmd == NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION &&
 	    ctx->aux_buf &&
@@ -349,7 +349,7 @@ int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx)
 			      struct nvos54_parameters), p);
 	}
 
-	fprintf(stderr, "nvkvm: rm_control: ret=%ld status=0x%x cmd=0x%x\n",
+	NVKVM_DBG( "nvkvm: rm_control: ret=%ld status=0x%x cmd=0x%x\n",
 		ret, p->status, p->cmd);
 
 	p->params = saved_params;
@@ -406,7 +406,7 @@ int nvkvm_handle_register_fd(struct nvkvm_req_ctx *ctx)
 	ret = host_ioctl(ctx->hfd->fd,
 		_IOWR('F', NV_ESC_REGISTER_FD,
 		      struct nv_ioctl_register_fd), p);
-	fprintf(stderr, "nvkvm: register_fd: hfd=%d ctl_fd=%d (token=%u) ret=%ld\n",
+	NVKVM_DBG( "nvkvm: register_fd: hfd=%d ctl_fd=%d (token=%u) ret=%ld\n",
 		ctx->hfd->fd, (int)p->ctl_fd, (uint32_t)saved_fd, ret);
 	p->ctl_fd = saved_fd;
 	return (int)ret;
@@ -466,7 +466,7 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		const uint8_t *b = (const uint8_t *)ctx->params_buf;
 		unsigned sz = _IOC_SIZE(cmd);
 		unsigned i;
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: numa_info PRE: hfd=%d dev_id=%d cmd=0x%x size=%u\n",
 			ctx->hfd->fd, ctx->hfd->dev_id, cmd, sz);
 		/* Scan for any non-zero bytes so we know the "interesting" range */
@@ -480,14 +480,14 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 			}
 		}
 		if (any_nonzero)
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: numa_info PRE: NONZERO bytes in range [%u..%u]\n",
 				first_nonzero, last_nonzero);
 		else
-			fprintf(stderr, "nvkvm: numa_info PRE: all bytes zero\n");
+			NVKVM_DBG( "nvkvm: numa_info PRE: all bytes zero\n");
 		/* Print first 64 bytes */
 		for (i = 0; i + 15 < 64 && i < sz; i += 16)
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: numa_info PRE buf[%u..%u]= "
 				"%02x %02x %02x %02x  %02x %02x %02x %02x  "
 				"%02x %02x %02x %02x  %02x %02x %02x %02x\n",
@@ -500,7 +500,7 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 			unsigned end   = (last_nonzero + 32) & ~15U;
 			if (end > sz) end = sz;
 			for (i = start; i < end && i + 15 < sz; i += 16)
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: numa_info PRE buf[%u..%u]= "
 					"%02x %02x %02x %02x  %02x %02x %02x %02x  "
 					"%02x %02x %02x %02x  %02x %02x %02x %02x\n",
@@ -521,11 +521,11 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 			memcpy(&rm_status,
 			       (const char *)ctx->params_buf + 4,
 			       sizeof(rm_status));
-		fprintf(stderr, "nvkvm: uvm ioctl cmd=0x%x dev_id=%d ret=%ld rm_status=0x%x\n",
+		NVKVM_DBG( "nvkvm: uvm ioctl cmd=0x%x dev_id=%d ret=%ld rm_status=0x%x\n",
 			cmd, ctx->hfd->dev_id, ret, rm_status);
 	}
 	if (_IOC_NR(cmd) == NV_ESC_NUMA_INFO) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: numa_info: hfd=%d cmd=0x%x size=%u ret=%ld errno=%d\n",
 			ctx->hfd->fd, cmd, _IOC_SIZE(cmd), ret,
 			(ret == -EINVAL || ret < 0) ? -(int)ret : 0);
@@ -534,7 +534,7 @@ int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		/* Log the first entry of CARD_INFO to see if a GPU is visible */
 		const struct nv_ioctl_card_info *ci = ctx->params_buf;
 		size_t n = ctx->param_size / sizeof(*ci);
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: card_info: ret=%ld n_entries=%zu valid=%d devId=0x%x\n",
 			ret, n, (n > 0) ? ci[0].valid : 0,
 			(n > 0) ? ci[0].pci_info.device_id : 0);
