@@ -73,7 +73,8 @@ concurrent + nvidia-smi must all still pass):
   device handles). Test.
 - [ ] **0.3 user namespace** (QEMU child: unshare(CLONE_NEWUSER), write
   uid_map/gid_map mapping 0→vmm_uid, deny setgroups). Test rootless spawn.
-- [ ] **0.4 pid/net/ipc/uts namespaces** (QEMU: unshare(NEWPID|NEWNET|NEWIPC|
+- [x] **0.4 pid/net/ipc/uts namespaces** DONE — via clone(CLONE_NEWUSER|NEWPID|NEWNET|NEWIPC|NEWUTS) from QEMU (no double-fork; clone returns the stub's host pid directly; parent writes the rootless single-line uid/gid map gated by a sync pipe). Verified: stub is NSpid 1, all 5 ns isolated, caps=0, seccomp=2. Single/2/4-conc/nvidia-smi pass.
+- [ ] **0.4-old pid/net/ipc/uts namespaces** (QEMU: unshare(NEWPID|NEWNET|NEWIPC|
   NEWUTS) then fork so stub is PID 1). Bonus: nvidia host-kernel calls now see
   an empty pid ns → no other-process leakage. Test.
 - [ ] **0.5 empty mount namespace** (stub: capture dev O_PATH dirfd; unshare

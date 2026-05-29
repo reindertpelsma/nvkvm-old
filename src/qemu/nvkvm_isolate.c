@@ -49,42 +49,11 @@
  * Returns 0 on success, -1 on any failure (caller fail-closes unless the
  * NVKVM_ISOLATE_NO_HARDEN escape hatch is set).
  */
-static int nvkvm_harden_write_proc(const char *path, const char *val)
+static void nvkvm_drop_all_caps(void)
 {
-	int fd = open(path, O_WRONLY | O_CLOEXEC);
-	if (fd < 0)
-		return -1;
-	size_t len = strlen(val);
-	ssize_t n = write(fd, val, len);
-	close(fd);
-	return (n == (ssize_t)len) ? 0 : -1;
-}
-
-static int nvkvm_isolate_harden_child(void)
-{
-	char map[64];
-	unsigned uid = (unsigned)geteuid();
-	unsigned gid = (unsigned)getegid();
-
-	if (unshare(CLONE_NEWUSER) < 0)
-		return -1;
-	/* setgroups must be denied before writing gid_map (kernel rule). */
-	if (nvkvm_harden_write_proc("/proc/self/setgroups", "deny") < 0)
-		return -1;
-	snprintf(map, sizeof(map), "0 %u 1\n", uid);
-	if (nvkvm_harden_write_proc("/proc/self/uid_map", map) < 0)
-		return -1;
-	snprintf(map, sizeof(map), "0 %u 1\n", gid);
-	if (nvkvm_harden_write_proc("/proc/self/gid_map", map) < 0)
-		return -1;
-
-	if (unshare(CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) < 0)
-		return -1;
-
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-		return -1;
+		_exit(126);
 	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-
 	/* Drop the capability bounding set (so caps can't be regained on exec). */
 	for (int c = 0; c <= 63; c++)
 		prctl(PR_CAPBSET_DROP, c, 0, 0, 0);  /* EINVAL past last cap: ok */
@@ -95,7 +64,57 @@ static int nvkvm_isolate_harden_child(void)
 	syscall(SYS_capset, &hdr, data);
 	/* Clear ambient set. */
 	prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+}
+
+/* Parent-side: write one /proc/<pid>/<which> map file for the child's userns. */
+static int nvkvm_write_child_map(pid_t pid, const char *which, const char *val)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, which);
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	size_t len = strlen(val);
+	ssize_t n = write(fd, val, len);
+	close(fd);
+	return (n == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+ * Parent-side: set up the rootless uid/gid mapping for a child that was
+ * clone()'d with CLONE_NEWUSER.  ns-root 0 -> our euid/egid (single-line map,
+ * permitted even for an unprivileged parent).  Returns 0 / -1.
+ */
+static int nvkvm_map_child_userns(pid_t pid)
+{
+	char map[64];
+	if (nvkvm_write_child_map(pid, "setgroups", "deny") < 0)
+		return -1;
+	snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)geteuid());
+	if (nvkvm_write_child_map(pid, "uid_map", map) < 0)
+		return -1;
+	snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)getegid());
+	if (nvkvm_write_child_map(pid, "gid_map", map) < 0)
+		return -1;
 	return 0;
+}
+
+/*
+ * Spawn the isolate child.  When hardening, clone() it directly into fresh
+ * user + pid + net + ipc + uts namespaces (CLONE_NEWUSER lets an unprivileged
+ * parent create the rest; the child is PID 1 of the new pid ns and clone()
+ * returns its real host pid — no intermediate process, no second fork).  A
+ * NULL child stack with no CLONE_VM makes the raw clone behave like fork.
+ * Returns child pid (>0) / 0 in child / -1 on error, like fork().
+ */
+static pid_t nvkvm_isolate_spawn(bool harden)
+{
+	if (!harden)
+		return fork();
+	unsigned long flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET |
+			      CLONE_NEWIPC | CLONE_NEWUTS | (unsigned long)SIGCHLD;
+	return (pid_t)syscall(SYS_clone, flags, (void *)0, (void *)0,
+			      (void *)0, 0UL);
 }
 
 /* memfd_create may not be in older glibc headers; use syscall directly. */
@@ -506,6 +525,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	pthread_mutex_unlock(&t->lock);
 
 	pid_t pid;
+	/*
+	 * Phase 0 lockdown.  When hardening is on we clone() the child directly
+	 * into fresh user/pid/net/ipc/uts namespaces (it is PID 1 of the new pid
+	 * ns; clone() returns its real host pid).  The child blocks on syncpipe
+	 * until we write its uid/gid maps from the parent (rootless single-line
+	 * map), then drops all caps and execs.  No intermediate process.
+	 */
+	bool harden = (getenv("NVKVM_ISOLATE_NO_HARDEN") == NULL);
+	int syncpipe[2] = { -1, -1 };
+	if (harden && pipe2(syncpipe, O_CLOEXEC) < 0) {
+		int e = errno;
+		close(sv[0]); close(sv[1]); iso->in_use = false;
+		return -e;
+	}
 
 	if (stub_elf && stub_elf_len > 0) {
 		int mfd = nvkvm_memfd_create("nvkvm_stub", MFD_CLOEXEC);
@@ -524,24 +557,26 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		}
 		lseek(mfd, 0, SEEK_SET);
 
-		pid = fork();
+		pid = nvkvm_isolate_spawn(harden);
 		if (pid == 0) {
+			if (harden) {
+				/* Wait for the parent to install our uid/gid maps. */
+				char go;
+				close(syncpipe[1]);
+				if (read(syncpipe[0], &go, 1) != 1)
+					_exit(126);
+				close(syncpipe[0]);
+			}
 			dup2(sv[1], STDIN_FILENO);
-			/* Park the memfd at fd 3 so closefrom(4) preserves it.
-			 * fexecve(mfd) below needs mfd to still be valid. */
+			/* Park the memfd at fd 3 so closefrom(4) preserves it. */
 			if (mfd != 3) {
 				dup2(mfd, 3);
 				close(mfd);
 				mfd = 3;
 			}
-			/* Close every other inherited fd — KVM vm fd, memory-
-			 * backend fds, other isolates' socketpairs, etc.  M6. */
-			nvkvm_isolate_closefrom(4);
-			/* Phase 0 lockdown: namespaces + caps drop.  Fail closed
-			 * unless explicitly disabled — never run un-sandboxed. */
-			if (!getenv("NVKVM_ISOLATE_NO_HARDEN") &&
-			    nvkvm_isolate_harden_child() < 0)
-				_exit(126);
+			nvkvm_isolate_closefrom(4);  /* M6: drop KVM fd, syncpipe, etc. */
+			if (harden)
+				nvkvm_drop_all_caps();   /* no_new_privs + dumpable + caps */
 			const char *argv[] = { "nvkvm_stub", NULL };
 			const char *envp[] = { NULL };  /* M6: drop QEMU env */
 			fexecve(mfd, (char *const *)argv, (char *const *)envp);
@@ -559,13 +594,19 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		const char *dbg_mode = getenv("NVKVM_STUB_DEBUG");
 		bool keep_env = (dbg_mode && *dbg_mode == '1');
 
-		pid = fork();
+		pid = nvkvm_isolate_spawn(harden);
 		if (pid == 0) {
+			if (harden) {
+				char go;
+				close(syncpipe[1]);
+				if (read(syncpipe[0], &go, 1) != 1)
+					_exit(126);
+				close(syncpipe[0]);
+			}
 			dup2(sv[1], STDIN_FILENO);
 			nvkvm_isolate_closefrom(STDERR_FILENO + 1);
-			if (!getenv("NVKVM_ISOLATE_NO_HARDEN") &&
-			    nvkvm_isolate_harden_child() < 0)
-				_exit(126);  /* fail closed */
+			if (harden)
+				nvkvm_drop_all_caps();
 			if (!keep_env)
 				clearenv();
 			execl(stub_path, "nvkvm_stub", NULL);
@@ -575,15 +616,34 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	if (pid < 0) {
 		int e = errno;
+		if (harden) { close(syncpipe[0]); close(syncpipe[1]); }
 		close(sv[0]);
 		close(sv[1]);
 		iso->in_use = false;
 		return -e;
 	}
 
+	/* clone() returns the stub's real host pid directly — no intermediate. */
+	pid_t stub_pid = pid;
+	if (harden) {
+		close(syncpipe[0]);
+		int rc = nvkvm_map_child_userns(pid);   /* write uid/gid maps */
+		/* Signal the child to proceed (or, on failure, let its read see EOF
+		 * → _exit(126) → we fail closed below). */
+		if (rc == 0)
+			rc = (write(syncpipe[1], "x", 1) == 1) ? 0 : -1;
+		close(syncpipe[1]);
+		if (rc < 0) {
+			kill(pid, SIGKILL);
+			waitpid(pid, NULL, 0);
+			close(sv[0]); close(sv[1]); iso->in_use = false;
+			return -EPERM;
+		}
+	}
+
 	close(sv[1]);
 
-	iso->pid     = pid;
+	iso->pid     = stub_pid;
 	iso->sock_fd = sv[0];
 	iso->alive   = true;
 
@@ -592,8 +652,8 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		int e = errno;
 		close(iso->sock_fd);
 		iso->sock_fd = -1;
-		kill(pid, SIGKILL);
-		waitpid(pid, NULL, 0);
+		kill(stub_pid, SIGKILL);   /* the grandchild stub, not the reaped intermediate */
+		waitpid(stub_pid, NULL, 0);
 		iso->in_use = false;
 		return -e;
 	}
@@ -603,7 +663,7 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	fprintf(stderr,
 		"nvkvm_isolate: created isolate %u pid=%d sock=%d\n",
-		id, pid, sv[0]);
+		id, stub_pid, sv[0]);
 	return 0;
 }
 
