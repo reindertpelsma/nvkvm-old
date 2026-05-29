@@ -101,10 +101,24 @@ Refs memory: [[isolate_hardening_todo]], [[security_audit_2026_05_28]] (C6),
 
 ---
 
-## Phase 1 — Inventory pass  [ ]
-Log every forwarded cmd + WHERE it executes (stub vs QEMU-direct) over a full
-CUDA + nvidia-smi run. Produce the QEMU-direct danger list (the unscoped
-surface). Output: a table in this doc.
+## Phase 1 — Inventory pass  [x] DONE
+Classified by execution locus (nvkvm_isolate_handlers.c):
+
+**STUB-executed (kernel per-RM-client scoped → contained by the now-real isolate):**
+IOCTL_ON_ISOLATE non-UVM (nvkvm_isolate_ioctl @484/576), OPEN_NVIDIA_HANDLE,
+OPEN_MEMORY_HANDLE, CLOSE_HANDLE, COPY_HANDLE_TO_ISOLATE, CLOSE_HANDLE_ON_ISOLATE,
+POLL/UNPOLL, CREATE/KILL_ISOLATE, LIST_NVIDIA_DEVICES.
+
+**QEMU-DIRECT (privileged, NOT client-scoped → danger surface):**
+- **UVM ioctls** — dev_id==UVM runs `ioctl(h->fd, req->cmd, param_buf)` in QEMU
+  (line 420); embedded fds partially translated, pids/VAs/access NOT generically
+  validated. ← PRIMARY Phase-3 target.
+- **MMAP/MUNMAP** — KVM_SET_USER_MEMORY_REGION + mmap (885/943); req->offset/prot/len.
+- **REALIZE_UVM_MAPPING** — already §8a strict-validated. ✓
+- **READ_HOST_FILE** — allowlist by file_id (nvkvm_hfile_path), not guest path. ✓
+- **READ/WRITE_MEMORY_HANDLE** — by validated handle; bound-check sizes (low risk).
+
+Conclusion: Phase-3 focus = UVM-ioctl field schema + MMAP prot/offset bounds.
 
 ## Phase 2 — nvidia-smi PID translation + response scrubbing  [ ]
 nvidia-smi enumerates processes via RM ioctl (NV2080_CTRL_CMD_GPU_GET_PIDS /
