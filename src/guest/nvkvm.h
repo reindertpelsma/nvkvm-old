@@ -180,6 +180,11 @@ struct nvkvm_inflight {
 	/* extended fields for isolate-path responses */
 	__u64               fault_addr; /* GVA of SIGSEGV in isolate (IOCTL_ON_ISOLATE) */
 	__u32               nvstatus;   /* NvStatus from NVIDIA params              */
+	/* When nonzero, nvkvm_send_sync waits interruptibly and, on a pending
+	 * signal, asks this isolate to interrupt the in-flight ioctl (txn_id).
+	 * Set only on the IOCTL_ON_ISOLATE path; control-plane reqs leave it 0
+	 * and wait uninterruptibly. */
+	__u32               isolate_id;
 };
 
 /* ── Global module state ──────────────────────────────────────────────────── */
@@ -271,6 +276,7 @@ int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle(__u32 handle_id);
 int  nvkvm_virtio_kill_isolate(__u32 isolate_id);
+int  nvkvm_virtio_interrupt_isolate(__u32 isolate_id, __u32 target_txn);
 long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 				   unsigned int cmd,
 				   void *params_buf, size_t param_size,

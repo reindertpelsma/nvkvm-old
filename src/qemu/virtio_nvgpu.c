@@ -638,6 +638,10 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_kill_isolate,
 			    nvkvm_resp_kill_isolate,
 			    nvkvm_req_kill_isolate)
+		ISOLATE_REQ(NVKVM_REQ_INTERRUPT,
+			    nvkvm_req_interrupt,
+			    nvkvm_resp_interrupt,
+			    nvkvm_req_interrupt)
 		ISOLATE_REQ(NVKVM_REQ_COPY_HANDLE_TO_ISOLATE,
 			    nvkvm_req_copy_handle_to_isolate,
 			    nvkvm_resp_copy_handle_to_isolate,

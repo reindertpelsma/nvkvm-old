@@ -41,6 +41,7 @@
 /* From <asm-generic/errno-base.h> — the kernel UAPI errno values we use. */
 #ifndef EPERM
 #define EPERM     1
+#define EINTR     4
 #define EIO       5
 #define EBADF     9
 #define ENOMEM   12
@@ -92,6 +93,7 @@
 
 /* Signal numbers + sigaction shape (kernel ABI, not glibc-augmented). */
 #define SIGSEGV     11
+#define SIGUSR1     10
 #define SA_SIGINFO  0x00000004
 #define SA_RESTORER 0x04000000
 
@@ -439,6 +441,9 @@ static int send_full(const void *buf, size_t len)
 	const char *p = buf;
 	while (len > 0) {
 		long n = stub_write(SOCK_FD, p, len);
+		/* A stray SIGUSR1 (txn interrupt, #73) can hit a worker mid-send;
+		 * retry rather than corrupt the response framing. */
+		if (n == -EINTR) continue;
 		if (n <= 0) return -1;
 		p += n; len -= (size_t)n;
 	}
@@ -450,6 +455,7 @@ static int recv_full(void *buf, size_t len)
 	char *p = buf;
 	while (len > 0) {
 		long n = stub_read(SOCK_FD, p, len);
+		if (n == -EINTR) continue;
 		if (n <= 0) return -1;
 		p += n; len -= (size_t)n;
 	}
@@ -495,9 +501,25 @@ static int send_error(int err)
 static volatile int       worker_tids[WORKER_SLOT_MAX];      /* tid → slot */
 static volatile uint64_t  worker_fault_addr[WORKER_SLOT_MAX];
 
+/*
+ * txn currently executing in each worker's stub_ioctl (0 = idle).  Set by the
+ * worker immediately before the ioctl and cleared immediately after, so the
+ * reader thread can map an ISOLATE_CMD_INTERRUPT(target_txn) to the worker's
+ * tid and post SIGUSR1, making the in-flight host ioctl return -EINTR (#73).
+ */
+static volatile uint32_t  worker_inflight_txn[WORKER_SLOT_MAX];
+
+/* Our own pid (== tgid), cached before seccomp so tgkill needs no getpid. */
+static int stub_pid;
+
 static int stub_gettid(void)
 {
 	return (int)sc0(__NR_gettid);
+}
+
+static int stub_tgkill(int tgid, int tid, int sig)
+{
+	return (int)sc3(__NR_tgkill, tgid, tid, sig);
 }
 
 static int worker_self_slot(void)
@@ -524,6 +546,37 @@ static uint64_t get_fault_addr(void)
 static void clear_fault_addr(void)
 {
 	worker_fault_addr[worker_self_slot()] = 0;
+}
+
+/*
+ * SIGUSR1 handler — deliberately empty.  Its only purpose is to interrupt a
+ * blocking ioctl(2): registered WITHOUT SA_RESTART so the syscall returns
+ * -EINTR instead of auto-restarting.  Posted by the reader thread (tgkill) to
+ * the worker running an interrupted txn (#73).
+ */
+static void sigusr1_handler(int sig, siginfo_t *info, void *ctx)
+{
+	(void)sig; (void)info; (void)ctx;
+}
+
+/*
+ * Find the worker currently executing target_txn and post SIGUSR1 to it.
+ * Called on the reader thread for ISOLATE_CMD_INTERRUPT.  Best-effort: if no
+ * worker holds the txn (already finished, or not yet entered the ioctl) we do
+ * nothing — the normal IOCTL response path still delivers a result.
+ */
+static void interrupt_txn(uint32_t target_txn)
+{
+	if (target_txn == 0)
+		return;
+	for (int i = 1; i < WORKER_SLOT_MAX; i++) {
+		if (worker_inflight_txn[i] == target_txn) {
+			int tid = worker_tids[i];
+			if (tid > 0)
+				stub_tgkill(stub_pid, tid, SIGUSR1);
+			return;
+		}
+	}
 }
 
 /* ── Thread pool ──────────────────────────────────────────────────────────── */
@@ -1020,7 +1073,13 @@ static void worker_thread(void *arg)
 		 * stub-local backing allocation is needed here.
 		 */
 		clear_fault_addr();
+		/* Publish our in-flight txn so the reader can SIGUSR1 us if the
+		 * guest signals this ioctl (#73).  Cleared the instant the ioctl
+		 * returns so a late interrupt lands on a no-op handler, not on
+		 * the post-processing/send path. */
+		worker_inflight_txn[slot] = job.txn_id;
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
+		worker_inflight_txn[slot] = 0;
 		/* sc*: negative return is -errno, matching kernel convention. */
 		int  err  = (ret < 0) ? (int)(-ret) : 0;
 		if (ret < 0) ret = -1;  /* normalise to (-1, errno) for callers */
@@ -1673,6 +1732,7 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_openat);
 	ALLOW_IF(__NR_eventfd2);
 	ALLOW_IF(__NR_gettid);
+	ALLOW_IF(__NR_tgkill);   /* post SIGUSR1 to interrupt a worker's ioctl (#73) */
 	ALLOW_IF(__NR_readlinkat);
 
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
@@ -1756,6 +1816,9 @@ int main(void)
 	/* Reader thread reserves slot 0 in worker_tids[] so SIGSEGV from
 	 * inline (non-worker) ioctls is captured against the right slot. */
 	worker_tids[0] = stub_gettid();
+	/* Cache our pid (== tgid) for tgkill — gettid on the main thread IS the
+	 * tgid, and getpid would otherwise need a seccomp slot at runtime. */
+	stub_pid = worker_tids[0];
 
 	/* SIGSEGV handler — per-worker fault address via worker_fault_addr[] */
 	struct kernel_sigaction sa = {
@@ -1764,6 +1827,17 @@ int main(void)
 		.sa_restorer   = stub_sigreturn_trampoline,
 	};
 	stub_sigaction(SIGSEGV, &sa, NULL);
+
+	/* SIGUSR1 handler — interrupt a worker's blocking ioctl (#73).  No
+	 * SA_RESTART, so the ioctl returns -EINTR instead of auto-restarting.
+	 * Default SIGUSR1 action is terminate, so this MUST be installed before
+	 * any tgkill can arrive. */
+	struct kernel_sigaction sa_usr1 = {
+		.sa_handler_fn = sigusr1_handler,
+		.sa_flags      = SA_RESTORER,
+		.sa_restorer   = stub_sigreturn_trampoline,
+	};
+	stub_sigaction(SIGUSR1, &sa_usr1, NULL);
 
 	/* Spawn worker threads via clone3.  Each worker gets a fresh stack
 	 * and a slot id stashed in worker_tids[] for fault-addr indexing.
@@ -1856,6 +1930,7 @@ int main(void)
 			struct isolate_cmd_unpoll           unpoll_cmd;
 			struct isolate_cmd_open_device      open_dev;
 			struct isolate_cmd_realize_uvm_fd   realize;
+			struct isolate_cmd_interrupt        interrupt_cmd;
 		} cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
@@ -1868,6 +1943,8 @@ int main(void)
 		};
 
 		long n = stub_recvmsg(SOCK_FD, &msg_hdr, 0);
+		if (n == -EINTR)
+			continue;   /* stray SIGUSR1; not EOF/error */
 		if (n <= 0)
 			break;
 		if (n < (long)sizeof(uint32_t))
@@ -1935,6 +2012,11 @@ int main(void)
 			handle_realize_uvm_fd(r);
 			break;
 		}
+		case ISOLATE_CMD_INTERRUPT:
+			/* Fire-and-forget: signal the worker on this txn so its
+			 * in-flight ioctl returns -EINTR.  No response. (#73) */
+			interrupt_txn(cmd.interrupt_cmd.target_txn);
+			break;
 		case ISOLATE_CMD_EXIT:
 			goto done;
 		default:

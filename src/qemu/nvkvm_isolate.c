@@ -996,6 +996,38 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	return ret;
 }
 
+int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
+			    uint32_t isolate_id, uint32_t target_txn)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	struct isolate_cmd_interrupt cmd = {
+		.type       = ISOLATE_CMD_INTERRUPT,
+		.target_txn = target_txn,
+	};
+
+	/*
+	 * Fire-and-forget under write_lock — no sync_lock, no response wait.
+	 * The reader thread is the sole reader; the stub posts SIGUSR1 to the
+	 * worker and the interrupted ioctl's result comes back on the normal
+	 * IOCTL response path.  write_lock just serialises this write against
+	 * concurrent command writers on the same socket.
+	 */
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive &&
+		     iso->sock_fd >= 0;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	return sr < 0 ? (int)sr : 0;
+}
+
 int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 			      uint32_t isolate_id, uint32_t handle_id,
 			      uint32_t dev_id, uint32_t flags,

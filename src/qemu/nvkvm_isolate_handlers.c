@@ -345,6 +345,26 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 	return 0;
 }
 
+/*
+ * NVKVM_REQ_INTERRUPT — a guest task blocked on a forwarded ioctl received a
+ * signal.  Route a best-effort interrupt to the named isolate's worker.
+ *
+ * Access model: isolate_id is QEMU-managed and VM-scoped; a guest can only
+ * name isolates this device created.  target_txn is the guest's own in-flight
+ * ioctl — interrupting it is purely an intra-VM concern, so no cross-VM check
+ * is needed (the guest kernel owns intra-VM policy).  We simply forward and
+ * report whether the isolate was live.
+ */
+int nvkvm_req_interrupt(VirtIONvgpu *nv,
+			struct nvkvm_req_interrupt *req,
+			struct nvkvm_resp_interrupt *resp)
+{
+	int ret = nvkvm_isolate_interrupt(&nv->isolates,
+					  req->isolate_id, req->target_txn);
+	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
+	return 0;
+}
+
 /* ── Handle distribution ────────────────────────────────────────────────── */
 
 int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,

@@ -107,6 +107,16 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 
 /*
+ * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently
+ * running target_txn so its in-flight host ioctl returns -EINTR.  Returns 0 if
+ * the command was written to a live isolate, -ENOENT for an unknown/dead one.
+ * Does NOT wait for the ioctl to actually return — the normal IOCTL response
+ * path delivers the (now -EINTR) result.
+ */
+int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
+			    uint32_t isolate_id, uint32_t target_txn);
+
+/*
  * Send a handle's fd to the isolate via SCM_RIGHTS.
  * Also bumps the handle's isolate_refcount.
  */

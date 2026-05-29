@@ -30,6 +30,7 @@
 #define ISOLATE_CMD_EXIT         8   /* clean shutdown                       */
 #define ISOLATE_CMD_OPEN_DEVICE  9   /* stub opens /dev/nvidia*, replies w/ SCM_RIGHTS fd */
 #define ISOLATE_CMD_REALIZE_UVM_FD 10 /* full UVM realize: init+register+intent+mmap */
+#define ISOLATE_CMD_INTERRUPT    11   /* post SIGUSR1 to the worker on txn_id  */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -85,6 +86,17 @@ struct isolate_resp_ioctl {
 	int32_t  retval;      /* ioctl return value (0 or -errno)          */
 	uint32_t nvstatus;    /* NvStatus from params.status field         */
 	uint64_t fault_addr;  /* GVA that triggered SIGSEGV (0 if none)   */
+};
+
+/* ── INTERRUPT ───────────────────────────────────────────────────────────────
+ * Fire-and-forget (QEMU does not wait for a reply): the stub's reader thread
+ * finds the worker currently executing target_txn and posts SIGUSR1 to it so
+ * its in-flight host ioctl returns -EINTR.  The interrupted worker then sends
+ * the normal ISOLATE_RESP_IOCTL with retval=-EINTR on the regular path.
+ */
+struct isolate_cmd_interrupt {
+	uint32_t type;        /* ISOLATE_CMD_INTERRUPT */
+	uint32_t target_txn;  /* txn_id of the ioctl to interrupt */
 };
 
 /* ── MMAP ────────────────────────────────────────────────────────────────── */
