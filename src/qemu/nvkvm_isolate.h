@@ -103,6 +103,9 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
  */
 int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 
+/* Host pid of a live isolate by id (0 if none) — for GET_PID_INFO pid mapping. */
+pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+
 /*
  * Send a handle's fd to the isolate via SCM_RIGHTS.
  * Also bumps the handle's isolate_refcount.

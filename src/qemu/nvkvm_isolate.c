@@ -777,6 +777,25 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	return 0;
 }
 
+/*
+ * Return the host pid of a live isolate by id, or 0.  Used by the GET_PID_INFO
+ * translator to map a guest pid's owning isolate to the real host pid the kernel
+ * can resolve — QEMU thereby validates that a per-pid query targets a managed
+ * isolate of this VM, never an arbitrary host pid.
+ */
+pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
+{
+	pid_t pid = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return 0;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	pthread_mutex_lock(&iso->lock);
+	if (iso->in_use && iso->id == isolate_id && iso->alive)
+		pid = iso->pid;
+	pthread_mutex_unlock(&iso->lock);
+	return pid;
+}
+
 /* ── Kill isolate ───────────────────────────────────────────────────────── */
 
 int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)

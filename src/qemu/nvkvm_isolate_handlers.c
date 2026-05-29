@@ -505,6 +505,130 @@ static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
 	return found;
 }
 
+/* NV2080_CTRL_GPU_PID_INFO is 72 bytes (pid@0, index@4, result@8, data@16 =
+ * NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA[6×NvU64], smcSubscription@64);
+ * pidInfoList[] starts at +8 in the params struct.  Verified via sizeof on the
+ * 575 open-driver SDK headers. */
+#define NVKVM_PIDINFO_STRIDE 72u
+
+/*
+ * Read the innermost-namespace tid for a host tid from /proc/<tid>/status.
+ *
+ * nvidia attributes per-process GPU memory to the creating thread's pid as seen
+ * in the *caller's* pid namespace, and our stub runs in its own PID namespace
+ * (CLONE_NEWPID).  The "NSpid:" line lists the tid at each namespace level from
+ * the reader's ns (host root, first field) down to the innermost (the stub's
+ * ns, last field).  We must query GET_PID_INFO with that innermost value,
+ * because the stub worker thread that executes the forwarded query resolves
+ * pid_vnr() in the stub's ns.  Returns the innermost ns tid, or 0 on failure.
+ */
+static uint32_t nvkvm_proc_innermost_nspid(pid_t host_tid)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/status", (int)host_tid);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return 0;
+	char line[256];
+	uint32_t ns_tid = 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "NSpid:", 6) != 0)
+			continue;
+		/* Take the LAST whitespace-separated integer on the line. */
+		char *p = line + 6;
+		char *tok = strtok(p, " \t\n");
+		while (tok) {
+			ns_tid = (uint32_t)strtoul(tok, NULL, 10);
+			tok = strtok(NULL, " \t\n");
+		}
+		break;
+	}
+	fclose(f);
+	return ns_tid;
+}
+
+/*
+ * GET_PID_INFO (#66) helper — sum a per-pid GPU metric across all worker
+ * threads of an isolate's stub process.
+ *
+ * nvidia attributes per-process GPU memory to the *kernel tid* (in the caller's
+ * pid ns) that created the owning RM client.  Our stub services an isolate's
+ * ioctls from a shared worker pool inside its own PID namespace, so a single
+ * isolate's clients are spread across several stub-ns worker tids.  We enumerate
+ * /proc/<tgid>/task, map each host tid to its stub-ns tid (NSpid innermost), and
+ * run a 1-entry GET_PID_INFO against each, summing the metric.  `tmpl_aux` is
+ * the original full-size aux buffer; we copy it (so param_size/aux_size stay
+ * ABI-exact) and only rewrite count=1 and entry0.pid/index.  Returns the summed
+ * metric; *any_out is set if at least one thread reported it (result==NV_OK).
+ *
+ * Security: tgid is the validated isolate's own process (from
+ * nvkvm_isolate_host_pid); we only ever query tids under that tgid, never an
+ * arbitrary host pid the guest could name.
+ */
+static uint64_t nvkvm_get_pid_info_sum(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint32_t handle_id,
+				       unsigned int cmd,
+				       void *param_buf, size_t param_size,
+				       void *tmpl_aux, size_t aux_size,
+				       pid_t tgid, uint32_t index, int *any_out)
+{
+	uint64_t sum = 0;
+	int any = 0;
+	char path[64];
+
+	if (any_out)
+		*any_out = 0;
+	if (aux_size < 8 + NVKVM_PIDINFO_STRIDE)
+		return 0;
+	snprintf(path, sizeof(path), "/proc/%d/task", (int)tgid);
+	DIR *d = opendir(path);
+	if (!d)
+		return 0;
+
+	void *aux = g_malloc(aux_size);
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		if (de->d_name[0] < '0' || de->d_name[0] > '9')
+			continue;
+		long host_tid = strtol(de->d_name, NULL, 10);
+		if (host_tid <= 0)
+			continue;
+		uint32_t ns_tid = nvkvm_proc_innermost_nspid((pid_t)host_tid);
+		if (ns_tid == 0)
+			continue;
+
+		memcpy(aux, tmpl_aux, aux_size);
+		uint32_t one = 1;
+		memcpy(aux, &one, 4);                    /* pidInfoListCount = 1 */
+		memcpy((char *)aux + 8 + 0, &ns_tid, 4); /* entry0.pid (stub ns) */
+		memcpy((char *)aux + 8 + 4, &index, 4);  /* entry0.index        */
+
+		uint32_t ns = 0;
+		uint64_t fa = 0;
+		int r = nvkvm_isolate_ioctl(t, isolate_id, handle_id, cmd,
+					    param_buf, param_size,
+					    aux, aux_size, 0, &ns, &fa);
+		if (r != 0 || ns != 0)
+			continue;
+		uint32_t result = 0;
+		uint64_t priv = 0, shOwned = 0;
+		memcpy(&result,  (char *)aux + 8 + 8,  4);
+		memcpy(&priv,    (char *)aux + 8 + 16, 8);  /* memPrivate     */
+		memcpy(&shOwned, (char *)aux + 8 + 24, 8);  /* memSharedOwned */
+		if (result == 0) {                          /* NV_OK */
+			/* Count owned memory only; shared-duped would double-count
+			 * across the clients that duped the same descriptor. */
+			sum += priv + shOwned;
+			any = 1;
+		}
+	}
+	g_free(aux);
+	closedir(d);
+	if (any_out)
+		*any_out = any;
+	return sum;
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
@@ -741,6 +865,59 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		}
 	}
 
+	/*
+	 * GET_PID_INFO (#66): NV2080_CTRL_CMD_GPU_GET_PID_INFO (inner cmd
+	 * 0x2080018e) carries pidInfoList[] in aux_buf (count@0, 56-byte entries
+	 * @8, pid@+0).  The guest tagged each pid it owns with 0x80000000|
+	 * isolate_id (ns-filtered).  We validate the isolate belongs to THIS VM and
+	 * write its stub-process tgid into the pid field so the baseline forward
+	 * resolves a known process (NV_OK).  Because nvidia attributes vidmem to the
+	 * worker *tid* that owns each RM client — and our pool spreads ownership
+	 * across the stub's worker tids — the tgid query returns 0 bytes; we fix
+	 * that up post-forward by summing per-tid (nvkvm_get_pid_info_sum).  QEMU
+	 * thus validates pids against managed isolates: a guest can never make the
+	 * privileged stub query an arbitrary host pid.  The guest restores its own
+	 * pids into the response, so nvidia-smi sees its pid + the real usage.
+	 */
+	bool     gpi_active = false;
+	uint32_t gpi_count  = 0;
+	static __thread uint32_t gpi_iso[200];   /* per-entry isolate (0 = skip) */
+	if (_IOC_TYPE(req->cmd) == 'F' &&
+	    _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL &&
+	    param_buf && req->param_size >= 12 &&
+	    aux_buf && req->aux_size >= 8 + NVKVM_PIDINFO_STRIDE) {
+		uint32_t icmd = 0;
+		memcpy(&icmd, (char *)param_buf + 8, 4);
+		if (icmd == 0x2080018eu) {        /* NV2080_CTRL_CMD_GPU_GET_PID_INFO */
+			uint32_t count = 0;
+			memcpy(&count, aux_buf, 4);
+			if (count > 200)
+				count = 200;
+			gpi_active = true;
+			gpi_count  = count;
+			for (uint32_t i = 0; i < count; i++) {
+				uint32_t off = 8 + i * NVKVM_PIDINFO_STRIDE;
+				uint32_t v = 0, repl = 0;
+				gpi_iso[i] = 0;
+				if ((uint64_t)off + 4 > req->aux_size) {
+					gpi_count = i;
+					break;
+				}
+				memcpy(&v, (char *)aux_buf + off, 4);
+				if (v & 0x80000000u) {
+					uint32_t iso = v & 0x7fffffffu;
+					pid_t hp = nvkvm_isolate_host_pid(
+						&nv->isolates, iso);
+					if (hp > 0) {
+						repl = (uint32_t)hp;
+						gpi_iso[i] = iso;
+					}
+				}
+				memcpy((char *)aux_buf + off, &repl, 4);
+			}
+		}
+	}
+
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
@@ -757,6 +934,35 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	resp->status     = (ret == -EFAULT && fault_addr) ? EFAULT : 0;
 	resp->nvstatus   = nvstatus;
 	resp->fault_addr = fault_addr;
+
+	/*
+	 * GET_PID_INFO fixup (#66): the baseline forward queried each entry's stub
+	 * tgid and got NV_OK with 0 bytes (vidmem is tid-attributed).  For every
+	 * entry that mapped to a validated isolate, sum the metric across that
+	 * isolate's worker tids and overwrite the entry's data union, marking it
+	 * NV_OK so nvidia-smi reports the real per-process usage.
+	 */
+	if (gpi_active && ret == 0) {
+		for (uint32_t i = 0; i < gpi_count; i++) {
+			if (gpi_iso[i] == 0)
+				continue;
+			uint32_t off = 8 + i * NVKVM_PIDINFO_STRIDE;
+			pid_t tgid = nvkvm_isolate_host_pid(&nv->isolates,
+							    gpi_iso[i]);
+			if (tgid <= 0)
+				continue;
+			uint32_t index = 0;
+			memcpy(&index, (char *)aux_buf + off + 4, 4);
+			int any = 0;
+			uint64_t sum = nvkvm_get_pid_info_sum(
+				&nv->isolates, req->isolate_id, req->handle_id,
+				req->cmd, param_buf, req->param_size,
+				aux_buf, req->aux_size, tgid, index, &any);
+			uint32_t result = any ? 0u : 0xffffu; /* NV_OK / NOT_FOUND */
+			memcpy((char *)aux_buf + off + 8, &result, 4);
+			memcpy((char *)aux_buf + off + 16, &sum, 8);
+		}
+	}
 
 	/*
 	 * Phase 4 — record this VM's RM client handles.  Every successful 'F'
