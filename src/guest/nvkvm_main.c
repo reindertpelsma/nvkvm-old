@@ -386,6 +386,67 @@ static int nvkvm_release(struct inode *inode, struct file *filp)
 /* ── ioctl forwarding ─────────────────────────────────────────────────────── */
 
 /*
+ * GPU process enumeration (nvidia-smi).  NV2080_CTRL_CMD_GPU_GET_PIDS asks the
+ * RM "which pids have GPU allocations".  We must NOT forward it: the stub runs
+ * in its own pid namespace and as a distinct RM client, so the host RM (a)
+ * cannot see other isolates' pids and (b) would report host pids meaningless
+ * to the guest.  Instead the guest module — the authority on which guest
+ * processes hold GPU sessions — synthesizes the answer from its session table.
+ * Returns 1 if it handled the control (caller copies params_buf back + returns
+ * 0), 0 to fall through to normal forwarding.
+ */
+#define NVKVM_NV2080_GET_PIDS      0x2080018du
+#define NVKVM_GET_PIDS_MAX         950u
+struct nvkvm_get_pids_params {
+	__u32 id_type;
+	__u32 id;
+	__u32 pid_tbl_count;
+	__u32 pid_tbl[NVKVM_GET_PIDS_MAX];
+};
+
+static int nvkvm_synth_get_pids(void *params_buf, __u32 param_size)
+{
+	struct nvos54_parameters *ctl = params_buf;
+	struct nvkvm_get_pids_params *gp;
+	struct nvkvm_session *s;
+	void __user *up;
+	size_t outsz;
+	__u32 n = 0;
+	int id;
+
+	if (param_size != sizeof(*ctl) || ctl->cmd != NVKVM_NV2080_GET_PIDS)
+		return 0;
+	up = (void __user *)(uintptr_t)ctl->params;
+	if (!up || ctl->params_size < offsetof(struct nvkvm_get_pids_params, pid_tbl))
+		return 0;
+
+	gp = kzalloc(sizeof(*gp), GFP_KERNEL);
+	if (!gp)
+		return 0;   /* fall through to forwarding on OOM */
+
+	/* The guest's GPU processes = the tgids holding nvkvm sessions. */
+	mutex_lock(&nvkvm.sessions_lock);
+	idr_for_each_entry(&nvkvm.sessions_idr, s, id) {
+		if (s->tgid && n < NVKVM_GET_PIDS_MAX)
+			gp->pid_tbl[n++] = (__u32)s->tgid;
+	}
+	mutex_unlock(&nvkvm.sessions_lock);
+	gp->pid_tbl_count = n;
+
+	outsz = offsetof(struct nvkvm_get_pids_params, pid_tbl) + (size_t)n * 4;
+	if (outsz > ctl->params_size)
+		outsz = ctl->params_size;
+	if (copy_to_user(up, gp, outsz)) {
+		kfree(gp);
+		return 0;
+	}
+	kfree(gp);
+	ctl->status = 0;   /* NV_OK — caller writes params_buf back to user */
+	pr_info_ratelimited("nvkvm: synthesized GET_PIDS — %u guest pid(s)\n", n);
+	return 1;
+}
+
+/*
  * nvkvm_ioctl — validate and forward an ioctl to the host.
  *
  * Security: we validate param_size against the known ABI size before copying
@@ -433,6 +494,20 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			kfree(params_buf);
 			return -EFAULT;
 		}
+	}
+
+	/*
+	 * nvidia-smi process enumeration (GET_PIDS): synthesize from our session
+	 * table instead of forwarding — the host RM can't see the guest's pids
+	 * (pid namespace + per-isolate RM client).  Simulated entirely guest-side.
+	 */
+	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
+	    nvkvm_synth_get_pids(params_buf, param_size)) {
+		long sr = 0;
+		if (uparams && copy_to_user(uparams, params_buf, param_size))
+			sr = -EFAULT;
+		kfree(params_buf);
+		return sr;
 	}
 
 	/*

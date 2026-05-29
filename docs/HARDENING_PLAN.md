@@ -120,7 +120,16 @@ POLL/UNPOLL, CREATE/KILL_ISOLATE, LIST_NVIDIA_DEVICES.
 
 Conclusion: Phase-3 focus = UVM-ioctl field schema + MMAP prot/offset bounds.
 
-## Phase 2 — nvidia-smi PID translation + response scrubbing  [~] INVESTIGATING
+## Phase 2 — nvidia-smi process list (guest-synthesized)  [x] CORE DONE
+DONE: guest module intercepts NV2080_CTRL_CMD_GPU_GET_PIDS (0x2080018d) and
+synthesizes the response from its session table (guest tgids) instead of
+forwarding (host RM returns empty due to pid-ns). Verified: nvidia-smi lists the
+guest's processes with correct GUEST pids + names (matmul shown). Guest-side per
+your preference. FOLLOW-UPS: (a) GET_PID_INFO (0x2080018e) for per-pid memory —
+needs per-session GPU-mem tracking (currently 0 MiB); (b) filter sessions that
+haven't allocated GPU memory so nvidia-smi doesn't list itself. Neither blocks.
+
+### (original investigation notes)
 FINDING (2026-05-29): the process query is NOT NV2080_CTRL_CMD_GPU_GET_PIDS —
 0x2080018d/018e never appear in the forwarded inner-cmd log, and nvidia-smi's
 process table is empty even DURING a live matmul (148 MiB in use). strace shows
