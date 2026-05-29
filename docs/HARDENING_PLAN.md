@@ -77,7 +77,8 @@ concurrent + nvidia-smi must all still pass):
 - [ ] **0.4-old pid/net/ipc/uts namespaces** (QEMU: unshare(NEWPID|NEWNET|NEWIPC|
   NEWUTS) then fork so stub is PID 1). Bonus: nvidia host-kernel calls now see
   an empty pid ns → no other-process leakage. Test.
-- [ ] **0.5 empty mount namespace** (stub: capture dev O_PATH dirfd; unshare
+- [x] **0.5 empty mount namespace** DONE — clone adds CLONE_NEWNS; QEMU child captures /dev O_PATH @ fd4, mounts RO tmpfs (mode=000), pivot_root(.,.)+detach into empty root; both spawn paths now fexecve a PRE-OPENED binary fd (path vanishes after pivot). Stub opens devices via openat(dev_dirfd). Verified: all 6 ns isolated, root = empty RO tmpfs, single/2/4-conc/nvidia-smi pass.
+- [ ] **0.5-old empty mount namespace** (stub: capture dev O_PATH dirfd; unshare
   NEWNS; mount tmpfs; pivot_root + chroot + chdir; switch OPEN_DEVICE to
   openat(dev_dirfd, ...)). Test.
 - [ ] **0.6 fail-closed flags** + final re-test: single + 2/4 concurrent +

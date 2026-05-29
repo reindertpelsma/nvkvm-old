@@ -225,4 +225,13 @@ struct isolate_resp_realize_uvm {
 	uint64_t realize_token;/* opaque (currently == host_va for now)     */
 };
 
+/*
+ * When the isolate is hardened with an empty mount namespace, /dev is no
+ * longer reachable by path.  QEMU parks an O_PATH directory handle to the
+ * host's /dev at this fixed fd in the stub child before exec; the stub opens
+ * device nodes with openat(NVKVM_DEV_DIRFD, "nvidiaX", ...).  If the fd is not
+ * a directory (un-hardened spawn), the stub falls back to "/dev/<name>".
+ */
+#define NVKVM_DEV_DIRFD 4
+
 #endif /* NVKVM_ISOLATE_PROTO_H */

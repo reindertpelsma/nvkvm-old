@@ -26,7 +26,20 @@
 #include <signal.h>
 #include <sched.h>
 #include <sys/prctl.h>
+#include <sys/mount.h>
 #include <linux/capability.h>
+
+#ifndef MS_REC
+#define MS_REC      16384
+#endif
+#ifndef MS_PRIVATE
+#define MS_PRIVATE  (1UL << 18)
+#endif
+/* Also defined in nvkvm_isolate_proto.h; guard so the QEMU build tree's
+ * header-copy timing can't break compilation (fixed protocol value). */
+#ifndef NVKVM_DEV_DIRFD
+#define NVKVM_DEV_DIRFD 4
+#endif
 
 #ifndef PR_CAP_AMBIENT
 #define PR_CAP_AMBIENT            47
@@ -112,9 +125,51 @@ static pid_t nvkvm_isolate_spawn(bool harden)
 	if (!harden)
 		return fork();
 	unsigned long flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET |
-			      CLONE_NEWIPC | CLONE_NEWUTS | (unsigned long)SIGCHLD;
+			      CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS |
+			      (unsigned long)SIGCHLD;
 	return (pid_t)syscall(SYS_clone, flags, (void *)0, (void *)0,
 			      (void *)0, 0UL);
+}
+
+/*
+ * Child-side: capture an O_PATH handle to the host /dev (parked at
+ * NVKVM_DEV_DIRFD for the stub's openat), then pivot_root into an empty,
+ * read-only tmpfs so the stub has NO view of the host filesystem.  Runs in
+ * the clone()'d child (PID 1, ns-root with CAP_SYS_ADMIN in its userns),
+ * before caps are dropped.  Returns 0 / -1.
+ */
+static int nvkvm_child_enter_mount_ns(void)
+{
+	int dd = open("/dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (dd < 0)
+		return -1;
+	/* Don't let our mount changes propagate back to the host. */
+	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
+		goto fail;
+	/* Empty read-only root on tmpfs. */
+	if (mount("tmpfs", "/tmp", "tmpfs",
+		  MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64k,mode=000") < 0)
+		goto fail;
+	if (chdir("/tmp") < 0)
+		goto fail;
+	/* pivot_root(".",".") + detach old root: the runc idiom. */
+	if (syscall(SYS_pivot_root, ".", ".") < 0)
+		goto fail;
+	umount2(".", MNT_DETACH);
+	if (chdir("/") < 0)
+		goto fail;
+	mount(NULL, "/", NULL,
+	      MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
+	/* Park the /dev handle at the fd the stub expects. */
+	if (dd != NVKVM_DEV_DIRFD) {
+		if (dup2(dd, NVKVM_DEV_DIRFD) < 0)
+			goto fail;
+		close(dd);
+	}
+	return 0;
+fail:
+	close(dd);
+	return -1;
 }
 
 /* memfd_create may not be in older glibc headers; use syscall directly. */
@@ -568,13 +623,16 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				close(syncpipe[0]);
 			}
 			dup2(sv[1], STDIN_FILENO);
-			/* Park the memfd at fd 3 so closefrom(4) preserves it. */
+			/* Park the memfd at fd 3 so closefrom preserves it. */
 			if (mfd != 3) {
 				dup2(mfd, 3);
 				close(mfd);
 				mfd = 3;
 			}
-			nvkvm_isolate_closefrom(4);  /* M6: drop KVM fd, syncpipe, etc. */
+			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
+			if (harden && nvkvm_child_enter_mount_ns() < 0)
+				_exit(126);
+			nvkvm_isolate_closefrom(harden ? NVKVM_DEV_DIRFD + 1 : 4);
 			if (harden)
 				nvkvm_drop_all_caps();   /* no_new_privs + dumpable + caps */
 			const char *argv[] = { "nvkvm_stub", NULL };
@@ -603,13 +661,27 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 					_exit(126);
 				close(syncpipe[0]);
 			}
+			/* Open the stub binary as an fd BEFORE pivot_root — after we
+			 * pivot into the empty tmpfs root, stub_path no longer exists,
+			 * so exec must go through this fd (fexecve), not the path. */
+			int binfd = open(stub_path, O_RDONLY | O_CLOEXEC);
+			if (binfd < 0)
+				_exit(127);
 			dup2(sv[1], STDIN_FILENO);
-			nvkvm_isolate_closefrom(STDERR_FILENO + 1);
+			if (binfd != 3) {
+				dup2(binfd, 3);
+				close(binfd);
+				binfd = 3;
+			}
+			if (harden && nvkvm_child_enter_mount_ns() < 0)
+				_exit(126);
+			nvkvm_isolate_closefrom(harden ? NVKVM_DEV_DIRFD + 1 : 4);
 			if (harden)
 				nvkvm_drop_all_caps();
-			if (!keep_env)
-				clearenv();
-			execl(stub_path, "nvkvm_stub", NULL);
+			const char *argv[] = { "nvkvm_stub", NULL };
+			const char *empty_env[] = { NULL };
+			fexecve(binfd, (char *const *)argv,
+				keep_env ? environ : (char *const *)empty_env);
 			_exit(127);
 		}
 	}

@@ -274,6 +274,51 @@ static long stub_openat(int dfd, const char *path, int flags)
 	return sc3(__NR_openat, dfd, (long)path, flags);
 }
 
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0x10000
+#endif
+#ifndef O_PATH
+#define O_PATH 0x200000
+#endif
+
+/*
+ * Device-node opening that survives the empty mount namespace.  When the
+ * isolate is hardened, QEMU passes an O_PATH handle to the host /dev at
+ * NVKVM_DEV_DIRFD; we open nodes relative to it.  When un-hardened the fd is
+ * not a directory and we fall back to the absolute /dev path.  Set once at
+ * startup by stub_detect_dev_dirfd() (before pivot_root makes /dev vanish).
+ */
+static int g_dev_dirfd = -1;
+
+static void stub_detect_dev_dirfd(void)
+{
+	/* openat(fd, ".") succeeds only if fd is a directory. */
+	long r = sc3(__NR_openat, NVKVM_DEV_DIRFD, (long)".",
+		     O_PATH | O_DIRECTORY);
+	if (r >= 0) {
+		sc1(__NR_close, r);
+		g_dev_dirfd = NVKVM_DEV_DIRFD;
+	}
+}
+
+/* Open /dev/<name> in a mount-ns-agnostic way (name is relative, no /dev/). */
+static long stub_open_dev(const char *name, int flags)
+{
+	if (g_dev_dirfd >= 0)
+		return stub_openat(g_dev_dirfd, name, flags);
+	/* Un-hardened fallback: build "/dev/<name>". */
+	char p[40];
+	const char pre[] = "/dev/";
+	unsigned i = 0;
+	for (; i < sizeof(pre) - 1; i++)
+		p[i] = pre[i];
+	unsigned j = 0;
+	while (name[j] && i < sizeof(p) - 1)
+		p[i++] = name[j++];
+	p[i] = 0;
+	return stub_openat(AT_FDCWD, p, flags);
+}
+
 #ifndef __NR_eventfd2
 #define __NR_eventfd2 290   /* x86-64 */
 #endif
@@ -1138,23 +1183,25 @@ static void *blob_alloc(size_t size)
  */
 static int dev_id_to_path(uint32_t dev_id, char *buf, size_t buflen)
 {
+	/* Relative names (no "/dev/" prefix) so they work with openat() against
+	 * the /dev O_PATH dirfd in an empty mount namespace. */
 	if (dev_id == 0) {              /* NVKVM_DEV_CTL */
-		if (buflen < sizeof("/dev/nvidiactl")) return -1;
-		__builtin_memcpy(buf, "/dev/nvidiactl", sizeof("/dev/nvidiactl"));
+		if (buflen < sizeof("nvidiactl")) return -1;
+		__builtin_memcpy(buf, "nvidiactl", sizeof("nvidiactl"));
 		return 0;
 	}
 	if (dev_id >= 16 && dev_id < 16 + 16) {
 		unsigned n = dev_id - 16;
-		/* "/dev/nvidia" + up to 2 digits + NUL = 14 bytes */
-		if (buflen < 16) return -1;
-		__builtin_memcpy(buf, "/dev/nvidia", 11);
+		/* "nvidia" + up to 2 digits + NUL = 9 bytes */
+		if (buflen < 9) return -1;
+		__builtin_memcpy(buf, "nvidia", 6);
 		if (n < 10) {
-			buf[11] = '0' + (char)n;
-			buf[12] = 0;
+			buf[6] = '0' + (char)n;
+			buf[7] = 0;
 		} else {
-			buf[11] = '0' + (char)(n / 10);
-			buf[12] = '0' + (char)(n % 10);
-			buf[13] = 0;
+			buf[6] = '0' + (char)(n / 10);
+			buf[7] = '0' + (char)(n % 10);
+			buf[8] = 0;
 		}
 		return 0;
 	}
@@ -1215,8 +1262,7 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 			send_open_device_resp(cmd->txn_id, -EINVAL, -1);
 			return;
 		}
-		fd = (int)stub_openat(AT_FDCWD, path,
-				      (int)cmd->flags | O_CLOEXEC);
+		fd = (int)stub_open_dev(path, (int)cmd->flags | O_CLOEXEC);
 	}
 
 	if (fd < 0) {
@@ -1439,8 +1485,7 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 	}
 
 	/* 3. Open a fresh /dev/nvidia-uvm in the stub's mm. */
-	int uvm_fd = (int)stub_openat(AT_FDCWD, "/dev/nvidia-uvm",
-				      O_RDWR | O_CLOEXEC);
+	int uvm_fd = (int)stub_open_dev("nvidia-uvm", O_RDWR | O_CLOEXEC);
 	if (uvm_fd < 0) {
 		stub_munmap(intent_buf, intent_aligned);
 		resp.retval = uvm_fd;  /* already -errno from sc* */
@@ -1685,6 +1730,10 @@ int main(void)
 	handle_table_init();
 	job_queue_init();
 
+	/* Detect whether QEMU handed us an O_PATH /dev dirfd (hardened, empty
+	 * mount ns).  Must run before any device open below. */
+	stub_detect_dev_dirfd();
+
 	/* Reader thread reserves slot 0 in worker_tids[] so SIGSEGV from
 	 * inline (non-worker) ioctls is captured against the right slot. */
 	worker_tids[0] = stub_gettid();
@@ -1734,8 +1783,7 @@ int main(void)
 	 * the calling task; without this, fds passed via SCM_RIGHTS from
 	 * QEMU get rejected with NV_ERR_INVALID_ARGUMENT. */
 	for (int i = 0; i < NVKVM_STUB_UVM_LOCAL_POOL_SIZE; i++)
-		uvm_local_fds[i] = (int)stub_openat(AT_FDCWD,
-						"/dev/nvidia-uvm",
+		uvm_local_fds[i] = (int)stub_open_dev("nvidia-uvm",
 						O_RDWR | O_CLOEXEC);
 
 	/*
