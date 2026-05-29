@@ -67,6 +67,7 @@
 #ifndef PROT_READ
 #define PROT_READ      0x1
 #define PROT_WRITE     0x2
+#define PROT_EXEC      0x4
 #endif
 #ifndef MAP_PRIVATE
 #define MAP_PRIVATE    0x02
@@ -1610,7 +1611,7 @@ cleanup:
  */
 static long apply_seccomp(void)
 {
-	struct sock_filter filter[64];
+	struct sock_filter filter[96];
 	int n = 0;
 
 #define EMIT(...) do { \
@@ -1619,6 +1620,21 @@ static long apply_seccomp(void)
 } while (0)
 #define ALLOW_IF(nr_val) do { \
 	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 1)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
+} while (0)
+/*
+ * M-3: allow nr_val (mmap/mprotect) ONLY if it does not request W+X together
+ * (W^X).  The stub never maps writable+executable memory (libcuda runs in the
+ * guest, not here), so this blocks code-injection without affecting any real
+ * mapping.  prot is args[2]; on no-match we fall through with nr still loaded.
+ */
+#define ALLOW_IF_NO_WX(nr_val) do { \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 5)); \
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
+		      offsetof(struct seccomp_data, args[2]))); \
+	EMIT(BPF_STMT(BPF_ALU|BPF_AND|BPF_K, (PROT_WRITE | PROT_EXEC))); \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (PROT_WRITE | PROT_EXEC), 0, 1)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM)); \
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
 } while (0)
 
@@ -1635,8 +1651,8 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_recvmsg);
 	ALLOW_IF(__NR_sendmsg);
 	ALLOW_IF(__NR_ioctl);
-	ALLOW_IF(__NR_mmap);
-	ALLOW_IF(__NR_mprotect);
+	ALLOW_IF_NO_WX(__NR_mmap);
+	ALLOW_IF_NO_WX(__NR_mprotect);
 	ALLOW_IF(__NR_munmap);
 	ALLOW_IF(__NR_ppoll);
 	ALLOW_IF(__NR_close);
@@ -1790,10 +1806,11 @@ int main(void)
 	 * Apply the seccomp allowlist before entering the main loop.  After
 	 * this point only the explicitly-allowed syscalls work; anything
 	 * else returns -EPERM (or, for the arch-mismatch case, kills the
-	 * process).  Audit C6: re-enabled after the debug period; until
-	 * tightening lands (the openat/mprotect-PROT_EXEC arg filters), the
-	 * coarse allowlist still blocks execve, ptrace, fork, prctl, init_-
-	 * module, etc. — the actually-dangerous escape primitives.
+	 * process).  Audit C6/M-3: the allowlist blocks execve, ptrace, fork,
+	 * prctl, init_module, etc. — the dangerous escape primitives — and the
+	 * mmap/mprotect entries now enforce W^X (no PROT_WRITE|PROT_EXEC), so a
+	 * compromised stub cannot map RWX to inject code.  (openat remains bounded
+	 * by the post-pivot /dev dirfd sandbox, which seccomp can't path-filter.)
 	 *
 	 * The NVKVM_STUB_NO_SECCOMP env hatch was dropped along with libc:
 	 * the parent calls clearenv() before exec so there is no environment
