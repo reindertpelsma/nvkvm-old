@@ -27,6 +27,7 @@
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <linux/capability.h>
 
 #ifndef MS_REC
@@ -132,44 +133,81 @@ static pid_t nvkvm_isolate_spawn(bool harden)
 }
 
 /*
- * Child-side: capture an O_PATH handle to the host /dev (parked at
- * NVKVM_DEV_DIRFD for the stub's openat), then pivot_root into an empty,
- * read-only tmpfs so the stub has NO view of the host filesystem.  Runs in
- * the clone()'d child (PID 1, ns-root with CAP_SYS_ADMIN in its userns),
+ * Child-side: build a MINIMAL root containing only the nvidia device nodes the
+ * stub opens, pivot into it, and hand the stub a /dev dirfd that cannot escape.
+ * Runs in the clone()'d child (PID 1, ns-root with CAP_SYS_ADMIN in its userns),
  * before caps are dropped.  Returns 0 / -1.
+ *
+ * SECURITY: an earlier version parked an O_PATH handle to the *whole host /dev*
+ * at NVKVM_DEV_DIRFD and pivoted into an empty tmpfs.  That handle was an escape
+ * hatch — a compromised stub could openat(dd, "../../etc/shadow", O_RDONLY) and
+ * read any host file, because the dirfd's ".." resolved to the (still-referenced)
+ * host root above /dev.  Fix (the runc device-bind idiom): construct a tmpfs root
+ * holding ONLY /dev/nvidia*, pivot into it, then open the dirfd AFTER the pivot so
+ * its ".." is the sandbox root, which contains nothing but those nodes.
+ *
+ * We build the root on a tmpfs mounted over /proc (guaranteed to exist; also masks
+ * the host /proc).  Bind-mounting EXISTING device nodes is permitted in our userns
+ * (mknod is not — hence touch-then-bind), and we deliberately omit MS_NODEV on the
+ * binds so the nodes stay openable.  /dev/nvidia-uvm is intentionally absent: UVM
+ * is opened by QEMU, never by the sandboxed stub.
  */
 static int nvkvm_child_enter_mount_ns(void)
 {
-	int dd = open("/dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
-	if (dd < 0)
-		return -1;
+	static const char *const nodes[] = {
+		"nvidiactl", "nvidia0", "nvidia1", "nvidia2", "nvidia3",
+		"nvidia4", "nvidia5", "nvidia6", "nvidia7",
+	};
+	char src[64], dst[80];
+	int dd;
+
 	/* Don't let our mount changes propagate back to the host. */
 	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
-		goto fail;
-	/* Empty read-only root on tmpfs. */
-	if (mount("tmpfs", "/tmp", "tmpfs",
-		  MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64k,mode=000") < 0)
-		goto fail;
-	if (chdir("/tmp") < 0)
-		goto fail;
-	/* pivot_root(".",".") + detach old root: the runc idiom. */
+		return -1;
+	/* Scratch tmpfs that becomes the sandbox root; mode 0755 so we can
+	 * populate it and the stub can traverse to /dev. */
+	if (mount("tmpfs", "/proc", "tmpfs",
+		  MS_NOSUID | MS_NOEXEC, "size=256k,mode=0755") < 0)
+		return -1;
+	if (mkdir("/proc/dev", 0755) < 0)
+		return -1;
+	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+		int fd;
+		snprintf(src, sizeof(src), "/dev/%s", nodes[i]);
+		if (access(src, F_OK) != 0)
+			continue;                 /* node absent (e.g. nvidiaN) */
+		snprintf(dst, sizeof(dst), "/proc/dev/%s", nodes[i]);
+		fd = open(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+		if (fd >= 0)
+			close(fd);                /* empty bind target */
+		if (mount(src, dst, NULL, MS_BIND, NULL) < 0 && i == 0)
+			return -1;                /* nvidiactl is mandatory */
+	}
+	/* pivot_root into the minimal tmpfs; detach the old (host) root. */
+	if (chdir("/proc") < 0)
+		return -1;
 	if (syscall(SYS_pivot_root, ".", ".") < 0)
-		goto fail;
+		return -1;
 	umount2(".", MNT_DETACH);
 	if (chdir("/") < 0)
-		goto fail;
-	mount(NULL, "/", NULL,
-	      MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
-	/* Park the /dev handle at the fd the stub expects. */
+		return -1;
+	/* Restricted /dev dirfd, opened AFTER the pivot: its ".." is the sandbox
+	 * root (holds only /dev/nvidia*), so openat(dd,"..") cannot reach the host. */
+	dd = open("/dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (dd < 0)
+		return -1;
 	if (dd != NVKVM_DEV_DIRFD) {
-		if (dup2(dd, NVKVM_DEV_DIRFD) < 0)
-			goto fail;
+		if (dup2(dd, NVKVM_DEV_DIRFD) < 0) {
+			close(dd);
+			return -1;
+		}
 		close(dd);
 	}
+	/* Seal the root read-only now that the nvidia binds are in place (they are
+	 * separate mounts, unaffected, and stay openable). */
+	mount(NULL, "/", NULL,
+	      MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL);
 	return 0;
-fail:
-	close(dd);
-	return -1;
 }
 
 /* memfd_create may not be in older glibc headers; use syscall directly. */
