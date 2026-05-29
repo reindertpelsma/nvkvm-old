@@ -510,6 +510,18 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * so the kernel's copy_from_user reading param_buf from QEMU's
 	 * address space gives the right bytes regardless of which process
 	 * issues the ioctl.
+	 *
+	 * NOTE on access rights (intentionally NOT enforced here): intra-VM,
+	 * per-guest-process access control (which process may touch which
+	 * object) is emulated entirely by the guest kernel module — it owns the
+	 * guest's pids/uids/namespaces/fds and is the authority.  QEMU must NOT
+	 * second-guess it with a session-ownership check: doing so would wrongly
+	 * reject a handle that the guest LEGITIMATELY shared into another isolate
+	 * via a guest-commanded COPY_HANDLE_TO_ISOLATE (e.g. CUDA IPC), and it
+	 * adds no security (malicious guest userspace is blocked by the guest
+	 * module; a malicious guest kernel would just forge session_id).  QEMU's
+	 * boundary is cross-VM / host-process (the per-VM handle table + hClient
+	 * allowlist + no host-wide TYPE_ALL), not intra-VM.
 	 */
 	{
 		struct nvkvm_handle *h =
