@@ -1079,6 +1079,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case GT200_DEBUGGER:
 				ap_size = sizeof(struct nv83de_alloc_parameters);
 				break;
+			case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
+			case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
+			case AMPERE_COMPUTE_B: case ADA_COMPUTE_A:
+			case HOPPER_COMPUTE_A: case BLACKWELL_COMPUTE_A:
+			case BLACKWELL_COMPUTE_B:
+			case VOLTA_A: case TURING_A: case AMPERE_A:
+			case AMPERE_B: case ADA_A: case HOPPER_A:
+				ap_size = sizeof(struct nv_gr_allocation_parameters);
+				break;
 			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
@@ -1154,6 +1163,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				case GT200_DEBUGGER:
 					ap_size = sizeof(struct nv83de_alloc_parameters);
+					break;
+				case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
+				case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
+				case AMPERE_COMPUTE_B: case ADA_COMPUTE_A:
+				case HOPPER_COMPUTE_A: case BLACKWELL_COMPUTE_A:
+				case BLACKWELL_COMPUTE_B:
+				case VOLTA_A: case TURING_A: case AMPERE_A:
+				case AMPERE_B: case ADA_A: case HOPPER_A:
+					ap_size = sizeof(struct nv_gr_allocation_parameters);
 					break;
 				}
 			}
