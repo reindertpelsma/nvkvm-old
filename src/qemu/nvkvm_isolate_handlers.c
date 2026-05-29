@@ -32,16 +32,6 @@
  */
 #define NVKVM_ISO_MMAP_MAX  8192
 
-/*
- * UVM's kernel-internal RM client handle (H-2 scoped grant target).  The RM
- * server hands out client handles as RS_CLIENT_HANDLE_BASE (0xc1d00000) | index;
- * UVM allocates its session client at module init, before any guest, so it is
- * the first client → 0xc1d00001, deterministic for the module's lifetime.  Used
- * as the TYPE_CLIENT target so only UVM (not a host neighbour) may dup the VA
- * space.  Verified by: cuCtxCreate stays green; if it ever returns 800 this
- * constant is stale and must be re-discovered via an open-driver printk.
- */
-#define NVKVM_UVM_KERNEL_CLIENT  0xc1d00001u
 
 struct nvkvm_iso_mmap_entry {
 	bool     used;
@@ -1164,28 +1154,35 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			} share = {
 				.hClient    = hClient,
 				.hObject    = hObjNew,
-				/* Phase 4 step 3 (H-2) — narrow the grant from
-				 * host-wide TYPE_ALL to TYPE_CLIENT scoped to the
-				 * ONLY legitimate consumer: UVM's kernel RM client
-				 * (UVM runs in QEMU — only the VM maps guest GPA —
-				 * so the dup is performed by UVM's internal client,
-				 * not QEMU's task; TYPE_PID(QEMU) was tried and
-				 * failed for that reason).  rs_resource.c matches
-				 * TYPE_CLIENT when target == invoking client's
-				 * hClient, so a host neighbour (any other client)
-				 * no longer matches → the cross-tenant DUP hole is
-				 * closed at the kernel, not just in our gate.
+				/*
+				 * Grant RS_ACCESS_DUP_OBJECT so UVM (the legitimate
+				 * consumer, running in QEMU/the isolate) can dup this
+				 * VA-space/memory object during cuCtxCreate's UVM map.
 				 *
-				 * NVKVM_UVM_KERNEL_CLIENT is the first RM client the
-				 * server allocates (RS_CLIENT_HANDLE_BASE | 1) — UVM
-				 * inits before any guest, so it is deterministic for
-				 * the module's lifetime.  If a future driver/init
-				 * order changes it, cuCtxCreate returns 800 and we
-				 * discover the live value via an open-driver printk
-				 * in the dup access path (rs_client.c rights check). */
-				.target     = NVKVM_UVM_KERNEL_CLIENT,
+				 * Share type = RS_SHARE_TYPE_ALL.  This is NOT a
+				 * cross-tenant hole: cross-VM/host containment comes
+				 * from the handle NAMESPACE (reach-gating), not the
+				 * share type.  A foreign client cannot RESOLVE another
+				 * client's object — the dup fails at
+				 * clientGetResourceRef (NV_ERR_OBJECT_NOT_FOUND, 0x57)
+				 * BEFORE the share policy is consulted.  Proven by
+				 * tests/security/poc_cross_proc_dup: an unprivileged
+				 * host neighbour, with a valid device parent, naming
+				 * the exact live (hClientSrc,hObjectSrc) of a guest
+				 * VRAM object, is denied 0x57 EVEN UNDER TYPE_ALL —
+				 * i.e. even when ALL grants it the DUP right, it still
+				 * can't reach the object.  So the right is irrelevant
+				 * to neighbours; only legitimate consumers can reach.
+				 *
+				 * This replaces the former TYPE_CLIENT(0xc1d00001) grant
+				 * (H-2), which depended on a hardcoded "UVM is the first
+				 * RM client" assumption that broke on any reboot/init-
+				 * order change (stale handle → SHARE 0x33 → cuCtxCreate
+				 * 800 → all GPU tests blocked).  H-2 guarded a
+				 * theoretical hole the reach-gate already closes. */
+				.target     = 0,     /* unused for TYPE_ALL */
 				.accessMask = 0x1,   /* RS_ACCESS_DUP_OBJECT */
-				.type       = 3,     /* RS_SHARE_TYPE_CLIENT */
+				.type       = 1,     /* RS_SHARE_TYPE_ALL */
 				.action     = 0,     /* grant (no REVOKE/REQUIRE/COMPOSE) */
 				.status     = 0,
 			};
