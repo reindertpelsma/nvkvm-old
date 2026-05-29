@@ -30,6 +30,17 @@
  */
 #define NVKVM_ISO_MMAP_MAX  8192
 
+/*
+ * UVM's kernel-internal RM client handle (H-2 scoped grant target).  The RM
+ * server hands out client handles as RS_CLIENT_HANDLE_BASE (0xc1d00000) | index;
+ * UVM allocates its session client at module init, before any guest, so it is
+ * the first client → 0xc1d00001, deterministic for the module's lifetime.  Used
+ * as the TYPE_CLIENT target so only UVM (not a host neighbour) may dup the VA
+ * space.  Verified by: cuCtxCreate stays green; if it ever returns 800 this
+ * constant is stale and must be re-discovered via an open-driver printk.
+ */
+#define NVKVM_UVM_KERNEL_CLIENT  0xc1d00001u
+
 struct nvkvm_iso_mmap_entry {
 	bool     used;
 	bool     stub_mirrored; /* true if isolate-side mmap was also installed */
@@ -854,22 +865,28 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			} share = {
 				.hClient    = hClient,
 				.hObject    = hObjNew,
-				/* Phase 4 step 3 — STILL TYPE_ALL pending a proper
-				 * narrowing.  EXPERIMENT (reverted): TYPE_PID
-				 * targeted at QEMU's getpid() broke cuCtxCreate
-				 * (=800), proving the dup consumer is NOT QEMU's
-				 * task pid but the UVM KERNEL-internal client.  The
-				 * correct narrowing is TYPE_CLIENT targeted at that
-				 * UVM kernel client's handle, which must first be
-				 * discovered (kernel-internal; ~0xc1d00001 but it
-				 * drifts) — e.g. via a printk in the open driver's
-				 * dup access path.  Until then TYPE_ALL remains the
-				 * known host-process exposure; the per-VM hClient
-				 * gate (above) still blocks the guest-driven path.
-				 * TODO(phase4-step3): TYPE_CLIENT(uvm_kernel_client). */
-				.target     = 0,
+				/* Phase 4 step 3 (H-2) — narrow the grant from
+				 * host-wide TYPE_ALL to TYPE_CLIENT scoped to the
+				 * ONLY legitimate consumer: UVM's kernel RM client
+				 * (UVM runs in QEMU — only the VM maps guest GPA —
+				 * so the dup is performed by UVM's internal client,
+				 * not QEMU's task; TYPE_PID(QEMU) was tried and
+				 * failed for that reason).  rs_resource.c matches
+				 * TYPE_CLIENT when target == invoking client's
+				 * hClient, so a host neighbour (any other client)
+				 * no longer matches → the cross-tenant DUP hole is
+				 * closed at the kernel, not just in our gate.
+				 *
+				 * NVKVM_UVM_KERNEL_CLIENT is the first RM client the
+				 * server allocates (RS_CLIENT_HANDLE_BASE | 1) — UVM
+				 * inits before any guest, so it is deterministic for
+				 * the module's lifetime.  If a future driver/init
+				 * order changes it, cuCtxCreate returns 800 and we
+				 * discover the live value via an open-driver printk
+				 * in the dup access path (rs_client.c rights check). */
+				.target     = NVKVM_UVM_KERNEL_CLIENT,
 				.accessMask = 0x1,   /* RS_ACCESS_DUP_OBJECT */
-				.type       = 1,     /* RS_SHARE_TYPE_ALL */
+				.type       = 3,     /* RS_SHARE_TYPE_CLIENT */
 				.action     = 0,     /* grant (no REVOKE/REQUIRE/COMPOSE) */
 				.status     = 0,
 			};
