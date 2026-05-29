@@ -229,6 +229,22 @@ typedef struct VirtIONvgpu {
 	struct nvkvm_handle_table   handles;
 	struct nvkvm_isolate_table  isolates;
 
+	/*
+	 * Phase 4 — per-VM RM client-handle allowlist.  nvidia hClient ids are
+	 * a GLOBAL, access-gated namespace (not fd-scoped): an ioctl can name a
+	 * client created on another fd/process if share rights allow.  Combined
+	 * with the Path-alpha TYPE_ALL DUP grant, a guest could DUP another VM's
+	 * object by naming its (h_client_src, h_src_object).  We record every
+	 * hClient this VM's isolates successfully use and reject any forwarded
+	 * ioctl that references a foreign hClient (e.g. DUP_OBJECT h_client_src).
+	 * Grow-only is safe: a freed handle still belonged to this VM, and the
+	 * kernel rejects a stale handle anyway.
+	 */
+#define NVKVM_CLIENT_ALLOWLIST_MAX 8192
+	uint32_t            client_allow[NVKVM_CLIENT_ALLOWLIST_MAX];
+	uint32_t            client_allow_n;
+	pthread_mutex_t     client_allow_lock;
+
 	/* Host NVIDIA driver version (read at init) */
 	char                driver_version[64];
 } VirtIONvgpu;

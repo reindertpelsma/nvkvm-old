@@ -903,6 +903,8 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 
 	pthread_mutex_init(&nv->sessions_lock, NULL);
 	pthread_mutex_init(&nv->mmap_win_lock, NULL);
+	pthread_mutex_init(&nv->client_allow_lock, NULL);
+	nv->client_allow_n = 0;
 	TAILQ_INIT(&nv->sessions);
 
 	/* Initialize isolate/handle managers */

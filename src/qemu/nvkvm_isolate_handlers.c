@@ -460,6 +460,40 @@ static const struct nvkvm_uvm_desc *nvkvm_uvm_lookup(uint32_t cmd)
 	return NULL;
 }
 
+/* ── Phase 4: per-VM RM client-handle allowlist ─────────────────────────────
+ * Record every hClient this VM's isolates successfully use, and vet foreign
+ * hClient references (e.g. DUP_OBJECT h_client_src) against the set.  See the
+ * VirtIONvgpu.client_allow comment for why fds are not the boundary. */
+static void nvkvm_client_allow_add(VirtIONvgpu *nv, uint32_t hc)
+{
+	if (hc == 0 || hc == (uint32_t)-1)
+		return;
+	pthread_mutex_lock(&nv->client_allow_lock);
+	for (uint32_t i = 0; i < nv->client_allow_n; i++) {
+		if (nv->client_allow[i] == hc) {
+			pthread_mutex_unlock(&nv->client_allow_lock);
+			return;
+		}
+	}
+	if (nv->client_allow_n < NVKVM_CLIENT_ALLOWLIST_MAX)
+		nv->client_allow[nv->client_allow_n++] = hc;
+	pthread_mutex_unlock(&nv->client_allow_lock);
+}
+
+static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
+{
+	bool found = false;
+	pthread_mutex_lock(&nv->client_allow_lock);
+	for (uint32_t i = 0; i < nv->client_allow_n; i++) {
+		if (nv->client_allow[i] == hc) {
+			found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&nv->client_allow_lock);
+	return found;
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
@@ -593,6 +627,32 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		}
 	}
 
+	/*
+	 * Phase 4 gate — DUP_OBJECT cross-VM defense.  NVOS55 (our 36-byte
+	 * layout): h_client@0, h_client_src@16.  The source client must be one
+	 * THIS VM allocated; otherwise a guest (whose objects carry the Path-α
+	 * TYPE_ALL DUP grant) could dup another VM's object by naming its
+	 * (h_client_src, h_src_object).  h_client itself is the caller's own
+	 * client (recorded post-success below), so we only need to vet the src.
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F' &&
+	    _IOC_NR(req->cmd) == NV_ESC_RM_DUP_OBJECT &&
+	    param_buf && req->param_size >= 20) {
+		uint32_t h_client_src = 0;
+		memcpy(&h_client_src, (char *)param_buf + 16, 4);
+		if (h_client_src != 0 && h_client_src != (uint32_t)-1 &&
+		    !nvkvm_client_allow_has(nv, h_client_src)) {
+			fprintf(stderr,
+				"nvkvm: DENY DUP_OBJECT foreign h_client_src=0x%x "
+				"(not a client of this VM)\n", h_client_src);
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
+			resp->fault_addr = 0;
+			return 0;
+		}
+	}
+
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
@@ -609,6 +669,28 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	resp->status     = (ret == -EFAULT && fault_addr) ? EFAULT : 0;
 	resp->nvstatus   = nvstatus;
 	resp->fault_addr = fault_addr;
+
+	/*
+	 * Phase 4 — record this VM's RM client handles.  Every successful 'F'
+	 * RM ioctl carries the owning hClient at param offset 0; recording it
+	 * builds the per-VM allowlist the DUP_OBJECT gate above consults.  (A
+	 * client this VM uses successfully is, by definition, this VM's.)
+	 */
+	if (ret == 0 && nvstatus == 0 &&
+	    _IOC_TYPE(req->cmd) == 'F' && param_buf && req->param_size >= 4) {
+		/* Only the NVOSxx structs whose first field is hClient: ALLOC,
+		 * ALLOC_MEMORY, CONTROL, FREE, DUP_OBJECT, SHARE.  Every RM
+		 * client performs at least an ALLOC, so this captures them all
+		 * without recording stray words from header-less ioctls. */
+		unsigned nr = _IOC_NR(req->cmd);
+		if (nr == NV_ESC_RM_ALLOC || nr == NV_ESC_RM_ALLOC_MEMORY ||
+		    nr == NV_ESC_RM_CONTROL || nr == NV_ESC_RM_FREE ||
+		    nr == NV_ESC_RM_DUP_OBJECT || nr == 0x35 /* RM_SHARE */) {
+			uint32_t hc = 0;
+			memcpy(&hc, (char *)param_buf, 4);
+			nvkvm_client_allow_add(nv, hc);
+		}
+	}
 
 	/*
 	 * Path α — explicit DUP_OBJECT grant for cross-process duplication.

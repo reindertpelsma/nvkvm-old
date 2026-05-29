@@ -173,7 +173,26 @@ translate per field. **No descriptor ⇒ not forwardable from QEMU** (stub-only)
 Move every movable QEMU-direct cmd into the stub. Genuine exceptions (UVM binds
 to mm; mmap/KVM-region installs) keep explicit schemas.
 
-## Phase 4 — Access-model simulation  [ ]
+## Phase 4 — Access-model simulation  [~] IN PROGRESS
+KEY INSIGHT (see memory [[hclient_not_fd_scoped]]): nvidia hClient/handle ids are
+a GLOBAL access-gated namespace, NOT fd- or namespace-scoped. The real driver's
+default RS_SHARE_TYPE_PID policy contains objects to the owning PID (global pid),
+which incidentally isolates containers. Our split-process model breaks that PID
+match, so Path-α grants RS_SHARE_TYPE_ALL — removing ALL containment (any host
+process/VM can dup a guessed handle). 4-step fix:
+  1. PoC: unprivileged host proc dups a live guest handle → prove the hole + get a
+     regression oracle. [TODO]
+  2. [DONE, matmul-green] QEMU per-VM hClient allowlist: VirtIONvgpu.client_allow[]
+     records every hClient this VM's isolates use (RM_ALLOC/CONTROL/FREE/DUP/SHARE
+     param[0]); DUP_OBJECT with a foreign h_client_src (offset 16, our 36B nvos55)
+     is denied. matmul single+2conc PASS, 0 gate denials (matmul issues no guest
+     DUP — its dups are kernel-internal). Allow-path correct by construction;
+     allow/deny still need PoC + a CUDA-IPC test to exercise live.
+  3. Narrow the Path-α TYPE_ALL grant → minimal consumer (the only layer that stops
+     a host process bypassing our stack). [TODO]
+  4. Guest-module hClient allowlist + ns-translated pids (intra-VM per-process). [TODO]
+
+### (original)
 Guest kernel module enforces guest-local /dev/nvidia* uid/gid/mode ("all" =
 all-in-VM, never host-wide). RM-level sharing (RS_ACCESS/share-mask/DUP_OBJECT,
 the ownMask machinery from cuctxcreate_800_pinned) brokered by QEMU within one
