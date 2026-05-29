@@ -21,6 +21,7 @@
 
 #include "virtio_nvgpu.h"
 #include "nvkvm_ctrl_allowlist.h"
+#include "nvkvm_fe_alloc_allowlist.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -511,6 +512,24 @@ static bool nvkvm_ctrl_cmd_allowed(uint32_t cmd)
 	return false;
 }
 
+/* #76b — frontend-ioctl NR allowlist (nvproxy parity, default-deny). */
+static bool nvkvm_fe_nr_allowed(unsigned nr)
+{
+	for (size_t i = 0; i < NVKVM_FE_NR_ALLOWLIST_N; i++)
+		if (nvkvm_fe_nr_allowlist[i] == nr)
+			return true;
+	return false;
+}
+
+/* #76b — RM_ALLOC class allowlist (nvproxy parity, default-deny). */
+static bool nvkvm_alloc_class_allowed(uint32_t cls)
+{
+	for (size_t i = 0; i < NVKVM_ALLOC_CLASS_ALLOWLIST_N; i++)
+		if (nvkvm_alloc_class_allowlist[i] == cls)
+			return true;
+	return false;
+}
+
 static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
 {
 	bool found = false;
@@ -806,6 +825,37 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],
 				a[8],a[9],a[10],a[11],a[12],a[13],a[14],a[15],
 				a[16],a[17],a[18],a[19],a[20],a[21],a[22],a[23]);
+		}
+	}
+
+	/*
+	 * #76b default-deny frontend-ioctl + alloc-class allowlists (nvproxy
+	 * parity).  A 'F' ioctl whose NR is outside the known RM frontend set, or
+	 * an RM_ALLOC of a class outside the permitted set, is refused before it
+	 * reaches the host driver.  Host/cross-VM attack-surface control → QEMU.
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F') {
+		unsigned nr = _IOC_NR(req->cmd);
+		if (!nvkvm_fe_nr_allowed(nr)) {
+			fprintf(stderr, "nvkvm: DENY frontend ioctl nr=0x%02x\n", nr);
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
+		}
+		/* RM_ALLOC (nvos21/nvos64): hClass at param+12 (shared prefix). */
+		if (nr == 0x2b && param_buf && req->param_size >= 16) {
+			uint32_t cls = 0;
+			memcpy(&cls, (char *)param_buf + 12, 4);
+			if (!nvkvm_alloc_class_allowed(cls)) {
+				fprintf(stderr, "nvkvm: DENY alloc class 0x%08x\n", cls);
+				resp->retval     = (uint64_t)(int64_t)(-EACCES);
+				resp->status     = 0;
+				resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+				resp->fault_addr = 0;
+				return 0;
+			}
 		}
 	}
 
