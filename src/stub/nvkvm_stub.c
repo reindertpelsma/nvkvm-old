@@ -1623,17 +1623,20 @@ static long apply_seccomp(void)
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
 } while (0)
 /*
- * M-3: allow nr_val (mmap/mprotect) ONLY if it does not request W+X together
- * (W^X).  The stub never maps writable+executable memory (libcuda runs in the
- * guest, not here), so this blocks code-injection without affecting any real
- * mapping.  prot is args[2]; on no-match we fall through with nr still loaded.
+ * M-3: allow nr_val (mmap/mprotect) ONLY if it does NOT request PROT_EXEC at
+ * all.  Plain W^X (deny only W+X together) is insufficient: an attacker can
+ * mmap a page RW, write shellcode, then mprotect it R-X — each step passes W^X
+ * but the result is executable attacker code.  The stub's own .text is mapped
+ * executable by the ELF loader BEFORE seccomp and it never JITs (libcuda runs
+ * in the guest), so no runtime mapping ever needs PROT_EXEC.  Deny it outright.
+ * prot is args[2]; on no-match we fall through with nr still loaded.
  */
-#define ALLOW_IF_NO_WX(nr_val) do { \
+#define ALLOW_IF_NO_EXEC(nr_val) do { \
 	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 5)); \
 	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
 		      offsetof(struct seccomp_data, args[2]))); \
-	EMIT(BPF_STMT(BPF_ALU|BPF_AND|BPF_K, (PROT_WRITE | PROT_EXEC))); \
-	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (PROT_WRITE | PROT_EXEC), 0, 1)); \
+	EMIT(BPF_STMT(BPF_ALU|BPF_AND|BPF_K, PROT_EXEC)); \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, PROT_EXEC, 0, 1)); \
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM)); \
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
 } while (0)
@@ -1651,8 +1654,8 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_recvmsg);
 	ALLOW_IF(__NR_sendmsg);
 	ALLOW_IF(__NR_ioctl);
-	ALLOW_IF_NO_WX(__NR_mmap);
-	ALLOW_IF_NO_WX(__NR_mprotect);
+	ALLOW_IF_NO_EXEC(__NR_mmap);
+	ALLOW_IF_NO_EXEC(__NR_mprotect);
 	ALLOW_IF(__NR_munmap);
 	ALLOW_IF(__NR_ppoll);
 	ALLOW_IF(__NR_close);

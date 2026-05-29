@@ -51,7 +51,6 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x00000d01u,
 	0x00000d04u,
 	0x00410110u,
-	0x00800201u,
 	0x00800280u,
 	0x00800288u,
 	0x00800289u,
