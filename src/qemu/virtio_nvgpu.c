@@ -137,6 +137,29 @@ static void *slot_ptr(VirtIONvgpu *nv, uint32_t slot)
 }
 
 /*
+ * Audit C-1: a guest-controlled `size` (param_size/aux_size/req->size, up to the
+ * stub's 256 KiB cap) must NEVER exceed the 64 KiB slot it indexes, or the
+ * subsequent send/recv/pread on slot_ptr() over-reads/over-writes past the slot
+ * and past the 16 MiB shm region — a guest-driven OOB R/W in the privileged VMM.
+ * Every live handler must obtain its shm pointer through this bounded helper,
+ * which returns NULL unless the slot is valid AND [slot, slot+size) fits inside
+ * both the slot and the whole shm region.  (The legacy path had this check; the
+ * thread-pool/memory/realize paths lost it.)
+ */
+static void *slot_blob(VirtIONvgpu *nv, uint32_t slot, uint64_t size)
+{
+	uint64_t base;
+	if (!slot_valid(nv, slot))
+		return NULL;
+	if (size > nv->slot_size)
+		return NULL;
+	base = (uint64_t)slot * nv->slot_size;
+	if (base + size > nv->shm_size)        /* defense-in-depth vs the last slot */
+		return NULL;
+	return slot_ptr(nv, slot);
+}
+
+/*
  * Legacy NVKVM_REQ_OPEN / _CLOSE / _IOCTL / _MMAP / _MUNMAP request handlers.
  * These are dead code as of Step 3d.1 (guest module no longer sends these
  * request types). Kept under #if 0 as a tombstone until Step 3d.3 deletes
@@ -650,13 +673,25 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 				   &w->req, sizeof(w->req));
 			/* param/aux buffers live in shared memory; the guest
 			 * keeps the slot reserved until it sees the response,
-			 * so these pointers stay valid for the whole job. */
-			w->param_buf = (w->req.param_size > 0 &&
-					slot_valid(nv, w->req.shm_slot)) ?
-				       slot_ptr(nv, w->req.shm_slot) : NULL;
-			w->aux_buf   = (w->req.aux_size > 0 &&
-					slot_valid(nv, w->req.shm_aux_slot)) ?
-				       slot_ptr(nv, w->req.shm_aux_slot) : NULL;
+			 * so these pointers stay valid for the whole job.
+			 * Audit C-1: bound size<=slot_size via slot_blob; on a
+			 * malformed/oversize request clamp the size to 0 so the
+			 * worker's send/recv touches nothing (no OOB, no NULL+len
+			 * deref). */
+			w->param_buf = NULL;
+			w->aux_buf   = NULL;
+			if (w->req.param_size > 0) {
+				w->param_buf = slot_blob(nv, w->req.shm_slot,
+							 w->req.param_size);
+				if (!w->param_buf)
+					w->req.param_size = 0;
+			}
+			if (w->req.aux_size > 0) {
+				w->aux_buf = slot_blob(nv, w->req.shm_aux_slot,
+						       w->req.aux_size);
+				if (!w->aux_buf)
+					w->req.aux_size = 0;
+			}
 			thread_pool_submit_aio(nvkvm_ioctl_work_fn, w,
 					       nvkvm_ioctl_work_done, w);
 			continue;  /* elem now owned by the work item */
@@ -697,8 +732,8 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct nvkvm_resp_write_memory_handle resp = {0};
 			iov_to_buf(elem->out_sg, elem->out_num,
 				   sizeof(hdr), &req, sizeof(req));
-			void *db = (req.size > 0 && slot_valid(nv, req.shm_slot)) ?
-				   slot_ptr(nv, req.shm_slot) : NULL;
+			void *db = (req.size > 0) ?
+				   slot_blob(nv, req.shm_slot, req.size) : NULL; /* C-1 */
 			nvkvm_req_write_memory_handle(nv, &req, &resp, db);
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_write_memory_handle r; } wout;
@@ -714,8 +749,8 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct nvkvm_resp_read_memory_handle resp = {0};
 			iov_to_buf(elem->out_sg, elem->out_num,
 				   sizeof(hdr), &req, sizeof(req));
-			void *db = (req.size > 0 && slot_valid(nv, req.shm_slot)) ?
-				   slot_ptr(nv, req.shm_slot) : NULL;
+			void *db = (req.size > 0) ?
+				   slot_blob(nv, req.shm_slot, req.size) : NULL; /* C-1 */
 			nvkvm_req_read_memory_handle(nv, &req, &resp, db);
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_read_memory_handle r; } rout;
@@ -731,8 +766,7 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct nvkvm_resp_read_host_file resp = {0};
 			iov_to_buf(elem->out_sg, elem->out_num,
 				   sizeof(hdr), &req, sizeof(req));
-			void *db = slot_valid(nv, req.shm_slot) ?
-				   slot_ptr(nv, req.shm_slot) : NULL;
+			void *db = slot_blob(nv, req.shm_slot, req.max_len); /* C-1 */
 			nvkvm_req_read_host_file(nv, &req, &resp, db);
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_read_host_file r; } hout;
@@ -748,11 +782,11 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct nvkvm_resp_realize_uvm_mapping resp = {0};
 			iov_to_buf(elem->out_sg, elem->out_num,
 				   sizeof(hdr), &req, sizeof(req));
-			void *sb = slot_valid(nv, req.state_shm_slot) ?
-				   slot_ptr(nv, req.state_shm_slot) : NULL;
-			void *ib = (req.intent_size > 0 &&
-				    slot_valid(nv, req.intent_shm_slot)) ?
-				   slot_ptr(nv, req.intent_shm_slot) : NULL;
+			/* C-1: bound state slot to the whole slot (handler validates
+			 * the snapshot size internally) and intent to intent_size. */
+			void *sb = slot_blob(nv, req.state_shm_slot, nv->slot_size);
+			void *ib = (req.intent_size > 0) ?
+				   slot_blob(nv, req.intent_shm_slot, req.intent_size) : NULL;
 			nvkvm_req_realize_uvm_mapping(nv, &req, &resp, sb, ib);
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_realize_uvm_mapping r; } rout;

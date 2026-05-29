@@ -970,6 +970,20 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	len = (len + 4095UL) & ~4095UL;  /* page-align */
 
 	/*
+	 * Audit M-1: this mmap runs in the privileged QEMU process against the
+	 * real GPU device fd with a guest-controlled prot/len.  Mask prot to
+	 * R/W only (never PROT_EXEC, matching the REALIZE path's
+	 * NVKVM_REALIZE_PROT_MASK) and reject absurd lengths before we touch the
+	 * device fd or the sparse window.  (Window allocation also rejects
+	 * oversize, but bound here so we never hand a wild len to mmap().)
+	 */
+	req->prot &= (uint32_t)(PROT_READ | PROT_WRITE);
+	if (len == 0 || len > nv->sparse_size) {
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	/*
 	 * Place the mapping inside the single pre-installed 128 GiB sparse
 	 * window instead of allocating a fresh KVM memslot per mmap.  A single
 	 * cuCtxCreate issues >1500 tiny (4 KB) device mmaps; one memslot each
