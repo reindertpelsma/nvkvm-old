@@ -150,7 +150,23 @@ in the response using the isolate↔session↔mm/tgid map (H2). Discard/scrub an
 process the guest must not see. Same for per-process mem/util. Verify
 nvidia-smi shows the guest's own PIDs.
 
-## Phase 3 — Schema table + default-deny  [ ]
+## Phase 3 — Schema table + default-deny  [x] DONE (UVM)
+DONE + verified on vast.ai (single + 2-concurrent matmul PASS, DENY=0): the
+QEMU-direct UVM handler (nvkvm_isolate_handlers.c) now consults an allowlist
+schema (nvkvm_uvm_schema[]) keyed on cmd, with EXACT per-cmd param sizes taken
+from our ABI (src/abi/uvm.h, driver 575.51.03 — NOT gVisor's newer layouts;
+several differ). DEFAULT-DENY: any UVM cmd absent from the table is refused,
+never forwarded into privileged QEMU — this denies UVM_TOOLS_READ/WRITE_
+PROCESS_MEMORY (62/63, a cross-process memory peek/poke) and any garbage cmd.
+Embedded frontend-fd translation generalized to a schema field (kept to the two
+cmds the prior code translated: MM_INITIALIZE@0, REGISTER_GPU_VASPACE@16).
+Lessons: (a) min_size must come from OUR ABI, not gVisor (mis-denied REGISTER_GPU
+40 vs real 32); (b) MAP_EXTERNAL_ALLOCATION (33) and MAP_DYNAMIC_PARALLELISM (65)
+ALSO arrive via the generic path during cuCtxCreate, not only REALIZE — found via
+DENY logs. Future refinement: per-field fd/VA validation for MAP_EXTERNAL on this
+path (currently forwarded as-is, as before).
+
+### (original)
 Per-cmd descriptor table: `cmd → {runs_in, fields:[{off,size,kind}]}`,
 kind ∈ {fd, handle, pid, gva_ptr, access_mask, count, opaque}. Validate/
 translate per field. **No descriptor ⇒ not forwardable from QEMU** (stub-only).

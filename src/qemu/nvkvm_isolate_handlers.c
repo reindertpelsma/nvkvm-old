@@ -366,6 +366,100 @@ int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
 
 /* ── Ioctl on isolate ────────────────────────────────────────────────────── */
 
+/* ── Phase 3: UVM ioctl field schema + default-deny ──────────────────────────
+ *
+ * UVM ioctls execute in QEMU's (privileged) process, so we MUST NOT blindly
+ * forward an arbitrary cmd the guest names.  This table is the allowlist: each
+ * UVM cmd we will forward is listed with (a) a minimum param_size and (b) the
+ * offsets of any embedded *frontend fd* fields (RMCtrlFD / UvmFD) that the
+ * guest sanitizer rewrote into a handle_id and that the kernel will dereference
+ * as an fd — those are translated to QEMU's local fd and restored on response.
+ *
+ * Field offsets/sizes are taken from the open kernel module / gVisor nvproxy
+ * (pkg/abi/nvgpu/uvm.go): NvUUID is 16 bytes, Handle/NvU32 is 4 bytes, the
+ * frontend fd is an NvS32 at a fixed offset in the struct header (before any
+ * variable-length PerGPUAttributes array, so the offset is version-stable).
+ *
+ * DEFAULT-DENY: any UVM cmd absent from this table is refused, never forwarded.
+ * Notably this denies UVM_TOOLS_READ/WRITE_PROCESS_MEMORY (62/63) — a
+ * cross-process memory peek/poke primitive that has no place in our model.
+ * min_size uses the base (pre-V550) struct size as a conservative floor; the
+ * fd-field read is additionally guarded against the actual param_size.
+ */
+enum { NVKVM_UVM_FD_FIELD = 1 };
+struct nvkvm_uvm_desc {
+	uint32_t cmd;
+	uint16_t min_size;
+	uint16_t fd_off[2];   /* frontend-fd field byte offsets; 0xffff = none */
+};
+/*
+ * min_size is the EXACT struct size from our ABI (src/abi/uvm.h, driver
+ * 575.51.03) — verified by sizeof, NOT copied from gVisor's newer layouts
+ * (several differ: e.g. REGISTER_GPU is 32B here, not gVisor's 40B-with-NUMA;
+ * REGISTER_CHANNEL 48 not 56; MIGRATE 48 not 56).  The guest always sends
+ * exactly this size, so "param_size < min_size" rejects only malformed calls.
+ * fd-field translation is limited to the two cmds the prior code translated
+ * (MM_INITIALIZE@0, REGISTER_GPU_VASPACE@16); every other cmd forwarded with
+ * its fd field untouched, exactly as before — generalizing it was speculative.
+ */
+static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
+	/* The full UVM command set (open kernel module / gVisor nvproxy
+	 * uvm.go).  min_size: cmds whose struct is defined in our ABI
+	 * (src/abi/uvm.h, driver 575.51.03) carry the exact sizeof, verified
+	 * by measurement — these are the layouts the guest actually sends, so
+	 * "param_size < min" rejects only malformed calls.  The five cmds NOT
+	 * in our ABI (44/45/53/65/66) carry min_size 0 (allow any size): we
+	 * have no driver-verified layout for them and an over-strict guess
+	 * already mis-denied REGISTER_GPU once; the kernel validates its own
+	 * struct against the fixed shm slot regardless.  fd-field translation
+	 * stays limited to the two cmds the pre-schema code translated. */
+	{ 0x30000001 /* UVM_INITIALIZE          */,  16, { 0xffff, 0xffff } },
+	{ 0x30000002 /* UVM_DEINITIALIZE        */,   8, { 0xffff, 0xffff } },
+	{ 23 /* UVM_CREATE_RANGE_GROUP          */,  16, { 0xffff, 0xffff } },
+	{ 24 /* UVM_DESTROY_RANGE_GROUP         */,  16, { 0xffff, 0xffff } },
+	{ 25 /* UVM_REGISTER_GPU_VASPACE        */,  32, { 16,     0xffff } },
+	{ 26 /* UVM_UNREGISTER_GPU_VASPACE      */,  20, { 0xffff, 0xffff } },
+	{ 27 /* UVM_REGISTER_CHANNEL            */,  48, { 0xffff, 0xffff } },
+	{ 28 /* UVM_UNREGISTER_CHANNEL          */,  28, { 0xffff, 0xffff } },
+	{ 29 /* UVM_ENABLE_PEER_ACCESS          */,  40, { 0xffff, 0xffff } },
+	{ 30 /* UVM_DISABLE_PEER_ACCESS         */,  40, { 0xffff, 0xffff } },
+	{ 31 /* UVM_SET_RANGE_GROUP             */,  32, { 0xffff, 0xffff } },
+	{ 33 /* UVM_MAP_EXTERNAL_ALLOCATION     */, 9264, { 0xffff, 0xffff } },
+	{ 34 /* UVM_FREE                        */,  24, { 0xffff, 0xffff } },
+	{ 37 /* UVM_REGISTER_GPU                */,  32, { 0xffff, 0xffff } },
+	{ 38 /* UVM_UNREGISTER_GPU              */,  24, { 0xffff, 0xffff } },
+	{ 39 /* UVM_PAGEABLE_MEM_ACCESS         */,   8, { 0xffff, 0xffff } },
+	{ 42 /* UVM_SET_PREFERRED_LOCATION      */,  40, { 0xffff, 0xffff } },
+	{ 43 /* UVM_UNSET_PREFERRED_LOCATION    */,  24, { 0xffff, 0xffff } },
+	{ 44 /* UVM_ENABLE_READ_DUPLICATION     */,   0, { 0xffff, 0xffff } },
+	{ 45 /* UVM_DISABLE_READ_DUPLICATION    */,   0, { 0xffff, 0xffff } },
+	{ 46 /* UVM_SET_ACCESSED_BY             */,  40, { 0xffff, 0xffff } },
+	{ 47 /* UVM_UNSET_ACCESSED_BY           */,  40, { 0xffff, 0xffff } },
+	{ 51 /* UVM_MIGRATE                     */,  48, { 0xffff, 0xffff } },
+	{ 53 /* UVM_MIGRATE_RANGE_GROUP         */,   0, { 0xffff, 0xffff } },
+	{ 65 /* UVM_MAP_DYNAMIC_PARALLELISM_REGION */, 0, { 0xffff, 0xffff } },
+	{ 66 /* UVM_UNMAP_EXTERNAL              */,   0, { 0xffff, 0xffff } },
+	{ 68 /* UVM_ALLOC_SEMAPHORE_POOL        */, 9248, { 0xffff, 0xffff } },
+	{ 70 /* UVM_PAGEABLE_MEM_ACCESS_ON_GPU  */,  24, { 0xffff, 0xffff } },
+	{ 72 /* UVM_VALIDATE_VA_RANGE           */,  24, { 0xffff, 0xffff } },
+	{ 73 /* UVM_CREATE_EXTERNAL_RANGE       */,  24, { 0xffff, 0xffff } },
+	{ 75 /* UVM_MM_INITIALIZE               */,   8, { 0,      0xffff } },
+	/* Default-denied by omission: UVM_TOOLS_READ_PROCESS_MEMORY (62) and
+	 * UVM_TOOLS_WRITE_PROCESS_MEMORY (63) — a cross-process memory
+	 * peek/poke primitive with no place in our isolation model — plus any
+	 * unknown/garbage cmd a malicious guest might name. */
+};
+
+static const struct nvkvm_uvm_desc *nvkvm_uvm_lookup(uint32_t cmd)
+{
+	for (size_t i = 0;
+	     i < sizeof(nvkvm_uvm_schema) / sizeof(nvkvm_uvm_schema[0]); i++) {
+		if (nvkvm_uvm_schema[i].cmd == cmd)
+			return &nvkvm_uvm_schema[i];
+	}
+	return NULL;
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
@@ -387,41 +481,61 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		struct nvkvm_handle *h =
 			nvkvm_handle_get(&nv->handles, req->handle_id);
 		if (h && h->dev_id == NVKVM_DEV_UVM && h->fd >= 0) {
-			/* Some UVM ioctls embed a handle_id (translated by the
-			 * guest sanitizer from a guest fd) that the kernel will
-			 * dereference as an fd.  Translate to QEMU's local fd
-			 * for that handle, then restore the handle_id on
-			 * response so libcuda sees the value it sent. */
-			static const struct { uint32_t cmd; uint32_t off; }
-				uvm_embedded_fd[] = {
-				{ 75 /* UVM_MM_INITIALIZE       */, 0  },
-				{ 25 /* UVM_REGISTER_GPU_VASPACE */, 16 },
-			};
-			uint32_t saved_fd_handle = 0;
-			int      saved_off = -1;
-			for (size_t k = 0;
-			     k < sizeof(uvm_embedded_fd) /
-				 sizeof(uvm_embedded_fd[0]); k++) {
-				if (req->cmd != uvm_embedded_fd[k].cmd) continue;
-				uint32_t off = uvm_embedded_fd[k].off;
-				if (!param_buf || req->param_size < off + 4) break;
+			/* Phase 3: schema-gated forwarding.  Look the cmd up in
+			 * the UVM allowlist; refuse anything not described. */
+			const struct nvkvm_uvm_desc *d = nvkvm_uvm_lookup(req->cmd);
+			if (!d) {
+				fprintf(stderr,
+					"nvkvm: DENY unschemaed UVM ioctl cmd=0x%x "
+					"(default-deny)\n", req->cmd);
+				resp->retval     = (uint64_t)(int64_t)(-EPERM);
+				resp->status     = 0;
+				resp->nvstatus   = 0x57; /* NV_ERR_NOT_SUPPORTED */
+				resp->fault_addr = 0;
+				return 0;
+			}
+			if (req->param_size < d->min_size ||
+			    (d->min_size > 0 && !param_buf)) {
+				fprintf(stderr,
+					"nvkvm: DENY UVM cmd=0x%x short param_size=%u "
+					"(<%u)\n", req->cmd, req->param_size,
+					d->min_size);
+				resp->retval     = (uint64_t)(int64_t)(-EINVAL);
+				resp->status     = 0;
+				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
+				resp->fault_addr = 0;
+				return 0;
+			}
+			/* Translate each embedded frontend-fd field: the guest
+			 * sanitizer rewrote the fd into a handle_id; swap to
+			 * QEMU's local fd for the kernel, then restore the
+			 * handle_id on response so libcuda sees what it sent. */
+			uint32_t saved_val[2];
+			int      saved_off[2];
+			int      nsaved = 0;
+			for (int k = 0; k < 2 && d->fd_off[k] != 0xffff; k++) {
+				uint32_t off = d->fd_off[k];
+				if (!param_buf || req->param_size < off + 4)
+					continue;
 				uint32_t hid;
 				memcpy(&hid, (char *)param_buf + off, 4);
-				if (hid == 0 || hid == (uint32_t)-1) break;
+				if (hid == 0 || hid == (uint32_t)-1)
+					continue;
 				struct nvkvm_handle *hh =
 					nvkvm_handle_get(&nv->handles, hid);
-				if (!hh || hh->fd < 0) break;
-				saved_fd_handle = hid;
-				saved_off = (int)off;
+				if (!hh || hh->fd < 0)
+					continue;
+				saved_val[nsaved] = hid;
+				saved_off[nsaved] = (int)off;
+				nsaved++;
 				uint32_t fd32 = (uint32_t)hh->fd;
 				memcpy((char *)param_buf + off, &fd32, 4);
-				break;
 			}
 			int r = ioctl(h->fd, (unsigned long)req->cmd, param_buf);
 			int saved_errno = errno;
-			if (saved_off >= 0)
-				memcpy((char *)param_buf + saved_off,
-				       &saved_fd_handle, 4);
+			for (int k = 0; k < nsaved; k++)
+				memcpy((char *)param_buf + saved_off[k],
+				       &saved_val[k], 4);
 			uint32_t st = 0;
 			/* UVM_*_PARAMS conventionally ends with rmStatus (u32).
 			 * Read the last 4 bytes of the params struct. */
