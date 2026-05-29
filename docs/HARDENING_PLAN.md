@@ -120,7 +120,20 @@ POLL/UNPOLL, CREATE/KILL_ISOLATE, LIST_NVIDIA_DEVICES.
 
 Conclusion: Phase-3 focus = UVM-ioctl field schema + MMAP prot/offset bounds.
 
-## Phase 2 — nvidia-smi PID translation + response scrubbing  [ ]
+## Phase 2 — nvidia-smi PID translation + response scrubbing  [~] INVESTIGATING
+FINDING (2026-05-29): the process query is NOT NV2080_CTRL_CMD_GPU_GET_PIDS —
+0x2080018d/018e never appear in the forwarded inner-cmd log, and nvidia-smi's
+process table is empty even DURING a live matmul (148 MiB in use). strace shows
+its tail is NV_ESC_RM_CONTROL (0x2a) + RM_FREE (0x29); the inner control cmd is
+inside the NVOS54 param so strace can't show it. NEXT DIAGNOSTIC (resume here):
+instrument the stub (or QEMU) to dump the inner control cmd + response bytes of
+the controls nvidia-smi issues near exit, with a matmul running, to find which
+control carries process info and WHY it returns empty. Hypotheses: (a) the RM
+ties GPU allocations to the stub's host pid but the query client (nvidia-smi's
+own stub = different RM client) isn't authorized to see other clients' pids;
+(b) a control we stub/forge returns empty; (c) per-pid info needs a capability
+(/dev/nvidia-caps) the stub doesn't open. Then translate stub-host-pid →
+guest-tgid (needs guest tgid plumbed per session/isolate — not currently sent).
 nvidia-smi enumerates processes via RM ioctl (NV2080_CTRL_CMD_GPU_GET_PIDS /
 GET_PID_INFO) — confirmed NOT a /proc scan (strace showed zero /proc/<pid>
 opens). Returned PIDs are HOST stub PIDs. Translate stub-host-pid → guest-tgid
