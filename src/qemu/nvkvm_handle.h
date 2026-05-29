@@ -68,6 +68,11 @@ int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 struct nvkvm_handle *nvkvm_handle_get(struct nvkvm_handle_table *t,
 				      uint32_t handle_id);
 
+/* C-2: dup the handle's fd atomically under the table lock so a concurrent
+ * close cannot recycle it mid-ioctl. Caller MUST close() the returned fd. */
+int nvkvm_handle_acquire_fd(struct nvkvm_handle_table *t, uint32_t handle_id,
+			    int *dev_id_out);
+
 /* Bump isolate refcount (called when sending fd to an isolate). */
 int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id);
 

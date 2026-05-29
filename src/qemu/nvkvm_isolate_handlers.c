@@ -565,8 +565,23 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				uint32_t fd32 = (uint32_t)hh->fd;
 				memcpy((char *)param_buf + off, &fd32, 4);
 			}
-			int r = ioctl(h->fd, (unsigned long)req->cmd, param_buf);
+			/* C-2: dup the target fd under the table lock so a
+			 * concurrent CLOSE_HANDLE on the TX thread cannot
+			 * close()+recycle this fd while we're mid-ioctl on the
+			 * pool worker.  The dup keeps the struct file alive for
+			 * the whole call; we close it immediately after. */
+			int tfd = nvkvm_handle_acquire_fd(&nv->handles,
+							  req->handle_id, NULL);
+			if (tfd < 0) {
+				resp->retval     = (uint64_t)(int64_t)(-EBADF);
+				resp->status     = 0;
+				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
+				resp->fault_addr = 0;
+				return 0;
+			}
+			int r = ioctl(tfd, (unsigned long)req->cmd, param_buf);
 			int saved_errno = errno;
+			close(tfd);
 			for (int k = 0; k < nsaved; k++)
 				memcpy((char *)param_buf + saved_off[k],
 				       &saved_val[k], 4);

@@ -248,6 +248,34 @@ struct nvkvm_handle *nvkvm_handle_get(struct nvkvm_handle_table *t,
 	return h;
 }
 
+/*
+ * Audit C-2 fix: return a *dup* of the handle's fd, taken atomically under the
+ * table lock.  IOCTL_ON_ISOLATE runs on QEMU's thread pool; without this a
+ * concurrent nvkvm_handle_close() on the TX thread could close()+recycle the
+ * host fd while a worker is mid-ioctl on it (use-after-close / wrong-object).
+ * The dup is an independent fd referencing the SAME struct file, so the kernel
+ * keeps that open file description alive for the whole ioctl regardless of what
+ * happens to the original fd (the documented "blocking syscall holds a
+ * reference and may complete" behaviour).  Caller MUST close() the returned fd.
+ * Returns -1 if the handle is gone/closed.  *dev_id_out (optional) gets dev_id.
+ */
+int nvkvm_handle_acquire_fd(struct nvkvm_handle_table *t, uint32_t handle_id,
+			    int *dev_id_out)
+{
+	int dfd = -1;
+	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
+		return -1;
+	pthread_mutex_lock(&t->lock);
+	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
+	if (h->in_use && h->id == handle_id && h->fd >= 0) {
+		dfd = fcntl(h->fd, F_DUPFD_CLOEXEC, 0);
+		if (dev_id_out)
+			*dev_id_out = h->dev_id;
+	}
+	pthread_mutex_unlock(&t->lock);
+	return dfd;
+}
+
 int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
 {
 	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
