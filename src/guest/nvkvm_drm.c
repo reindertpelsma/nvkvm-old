@@ -48,6 +48,23 @@ struct drm_nvidia_get_dev_info_params {       /* 36 bytes, all scalars */
 	__u32 supports_sync_fd, supports_semsurf;
 };
 
+/* Semaphore-surface fence ioctls (render-path sync, #84). Sizes/layout MUST
+ * match host nvidia-drm-ioctl.h so the DRM core copies the right byte count. */
+struct drm_nvidia_semsurf_fence_ctx_create_params {  /* 32 bytes */
+	__u64 index;             /* IN  */
+	__u64 nvkms_params_ptr;  /* IN  user ptr to NVKMS import params */
+	__u64 nvkms_params_size; /* IN  */
+	__u32 handle;            /* OUT GEM handle to fence context */
+	__u32 __pad;
+};
+struct drm_nvidia_semsurf_fence_create_params {      /* 24 bytes */
+	__u32 fence_context_handle; /* IN  */
+	__u32 timeout_value_ms;     /* IN  */
+	__u64 wait_value;           /* IN  */
+	__s32 fd;                   /* OUT sync fd */
+	__u32 __pad;
+};
+
 /* Forward an already-kernel-copied DRM param blob to the host render node via
  * the process's isolate.  The DRM core handled the user<->kernel copy using
  * _IOC_SIZE(cmd); we just relay `data` and let the host write results back. */
@@ -74,6 +91,58 @@ NVKVM_DRM_FWD(get_dev_info,
 	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
 		       struct drm_nvidia_get_dev_info_params))
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
+NVKVM_DRM_FWD(semsurf_fence_create,
+	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x15,
+		       struct drm_nvidia_semsurf_fence_create_params))
+
+/*
+ * SEMSURF_FENCE_CTX_CREATE embeds a userspace pointer `nvkms_params_ptr`
+ * (-> nvkms_params_size bytes, IN only) that the host kernel reads.  The host
+ * has no access to guest VAs, so stage those bytes in the aux slot, zero the
+ * pointer (the stub substitutes a host VA at offset 8), and forward.  Mirrors
+ * the RM_CONTROL / NVKMS aux pattern; handle@24 comes back inline in `data`.
+ */
+static int nvkvm_drm_fwd_semsurf_fence_ctx_create(struct drm_device *dev,
+						  void *data,
+						  struct drm_file *file)
+{
+	struct drm_nvidia_semsurf_fence_ctx_create_params *p = data;
+	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x14,
+				    struct drm_nvidia_semsurf_fence_ctx_create_params);
+	void *aux = NULL;
+	size_t aux_sz = 0;
+	__u64 orig_ptr;
+	__u64 fault = 0;
+	long r;
+
+	(void)dev;
+	if (!ctx)
+		return -EBADF;
+
+	orig_ptr = p->nvkms_params_ptr;
+	if (orig_ptr && p->nvkms_params_size > 0 &&
+	    p->nvkms_params_size <= NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+		aux_sz = p->nvkms_params_size;
+		aux = kzalloc(aux_sz, GFP_KERNEL);
+		if (!aux)
+			return -ENOMEM;
+		if (copy_from_user(aux, (void __user *)(uintptr_t)orig_ptr,
+				   aux_sz)) {
+			kfree(aux);
+			return -EFAULT;
+		}
+		p->nvkms_params_ptr = 0;   /* stub fills host VA at offset 8 */
+	}
+
+	r = nvkvm_virtio_ioctl_on_isolate(ctx, cmd, data,
+					  sizeof(*p), aux, aux_sz, 0, &fault);
+
+	/* Restore the caller's ptr; the kernel only reads it (IN). */
+	p->nvkms_params_ptr = orig_ptr;
+	kfree(aux);
+	return (r < 0) ? (int)r : 0;
+}
 
 /* Indexed by (DRM_NVIDIA_* number) = (nr - DRM_COMMAND_BASE).  Gaps have a NULL
  * .func, which the DRM core rejects with -EINVAL (default-deny here too). */
@@ -85,6 +154,14 @@ static const struct drm_ioctl_desc nvkvm_drm_ioctls[] = {
 	[0x0f] = { .cmd = DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f),
 		   .func = nvkvm_drm_fwd_dmabuf_supported,
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_DMABUF_SUPPORTED" },
+	[0x14] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x14,
+				   struct drm_nvidia_semsurf_fence_ctx_create_params),
+		   .func = nvkvm_drm_fwd_semsurf_fence_ctx_create,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_CTX_CREATE" },
+	[0x15] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x15,
+				   struct drm_nvidia_semsurf_fence_create_params),
+		   .func = nvkvm_drm_fwd_semsurf_fence_create,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_CREATE" },
 };
 
 /* Each open of the render node gets its own forwarding context, sharing the

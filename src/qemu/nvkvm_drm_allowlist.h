@@ -38,6 +38,13 @@ static inline bool nvkvm_drm_nr_allowed(unsigned nr)
 	case NVKVM_DRM_COMMAND_BASE + 0x0d: /* GEM_EXPORT_DMABUF_MEMORY */
 	case NVKVM_DRM_COMMAND_BASE + 0x0e: /* GEM_IDENTIFY_OBJECT */
 	case NVKVM_DRM_COMMAND_BASE + 0x0f: /* DMABUF_SUPPORTED */
+	/* Semaphore-surface fences — render-path GPU synchronisation primitives
+	 * (pair with NV_SEMAPHORE_SURFACE); NOT display/permissions.  The Vulkan
+	 * ICD uses them for cross-queue/cross-process sync (#84). */
+	case NVKVM_DRM_COMMAND_BASE + 0x14: /* SEMSURF_FENCE_CTX_CREATE */
+	case NVKVM_DRM_COMMAND_BASE + 0x15: /* SEMSURF_FENCE_CREATE */
+	case NVKVM_DRM_COMMAND_BASE + 0x16: /* SEMSURF_FENCE_WAIT */
+	case NVKVM_DRM_COMMAND_BASE + 0x17: /* SEMSURF_FENCE_ATTACH */
 		return true;
 	default:
 		return false;

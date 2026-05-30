@@ -741,9 +741,15 @@ static void worker_thread(void *arg)
 		 * slot; we restore the host-accessible address here so the
 		 * driver can dereference it.
 		 */
-		if (job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
-		    job.aux_size > 0 && job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
-			/* NVKMS wrapper: embedded `address` ptr is at offset 8. */
+		unsigned job_type = (job.cmd >> 8) & 0xff;
+		unsigned job_nr   = job.cmd & 0xff;
+		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper and the
+		 * DRM SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) both carry
+		 * their single user ptr there. */
+		if (job.aux_size > 0 &&
+		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
+		     (job_type == 'd' && job_nr == 0x54 && job.param_size >= 16))) {
 			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
 			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
 					 &aux_ptr, sizeof(uint64_t));
@@ -1083,8 +1089,11 @@ static void worker_thread(void *arg)
 
 		/* Zero the embedded pointer field (don't leak host VA): nvos54/
 		 * nvos64 at offset 16, NVKMS wrapper at offset 8. */
-		if (job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
-		    job.aux_size > 0 && job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+		if (job.aux_size > 0 &&
+		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
+		     (((job.cmd >> 8) & 0xff) == 'd' &&
+		      (job.cmd & 0xff) == 0x54 && job.param_size >= 16))) {
 			uint64_t zero = 0;
 			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
 					 &zero, sizeof(uint64_t));
