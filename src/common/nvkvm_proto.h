@@ -97,6 +97,24 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_NVKMS_IOCTL_CMD   0xC0106D00u
 #define NVKVM_NVKMS_PARAMS_SIZE 16u   /* sizeof(struct NvKmsIoctlParams) */
 #define NVKVM_NVKMS_ADDR_OFF    8u    /* offset of the embedded address ptr */
+
+/*
+ * NVKMS sub-commands (NvKmsIoctlParams.cmd @ wrapper offset 0) whose inner
+ * params embed file descriptors that must be translated guest-fd↔handle_id↔
+ * stub-fd (same machinery as RM EXPORT_OBJECT_TO_FD).
+ *
+ * REGISTER_SURFACE (cmd 17): the Vulkan ICD exports the semaphore-surface
+ * memory to an fd (RM EXPORT_OBJECT_TO_FD) then registers it here by fd
+ * (useFd=TRUE).  NvKmsRegisterSurfaceRequest layout (nvkms-api.h, 575/580):
+ *   deviceHandle@0, useFd@4, rmClient@8, planes[3]@16 (each 32B:
+ *   {union{rmObject/fd}@0, offset@8, pitch@16, rmObjectSizeInBytes@24}).
+ * So planes[i].u.fd live at 16 + i*32 = {16,48,80}, valid only when useFd!=0.
+ */
+#define NVKVM_NVKMS_CMD_REGISTER_SURFACE 17u
+#define NVKVM_NVKMS_REGSURF_USEFD_OFF    4u
+#define NVKVM_NVKMS_REGSURF_PLANE0_OFF   16u
+#define NVKVM_NVKMS_REGSURF_PLANE_STRIDE 32u
+#define NVKVM_NVKMS_MAX_PLANES           3u
 #define NVKVM_DEV_EVENTFD    0xFF       /* eventfd2() — for NV01_EVENT_OS_EVENT */
 
 /* ── Request types ───────────────────────────────────────────────────────── */

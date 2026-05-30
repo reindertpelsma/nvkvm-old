@@ -849,6 +849,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	__s32 orig_fe_nvos02_fd = 0;  bool have_fe_nvos02_fd = false;  /* RM_ALLOC_MEMORY   */
 	__s32 orig_fe_nvos33_fd = 0;  bool have_fe_nvos33_fd = false;  /* RM_MAP_MEMORY     */
 	u64 orig_modeset_addr = 0;    bool have_modeset = false;       /* NVKMS address ptr */
+	/* NVKMS REGISTER_SURFACE embedded plane fds (IN): swapped for handle_ids
+	 * before forwarding, restored to the caller's fds on the response. */
+	__s32 orig_regsurf_fd[NVKVM_NVKMS_MAX_PLANES] = {0};
+	unsigned orig_regsurf_off[NVKVM_NVKMS_MAX_PLANES] = {0};
+	int      regsurf_nfd = 0;
 	if (ctx->dev_id == NVKVM_DEV_MODESET && params_buf &&
 	    param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
 		orig_modeset_addr =
@@ -985,6 +990,40 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			aux_size = inner_sz;
 			/* Zero the ptr so we never forward a guest VA. */
 			*(__u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF) = 0;
+
+			/*
+			 * REGISTER_SURFACE registers the (semaphore-)surface by
+			 * fd (useFd=TRUE); the inner params carry up to 3 plane
+			 * fds the host NVKMS dups.  The host can't see guest fds,
+			 * so swap each for our handle_id (the stub resolves its
+			 * own local fd), exactly like EXPORT_OBJECT_TO_FD.  Save
+			 * the caller's fds to restore on the response.
+			 */
+			if (*(__u32 *)params_buf == NVKVM_NVKMS_CMD_REGISTER_SURFACE &&
+			    inner_sz >= NVKVM_NVKMS_REGSURF_PLANE0_OFF +
+					NVKVM_NVKMS_MAX_PLANES *
+					NVKVM_NVKMS_REGSURF_PLANE_STRIDE &&
+			    *(__u8 *)((char *)aux_buf +
+				      NVKVM_NVKMS_REGSURF_USEFD_OFF)) {
+				unsigned i;
+				for (i = 0; i < NVKVM_NVKMS_MAX_PLANES; i++) {
+					unsigned off = NVKVM_NVKMS_REGSURF_PLANE0_OFF +
+						       i * NVKVM_NVKMS_REGSURF_PLANE_STRIDE;
+					__s32 gfd;
+					memcpy(&gfd, (char *)aux_buf + off, sizeof(gfd));
+					if (gfd <= 0)
+						continue;
+					orig_regsurf_fd[regsurf_nfd]  = gfd;
+					orig_regsurf_off[regsurf_nfd] = off;
+					regsurf_nfd++;
+					{
+						__s32 hid = guest_fd_to_handle_id(gfd);
+						if (hid >= 0)
+							memcpy((char *)aux_buf + off,
+							       &hid, sizeof(hid));
+					}
+				}
+			}
 		}
 	} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
 		struct nvos54_parameters *ctrl = params_buf;
@@ -1742,6 +1781,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ret = -EFAULT;
 				goto done_aux_copy;
 			}
+		}
+		/* NVKMS REGISTER_SURFACE: put the caller's own plane fds back
+		 * (we swapped them for handle_ids); the fd is IN, value kept. */
+		{
+			int k;
+			for (k = 0; k < regsurf_nfd; k++)
+				if (orig_regsurf_off[k] + sizeof(__s32) <= aux_size)
+					memcpy((char *)aux_buf + orig_regsurf_off[k],
+					       &orig_regsurf_fd[k], sizeof(__s32));
 		}
 		if (copy_to_user(aux_uptr, aux_buf, aux_size))
 			ret = -EFAULT;
