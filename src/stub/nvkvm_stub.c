@@ -736,6 +736,10 @@ static void worker_thread(void *arg)
 		uint32_t str_sz = 0;
 		uint32_t info_list_size = 0; /* if non-zero, info_list pointer must be re-zeroed after the ioctl */
 		uint32_t info_list_base = 0; /* base offset of info_list area in aux_buf */
+		/* EXPORT_OBJECT_TO_FD (inner ctrl 0x3d05): handle_id→local fd at
+		 * aux offset 16; restore the handle_id after the ioctl. */
+		int      export_fd_off   = -1;
+		int32_t  export_fd_saved = 0;
 		if ((job.cmd & 0xff) == 0x2a &&        /* NV_ESC_RM_CONTROL */
 		    job.aux_size > 0 && job.param_size >= 12) {
 			uint32_t inner_cmd;
@@ -770,6 +774,26 @@ static void worker_thread(void *arg)
 						info_list_size = ls;
 						info_list_base = base;
 					}
+				}
+			}
+			if (inner_cmd == 0x00003d05U &&
+			    job.aux_size >= 20) {
+				/* NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD:
+				 * frontend fd at aux offset 16 carries a handle_id
+				 * (guest translated it); map to our local fd so the
+				 * kernel associates the object with a real fd in this
+				 * process.  Restore the handle_id after the ioctl. */
+				int32_t hid;
+				__builtin_memcpy(&hid,
+						 (char *)job.aux_buf + 16,
+						 sizeof(hid));
+				export_fd_saved = hid;
+				int lfd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
+				if (lfd >= 0) {
+					int32_t lfd32 = lfd;
+					__builtin_memcpy((char *)job.aux_buf + 16,
+							 &lfd32, sizeof(lfd32));
+					export_fd_off = 16;
 				}
 			}
 			if (inner_cmd == 0x0080170dU) {
@@ -1051,6 +1075,12 @@ static void worker_thread(void *arg)
 				__builtin_memcpy((char *)job.aux_buf + 16, &z, 8);
 		}
 		(void)info_list_base;
+
+		/* EXPORT_OBJECT_TO_FD: put the handle_id back at aux+16 (the guest
+		 * then restores its own fd) — never leak the stub's local fd. */
+		if (export_fd_off >= 0)
+			__builtin_memcpy((char *)job.aux_buf + export_fd_off,
+					 &export_fd_saved, sizeof(export_fd_saved));
 
 		/*
 		 * Extract NvStatus from the response struct.

@@ -755,6 +755,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	bool have_uvm_mm_init     = false;
 	__u32 orig_uvm_rm_ctrl_fd = 0;
 	bool have_uvm_rm_ctrl     = false;
+	/* EXPORT_OBJECT_TO_FD (ctrl 0x3d05): frontend fd embedded in the INNER
+	 * control params (aux) at offset 16 — translate guest-fd→handle_id, save
+	 * the caller's fd to restore on the response (fd is IN/OUT, value kept). */
+	__s32 orig_export_fd = 0;
+	bool have_export_fd  = false;
 	/* Embedded-fd fields in frontend ioctls: sanitizer overwrites these
 	 * with handle_ids; capture the caller's original guest-fd so the
 	 * response round-trips libcuda's value unchanged. */
@@ -888,6 +893,25 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			if (ctrl->cmd == NVKVM_NV2080_GET_PID_INFO)
 				nvkvm_get_pid_info_tag(aux_buf, aux_size,
 						       &gpi_save, &gpi_n);
+
+			/* NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD (0x3d05): the
+			 * inner params carry a frontend fd at offset 16 (the "empty
+			 * fd" libGLX exports the object onto).  Like REGISTER_FD, the
+			 * stub needs our handle_id there so it can resolve its own
+			 * local fd; save the caller's guest fd to restore on response
+			 * (fd is IN/OUT, value unchanged by the export). */
+			if (ctrl->cmd == 0x3d05 && aux_size >= 20) {
+				__s32 gfd;
+				memcpy(&gfd, (char *)aux_buf + 16, sizeof(gfd));
+				orig_export_fd = gfd;
+				have_export_fd = true;
+				if (gfd >= 0) {
+					__s32 hid = guest_fd_to_handle_id(gfd);
+					if (hid >= 0)
+						memcpy((char *)aux_buf + 16, &hid,
+						       sizeof(hid));
+				}
+			}
 
 			/*
 			 * Commands that embed an `NvxxxCtrlXxxGetInfoParams` preamble
@@ -1331,6 +1355,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (gpi_save)
 			nvkvm_get_pid_info_restore(aux_buf, aux_size,
 						   gpi_save, gpi_n);
+
+		/* EXPORT_OBJECT_TO_FD: restore the caller's own fd in the inner
+		 * params (we swapped it for a handle_id; the export keeps the fd
+		 * value, so libGLX must read its own fd back). */
+		if (have_export_fd && aux_buf && aux_size >= 20)
+			memcpy((char *)aux_buf + 16, &orig_export_fd,
+			       sizeof(orig_export_fd));
 	} else {
 		/* Open establishes ctx->handle_id and ctx->session->isolate_id;
 		 * an ioctl on a ctx missing either is a logic bug. The legacy
