@@ -318,3 +318,307 @@ patch.
   (39 versions `v535_104_05`…`v590_44_01`).
 - vGPU needs SR-IOV (Ampere+) + version-matched host/guest: NVIDIA vGPU User Guide;
   `vgpu_unlock`/Open-IOV defeat licensing, not the VF hardware requirement.
+
+---
+
+## Corrected framing: fake-the-boot, impersonate GSP, forward only compute
+
+**Status: this section SUPERSEDES the §4 "No-go" verdict for the specific architecture below.**
+The original study's blocker (§3.1, "GSP firmware boot is anchored in silicon, signature
+verified by hardware") only bites if *we try to boot real GSP*. The corrected architecture
+**never boots GSP in the guest at all**, so the silicon-signature blocker simply does not
+apply — there is no falcon, no SEC2, no RISC-V core, no WPR2 on an emulated device, and
+nothing checks a signature because **we author every register response**. Re-scoped below.
+
+The host GPU is already fully booted by the host's real driver (real GSP runs on the host).
+The guest runs a stock `open-gpu-kernel-modules` against an **emulated PCI device** that
+nvkvm/QEMU presents. We make the guest's GSP-bootstrap code *believe* GSP came up by
+synthesizing the registers/handshake it polls, then we **terminate the GSP-RPC ring in
+software** and triage: management RPCs get a faked ACK; compute RPCs (RM_ALLOC / RM_CONTROL /
+work-related) are lowered into the **existing Mode-1 sanitizer + GPA-window + handle-translation
+core** that already runs CUDA and a 7B LLM today.
+
+### CF.1 — Scope of the boot-fake (what we must synthesize before the driver sends RPCs)
+
+Traced from `kgspInitRm_IMPL` (`src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c:3619`). The init
+path, in order, is the surface we must satisfy. Crucially, **most of it is gated on
+`IS_GSP_CLIENT(pGpu)`** (`generated/g_gpu_nvoc.h:5451`, `(pGpu)->isGspClient`): the very
+first line of `kgspInitRm_IMPL` is `if (!IS_GSP_CLIENT(pGpu)) return NV_OK;`. Whether the
+heavy VBIOS/FWSEC/booter machinery even runs is a *property* set during early GPU detect,
+which gives us two implementation levers (synthesize the registers so the stock path runs to
+"GSP up", **or** present PCI IDs/scratch such that the driver picks a lighter path). The
+concrete poll/read points the stock driver hits before it will issue RPCs:
+
+1. **GFW (GPU firmware / devinit) boot-complete poll.** `kgspWaitForGfwBootOk_TU102`
+   (`arch/turing/kernel_gsp_tu102.c:1239`) → `gpuWaitForGfwBootComplete_TU102`
+   (`arch/turing/kern_gpu_tu102.c:453`). It (a) waits for a **falcon halt**
+   (`kflcnWaitForHalt_HAL`) and (b) reads `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT`
+   and checks the `_PROGRESS == _COMPLETED` field, after first checking the PLM register
+   `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK` has `_READ_PROTECTION_LEVEL0_ENABLE`
+   (`_gpuIsGfwBootCompleted_TU102`, kern_gpu_tu102.c:399–445). **To fake "GFW booted" we
+   return: PLM reg with RPL0 enable set, and the GFW_BOOT scratch with PROGRESS=COMPLETED.**
+   The falcon-halt wait is satisfied by returning the falcon idle/halt status bits. Two
+   register values + one falcon status — trivial to synthesize.
+2. **VBIOS / FWSEC / FRTS / WPR2.** `kgspExtractVbiosFromRom_HAL`,
+   `kgspParseFwsecUcodeFromVbiosImg`, booter-ucode alloc, `kgspPrepareBootBinaryImage`,
+   `_kgspPrepareGspRmBinaryImage` (kernel_gsp.c:3660–3760). **In the fake-boot model we do
+   NOT run any of this** — there is no ROM to extract, no FWSEC to run, no WPR2 to build.
+   We must make the driver *skip* it. Either: (i) report `NV_ERR_NOT_SUPPORTED` from the
+   emulated ROM extract (the code at kernel_gsp.c:3690 already treats NOT_SUPPORTED as "OK,
+   continue" — a stock, supported escape hatch), or (ii) clamp `isGspClient`/`bPartitionedFmc`
+   so the booter path is bypassed. This is the part most likely to need a **thin out-of-tree
+   guest patch** rather than pure register-faking, but the driver already has a
+   NOT_SUPPORTED branch, so a no-VBIOS emulated device may walk it unmodified.
+3. **The actual GSP "boot".** `_kgspBootGspRm` (called in the retry loop, kernel_gsp.c:3855)
+   writes the boot-args physaddr into `NV_PGSP_FALCON_MAILBOX0/1`
+   (`arch/turing/kernel_gsp_tu102.c:370`) and waits for the RISC-V app to come up. **We never
+   run this** — instead our emulated device immediately presents an *already-initialized*
+   message-queue pair and posts the `GSP_INIT_DONE` event so that
+   `kgspWaitForRmInitDone_IMPL` (kernel_gsp.c:4863 → `rpcRecvPoll(... GSP_INIT_DONE)`:4878)
+   returns OK. The driver's "GSP is up" signal is **literally just the GSP_INIT_DONE event
+   (0x1001) arriving on the status queue** — we post it ourselves.
+4. **Static GPU info the driver consumes after "boot".** Two RPCs:
+   `NV_RM_RPC_SET_GUEST_SYSTEM_INFO` and `NV_RM_RPC_GET_GSP_STATIC_INFO` (kernel_gsp.c:3896,
+   3905) → `_kgspInitGpuProperties` (kernel_gsp.c:5349) + `_kgspSetFwWprLayoutOffset`
+   (kernel_gsp.c:3466). The payload is `GspStaticConfigInfo`
+   (`inc/kernel/gpu/gsp/gsp_static_config.h`): grCapsBits, `fbRegionInfoParams`, engineCaps,
+   `fb_length`/`fbio_mask`/`fb_bus_width`/`fb_ram_type`/`fbp_mask`/`l2_cache_size`,
+   gpuNameString, the SKU bool flags (bIsTesla/bIsMobile/bIsMigSupported/…), ECID, and
+   `fwWprLayoutOffset`. **We synthesize this by querying the HOST GPU** (same RM control
+   commands the host driver already answers — these are exactly the `NV2080`/`NV0080` ctrls
+   Mode 1 forwards) and editing per-guest fields (fb_length = guest's VRAM slice, GFID-ish
+   bits zeroed). This is the largest *data* surface, but it is **static, host-sourced, and
+   read-only** — not a live hardware model.
+
+**Size / brittleness of the boot-fake.** The *register* surface is remarkably small: a
+handful of PGC6 secure-scratch reads (GFW_BOOT + its PLM), falcon halt/status,
+PMC/PBUS/boot-status scaffolding the driver touches during detect, the
+`NV_PGSP_QUEUE_HEAD`/`QUEUE_TAIL` doorbell pair, and MSI-X config. The *data* surface
+(GspStaticConfigInfo + GSP_FW_WPR_META layout) is bigger but is filled from the host GPU.
+**Per-version churn**: the register names (PGC6 scratch, PGSP queue head) are stable across
+Turing→Blackwell (same HAL family); the *RPC struct layouts* (GspStaticConfigInfo, and every
+forwarded payload) are `g_`-generated and **version-locked** — this is the real treadmill,
+identical in spirit to the 39-version nvproxy ABI treadmill (`gvisor/.../nvproxy/version.go`)
+but tracking RPC structs instead of ioctl structs. Net: the boot-fake itself is **small and
+not very brittle**; the ongoing cost is the same per-driver-build struct regeneration Mode 1
+already lives with, now applied to the RPC structs.
+
+### CF.2 — RPC ring mechanics (what our software GSP endpoint must implement)
+
+Fully traced from `src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c` + `kernel_gsp.c`:
+
+- **Queue setup.** `GspMsgQueueInit` (message_queue_cpu.c:180) builds a
+  `MESSAGE_QUEUE_COLLECTION` with a command (TX) and status (RX) queue in **system memory**
+  (guest RAM, so directly visible to QEMU), each driven by `msgqInit` over a shared header
+  (`GSP_MSG_QUEUE_HEADER`, tx/rx `msgqTxHeader`/`msgqRxHeader`). `GspStatusQueueInit`
+  (msgq_cpu.c:307) "waits for the other end to run msgqInit" — i.e. it expects **us** (the
+  GSP side) to have initialized our half. We pre-init both halves in the emulated device.
+- **Doorbell (driver → GSP).** After writing an element, `_kgspRpcSendMessage`
+  (kernel_gsp.c:372) calls `GspMsgQueueSendCommand` then `kgspSetCmdQueueHead_HAL`
+  (kernel_gsp.c:400) which on Turing is `kgspSetCmdQueueHead_TU102` →
+  `GPU_REG_WR32(pGpu, NV_PGSP_QUEUE_HEAD(queueIdx), value)`
+  (`arch/turing/kernel_gsp_tu102.c:352`). **This single BAR0 register write is the
+  doorbell we trap.** On the trap we read the new TX-queue element(s) out of guest RAM.
+- **Element format / integrity.** `GSP_MSG_QUEUE_ELEMENT` carries `seqNum`, `elemCount`,
+  `checkSum` (a plain `_checkSum32` over the element — message_queue_cpu.c:508/586), and on
+  **confidential-compute builds** an `authTagBuffer[16]` + `aadBuffer` with the body
+  AES-encrypted (`ccslEncryptWithRotationChecks`, msgq_cpu.c:475). **Non-CC parts: we
+  compute the same plaintext checksum and read the body directly. CC parts: blocked** (we
+  cannot forge auth tags without the session key) — but CC is datacenter-only and irrelevant
+  to GeForce targets.
+- **Responses + events (GSP → driver).** We write status-queue elements (with correct
+  seqNum/checksum) into guest RAM and **inject an MSI-X interrupt** so the driver's RX poll
+  /ISR drains them. Async events are the same path with `NV_VGPU_MSG_EVENT_*` function codes
+  (0x1001 GSP_INIT_DONE, 0x1003 POST_EVENT, 0x1004 RC_TRIGGERED, 0x1005 MMU_FAULT_QUEUED,
+  0x1006 OS_ERROR_LOG, …). Doorbell-trap + virtual-MSI-X + a shared-RAM ring is **standard
+  QEMU device-model work** (virtio/vfio do exactly this).
+
+**Independent corroboration that this ring is RE-tractable:** the upstream **nouveau** driver
+re-implements this exact GSP-RPC ring from scratch — `struct r535_gsp_msg` (the element
+header) and `struct nvfw_gsp_rpc` (the RPC header), command/status queues, doorbell, MSI →
+which is direct evidence a *third party* already terminates/originates this ring without
+NVIDIA's host plugin. We are doing the mirror image (be the GSP end, not the CPU end).
+(Linux nouveau GSP docs; Phoronix GSP-RM firmware coverage.)
+
+### CF.3 — Triage of the 227 RPC functions (management→fake-ack vs compute→forward)
+
+From `inc/kernel/vgpu/rpc_global_enums.h` (227 `NV_VGPU_MSG_FUNCTION_*`, 35 events
+0x1000–0x1022). Rough family breakdown:
+
+**FORWARD (compute / graphics / memory / work) → lower into the Mode-1 sanitizer.** These
+carry the *identical* `NVOS*`/`NV*_CTRL_*` payloads Mode 1 already sanitizes:
+- The two workhorses: **GSP_RM_CONTROL (76)** = the entire `NV*_CTRL_*` space, **GSP_RM_ALLOC
+  (103)** = the `nvos64`/class allocator. Plus `RM_API_CONTROL (204)`.
+- Alloc/map/free family: `ALLOC_ROOT (2)`, `ALLOC_MEMORY (4)`, `ALLOC_CHANNEL_DMA (6)`,
+  `MAP_MEMORY (7)`, `ALLOC_OBJECT (9)`, `FREE (10)`, `ALLOC_VIDMEM (12)`,
+  `MAP_MEMORY_DMA (14)/UNMAP* (13/15)`, `ALLOC_SUBDEVICE (19)`, `ALLOC_DYNAMIC_MEMORY (20)`,
+  `DUP_OBJECT (21)`, `ALLOC_EVENT (23)`, `ALLOC_VIRTMEM (52)`, `ALLOC_SHARE_DEVICE (32)`.
+- Work / channel / context: `CTRL_GPFIFO_SCHEDULE (97)`, `CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN
+  (186)`/`SET_..._NOTIF_INDEX (187)`, `CTRL_GPU_PROMOTE_CTX (111)`, `CTRL_GPU_INITIALIZE_CTX
+  (115)`, `CTRL_RESET_CHANNEL (88)`, `CTRL_PREEMPT (99)`, `CTRL_SET_TIMESLICE (98)`,
+  `CTRL_STOP_CHANNEL (149)`, the GR ctxsw family (112–114), `CTRL_GR_GET_CTX_BUFFER_*
+  (144/145)`, the UVM paging-channel family (160–166).
+- DMA/PTE plumbing (forward, but **address-translate** — see CF.5): `DMA_FILL_PTE_MEM (27)`,
+  `SET_PAGE_DIRECTORY (54)`, `UNSET_PAGE_DIRECTORY (79)`, `UPDATE_GPU_PDES (61)`,
+  `UPDATE_PDE_2 (53)`, `TRANSLATE_GUEST_GPU_PTES (56)`, `INVALIDATE_TLB (200)`,
+  `CTRL_DMA_SET_DEFAULT_VASPACE (120)`, `UPDATE_BAR_PDE (70)`.
+
+**FAKE-ACK (hardware/system management — return OK without touching real HW)**: clocks/perf/
+power/thermal/ECC/TDP/registry/system-info:
+- `SET_GUEST_SYSTEM_INFO (1)`, `GSP_SET_SYSTEM_INFO (72)`, `SET_GUEST_SYSTEM_INFO_EXT (64)`,
+  `SET_REGISTRY (73)` — accept and stash.
+- `CTRL_PERF_BOOST (92)` (the famous cuCtxCreate=800 BOOST_TO_MAX; ack it),
+  `PERF_GET_*` (40/42), `CTRL_PERF_RATED_TDP_* (151/152)`, `CTRL_PERF_LIMITS_SET_STATUS_V2
+  (172)`, `CTRL_PERF_VPSTATES_GET_CONTROL (93)`, `GET_STATIC_PSTATE_INFO (55)`.
+- `CTRL_CLK_GET_EXTENDED_INFO (91)`, `CTRL_GPU_QUERY_ECC_STATUS (201, deprecated)`,
+  `ECC_NOTIFIER_WRITE_ACK (202)`, `CTRL_GET_LATEST_ECC_ADDRESSES (118)`, ZBC table ctrls
+  (94–96/122/214), `TDR_SET_TIMEOUT_STATE (48)`, `UNLOADING_GUEST_DRIVER (47)`,
+  `SAVE/RESTORE_HIBERNATION_DATA (181/182)`, display/NvFBC/NvENC session ctrls (45/46/86/87).
+- **Static-info answers (fake, but populated from the HOST GPU):** `GET_GSP_STATIC_INFO (65)`,
+  `GET_STATIC_INFO (51)`, `GET_STATIC_INFO2 (77)`, `GET_STATIC_DATA (207)`,
+  `GET_CONSOLIDATED_GR_STATIC_INFO (156)`, `CTRL_FB_GET_INFO_V2 (142)`,
+  `CTRL_GPU_GET_INFO_V2 (209)`, `GET_GSP_STATIC_PSTATE_INFO`, `CTRL_GET_CE_PCE_MASK (121)`,
+  `CTRL_GRMGR_GET_GR_FS_INFO (148)`/`CTRL_FB_GET_FS_INFO (147)`. (Answer from host RM, then
+  edit fb size/GFID fields per guest.)
+- **NVLink / fabric / MIG / SR-IOV-internal / vGPU-plugin families** — N/A on a single
+  GeForce; stub to NOT_SUPPORTED/OK (124/206/211, 179/180/194, 184/185/195, 173/205, …).
+
+**SECURITY-CRITICAL (forward but must validate, do not blind-ack)** — these carry near-raw
+HW: `GPU_EXEC_REG_OPS (50)`, `CTRL_B0CC_EXEC_REG_OPS (130)`, `CTRL_DBG_EXEC_REG_OPS (134)`,
+the debugger SM-error/exception family (108–110, 132–139, 157), HWPM/PM-area reserve
+(128/129/131/199/219–222), and the PTE/page-dir installs above. These are the RPC analog of
+Mode 1's already-known dangerous ioctls.
+
+**Confirmation of the key claim:** the forward set's payloads ARE the same `NVOS*`/`NV*_CTRL_*`
+ABI Mode 1 sanitizes — `GSP_RM_CONTROL`/`GSP_RM_ALLOC` are thin RPC envelopes around those
+exact structs, and gVisor's nvproxy models the very same surface. The triage is therefore a
+**routing layer on top of the existing sanitizer**, not a new semantic engine. Ballpark of
+the 227: ~40–60 must be genuinely forwarded for CUDA, ~30 are security-critical-but-forwarded,
+the rest fake-ack or are N/A on commodity single-GPU.
+
+### CF.4 — Work submission is OUTSIDE the RPC ring (direct MMIO doorbell)
+
+Confirmed: post-init CUDA channel kickoff does **not** go through the GSP-RPC ring. It is a
+**direct MMIO write to a doorbell page** in a BAR-mapped USERMODE aperture:
+- The class is `*_USERMODE_A` (`clc361.h`: `NVC361_NV_USERMODE__SIZE = 65536` — a 64 KB
+  aperture; the doorbell/notify register is `NVC361_NOTIFY_CHANNEL_PENDING = 0x90`).
+  Allocated/mapped via `usermode_api.c` (`usrmodeConstruct`), which on modern chips
+  (`HOPPER_USERMODE_A`+) maps the doorbell page from **BAR1** (`pKernelFifo->pBar1VF` /
+  `pBar1PrivVF`, usermode_api.c:94–99) and falls back to a **BAR0** CPU mapping on
+  BAR1-disabled/coherent platforms (usermode_api.c:85–91). USERD itself lives in a memory
+  buffer; the doorbell is the MMIO write that says "channel N has new work in its GPFIFO."
+- **Implication for us:** the guest libcuda will `mmap` this USERMODE/doorbell page and write
+  to it on every submit. That write must reach the **host's real channel doorbell** for the
+  corresponding host-side channel. So beyond the RPC ring we need **either** (a) trap the
+  guest's doorbell MMIO and translate {guest channel/token} → host doorbell write (a
+  per-submit VM-exit — correctness-simple, perf-costly), **or** (b) back the guest's doorbell
+  page with the **host's real USERMODE doorbell page** via the GPA-window/MAP_FIXED trick
+  Mode 1 already uses for memory, so guest writes land directly on real hardware with no exit.
+  Option (b) is the performant target and is **the same GPA-window mechanism Mode 1 proved**
+  for memcpy/compute (`gpa_window_design`, `cumemcpy_first_pass`). The work-submit *token*
+  (`CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN`, RPC 186) is allocated on the host channel during the
+  forwarded alloc, so the value the guest writes is already host-correct. This interacts
+  cleanly with host real channels because the channels ARE host channels (created by the
+  forwarded RM_ALLOC), just doorbell-rung from the guest.
+
+### CF.5 — Honest re-verdict under the corrected framing
+
+**Is a STOCK Linux guest driver viable on a commodity GeForce, never booting guest GSP,
+faking management, forwarding compute into the Mode-1 core?** **Yes — plausibly viable**,
+and the original "no-go" does **not** apply because the silicon-signature/GSP-boot blocker is
+sidestepped entirely (we author the registers; nothing verifies a signature on an emulated
+device). One honest caveat on the word "stock": the cleanest builds may still need a **thin
+out-of-tree patch** to `open-gpu-kernel-modules` to take the no-VBIOS / skip-booter path
+deterministically — though the existing `NV_ERR_NOT_SUPPORTED` escape at kernel_gsp.c:3690
+plus an `isGspClient`-shaped detect hint suggests a *fully unmodified* Linux guest driver is
+within reach if the emulated PCI device is shaped correctly. Guest **userspace (libcuda) is
+fully stock** either way. This is strictly better than the §4 "middle path" framing: same
+reuse of Mode 1, but now with a credible path to an *unmodified* guest kernel driver.
+
+**Top 3 REAL risks (the GSP-signature risk is NOT one of them):**
+1. **DMA / guest-PTE ↔ host-physical translation (highest).** Every `SET_PAGE_DIRECTORY (54)`,
+   `UPDATE_GPU_PDES (61)`, `DMA_FILL_PTE_MEM (27)`, `TRANSLATE_GUEST_GPU_PTES (56)`, USERD,
+   semaphore, and the BAR1 doorbell/aperture carries **guest-physical** addresses the real
+   GPU MMU must never see verbatim. We must rewrite them into host-IOMMU/GPA-window space and
+   keep them coherent across guest remaps. NVIDIA's own design assumes a privileged host
+   translator here (the `TRANSLATE_GUEST_GPU_PTES` RPC exists *because* the host fixes up
+   guest PTEs) — **we have to be that translator.** Mode 1 sidesteps most of this at the
+   ioctl level; Mode 2 re-exposes the raw PTE plumbing. High effort, but tractable with the
+   existing GPA-window.
+2. **Doorbell / work-submit MMIO path (CF.4).** Getting the guest's USERMODE doorbell write
+   to land on the right host channel performantly (GPA-window-backed page vs trap-per-submit)
+   and keeping per-guest channels isolated. Standard device-model work, but perf-sensitive
+   and must be airtight for isolation.
+3. **Security of the forwarded compute RPCs + per-version churn (tie).** We now validate a
+   **227-function** surface where several messages carry register-op arrays and PTE installs
+   (CF.3 "security-critical" set). nvproxy is default-deny and still finds this hard; we need
+   a default-deny RPC allowlist that preserves CUDA. AND the RPC structs are `g_`-generated /
+   version-locked, so the regen treadmill (≥ the 39-version nvproxy cadence) is permanent.
+
+**Why Windows is materially harder.** Everything above leaned on the **open-source** Linux
+KMD: we read `kgspInitRm_IMPL`, the exact GFW-boot scratch fields, the doorbell register, the
+static-info struct, and the NOT_SUPPORTED escape hatch from source. Windows ships a **closed
+KMD** with no source — the boot-fake (which scratch regs it polls, in what order, what static
+info it consumes, how it decides "GSP up") must be **reverse-engineered by observation**
+(MMIO trace of a real boot under a recording hypervisor), and there is **no `NV_ERR_NOT_SUPPORTED`
+branch we can read** to know the skip-booter path exists. The RPC wire format is shared
+(GSP-RM is OS-agnostic), so the *forward* half ports; the *boot-fake* half is an RE project
+per Windows driver build. Treat Linux-first as mandatory; Windows as a later, higher-risk RE
+effort.
+
+**Rough effort + milestones (corrected framing).** Re-using Mode-1's sanitizer/GPA-window/
+handle core throughout:
+- **CF-M0 Boot-fake spike (1–2 pm):** emulated PCI device + BAR0 trap; synthesize GFW_BOOT
+  scratch + PLM + falcon-halt; pre-init the msgq pair; post `GSP_INIT_DONE`; answer
+  `GET_GSP_STATIC_INFO`/`SET_GUEST_SYSTEM_INFO` from the host GPU. Goal: a (lightly-patched)
+  stock open-RM reaches "GSP up" + GET_GSP_STATIC_INFO with **no silicon GSP boot**.
+- **CF-M1 RPC↔Mode-1 lowering (2–3 pm):** doorbell-trap → drain TX queue → route per CF.3 →
+  `GSP_RM_CONTROL`/`GSP_RM_ALLOC`/alloc/map/free into the existing sanitizer; status-queue
+  writeback + MSI-X; handle-namespace parity (reuse `rmclient_validate`/`hclient` work).
+- **CF-M2 DMA/PTE + doorbell datapath (3–5 pm, highest risk):** PTE/page-dir translation into
+  the GPA window; USERMODE doorbell page backed by host doorbell (CF.4); channel kickoff.
+- **CF-M3 Async events + RC/fault (1.5 pm):** POST_EVENT/RC_TRIGGERED/MMU_FAULT_QUEUED back-
+  channel; seqnum/checksum discipline (non-CC).
+- **CF-M4 Default-deny RPC allowlist + reg-op/PTE validators (2–3 pm, ongoing).**
+- **CF-M5 "Truly unmodified guest" hardening (1–2 pm):** shape the emulated PCI device so the
+  stock driver walks the NOT_SUPPORTED/skip-booter path with **zero** guest patch.
+- **CF-M6 Per-build RPC struct regen (recurring).**
+
+**Total ≈ 10–16 person-months** to a single-GPU, single-(few)-guest demo running stock
+libcuda on a (near-)stock Linux open-RM with no guest GSP boot. This is comparable to the old
+estimate but now buys a **credible unmodified-Linux-driver** outcome instead of a guaranteed
+guest patch — because the GSP-boot blocker that drove the old no-go **does not exist when we
+never boot GSP**. Windows remains a separate, RE-heavy follow-on. Confidence: medium-high on
+CF-M0/M1 (small register surface + ring is nouveau-proven), medium on CF-M2 (DMA/PTE), low on
+long-term version churn and on a *zero-patch* Linux guest (CF-M5).
+
+### CF.6 — Evidence pointers (this section)
+- Boot path / init: `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c` — `kgspInitRm_IMPL`:3619,
+  VBIOS/FWSEC/booter 3660–3760, NOT_SUPPORTED escape :3690, `_kgspBootGspRm` retry loop :3855,
+  `SET_GUEST_SYSTEM_INFO`/`GET_GSP_STATIC_INFO` :3896/:3905, `_kgspInitGpuProperties`:5349,
+  `kgspWaitForRmInitDone_IMPL`:4863 (`rpcRecvPoll ... GSP_INIT_DONE`:4878),
+  `_kgspSetFwWprLayoutOffset`:3466.
+- GFW boot poll regs: `src/nvidia/src/kernel/gpu/arch/turing/kern_gpu_tu102.c` —
+  `_gpuIsGfwBootCompleted_TU102`:399 (PGC6 GROUP_05 PLM + GFW_BOOT PROGRESS_COMPLETED),
+  `gpuWaitForGfwBootComplete_TU102`:453; `kgspWaitForGfwBootOk_TU102`
+  (`arch/turing/kernel_gsp_tu102.c:1239`); falcon mailboxes
+  `arch/turing/kernel_gsp_tu102.c:370`.
+- `IS_GSP_CLIENT`: `generated/g_gpu_nvoc.h:5451` (`(pGpu)->isGspClient`).
+- RPC ring: `src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c` — `GspMsgQueueInit`:180,
+  `GspStatusQueueInit`:307, `GspMsgQueueSendCommand`:446 (checksum :508/:586, CC encrypt
+  :475, authTag/aadBuffer), `GspMsgQueueReceiveStatus`:598; send wrapper + doorbell
+  `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c:_kgspRpcSendMessage:372` →
+  `kgspSetCmdQueueHead_TU102` `arch/turing/kernel_gsp_tu102.c:341` (`GPU_REG_WR32(...,
+  NV_PGSP_QUEUE_HEAD(queueIdx), value)`:352).
+- Static info struct: `src/nvidia/inc/kernel/gpu/gsp/gsp_static_config.h` (`GspStaticConfigInfo`:
+  grCapsBits, fbRegionInfoParams, engineCaps, fb_length/fbio_mask/fb_ram_type/fbp_mask,
+  gpuNameString, SKU bools, ECID, fwWprLayoutOffset).
+- Work-submit doorbell (MMIO, not RPC): `src/common/sdk/nvidia/inc/class/clc361.h`
+  (`NVC361_NV_USERMODE__SIZE 65536`, `NVC361_NOTIFY_CHANNEL_PENDING 0x90`);
+  `src/nvidia/src/kernel/gpu/fifo/usermode_api.c` (BAR1 doorbell page :94–99, BAR0 fallback
+  :85–91); work-submit token RPC 186 (`CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN`).
+- RPC function/event table (227 fns / 35 events): `src/nvidia/inc/kernel/vgpu/rpc_global_enums.h`.
+- Independent RE corroboration (the ring is reproducible without NVIDIA's host plugin):
+  upstream **nouveau** GSP-RPC (`r535_gsp_msg`, `nvfw_gsp_rpc`, command/status queues,
+  doorbell, MSI) — Linux nouveau GSP documentation; Phoronix "NVIDIA Upstreams Newer GSP
+  Firmware For Open-Source Nouveau Driver".
