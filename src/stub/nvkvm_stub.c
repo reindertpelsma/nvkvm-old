@@ -1178,6 +1178,18 @@ static int dev_id_to_path(uint32_t dev_id, char *buf, size_t buflen)
 		}
 		return 0;
 	}
+	if (dev_id >= 32 && dev_id < 32 + 16) {   /* NVKVM_DEV_DRM_RD(n) */
+		/* renderD(128+n) under dri/ — relative to the host /dev dirfd. */
+		unsigned minor = 128 + (dev_id - 32);
+		/* "dri/renderD" + up to 3 digits + NUL = 15 bytes */
+		if (buflen < 15) return -1;
+		__builtin_memcpy(buf, "dri/renderD", 11);
+		buf[11] = '0' + (char)(minor / 100);
+		buf[12] = '0' + (char)((minor / 10) % 10);
+		buf[13] = '0' + (char)(minor % 10);
+		buf[14] = 0;
+		return 0;
+	}
 	return -1;
 }
 

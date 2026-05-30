@@ -83,6 +83,7 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_DEV_CTL        0          /* /dev/nvidiactl                */
 #define NVKVM_DEV_UVM        1          /* /dev/nvidia-uvm               */
 #define NVKVM_DEV_GPU(n)     (16 + (n)) /* /dev/nvidia0 → /dev/nvidia15  */
+#define NVKVM_DEV_DRM_RD(n)  (32 + (n)) /* /dev/dri/renderD128+n (nvidia-drm) */
 #define NVKVM_DEV_EVENTFD    0xFF       /* eventfd2() — for NV01_EVENT_OS_EVENT */
 
 /* ── Request types ───────────────────────────────────────────────────────── */

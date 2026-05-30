@@ -183,6 +183,21 @@ static int nvkvm_child_enter_mount_ns(void)
 		if (mount(src, dst, NULL, MS_BIND, NULL) < 0 && i == 0)
 			return -1;                /* nvidiactl is mandatory */
 	}
+	/* nvidia-drm render node(s) for graphics (Vulkan) live under dri/.
+	 * Create the subdir in the sandbox /dev and bind each present
+	 * renderD12{8..} node.  Graphics-only — absence is non-fatal. */
+	mkdir("/proc/dev/dri", 0755);
+	for (int n = 128; n < 128 + 8; n++) {
+		int fd;
+		snprintf(src, sizeof(src), "/dev/dri/renderD%d", n);
+		if (access(src, F_OK) != 0)
+			continue;
+		snprintf(dst, sizeof(dst), "/proc/dev/dri/renderD%d", n);
+		fd = open(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+		if (fd >= 0)
+			close(fd);
+		mount(src, dst, NULL, MS_BIND, NULL);
+	}
 	/* pivot_root into the minimal tmpfs; detach the old (host) root. */
 	if (chdir("/proc") < 0)
 		return -1;

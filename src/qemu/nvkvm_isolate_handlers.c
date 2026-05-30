@@ -22,6 +22,7 @@
 #include "virtio_nvgpu.h"
 #include "nvkvm_ctrl_allowlist.h"
 #include "nvkvm_fe_alloc_allowlist.h"
+#include "nvkvm_drm_allowlist.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -856,7 +857,22 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * straight through to the raw ioctl() in the stub — the kmd dispatches
 	 * on _IOC_NR, so that could reach a denied privileged escape.
 	 */
-	if (_IOC_TYPE(req->cmd) != 'F') {
+	if (_IOC_TYPE(req->cmd) == 'd') {
+		/* nvidia-drm render node (graphics).  Default-deny: only the
+		 * render/compute-relevant DRM ioctls are forwarded; display,
+		 * modeset and permission surfaces are excluded.  Falls through to
+		 * the generic forward path below (skips the 'F' frontend
+		 * allowlists, which all guard on type=='F'). */
+		if (!nvkvm_drm_nr_allowed(_IOC_NR(req->cmd))) {
+			fprintf(stderr, "nvkvm: DENY drm ioctl nr=0x%02x\n",
+				_IOC_NR(req->cmd));
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
+		}
+	} else if (_IOC_TYPE(req->cmd) != 'F') {
 		NVKVM_DBG("nvkvm: DENY non-'F' cmd 0x%x (type=0x%x)\n",
 			  req->cmd, _IOC_TYPE(req->cmd));
 		resp->retval     = (uint64_t)(int64_t)(-EPERM);

@@ -238,39 +238,31 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 	return ret;
 }
 
-static int nvkvm_open(struct inode *inode, struct file *filp)
+/*
+ * Build a forwarding fd-context for dev_id: get/create the per-mm session,
+ * ensure its isolate, and open the device handle on the stub.  Shared by the
+ * char-device open path (nvkvm_open) and the DRM render-node driver
+ * (nvkvm_drm.c) so both share the SAME session/isolate for a given mm — that
+ * is what lets the renderD128 handle correlate with the process's /dev/nvidia0
+ * RM device.  Returns ERR_PTR on failure.  Does NOT allocate UVM state; the
+ * UVM caller adds it.
+ */
+struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 {
 	struct nvkvm_fd_ctx *ctx;
-	int dev_id;
+	__u32 handle_id = 0;
 	int ret;
-
-	/*
-	 * Determine which device is being opened.
-	 *
-	 * nvidiactl and nvidia0..N share major 195 (NV_NVIDIA_MAJOR) so we MUST
-	 * check BOTH major AND minor to identify nvidiactl (minor=255).  Checking
-	 * major alone incorrectly classifies every nvidia0 open as NVKVM_DEV_CTL.
-	 *
-	 * nvidia-uvm has a dynamic (distinct) major so major comparison is enough.
-	 */
-	if (imajor(inode) == nvkvm.ctl_major &&
-	    iminor(inode) == NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
-		dev_id = NVKVM_DEV_CTL;
-	else if (imajor(inode) == nvkvm.uvm_major)
-		dev_id = NVKVM_DEV_UVM;
-	else
-		dev_id = NVKVM_DEV_GPU(iminor(inode));
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	ctx->dev_id  = dev_id;
 	ctx->session = nvkvm_session_get_or_create(current->mm, current->tgid);
 	if (IS_ERR(ctx->session)) {
 		ret = PTR_ERR(ctx->session);
 		kfree(ctx);
-		return ret;
+		return ERR_PTR(ret);
 	}
 	init_waitqueue_head(&ctx->poll_wq);
 	atomic_set(&ctx->poll_events, 0);
@@ -279,62 +271,26 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	mutex_init(&ctx->cpu_pages_lock);
 	INIT_LIST_HEAD(&ctx->cpu_pages);
 
-	/* State-machine state for UVM fds — see docs/STATE_MACHINE_PLAN.md. */
-	if (dev_id == NVKVM_DEV_UVM) {
-		ctx->uvm_state = kzalloc(sizeof(*ctx->uvm_state), GFP_KERNEL);
-		if (!ctx->uvm_state) {
-			nvkvm_session_put(ctx->session);
-			kfree(ctx);
-			return -ENOMEM;
-		}
-		mutex_init(&ctx->uvm_state->lock);
-		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
-		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
-		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
-		INIT_LIST_HEAD(&ctx->uvm_state->intents);
-		INIT_LIST_HEAD(&ctx->uvm_state->realizations);
-	}
-
-	/*
-	 * Open flow: spawn the isolate (creates the QEMU-side session as
-	 * a side effect) and then open the device via the stub so its
-	 * nvfp/mm lineage is the isolate process.
-	 */
-	{
-		__u32 handle_id = 0;
-
-		ret = nvkvm_ensure_isolate(ctx->session);
-		if (ret) {
-			nvkvm_session_put(ctx->session);
-			kfree(ctx);
-			return ret;
-		}
-
-		ret = nvkvm_virtio_open_nvidia_handle(dev_id, filp->f_flags,
-						      (unsigned int)ctx->session->id,
-						      &handle_id);
-		if (ret) {
-			nvkvm_session_put(ctx->session);
-			kfree(ctx);
-			return ret;
-		}
-		ctx->handle_id = handle_id;
-	}
-
-	filp->private_data = ctx;
-	pr_debug("nvkvm: opened dev_id=%d handle_id=%u isolate_id=%u tgid=%d\n",
-		 dev_id, ctx->handle_id,
-		 ctx->session->isolate_id, current->tgid);
-	return 0;
+	ret = nvkvm_ensure_isolate(ctx->session);
+	if (ret)
+		goto err;
+	ret = nvkvm_virtio_open_nvidia_handle(dev_id, flags,
+					      (unsigned int)ctx->session->id,
+					      &handle_id);
+	if (ret)
+		goto err;
+	ctx->handle_id = handle_id;
+	return ctx;
+err:
+	nvkvm_session_put(ctx->session);
+	kfree(ctx);
+	return ERR_PTR(ret);
 }
 
-static int nvkvm_release(struct inode *inode, struct file *filp)
+/* Tear down a context built by nvkvm_fd_ctx_open_dev (also the body of the
+ * char-device release path). */
+void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
 {
-	struct nvkvm_fd_ctx *ctx = filp->private_data;
-
-	if (!ctx)
-		return 0;
-
 	if (ctx->handle_id && ctx->session->isolate_id)
 		nvkvm_virtio_close_handle_on_isolate(ctx->handle_id,
 						     ctx->session->isolate_id);
@@ -380,6 +336,64 @@ static int nvkvm_release(struct inode *inode, struct file *filp)
 
 	nvkvm_session_put(ctx->session);
 	kfree(ctx);
+}
+
+static int nvkvm_open(struct inode *inode, struct file *filp)
+{
+	struct nvkvm_fd_ctx *ctx;
+	int dev_id;
+
+	/*
+	 * Determine which device is being opened.
+	 *
+	 * nvidiactl and nvidia0..N share major 195 (NV_NVIDIA_MAJOR) so we MUST
+	 * check BOTH major AND minor to identify nvidiactl (minor=255).  Checking
+	 * major alone incorrectly classifies every nvidia0 open as NVKVM_DEV_CTL.
+	 *
+	 * nvidia-uvm has a dynamic (distinct) major so major comparison is enough.
+	 */
+	if (imajor(inode) == nvkvm.ctl_major &&
+	    iminor(inode) == NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
+		dev_id = NVKVM_DEV_CTL;
+	else if (imajor(inode) == nvkvm.uvm_major)
+		dev_id = NVKVM_DEV_UVM;
+	else
+		dev_id = NVKVM_DEV_GPU(iminor(inode));
+
+	ctx = nvkvm_fd_ctx_open_dev(dev_id, filp->f_flags);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	/* State-machine state for UVM fds — see docs/STATE_MACHINE_PLAN.md. */
+	if (dev_id == NVKVM_DEV_UVM) {
+		ctx->uvm_state = kzalloc(sizeof(*ctx->uvm_state), GFP_KERNEL);
+		if (!ctx->uvm_state) {
+			nvkvm_fd_ctx_close(ctx);
+			return -ENOMEM;
+		}
+		mutex_init(&ctx->uvm_state->lock);
+		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
+		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
+		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
+		INIT_LIST_HEAD(&ctx->uvm_state->intents);
+		INIT_LIST_HEAD(&ctx->uvm_state->realizations);
+	}
+
+	filp->private_data = ctx;
+	pr_debug("nvkvm: opened dev_id=%d handle_id=%u isolate_id=%u tgid=%d\n",
+		 dev_id, ctx->handle_id,
+		 ctx->session->isolate_id, current->tgid);
+	return 0;
+}
+
+static int nvkvm_release(struct inode *inode, struct file *filp)
+{
+	struct nvkvm_fd_ctx *ctx = filp->private_data;
+
+	if (!ctx)
+		return 0;
+
+	nvkvm_fd_ctx_close(ctx);
 	filp->private_data = NULL;
 	return 0;
 }
@@ -1644,11 +1658,17 @@ static int nvkvm_virtio_probe(struct virtio_device *vdev)
 		return ret;
 	}
 
+	/* nvidia-drm render node for graphics (Vulkan/EGL).  Non-fatal: compute
+	 * works without it.  Parent = the virtio device so the DRM core builds
+	 * /sys/.../<virtio-dev>/drm/renderD128 that the NVIDIA ICD requires. */
+	nvkvm_drm_init(&vdev->dev);
+
 	return 0;
 }
 
 static void nvkvm_virtio_remove(struct virtio_device *vdev)
 {
+	nvkvm_drm_fini();
 	nvkvm_virtio_fini(&nvkvm);
 }
 

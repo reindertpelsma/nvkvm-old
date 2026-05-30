@@ -48,4 +48,27 @@ sudo rm -f "$CUDADIR/libcuda.so.575.51.03" \
     sudo chmod +x /usr/local/bin/nvidia-smi
 
 sudo ldconfig
+
+# GLVND EGL vendor config for NVIDIA.  Without /usr/share/glvnd/egl_vendor.d/
+# 10_nvidia.json, libGLX_nvidia never enters its NVIDIA device-detection path
+# (it only sees mesa) and the Vulkan ICD bows out to llvmpipe.  Points at
+# libEGL_nvidia.so.0 (staged above).
+sudo mkdir -p /usr/share/glvnd/egl_vendor.d
+sudo tee /usr/share/glvnd/egl_vendor.d/10_nvidia.json >/dev/null <<'JSON'
+{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "libEGL_nvidia.so.0"
+    }
+}
+JSON
+
+# Blacklist nouveau: the emulated NVIDIA-id PCI device (nvkvm-gpu, the DRM render
+# node's parent) would otherwise have nouveau auto-bind and probe it.  The device
+# has no BARs, so nouveau can only fail/noise — keep it off the device entirely.
+if [ ! -f /etc/modprobe.d/blacklist-nvkvm-nouveau.conf ]; then
+    echo "blacklist nouveau" | sudo tee /etc/modprobe.d/blacklist-nvkvm-nouveau.conf >/dev/null
+    echo "stage_guest_libs: blacklisted nouveau (reboot to take effect)"
+fi
+
 echo "stage_guest_libs: done ($V)"

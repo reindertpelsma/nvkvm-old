@@ -204,6 +204,8 @@ struct nvkvm_state {
 	unsigned int   uvm_major;
 	dev_t          uvm_devno;
 	struct cdev    uvm_cdev;
+	/* /dev/dri/renderD128 (nvidia-drm) — graphics device (real DRM driver) */
+	struct drm_device *drm_dev;
 
 	/* Session management */
 	struct mutex   sessions_lock;
@@ -270,6 +272,14 @@ static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
 }
 
 /* ── Function declarations ─────────────────────────────────────────────────── */
+
+/* nvkvm_main.c — shared fd-context lifecycle (also used by the DRM driver) */
+struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags);
+void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx);
+
+/* nvkvm_drm.c — nvidia-drm render-node emulation (graphics) */
+int  nvkvm_drm_init(struct device *parent);
+void nvkvm_drm_fini(void);
 
 /* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
