@@ -168,6 +168,7 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x00801102u, /* NV0080 device controls */
 	0x00801104u,
 	0x00801301u,
+	0x00801401u, /* NV0080_CTRL_CMD_HOST_GET_CAPS (#84 graphics) */
 	0x00801701u,
 	0x00801707u,
 	0x00801b01u,

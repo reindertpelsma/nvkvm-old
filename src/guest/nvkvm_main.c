@@ -562,6 +562,40 @@ static void nvkvm_get_pid_info_restore(void *aux, __u32 aux_size,
  * from userspace. Pointer fields in the parameter blob are zeroed or replaced
  * with offsets into the aux slot; the host never receives raw guest VA values.
  */
+/*
+ * RM_CONTROL commands whose inner params begin with an embedded list preamble
+ * { u32 count@0; pad@4; NvP64 ptr@8 } that the driver writes through. Returns
+ * the size in bytes of ONE list element, or 0 if the command has no such list.
+ *
+ *   GET_INFO family  → 8 bytes/entry (NvxxxCtrlXxxInfo = {u32 index; u32 data})
+ *   GET_CAPS family  → 1 byte/entry  (the count field is a byte length)
+ *
+ * The two families are structurally identical (u32@0, ptr@8); only the unit of
+ * the count differs, so they share one handler parameterised by this size.
+ */
+static unsigned int nvkvm_ctrl_list_entry_size(__u32 cmd)
+{
+	switch (cmd) {
+	case NV0041_CTRL_CMD_GET_SURFACE_INFO:
+	case NV0080_CTRL_CMD_GR_GET_INFO:
+	case NV2080_CTRL_CMD_BIOS_GET_INFO:
+	case NV2080_CTRL_CMD_GR_GET_INFO:
+	case NV2080_CTRL_CMD_FB_GET_INFO:
+	case NV2080_CTRL_CMD_BUS_GET_INFO:
+		return NVXXX_CTRL_XXX_INFO_ENTRY_SIZE; /* 8 */
+	case NV2080_CTRL_CMD_GPU_GET_ENGINES:
+		return 4; /* engineList is NvU32[engineCount] */
+	case NV0080_CTRL_CMD_GR_GET_CAPS:
+	case NV0080_CTRL_CMD_FB_GET_CAPS:
+	case NV0080_CTRL_CMD_HOST_GET_CAPS:
+	case NV0080_CTRL_CMD_FIFO_GET_CAPS:
+	case NV0080_CTRL_CMD_MSENC_GET_CAPS:
+	case NV0080_CTRL_CMD_BSP_GET_CAPS_V2:
+		return 1; /* capsTblSize is a byte count */
+	}
+	return 0;
+}
+
 static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct nvkvm_fd_ctx *ctx = filp->private_data;
@@ -989,26 +1023,16 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 
 			{
-				int has_info_list = 0;
-				switch (ctrl->cmd) {
-				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
-				case NV0080_CTRL_CMD_GR_GET_INFO:
-				case 0x00801301: /* NV0080_CTRL_CMD_FB_GET_INFO (device) — graphics #84 */
-				case NV2080_CTRL_CMD_BIOS_GET_INFO:
-				case NV2080_CTRL_CMD_GR_GET_INFO:
-				case NV2080_CTRL_CMD_FB_GET_INFO:
-				case NV2080_CTRL_CMD_BUS_GET_INFO:
-					has_info_list = 1;
-					break;
-				}
-				if (has_info_list &&
+				unsigned int entry_size =
+					nvkvm_ctrl_list_entry_size(ctrl->cmd);
+				if (entry_size &&
 				    ctrl->params_size >= 16 /* size(4)+pad(4)+ptr(8) */) {
 					__u32 list_size = *(__u32 *)aux_buf;
 					__u64 list_ptr  = *(__u64 *)((char *)aux_buf + 8);
-					if (list_size > 0 && list_size <= 4096 && list_ptr != 0) {
+					if (list_size > 0 && list_size <= 65536 && list_ptr != 0) {
 						size_t list_bytes =
 							(size_t)list_size *
-							NVXXX_CTRL_XXX_INFO_ENTRY_SIZE;
+							entry_size;
 						size_t ext = ctrl->params_size + list_bytes;
 						void *ext_buf = kzalloc(ext, GFP_KERNEL);
 						if (!ext_buf) {
@@ -1120,6 +1144,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * ARGUMENT (#84). */
 				ap_size = sizeof(struct nv_memory_virtual_allocation_params);
 				break;
+			case NV_SEMAPHORE_SURFACE:
+				/* 0xda: 16B; same alloc_parms_size=0 path as 0x70 in the
+				 * EGL device-enum sequence (#84). Without this the kernel
+				 * sees empty params -> NV_ERR_INVALID_ARGUMENT (0x1f) and
+				 * libnvidia-eglcore later NULL-derefs the missing object. */
+				ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -1212,6 +1243,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					 * this the kernel sees hVASpace=0 -> INVALID_ARGUMENT
 					 * and graphics bails (#84). */
 					ap_size = sizeof(struct nv_memory_virtual_allocation_params);
+					break;
+				case NV_SEMAPHORE_SURFACE:
+					/* 0xda: 16B; libGLX EGL enum allocs this (nvos64)
+					 * with size=0. Without it the kernel sees empty
+					 * params -> NV_ERR_INVALID_ARGUMENT (0x1f) and
+					 * libnvidia-eglcore NULL-derefs later (#84). */
+					ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
 					break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
@@ -1543,19 +1581,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 
 			{
-				int has_info_list = 0;
-				switch (ctrl->cmd) {
-				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
-				case NV0080_CTRL_CMD_GR_GET_INFO:
-				case 0x00801301: /* NV0080_CTRL_CMD_FB_GET_INFO (device) — graphics #84 */
-				case NV2080_CTRL_CMD_BIOS_GET_INFO:
-				case NV2080_CTRL_CMD_GR_GET_INFO:
-				case NV2080_CTRL_CMD_FB_GET_INFO:
-				case NV2080_CTRL_CMD_BUS_GET_INFO:
-					has_info_list = 1;
-					break;
-				}
-				if (has_info_list &&
+				unsigned int entry_size =
+					nvkvm_ctrl_list_entry_size(ctrl->cmd);
+				if (entry_size &&
 				    ctrl->params_size >= 16 &&
 				    aux_size > ctrl->params_size) {
 					struct {
@@ -1567,7 +1595,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					    orig.list_size > 0 && orig.list_ptr != 0) {
 						size_t list_bytes =
 							(size_t)orig.list_size *
-							NVXXX_CTRL_XXX_INFO_ENTRY_SIZE;
+							entry_size;
 						if (aux_size >= ctrl->params_size + list_bytes) {
 							copy_to_user(
 								(void __user *)(uintptr_t)orig.list_ptr,

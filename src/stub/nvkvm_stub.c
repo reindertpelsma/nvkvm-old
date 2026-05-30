@@ -409,6 +409,33 @@ static struct fs_mutex write_mutex  = FS_MUTEX_INIT;
 static struct fs_mutex fd_mutex     = FS_MUTEX_INIT;
 
 
+/* RM_CONTROL commands with an embedded { u32 count@0; pad; NvP64 ptr@8 } list
+ * the driver writes through. Returns one element's size in bytes (8 for the
+ * GET_INFO family, 1 for the GET_CAPS family whose count is a byte length), or
+ * 0 if none. MUST stay in sync with the guest nvkvm_ctrl_list_entry_size(). */
+static uint32_t nvkvm_ctrl_list_entry_size(uint32_t cmd)
+{
+	switch (cmd) {
+	case 0x00410110U: /* NV0041_CTRL_CMD_GET_SURFACE_INFO */
+	case 0x00801104U: /* NV0080_CTRL_CMD_GR_GET_INFO */
+	case 0x20800802U: /* NV2080_CTRL_CMD_BIOS_GET_INFO */
+	case 0x20801201U: /* NV2080_CTRL_CMD_GR_GET_INFO */
+	case 0x20801301U: /* NV2080_CTRL_CMD_FB_GET_INFO */
+	case 0x20801802U: /* NV2080_CTRL_CMD_BUS_GET_INFO */
+		return 8;
+	case 0x20800123U: /* NV2080_CTRL_CMD_GPU_GET_ENGINES (engineList NvU32[]) */
+		return 4;
+	case 0x00801102U: /* NV0080_CTRL_CMD_GR_GET_CAPS */
+	case 0x00801301U: /* NV0080_CTRL_CMD_FB_GET_CAPS */
+	case 0x00801401U: /* NV0080_CTRL_CMD_HOST_GET_CAPS */
+	case 0x00801701U: /* NV0080_CTRL_CMD_FIFO_GET_CAPS */
+	case 0x00801b01U: /* NV0080_CTRL_CMD_MSENC_GET_CAPS */
+	case 0x00801c02U: /* NV0080_CTRL_CMD_BSP_GET_CAPS_V2 */
+		return 1;
+	}
+	return 0;
+}
+
 /* ── Handle fd table ─────────────────────────────────────────────────────── */
 
 static int handle_fds[MAX_HANDLES];
@@ -753,19 +780,17 @@ static void worker_thread(void *arg)
 			 * point info_list at the extension area so the host driver
 			 * writes into our own memory. After the ioctl we zero the
 			 * pointer again so we don't leak a host VA back to the guest. */
-			if (inner_cmd == 0x00410110U || /* NV0041_CTRL_CMD_GET_SURFACE_INFO */
-			    inner_cmd == 0x00801104U || /* NV0080_CTRL_CMD_GR_GET_INFO */
-			    inner_cmd == 0x00801301U || /* NV0080_CTRL_CMD_FB_GET_INFO (#84) */
-			    inner_cmd == 0x20800802U || /* NV2080_CTRL_CMD_BIOS_GET_INFO */
-			    inner_cmd == 0x20801201U || /* NV2080_CTRL_CMD_GR_GET_INFO */
-			    inner_cmd == 0x20801301U || /* NV2080_CTRL_CMD_FB_GET_INFO */
-			    inner_cmd == 0x20801802U) { /* NV2080_CTRL_CMD_BUS_GET_INFO */
+			uint32_t list_esz = nvkvm_ctrl_list_entry_size(inner_cmd);
+			if (list_esz) {
+				/* GET_INFO family → 8-byte entries; GET_CAPS family
+				 * → 1-byte (the count is a byte length). Mirrors the
+				 * guest nvkvm_ctrl_list_entry_size(). */
 				uint32_t ls = 0;
 				__builtin_memcpy(&ls, job.aux_buf, sizeof(uint32_t));
 				/* base_size is whatever the guest sent before the
-				 * extension; we recover it as aux_size - ls*8. */
-				if (ls > 0 && (size_t)ls * 8 < job.aux_size) {
-					uint32_t base = (uint32_t)(job.aux_size - (size_t)ls * 8);
+				 * extension; we recover it as aux_size - ls*esz. */
+				if (ls > 0 && (size_t)ls * list_esz < job.aux_size) {
+					uint32_t base = (uint32_t)(job.aux_size - (size_t)ls * list_esz);
 					if (base >= 16) {
 						uint64_t list_va =
 							(uint64_t)(uintptr_t)

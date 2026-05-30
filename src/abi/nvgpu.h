@@ -112,6 +112,7 @@ struct nv_gr_allocation_parameters {
 #define NV01_MEMORY_SYSTEM                  0x0000003EU
 #define NV01_MEMORY_LOCAL_USER              0x00000040U
 #define NV01_MEMORY_VIRTUAL                 0x00000070U  /* NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS (24B) */
+#define NV_SEMAPHORE_SURFACE                0x000000daU  /* NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS (16B) */
 #define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR    0x00000071U
 #define NV50_MEMORY_VIRTUAL                 0x000050A0U
 /* Events */
@@ -607,6 +608,20 @@ struct nv_memory_virtual_allocation_params {
 	__u32 h_vaspace;  /* [IN]     */
 };
 
+/* ── NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS — for NV_SEMAPHORE_SURFACE (0xda) ── */
+/*    16 bytes; from src/common/sdk/nvidia/inc/class/cl00da.h. Like
+ *    NV01_MEMORY_VIRTUAL, libGLX (EGL device enum) allocates this with
+ *    nvos64.alloc_parms_size=0, so the forwarder MUST size it by hClass — else
+ *    the inner params never reach the kernel and the alloc fails
+ *    NV_ERR_INVALID_ARGUMENT (0x1f), which crashes libnvidia-eglcore later.
+ *    h_semaphore_mem / h_max_submitted_mem are RM object handles in the
+ *    client's namespace (forwarded verbatim, not fd handle_ids). */
+struct nv_semaphore_surface_alloc_parameters {
+	__u32 h_semaphore_mem;     /* [IN] */
+	__u32 h_max_submitted_mem; /* [IN] */
+	__u64 flags;               /* [IN] */
+};
+
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */
 /*    several other generic memory classes. V545 layout (driver >= 545.23.06,
  *    matches our 575.51.03): adds numa_node + pad. */
@@ -674,6 +689,32 @@ struct nv0000_ctrl_system_get_build_version_params {
 #define NV2080_CTRL_CMD_FB_GET_INFO       0x20801301U
 #define NV2080_CTRL_CMD_BUS_GET_INFO      0x20801802U
 #define NVXXX_CTRL_XXX_INFO_ENTRY_SIZE    8U
+
+/*
+ * NV2080_CTRL_CMD_GPU_GET_ENGINES (non-V2) embeds { NvU32 engineCount@0; NvP64
+ * engineList@8 } where engineList points at a NvU32[engineCount] array the
+ * driver writes through (engineCount is IN=capacity / OUT=actual). Same
+ * preamble shape as GetInfo but the entries are 4-byte engine IDs, so the list
+ * handler uses an entry size of 4. The V2 form (0x20800170) inlines the array
+ * and needs no handling. cl2080.h / ctrl2080gpu.h.
+ */
+#define NV2080_CTRL_CMD_GPU_GET_ENGINES   0x20800123U
+
+/*
+ * Device-level (NV0080) GET_CAPS family. These embed an
+ * NvxxxCtrlXxxGetCapsParams preamble { NvU32 capsTblSize@0; NvP64 capsTbl@8 }
+ * — STRUCTURALLY identical to the GetInfo preamble (u32@0, ptr@8) but the
+ * size field counts capability-table BYTES, not 8-byte info entries. The
+ * list handler must therefore use an entry size of 1 for these, not
+ * NVXXX_CTRL_XXX_INFO_ENTRY_SIZE. See open-kernel-module
+ * ctrl0080{gr,fb,host,fifo,msenc,bsp}.h.
+ */
+#define NV0080_CTRL_CMD_GR_GET_CAPS      0x00801102U
+#define NV0080_CTRL_CMD_FB_GET_CAPS      0x00801301U
+#define NV0080_CTRL_CMD_HOST_GET_CAPS    0x00801401U
+#define NV0080_CTRL_CMD_FIFO_GET_CAPS    0x00801701U
+#define NV0080_CTRL_CMD_MSENC_GET_CAPS   0x00801b01U
+#define NV0080_CTRL_CMD_BSP_GET_CAPS_V2  0x00801c02U
 
 /* ── NV_ESC_RM_CONTROL command IDs used in tests ─────────────────────────── */
 
