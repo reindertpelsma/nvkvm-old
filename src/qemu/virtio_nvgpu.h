@@ -221,6 +221,18 @@ typedef struct VirtIONvgpu {
 	int                 sparse_kvm_slot;
 	pthread_mutex_t     sparse_lock;
 
+	/*
+	 * #55: the sparse window's GPA is the firmware-assigned base of the
+	 * reservation BAR (so QEMU/PCI never place anything else there), not a
+	 * hardcoded constant.  The PCI proxy sets window_base_get to a callback
+	 * that returns the BAR's current GPA (0 until the guest programs it).
+	 * The raw KVM memslot is installed lazily once the base is known
+	 * (nvkvm_sparse_ensure); if no BAR/callback, we fall back to the fixed
+	 * NVKVM_SPARSE_GPA_BASE so a transport without the BAR still works.
+	 */
+	uint64_t          (*window_base_get)(void *opaque);
+	void               *window_base_opaque;
+
 	/* Session table */
 	TAILQ_HEAD(, nvkvm_session) sessions;
 	pthread_mutex_t             sessions_lock;
@@ -405,6 +417,10 @@ int   nvkvm_sparse_init(VirtIONvgpu *nv);
 void  nvkvm_sparse_fini(VirtIONvgpu *nv);
 uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
+/* #55: resolve the window base (BAR-assigned, or fixed fallback) and lazily
+ * install the raw KVM memslot there.  Idempotent; returns the base GPA (0 on
+ * failure).  Safe to call from get_config and the alloc path. */
+uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv);
 VirtIONvgpu *nvkvm_get_global_device(void);
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
 

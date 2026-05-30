@@ -91,3 +91,31 @@ test_ioctl_fwd + 7B at each step). Probe code preserved for reference.
 - The guest module derives the window base from the BAR (no hardcoded 2 TB).
 - matmul, `test_ioctl_fwd` (48/48), and `run_llm_7b.sh` stay green.
 - A guest with large RAM (e.g. 1.5 TB) boots and runs without collision.
+
+## IMPLEMENTED (2026-05-30) — MMIO reservation BAR + raw KVM memslot
+
+The chosen solution (per the project owner: "the only thing we need is that QEMU
+doesn't pick our GPA; keep the raw KVM memory region"):
+
+- **Reservation-only MMIO BAR** (`virtio_nvgpu_pci.c`): a 128 GiB 64-bit
+  prefetchable BAR registered with `memory_region_init_io` (NOT `_ram_ptr`).
+  Being MMIO, QEMU's listener creates **no** KVM memslot for it — so it does NOT
+  collide with the window's own raw memslot (that collision was the probe's
+  cuInit regression). Its sole job is to make the guest firmware ASSIGN + reserve
+  a 128 GiB GPA range so QEMU/PCI never place anything else there.
+- **Raw window installs at the BAR's GPA** (`nvkvm_mmap_host.c`): `sparse_init`
+  now only mmaps the host buffer; `nvkvm_sparse_ensure()` lazily does the raw
+  `KVM_SET_USER_MEMORY_REGION` at the firmware-assigned BAR base (read via a
+  proxy callback `window_base_get`), or falls back to the fixed `NVKVM_SPARSE_GPA_BASE`
+  if there's no BAR transport. The MMIO BAR is shadowed by this raw RAM memslot,
+  so its accessors are never invoked.
+- **No guest change**: `get_config` resolves the base and reports it in the
+  existing `mmap_win_gpa`/`len` fields the guest already reads for GPA validation.
+  The guest gets actual GPAs from QEMU responses as before.
+- The legacy `mmap_win` (1.5 TB) is dead (both MMAP branches use the sparse
+  window), so only the one window needed rebasing.
+
+**Verified on RTX 3060:** lspci shows `Region 2: 128G @ 0x380000000000`;
+`nvkvm_sparse_ensure: 128 GiB at GPA=0x380000000000 slot=64` (firmware base, not
+the 2 TB fallback); matmul + full 7B inference (21 tok/s) both PASS. The fixed
+GPA is now only a fallback for a BAR-less transport.

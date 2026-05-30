@@ -819,6 +819,19 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 static void nvkvm_get_config(VirtIODevice *vdev, uint8_t *config)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
+	/*
+	 * #55: resolve the sparse window to the firmware-assigned reservation-BAR
+	 * GPA (and install the raw memslot there) the first time the guest reads
+	 * config — which happens during the guest's nvkvm probe, after PCI
+	 * enumeration has programmed the BAR.  Advertise that base/len as the
+	 * window the guest validates returned GPAs against.  Falls back to the
+	 * fixed base if there's no BAR (nvkvm_sparse_ensure handles both).
+	 */
+	uint64_t base = nvkvm_sparse_ensure(nv);
+	if (base) {
+		nv->config_space.mmap_win_gpa = cpu_to_le64(base);
+		nv->config_space.mmap_win_len = cpu_to_le64((uint64_t)nv->sparse_size);
+	}
 	memcpy(config, &nv->config_space, sizeof(nv->config_space));
 }
 

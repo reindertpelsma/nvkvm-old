@@ -155,25 +155,69 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 		return -errno;
 	}
 
-	int slot = -1;
-	int rc = kvm_add_memory_region(NVKVM_SPARSE_GPA_BASE, va,
-					NVKVM_SPARSE_GPA_SIZE, false, &slot);
-	if (rc) {
-		munmap(va, NVKVM_SPARSE_GPA_SIZE);
-		return rc;
-	}
-
+	/*
+	 * #55: do NOT raw-install the KVM memslot here.  The window's GPA is the
+	 * firmware-assigned base of the reservation BAR, which isn't known until
+	 * the guest programs the BAR (after device realize).  We only reserve the
+	 * host VMM buffer now; nvkvm_sparse_ensure() installs the memslot at the
+	 * resolved base on first use (or falls back to the fixed base).
+	 */
 	pthread_mutex_init(&nv->sparse_lock, NULL);
-	nv->sparse_gpa_base = NVKVM_SPARSE_GPA_BASE;
+	nv->sparse_gpa_base = 0;
 	nv->sparse_size     = NVKVM_SPARSE_GPA_SIZE;
 	nv->sparse_vmm_va   = va;
 	nv->sparse_cur      = 0;
-	nv->sparse_kvm_slot = slot;
-	NVKVM_DBG(
-		"nvkvm_sparse_init: %llu GiB at GPA=0x%llx VMM=%p slot=%d\n",
-		(unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
-		(unsigned long long)NVKVM_SPARSE_GPA_BASE, va, slot);
+	nv->sparse_kvm_slot = -1;
+	NVKVM_DBG("nvkvm_sparse_init: %llu GiB VMM buffer %p (memslot deferred to BAR base)\n",
+		  (unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30), va);
 	return 0;
+}
+
+/*
+ * #55: resolve the window base (BAR-assigned, else fixed fallback) and install
+ * the single raw KVM memslot there exactly once.  Returns the base GPA, or 0 if
+ * the window buffer is unavailable / the install failed.
+ */
+uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
+{
+	if (!nv->sparse_vmm_va)
+		return 0;
+	pthread_mutex_lock(&nv->sparse_lock);
+	if (nv->sparse_kvm_slot >= 0) {
+		uint64_t b = nv->sparse_gpa_base;
+		pthread_mutex_unlock(&nv->sparse_lock);
+		return b;
+	}
+	uint64_t base;
+	if (nv->window_base_get) {
+		/* BAR transport: use its firmware-assigned GPA.  If 0, the guest
+		 * hasn't programmed the BAR yet (e.g. an early config read during
+		 * PCI enumeration) — do NOT install at a fallback now, or we'd
+		 * cache the wrong base; wait for a later call once it's mapped. */
+		base = nv->window_base_get(nv->window_base_opaque);
+		if (base == 0) {
+			pthread_mutex_unlock(&nv->sparse_lock);
+			return 0;
+		}
+	} else {
+		base = NVKVM_SPARSE_GPA_BASE;   /* no BAR transport — fixed fallback */
+	}
+	int slot = -1;
+	int rc = kvm_add_memory_region(base, nv->sparse_vmm_va,
+				       nv->sparse_size, false, &slot);
+	if (rc) {
+		pthread_mutex_unlock(&nv->sparse_lock);
+		fprintf(stderr, "nvkvm: sparse memslot install at GPA=0x%llx failed: %d\n",
+			(unsigned long long)base, rc);
+		return 0;
+	}
+	nv->sparse_gpa_base = base;
+	nv->sparse_kvm_slot = slot;
+	pthread_mutex_unlock(&nv->sparse_lock);
+	NVKVM_DBG("nvkvm_sparse_ensure: %llu GiB at GPA=0x%llx slot=%d\n",
+		  (unsigned long long)(nv->sparse_size >> 30),
+		  (unsigned long long)base, slot);
+	return base;
 }
 
 void nvkvm_sparse_fini(VirtIONvgpu *nv)
@@ -188,6 +232,9 @@ void nvkvm_sparse_fini(VirtIONvgpu *nv)
 uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 {
 	if (!nv->sparse_vmm_va) return 0;
+	/* #55: install the memslot at the resolved (BAR-assigned) base on first
+	 * use; returns 0 if the window couldn't be installed. */
+	if (nvkvm_sparse_ensure(nv) == 0) return 0;
 	size = (size + 4095) & ~4095ULL;
 	pthread_mutex_lock(&nv->sparse_lock);
 	uint64_t off = (nv->sparse_cur + 4095) & ~4095ULL;

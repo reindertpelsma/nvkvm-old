@@ -12,6 +12,8 @@
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/qdev-properties.h"
+#include "hw/pci/pci.h"
+#include "exec/memory.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qom/object.h"
@@ -24,10 +26,54 @@ typedef struct VirtIONvgpuPCI VirtIONvgpuPCI;
 DECLARE_INSTANCE_CHECKER(VirtIONvgpuPCI, VIRTIO_NVGPU_PCI,
                          TYPE_VIRTIO_NVGPU_PCI)
 
+/*
+ * #55 GPA-window reservation BAR.  We deliberately do NOT make this a
+ * RAM-backed BAR: a RAM BAR gets a QEMU-listener-managed KVM memslot that
+ * collides with the window's own raw KVM_SET_USER_MEMORY_REGION slot (proven by
+ * the earlier probe — it broke cuInit).  Instead this is a pure MMIO BAR with
+ * no backing: registering it makes the guest firmware ASSIGN and reserve a
+ * 128 GiB 64-bit GPA range so QEMU/PCI never place another device or RAM there
+ * (the only thing #55 needs).  The actual window RAM is still installed via the
+ * raw KVM memslot at the BAR's firmware-assigned GPA — so we keep the raw path
+ * (no QEMU dirty-map/madvise/fault-tracker) and that raw memslot shadows this
+ * MMIO region, so these accessors are never invoked in practice.
+ */
+#define NVKVM_BAR_WINDOW       2
+#define NVKVM_BAR_WINDOW_SIZE  (128ULL << 30)
+
 struct VirtIONvgpuPCI {
 	VirtIOPCIProxy parent_obj;
 	VirtIONvgpu    vdev;
+	MemoryRegion   window_bar;
 };
+
+static uint64_t nvkvm_winbar_read(void *opaque, hwaddr addr, unsigned size)
+{
+	(void)opaque; (void)addr; (void)size;
+	return 0;  /* shadowed by the raw KVM memslot; never reached normally */
+}
+
+static void nvkvm_winbar_write(void *opaque, hwaddr addr, uint64_t val,
+			       unsigned size)
+{
+	(void)opaque; (void)addr; (void)val; (void)size;
+}
+
+static const MemoryRegionOps nvkvm_winbar_ops = {
+	.read       = nvkvm_winbar_read,
+	.write      = nvkvm_winbar_write,
+	.endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* #55: return the firmware-assigned GPA of the reservation BAR, or 0 if the
+ * guest hasn't programmed it yet (PCI_BAR_UNMAPPED).  The vdev uses this as the
+ * sparse window's base and raw-installs its KVM memslot there. */
+static uint64_t nvkvm_pci_window_base(void *opaque)
+{
+	VirtIOPCIProxy *vpci_dev = opaque;
+	uint64_t addr = vpci_dev->pci_dev.io_regions[NVKVM_BAR_WINDOW].addr;
+	return (addr == PCI_BAR_UNMAPPED) ? 0 : addr;
+}
 
 static void virtio_nvgpu_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 {
@@ -36,6 +82,24 @@ static void virtio_nvgpu_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 
 	vpci_dev->class_code = PCI_CLASS_OTHERS;
 	qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
+	if (errp && *errp)
+		return;
+
+	/* #55: MMIO reservation BAR (no RAM, no memslot — avoids the probe's
+	 * collision).  Firmware assigns its GPA; QEMU/PCI then reserve that
+	 * 128 GiB range for us. */
+	memory_region_init_io(&dev->window_bar, OBJECT(dev), &nvkvm_winbar_ops,
+			      dev, "nvkvm-gpa-window", NVKVM_BAR_WINDOW_SIZE);
+	pci_register_bar(&vpci_dev->pci_dev, NVKVM_BAR_WINDOW,
+			 PCI_BASE_ADDRESS_SPACE_MEMORY |
+			 PCI_BASE_ADDRESS_MEM_TYPE_64 |
+			 PCI_BASE_ADDRESS_MEM_PREFETCH,
+			 &dev->window_bar);
+
+	/* Let the vdev resolve the window base from this BAR (lazily, once the
+	 * guest has programmed it). */
+	dev->vdev.window_base_get     = nvkvm_pci_window_base;
+	dev->vdev.window_base_opaque  = vpci_dev;
 }
 
 static void virtio_nvgpu_pci_class_init(ObjectClass *klass, void *data)
