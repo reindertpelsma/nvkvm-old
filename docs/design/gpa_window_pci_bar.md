@@ -55,6 +55,36 @@ visible → guest reads base → allocator uses it → drop the raw memslot), ea
 validated against matmul + `test_ioctl_fwd` + the 7B run. Until then the fixed
 windows + the overlap guard are the safe, working state.
 
+## Probe results (2026-05-30)
+
+A probe (additive 64-bit prefetchable BAR 2, 128 GiB, MAP_NORESERVE, registered
+in `virtio_nvgpu_pci_realize`, fixed-GPA path left intact) established:
+
+- **Firmware assigns it.** SeaBIOS on the default `pc` machine + `-cpu host`
+  (48 phys bits) placed the BAR at GPA `0x380000000000` (lspci:
+  `Region 2: Memory at 380000000000 (64-bit, prefetchable) [size=128G]`). The
+  VM boots normally. So the firmware-assignment concern is **resolved** — no
+  OVMF/Q35/pci-hole64 tuning needed for a 128 GiB BAR here.
+- **But the additive BAR regresses cuInit (→100).** With the BAR present *and*
+  the fixed sparse window still installed, cuInit fails; reverting the BAR
+  restores matmul. No QEMU/KVM error is logged and 56 TB fits 48 bits, so the
+  likely cause is a **memslot conflict**: the sparse window is installed via a
+  *raw* `kvm_add_memory_region` (manual slot id) while the BAR's RAM region is
+  installed by QEMU's memory listener (auto slot id) — the two collide and the
+  GPU-mapping window gets clobbered.
+
+**Consequence for the migration:** the additive/incremental path is a dead end
+(raw + BAR coexist → collision). The full migration must, in one step, **drop
+the raw `kvm_add_memory_region`** and make the BAR's MemoryRegion the *sole*
+backing for the window: point `nv->sparse_vmm_va` at the BAR buffer, set
+`sparse_gpa_base` from the BAR's firmware-assigned address (read it from the
+PCIDevice's `io_regions[2].addr` once the guest has programmed the BAR, or have
+the guest read `pci_resource_start(pdev, 2)` and report it), and have the
+allocator hand out `BAR_base + offset`. Then there is exactly one memslot (the
+BAR's) and no collision. This is the high-risk single-shot change the rest of
+this doc describes; it needs a dedicated, heavily-tested pass (matmul +
+test_ioctl_fwd + 7B at each step). Probe code preserved for reference.
+
 ## Acceptance
 
 - `lspci -vv` in the guest shows the 128 GiB 64-bit prefetchable BAR.
