@@ -226,6 +226,9 @@ struct nvkvm_stub_uvm_register_channel_params {
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER  (1UL << 3)
 #endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC         (1UL << 0)
+#endif
 
 /*
  * UVM file ownership work-around.
@@ -1639,7 +1642,14 @@ static long apply_seccomp(void)
 		.filter = filter,
 	};
 	stub_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-	return stub_seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
+	/* TSYNC: apply the filter to EVERY thread in the group, not just the
+	 * caller.  The worker pool is spawned before this runs (audit C-1); a
+	 * non-TSYNC filter would bind to the reader thread only and leave the
+	 * workers — which run all attacker-influenced ioctl handling —
+	 * completely unsandboxed.  TSYNC requires every thread to already have
+	 * no_new_privs, which main() sets before the worker-spawn loop. */
+	return stub_seccomp(SECCOMP_SET_MODE_FILTER,
+			    SECCOMP_FILTER_FLAG_TSYNC, &prog);
 }
 
 /* ── Self-relocation ─────────────────────────────────────────────────────── */
@@ -1732,6 +1742,11 @@ int main(void)
 		.sa_restorer   = stub_sigreturn_trampoline,
 	};
 	stub_sigaction(SIGUSR1, &sa_usr1, NULL);
+
+	/* Set no_new_privs BEFORE spawning workers so they inherit it at clone
+	 * time — required for the TSYNC seccomp filter (audit C-1) to attach to
+	 * the whole thread group below. */
+	stub_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
 	/* Spawn worker threads via clone3.  Each worker gets a fresh stack
 	 * and a slot id stashed in worker_tids[] for fault-addr indexing.

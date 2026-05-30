@@ -822,6 +822,26 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			return 0;
 		}
 	}
+
+	/*
+	 * M-A (audit 2026-05-30): default-deny any non-'F'-type cmd here.  UVM
+	 * handles (type 0) already returned in the schema block above; every
+	 * legitimate RM ioctl on nvidiactl/nvidia0 is _IOC_TYPE 'F'.  Without
+	 * this, a guest crafting a cmd with a non-'F' type would skip ALL the
+	 * frontend allowlists below (they all guard on type=='F') and fall
+	 * straight through to the raw ioctl() in the stub — the kmd dispatches
+	 * on _IOC_NR, so that could reach a denied privileged escape.
+	 */
+	if (_IOC_TYPE(req->cmd) != 'F') {
+		NVKVM_DBG("nvkvm: DENY non-'F' cmd 0x%x (type=0x%x)\n",
+			  req->cmd, _IOC_TYPE(req->cmd));
+		resp->retval     = (uint64_t)(int64_t)(-EPERM);
+		resp->status     = 0;
+		resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+		resp->fault_addr = 0;
+		return 0;
+	}
+
 	/*
 	 * REGISTER_FD now runs inside the isolate (stub) along with every
 	 * other RM ioctl: the stub allocated the pClient (NV01_ROOT_CLIENT)
@@ -1029,7 +1049,13 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				uint32_t off = 8 + i * NVKVM_PIDINFO_STRIDE;
 				uint32_t v = 0, repl = 0;
 				gpi_iso[i] = 0;
-				if ((uint64_t)off + 4 > req->aux_size) {
+				/* Require the FULL 72-byte entry to fit: the
+				 * post-forward fixup writes result@off+8 and
+				 * sum@off+16 (out to off+24).  Validating only
+				 * off+4 here let a guest (aux_size=84,count=2)
+				 * drive a ~20-byte OOB write in QEMU (audit H-A). */
+				if ((uint64_t)off + NVKVM_PIDINFO_STRIDE >
+				    req->aux_size) {
 					gpi_count = i;
 					break;
 				}
