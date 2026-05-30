@@ -111,6 +111,7 @@ struct nv_gr_allocation_parameters {
 /* Memory classes */
 #define NV01_MEMORY_SYSTEM                  0x0000003EU
 #define NV01_MEMORY_LOCAL_USER              0x00000040U
+#define NV01_MEMORY_VIRTUAL                 0x00000070U  /* NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS (24B) */
 #define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR    0x00000071U
 #define NV50_MEMORY_VIRTUAL                 0x000050A0U
 /* Events */
@@ -593,6 +594,17 @@ struct nv_channel_alloc_params_v570 {
 	/* V570 extension */
 	__u32 tpc_config_id;
 	__u32 _pad0;
+};
+
+/* ── NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS — for NV01_MEMORY_VIRTUAL (0x70) ──── */
+/*    24 bytes; libGLX (EGL device enum) leaves nvos64.alloc_parms_size=0 and
+ *    relies on the kernel sizing it by hClass, so our forwarding MUST supply
+ *    this size for the inner params (incl hVASpace@16) to reach the kernel —
+ *    otherwise the alloc fails NV_ERR_INVALID_ARGUMENT and graphics bails. */
+struct nv_memory_virtual_allocation_params {
+	__u64 offset;     /* [IN]     */
+	__u64 limit;      /* [IN/OUT] */
+	__u32 h_vaspace;  /* [IN]     */
 };
 
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */

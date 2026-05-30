@@ -581,9 +581,19 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	/* Validate and get the expected parameter size for this ioctl */
 	param_size = nvkvm_ioctl_param_size(cmd);
 	if (param_size == (size_t)-1) {
-		pr_debug("nvkvm: unknown ioctl cmd=0x%x\n", cmd);
+		pr_warn("nvkvm: AUDIT unknown ioctl cmd=0x%x type=0x%x nr=0x%x iocsz=%u\n",
+			cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd));
 		return -ENOTTY;
 	}
+
+	/* PARANOID forwarding-fidelity audit (#84): if our param_size differs
+	 * from the size the caller encoded in the cmd (_IOC_SIZE), we will
+	 * forward a TRUNCATED/over-long, malformed buffer to the host kernel —
+	 * the low bytes match but the call is wrong (cf. the NVOS32 88-vs-184
+	 * bug).  Log every mismatch so EGL/graphics-path ioctls get caught. */
+	if (_IOC_SIZE(cmd) && (size_t)_IOC_SIZE(cmd) != param_size)
+		pr_warn("nvkvm: AUDIT param_size MISMATCH cmd=0x%x type=0x%x nr=0x%x iocsz=%u our=%zu\n",
+			cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd), param_size);
 
 	if (param_size > NVKVM_SHM_SLOT_DEFAULT_SIZE)
 		return -EINVAL;
@@ -1100,6 +1110,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case FERMI_VASPACE_A:
 				ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81: 48 / V580 56 */
 				break;
+			case NV01_MEMORY_VIRTUAL:
+				/* 0x70: NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS is 24B and
+				 * distinct from the mem_alloc_size (NV_MEMORY_ALLOCATION_
+				 * PARAMS) group below.  libGLX's EGL device enum allocs
+				 * this with alloc_parms_size=0; without this case we copy
+				 * 0 bytes -> kernel sees hVASpace=0 -> NV_ERR_INVALID_
+				 * ARGUMENT (#84). */
+				ap_size = sizeof(struct nv_memory_virtual_allocation_params);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -1184,6 +1203,14 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				case FERMI_VASPACE_A:
 					ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81 */
+					break;
+				case NV01_MEMORY_VIRTUAL:
+					/* 0x70: 24B NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS,
+					 * distinct from the mem_alloc_size group.  libGLX's
+					 * EGL enum allocs this (nvos64) with size=0; without
+					 * this the kernel sees hVASpace=0 -> INVALID_ARGUMENT
+					 * and graphics bails (#84). */
+					ap_size = sizeof(struct nv_memory_virtual_allocation_params);
 					break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
