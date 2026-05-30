@@ -287,25 +287,29 @@ struct nvos56_parameters {
 
 /* ── NV_ESC_RM_VID_HEAP_CONTROL ──────────────────────────────────────────── */
 
+/*
+ * NVOS32_PARAMETERS — real ABI is 184 bytes: a fixed prefix followed by a large
+ * union selected by `function`.  An earlier 88-byte definition with a scrambled
+ * field order truncated it, losing the AllocSize union fields at offsets 88+
+ * (size/alignment/offset/limit/address).  For the legacy graphics allocation
+ * path (NVOS32_FUNCTION_ALLOC_SIZE, used by libGLX_nvidia — compute uses
+ * RM_ALLOC memory classes instead) that meant the kernel got size=0 and never
+ * returned the allocated address, so libGLX saw a bogus allocation and bailed.
+ *
+ * We forward NVOS32 opaquely, so only the fixed prefix matters here (status is
+ * at offset 20); the union is a pass-through byte blob sized to the full 184.
+ * Verified against host nvidia-drm 580 (_IOC_SIZE == 184).
+ */
 struct nvos32_parameters {
-	nvhandle_t h_client;
-	nvhandle_t h_device;
-	nvhandle_t h_vab;
-	nvhandle_t h_memory;
-	__u32      function;
-	__u32      ivcomp;
-	__u32      client_type;
-	__u32      reserved0;
-	nvp64_t    p_memory;
-	__u64      u_start;
-	__u64      u_size;
-	__u64      u_alignment;
-	__u32      attr;
-	__u32      attr2;
-	__u32      format;
-	__u32      comp_tag;
-	__u32      flags;
-	__u32      status;
+	nvhandle_t h_root;            /* 0  [IN]  */
+	nvhandle_t h_object_parent;   /* 4  [IN]  */
+	__u32      function;          /* 8  [IN]  */
+	nvhandle_t h_vaspace;         /* 12 [IN]  */
+	__u32      ivc_heap_number;   /* 16 [IN]  (NvS16 + pad; opaque)        */
+	__u32      status;            /* 20 [OUT] */
+	__u64      total;             /* 24 [OUT] */
+	__u64      free;              /* 32 [OUT] */
+	__u8       data[144];         /* 40..183  union (AllocSize/Info/...)    */
 };
 
 /* ── NV_ESC_RM_MAP_MEMORY_DMA ────────────────────────────────────────────── */

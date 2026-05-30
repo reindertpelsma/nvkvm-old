@@ -1077,7 +1077,7 @@ static void worker_thread(void *arg)
 				break;
 			case 0x34: off = 24; break; /* NV_ESC_RM_DUP_OBJECT: nvos55 28B status@24 (575 SDK) */
 			case 0x35: off = 20; break; /* NV_ESC_RM_SHARE: nvos57 24B status@20 */
-			case 0x4a: off = job.param_size - 4; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@end */
+			case 0x4a: off = 20; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@20 (184B struct) */
 			case 0x4e: off = 40; break; /* NV_ESC_RM_MAP_MEMORY: nvos33_with_fd 56B status@40, fd@48 */
 			case 0x4f: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY: nvos34 32B status@24 */
 			case 0x57: /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 status@48 (V580: @56, #81) */
