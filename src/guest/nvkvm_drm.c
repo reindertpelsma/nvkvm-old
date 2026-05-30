@@ -33,12 +33,96 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_file.h>
 #include <drm/drm_device.h>
+#include <drm/drm_gem.h>
 
 #include "nvkvm.h"
 
 #define NVKVM_PCI_VENDOR_NVIDIA 0x10de
 
 #define NVKVM_DRM_COMMAND_BASE 0x40
+
+/* ── GEM handle bridging ─────────────────────────────────────────────────────
+ *
+ * nvidia-private ioctls that mint GEM objects (e.g. SEMSURF_FENCE_CTX_CREATE)
+ * run in the STUB's render-node DRM file, so the handle they return is valid in
+ * the stub's GEM table — not the guest DRM core's.  But the Vulkan ICD then
+ * uses that handle with DRM *core* ioctls (GEM_CLOSE, GEM_MAP_OFFSET) that the
+ * guest's built-in DRM core resolves against the guest file's GEM table, where
+ * it doesn't exist -> -ENOENT, and the ICD bails.
+ *
+ * Bridge the two namespaces: for every handle a forwarded ioctl returns, create
+ * a lightweight proxy drm_gem_object in the guest file (no backing pages — it
+ * never holds real memory; the hardware object lives in the stub).  The guest
+ * IDR assigns its own handle, so we keep the stub handle in the proxy and
+ * rewrite the returned handle to the guest one; calls that feed a handle back
+ * to a forwarded ioctl translate guest->stub first.  GEM_CLOSE on the guest
+ * frees the proxy and forwards a GEM_CLOSE(stub_handle) to release the real
+ * object.  All translation is intra-VM (guest kernel owns GEM semantics); the
+ * stub only ever sees its own handles. */
+struct nvkvm_gem_object {
+	struct drm_gem_object base;
+	struct nvkvm_fd_ctx  *ctx;         /* isolate to forward GEM_CLOSE to */
+	__u32                 stub_handle; /* handle in the stub's DRM file   */
+};
+
+#define to_nvkvm_gem(o) container_of(o, struct nvkvm_gem_object, base)
+
+static void nvkvm_gem_free(struct drm_gem_object *obj)
+{
+	struct nvkvm_gem_object *ng = to_nvkvm_gem(obj);
+
+	/* Release the real object in the stub.  Guest GEM handles are released
+	 * before the driver's postclose runs, so ctx is still live here. */
+	if (ng->ctx) {
+		struct drm_gem_close close = { .handle = ng->stub_handle };
+		__u64 fault = 0;
+
+		nvkvm_virtio_ioctl_on_isolate(ng->ctx, DRM_IOCTL_GEM_CLOSE,
+					      &close, sizeof(close),
+					      NULL, 0, 0, &fault);
+	}
+	drm_gem_object_release(obj);
+	kfree(ng);
+}
+
+static const struct drm_gem_object_funcs nvkvm_gem_funcs = {
+	.free = nvkvm_gem_free,
+};
+
+/* Create a guest proxy GEM for a stub-side handle; returns the guest handle. */
+static int nvkvm_gem_proxy_create(struct drm_file *file,
+				  struct nvkvm_fd_ctx *ctx,
+				  __u32 stub_handle, __u32 *guest_handle)
+{
+	struct nvkvm_gem_object *ng;
+	int ret;
+
+	ng = kzalloc(sizeof(*ng), GFP_KERNEL);
+	if (!ng)
+		return -ENOMEM;
+	drm_gem_private_object_init(file->minor->dev, &ng->base, PAGE_SIZE);
+	ng->base.funcs = &nvkvm_gem_funcs;
+	ng->ctx        = ctx;
+	ng->stub_handle = stub_handle;
+	ret = drm_gem_handle_create(file, &ng->base, guest_handle);
+	/* The handle (or the proxy on failure) now owns the only ref. */
+	drm_gem_object_put(&ng->base);
+	return ret;
+}
+
+/* Resolve a guest GEM handle to the stub handle it proxies, or 0 if unknown. */
+static __u32 nvkvm_gem_to_stub(struct drm_file *file, __u32 guest_handle)
+{
+	struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
+	__u32 sh = 0;
+
+	if (obj) {
+		if (obj->funcs == &nvkvm_gem_funcs)
+			sh = to_nvkvm_gem(obj)->stub_handle;
+		drm_gem_object_put(obj);
+	}
+	return sh;
+}
 
 /* Param structs — sizes must match the host nvidia-drm-ioctl.h exactly so the
  * DRM core copies the right number of bytes in/out. */
@@ -91,9 +175,39 @@ NVKVM_DRM_FWD(get_dev_info,
 	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
 		       struct drm_nvidia_get_dev_info_params))
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
-NVKVM_DRM_FWD(semsurf_fence_create,
-	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x15,
-		       struct drm_nvidia_semsurf_fence_create_params))
+
+/*
+ * SEMSURF_FENCE_CREATE takes fence_context_handle (a GEM handle from
+ * CTX_CREATE) — translate the guest proxy handle to the stub's before
+ * forwarding, restore after.  (fd@16 is an OUT sync fd; cross-boundary
+ * sync-fd passback is a separate milestone.)
+ */
+static int nvkvm_drm_fwd_semsurf_fence_create(struct drm_device *dev,
+					      void *data,
+					      struct drm_file *file)
+{
+	struct drm_nvidia_semsurf_fence_create_params *p = data;
+	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x15,
+				    struct drm_nvidia_semsurf_fence_create_params);
+	__u32 guest_h = p->fence_context_handle;
+	__u32 stub_h;
+	__u64 fault = 0;
+	long r;
+
+	(void)dev;
+	if (!ctx)
+		return -EBADF;
+	stub_h = nvkvm_gem_to_stub(file, guest_h);
+	if (stub_h)
+		p->fence_context_handle = stub_h;
+
+	r = nvkvm_virtio_ioctl_on_isolate(ctx, cmd, data, sizeof(*p),
+					  NULL, 0, 0, &fault);
+
+	p->fence_context_handle = guest_h;   /* round-trip the caller's handle */
+	return (r < 0) ? (int)r : 0;
+}
 
 /*
  * SEMSURF_FENCE_CTX_CREATE embeds a userspace pointer `nvkms_params_ptr`
@@ -141,7 +255,24 @@ static int nvkvm_drm_fwd_semsurf_fence_ctx_create(struct drm_device *dev,
 	/* Restore the caller's ptr; the kernel only reads it (IN). */
 	p->nvkms_params_ptr = orig_ptr;
 	kfree(aux);
-	return (r < 0) ? (int)r : 0;
+	if (r < 0)
+		return (int)r;
+
+	/*
+	 * The stub created the fence-context GEM object in its own DRM file and
+	 * wrote its handle to p->handle.  Mint a guest-core proxy GEM so the ICD's
+	 * subsequent core GEM ioctls (GEM_CLOSE) resolve, and hand back the guest
+	 * handle instead of the stub's.
+	 */
+	if (p->handle) {
+		__u32 guest_handle = 0;
+		int gret = nvkvm_gem_proxy_create(file, ctx, p->handle,
+						  &guest_handle);
+		if (gret)
+			return gret;
+		p->handle = guest_handle;
+	}
+	return 0;
 }
 
 /* Indexed by (DRM_NVIDIA_* number) = (nr - DRM_COMMAND_BASE).  Gaps have a NULL
@@ -201,7 +332,10 @@ static const struct file_operations nvkvm_drm_fops = {
 };
 
 static const struct drm_driver nvkvm_drm_driver = {
-	.driver_features = DRIVER_RENDER,
+	/* DRIVER_GEM: the DRM core only inits the per-file GEM object_idr (via
+	 * drm_gem_open) and wires the core GEM ioctls (GEM_CLOSE, etc.) when this
+	 * is set — required for our proxy GEM handles to resolve. */
+	.driver_features = DRIVER_RENDER | DRIVER_GEM,
 	.open            = nvkvm_drm_open,
 	.postclose       = nvkvm_drm_postclose,
 	.ioctls          = nvkvm_drm_ioctls,
