@@ -741,7 +741,13 @@ static void worker_thread(void *arg)
 		 * slot; we restore the host-accessible address here so the
 		 * driver can dereference it.
 		 */
-		if (job.aux_size > 0 && job.param_size >= 24) {
+		if (job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		    job.aux_size > 0 && job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+			/* NVKMS wrapper: embedded `address` ptr is at offset 8. */
+			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
+			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
+					 &aux_ptr, sizeof(uint64_t));
+		} else if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
 			__builtin_memcpy((char *)job.param_buf + 16, &aux_ptr,
 					 sizeof(uint64_t));
@@ -1075,8 +1081,14 @@ static void worker_thread(void *arg)
 					 &saved_fe_embedded_fd, sizeof(int32_t));
 		}
 
-		/* Zero the embedded pointer field in nvos54 (don't leak host VA) */
-		if (job.aux_size > 0 && job.param_size >= 24) {
+		/* Zero the embedded pointer field (don't leak host VA): nvos54/
+		 * nvos64 at offset 16, NVKMS wrapper at offset 8. */
+		if (job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		    job.aux_size > 0 && job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+			uint64_t zero = 0;
+			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
+					 &zero, sizeof(uint64_t));
+		} else if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t zero = 0;
 			__builtin_memcpy((char *)job.param_buf + 16, &zero,
 					 sizeof(uint64_t));
@@ -1232,6 +1244,11 @@ static int dev_id_to_path(uint32_t dev_id, char *buf, size_t buflen)
 			buf[7] = '0' + (char)(n % 10);
 			buf[8] = 0;
 		}
+		return 0;
+	}
+	if (dev_id == 48) {            /* NVKVM_DEV_MODESET */
+		if (buflen < sizeof("nvidia-modeset")) return -1;
+		__builtin_memcpy(buf, "nvidia-modeset", sizeof("nvidia-modeset"));
 		return 0;
 	}
 	if (dev_id >= 32 && dev_id < 32 + 16) {   /* NVKVM_DEV_DRM_RD(n) */

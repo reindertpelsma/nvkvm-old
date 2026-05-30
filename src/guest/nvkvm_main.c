@@ -167,6 +167,32 @@ static int __init register_devices(void)
 	device_create(nvkvm.class, NULL,
 		      MKDEV(nvkvm.uvm_major, 1), NULL, "nvidia-uvm-tools");
 
+	/*
+	 * /dev/nvidia-modeset (major 195, minor 254) — NVKMS config device.
+	 * libnvidia-glsi opens it during EGL/Vulkan device init.  Non-fatal if
+	 * registration fails (e.g. minor already taken): graphics degrades but
+	 * the compute path is unaffected.  nvkvm_devnode() makes it 0666 so an
+	 * unprivileged guest process can open it.
+	 */
+	{
+		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
+				   NV_MINOR_DEVICE_NUMBER_MODESET);
+		if (register_chrdev_region(mdev, 1, "nvidia-modeset") == 0) {
+			cdev_init(&nvkvm.modeset_cdev, &nvkvm_fops);
+			nvkvm.modeset_cdev.owner = THIS_MODULE;
+			if (cdev_add(&nvkvm.modeset_cdev, mdev, 1) == 0) {
+				device_create(nvkvm.class, NULL, mdev, NULL,
+					      "nvidia-modeset");
+				nvkvm.modeset_registered = true;
+			} else {
+				unregister_chrdev_region(mdev, 1);
+				pr_warn("nvkvm: nvidia-modeset cdev_add failed\n");
+			}
+		} else {
+			pr_warn("nvkvm: could not reserve nvidia-modeset (195:254)\n");
+		}
+	}
+
 	pr_info("nvkvm: registered nvidiactl (major %u), nvidia0-%d (major %u), nvidia-uvm/uvm-tools (major %u)\n",
 		nvkvm.ctl_major, nvkvm.num_gpus - 1, nvkvm.gpu_major,
 		nvkvm.uvm_major);
@@ -195,6 +221,14 @@ err_class:
 static void unregister_devices(void)
 {
 	int i;
+
+	if (nvkvm.modeset_registered) {
+		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
+				   NV_MINOR_DEVICE_NUMBER_MODESET);
+		device_destroy(nvkvm.class, mdev);
+		cdev_del(&nvkvm.modeset_cdev);
+		unregister_chrdev_region(mdev, 1);
+	}
 
 	device_destroy(nvkvm.class, MKDEV(nvkvm.uvm_major, 1));
 	device_destroy(nvkvm.class, nvkvm.uvm_devno);
@@ -355,6 +389,9 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	if (imajor(inode) == nvkvm.ctl_major &&
 	    iminor(inode) == NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
 		dev_id = NVKVM_DEV_CTL;
+	else if (imajor(inode) == NV_MAJOR_DEVICE_NUMBER &&
+		 iminor(inode) == NV_MINOR_DEVICE_NUMBER_MODESET)
+		dev_id = NVKVM_DEV_MODESET;
 	else if (imajor(inode) == nvkvm.uvm_major)
 		dev_id = NVKVM_DEV_UVM;
 	else
@@ -811,7 +848,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	__u32 orig_fe_os_evt_fd = 0;  bool have_fe_os_evt_fd = false;  /* ALLOC/FREE_OS_EVT */
 	__s32 orig_fe_nvos02_fd = 0;  bool have_fe_nvos02_fd = false;  /* RM_ALLOC_MEMORY   */
 	__s32 orig_fe_nvos33_fd = 0;  bool have_fe_nvos33_fd = false;  /* RM_MAP_MEMORY     */
-	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
+	u64 orig_modeset_addr = 0;    bool have_modeset = false;       /* NVKMS address ptr */
+	if (ctx->dev_id == NVKVM_DEV_MODESET && params_buf &&
+	    param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+		orig_modeset_addr =
+			*(u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF);
+		have_modeset = true;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
 	    param_size == sizeof(struct nvos54_parameters)) {
 		orig_nvos54_params =
 			((struct nvos54_parameters *)params_buf)->params;
@@ -911,7 +954,39 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * NV_ESC_RM_ALLOC (NVOS64): secondary buffer = class-specific alloc params
 	 *   (input only; alloc_parms_size tells us the size).
 	 */
-	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
+	/*
+	 * NVKMS (/dev/nvidia-modeset): the wrapper's single embedded user ptr
+	 * `address` (offset 8) points at `size` (offset 4) bytes of inner params
+	 * the host kernel reads AND writes.  Stage them in the aux slot exactly
+	 * like RM_CONTROL: copy in, zero the ptr (the stub substitutes a host VA
+	 * at offset 8), copy back after the ioctl via the generic aux writeback.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_MODESET && params_buf &&
+	    param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+		__u32 inner_sz  = *(__u32 *)((char *)params_buf + 4);
+		__u64 inner_ptr = *(__u64 *)((char *)params_buf +
+					     NVKVM_NVKMS_ADDR_OFF);
+		if (inner_sz > 0 && inner_ptr != 0) {
+			if (inner_sz > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+				kfree(params_buf);
+				return -EINVAL;
+			}
+			aux_uptr = (void __user *)(uintptr_t)inner_ptr;
+			aux_buf = kzalloc(inner_sz, GFP_KERNEL);
+			if (!aux_buf) {
+				kfree(params_buf);
+				return -ENOMEM;
+			}
+			if (copy_from_user(aux_buf, aux_uptr, inner_sz)) {
+				kfree(aux_buf);
+				kfree(params_buf);
+				return -EFAULT;
+			}
+			aux_size = inner_sz;
+			/* Zero the ptr so we never forward a guest VA. */
+			*(__u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF) = 0;
+		}
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
 		struct nvos54_parameters *ctrl = params_buf;
 		if (ctrl->params_size > 0 && ctrl->params != 0) {
 			if (ctrl->params_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
@@ -1444,7 +1519,12 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * caller's pointer should round-trip.
 	 */
 	if (params_buf && ret != -ENOMEM && ret != -ENOSPC && ret != -EFAULT) {
-		if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && orig_nvos54_params &&
+		if (have_modeset) {
+			/* NVKMS: restore the caller's address ptr (round-trips
+			 * unchanged; the inner params came back via the aux slot). */
+			*(u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF) =
+				orig_modeset_addr;
+		} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && orig_nvos54_params &&
 		    param_size == sizeof(struct nvos54_parameters)) {
 			((struct nvos54_parameters *)params_buf)->params =
 				orig_nvos54_params;

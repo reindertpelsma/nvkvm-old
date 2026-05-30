@@ -204,6 +204,9 @@ struct nvkvm_state {
 	unsigned int   uvm_major;
 	dev_t          uvm_devno;
 	struct cdev    uvm_cdev;
+	/* /dev/nvidia-modeset (NVKMS) — graphics config device (major 195 min 254) */
+	struct cdev    modeset_cdev;
+	bool           modeset_registered;
 	/* /dev/dri/renderD128 (nvidia-drm) — graphics device (real DRM driver) */
 	struct drm_device *drm_dev;
 

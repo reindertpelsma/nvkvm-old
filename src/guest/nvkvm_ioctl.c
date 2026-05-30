@@ -45,6 +45,12 @@
  */
 size_t nvkvm_ioctl_param_size(unsigned int cmd)
 {
+	/* NVKMS (/dev/nvidia-modeset): the single wrapper ioctl. Its 16-byte
+	 * NvKmsIoctlParams is the outer struct; the inner params live behind
+	 * the embedded address ptr and are staged in the aux slot. */
+	if (cmd == NVKVM_NVKMS_IOCTL_CMD)
+		return NVKVM_NVKMS_PARAMS_SIZE;
+
 	/* UVM ioctls — identified by full command word */
 	switch (cmd) {
 	case UVM_INITIALIZE:

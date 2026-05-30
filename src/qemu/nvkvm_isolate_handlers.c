@@ -872,6 +872,12 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			resp->fault_addr = 0;
 			return 0;
 		}
+	} else if (req->cmd == NVKVM_NVKMS_IOCTL_CMD) {
+		/* NVKMS (/dev/nvidia-modeset): the ONE allowed modeset ioctl
+		 * (_IOWR('m',0,NvKmsIoctlParams)).  Default-deny otherwise — any
+		 * other 'm'-type cmd is rejected by the non-'F' branch below.
+		 * Falls through to the generic forward path (the 'F' frontend
+		 * allowlists below all guard on type=='F', so they're skipped). */
 	} else if (_IOC_TYPE(req->cmd) != 'F') {
 		NVKVM_DBG("nvkvm: DENY non-'F' cmd 0x%x (type=0x%x)\n",
 			  req->cmd, _IOC_TYPE(req->cmd));

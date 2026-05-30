@@ -157,6 +157,7 @@ static int nvkvm_child_enter_mount_ns(void)
 	static const char *const nodes[] = {
 		"nvidiactl", "nvidia0", "nvidia1", "nvidia2", "nvidia3",
 		"nvidia4", "nvidia5", "nvidia6", "nvidia7",
+		"nvidia-modeset",   /* NVKMS — graphics (Vulkan/EGL); non-fatal */
 	};
 	char src[64], dst[80];
 	int dd;
