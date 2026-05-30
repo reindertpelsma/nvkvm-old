@@ -423,3 +423,32 @@ range is hardware-proven end-to-end including a 7B LLM. The profile-535
 needs the guest to additionally emit the 1-entry (vs 256-entry) UVM array layout
 for `UVM_MAP_EXTERNAL_ALLOCATION` / `ALLOC_SEMAPHORE_POOL`, which the current
 guest builds V550-only. That is the next increment for full 3-version coverage.
+
+### 3rd driver attempt: 535.309.01 — blocked by the host driver, not nvkvm
+
+Attempted the distinct profile-535 (pre-V550) branch with the 535.309.01 open
+driver. nvkvm behaved correctly: QEMU auto-detected `535.309.01 → ABI profile
+535` and forwarded ioctls. But the run failed early (`open /dev/nvidia0` → EIO,
+`RM_ALLOC failed`, matmul `cuInit 999`).
+
+Root cause is **the host driver, not the forwarder**: the 535.309.01 *open*
+kernel module fails to initialize this RTX 3060 (GA106) on bare metal —
+
+```
+NVRM: GPU 0000:00:07.0: RmInitAdapter failed! (0x62:0x0:1929)
+NVRM: GPU 0000:00:07.0: rm_init_adapter failed, device minor number 0
+Video BIOS: ??.??.??.??.??     # GSP couldn't even read the VBIOS
+```
+
+A bare-metal CUDA program (no VM, host libcuda 535.309.01) also returns
+`cuInit 999`. The 535 open driver's GSP-RM init (status 0x62) is incompatible
+with this GPU/VBIOS on the 6.8 kernel; the open modules were still maturing for
+Ampere consumer parts in the 535 branch. nvkvm cannot be validated on a driver
+that cannot drive the GPU at all.
+
+**Net result of the multi-driver effort:** 2 of 3 open driver *major* versions
+hardware-validated end-to-end (575 → profile 570, 580 → profile 580, the latter
+through a 7B LLM); the abi_profile auto-detect proven on all three majors. The
+profile-535 *code path* remains exercised-by-detection but not GPU-validated,
+blocked by an external 535-open/GA106 init bug. A datacenter GPU (Turing/Ampere
+server class, where 535-open is mature) would be the right target to close it.
