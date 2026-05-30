@@ -50,7 +50,20 @@ struct nvkvm_virtio_config {
 	__le64 shm_len;         /* size of shared memory region in bytes    */
 	__le64 mmap_win_gpa;    /* guest-physical base of mmap window       */
 	__le64 mmap_win_len;    /* size of mmap window in bytes             */
+	__le64 flags;           /* NVKVM_CONFIG_F_* — QEMU dictates features */
 };
+
+/*
+ * Config feature flags. QEMU is authoritative: it both advertises these and
+ * enforces them at the cross-VM boundary (a guest that ignores a cleared bit
+ * still can't open/forward the corresponding devices). The guest uses them to
+ * avoid exposing devices it can't use.
+ *
+ * F_GRAPHICS: this VM may use the graphics stack (/dev/dri/renderD128 +
+ *   /dev/nvidia-modeset and the DRM/NVKMS ioctl surface). Cleared for
+ *   compute-only VMs — shrinks the guest device + host attack surface.
+ */
+#define NVKVM_CONFIG_F_GRAPHICS  (1ULL << 0)
 
 /* ── Protocol version ────────────────────────────────────────────────────── */
 

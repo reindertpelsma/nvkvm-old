@@ -205,6 +205,12 @@ typedef struct VirtIONvgpu {
 	/* Virtio config space (little-endian, copied out by get_config) */
 	struct nvkvm_virtio_config config_space;
 
+	/* qdev property: enable the graphics stack (DRM render node + NVKMS).
+	 * Default true; set graphics=off for compute-only VMs to drop the DRM/
+	 * NVKMS device + ioctl attack surface. QEMU enforces it (rejects those
+	 * device opens + ioctls) regardless of the untrusted guest. */
+	bool                graphics;
+
 	/* Mmap window: GPA range for GPU memory mappings */
 	uint64_t            mmap_win_gpa;
 	size_t              mmap_win_size;

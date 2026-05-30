@@ -173,8 +173,13 @@ static int __init register_devices(void)
 	 * registration fails (e.g. minor already taken): graphics degrades but
 	 * the compute path is unaffected.  nvkvm_devnode() makes it 0666 so an
 	 * unprivileged guest process can open it.
+	 *
+	 * Only when QEMU enabled graphics for this VM.  The virtio probe runs
+	 * before register_devices (register_virtio_driver probes synchronously),
+	 * so graphics_enabled already reflects the host's NVKVM_CONFIG_F_GRAPHICS
+	 * by now; compute-only VMs never create the modeset device.
 	 */
-	{
+	if (nvkvm.graphics_enabled) {
 		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
 				   NV_MINOR_DEVICE_NUMBER_MODESET);
 		if (register_chrdev_region(mdev, 1, "nvidia-modeset") == 0) {
@@ -218,17 +223,27 @@ err_class:
 	return ret;
 }
 
-static void unregister_devices(void)
+/* Tear down /dev/nvidia-modeset. Idempotent — safe to call from probe (when
+ * QEMU disables graphics) and from module teardown. */
+static void nvkvm_modeset_unregister(void)
 {
-	int i;
-
-	if (nvkvm.modeset_registered) {
+	if (!nvkvm.modeset_registered)
+		return;
+	{
 		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
 				   NV_MINOR_DEVICE_NUMBER_MODESET);
 		device_destroy(nvkvm.class, mdev);
 		cdev_del(&nvkvm.modeset_cdev);
 		unregister_chrdev_region(mdev, 1);
 	}
+	nvkvm.modeset_registered = false;
+}
+
+static void unregister_devices(void)
+{
+	int i;
+
+	nvkvm_modeset_unregister();
 
 	device_destroy(nvkvm.class, MKDEV(nvkvm.uvm_major, 1));
 	device_destroy(nvkvm.class, nvkvm.uvm_devno);
@@ -1874,10 +1889,20 @@ static int nvkvm_virtio_probe(struct virtio_device *vdev)
 		return ret;
 	}
 
-	/* nvidia-drm render node for graphics (Vulkan/EGL).  Non-fatal: compute
-	 * works without it.  Parent = the virtio device so the DRM core builds
-	 * /sys/.../<virtio-dev>/drm/renderD128 that the NVIDIA ICD requires. */
-	nvkvm_drm_init(&vdev->dev);
+	/*
+	 * Graphics stack (nvidia-drm render node + /dev/nvidia-modeset).  QEMU
+	 * dictates availability via NVKVM_CONFIG_F_GRAPHICS: compute-only VMs
+	 * skip the DRM node and drop the modeset device (registered at module
+	 * init) so the guest exposes no graphics surface.  Non-fatal either way:
+	 * compute works without it.  Parent = the virtio device so the DRM core
+	 * builds /sys/.../<virtio-dev>/drm/renderD128 that the NVIDIA ICD needs.
+	 */
+	if (nvkvm.graphics_enabled)
+		nvkvm_drm_init(&vdev->dev);
+	else {
+		nvkvm_modeset_unregister();
+		pr_info("nvkvm: graphics disabled by host — compute-only\n");
+	}
 
 	return 0;
 }

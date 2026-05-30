@@ -162,6 +162,22 @@ int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
 	int ret;
 
 	/*
+	 * Graphics gate (compute-only VMs): refuse to open the DRM render node
+	 * or the NVKMS modeset device when graphics is disabled. This is the
+	 * authoritative enforcement — the stub only ever opens devices QEMU
+	 * grants a handle for, so a guest that ignores the cleared config bit
+	 * still cannot reach them.
+	 */
+	if (!nv->graphics &&
+	    ((int)req->dev_id == NVKVM_DEV_MODESET ||
+	     ((int)req->dev_id >= NVKVM_DEV_DRM_RD(0) &&
+	      (int)req->dev_id < NVKVM_DEV_DRM_RD(16)))) {
+		resp->handle_id = 0;
+		resp->status    = EPERM;
+		return 0;
+	}
+
+	/*
 	 * UVM stays opened in QEMU (driver enforces opener-does-mmap, and
 	 * mmap is done in QEMU for KVM region installation). The other
 	 * devices — /dev/nvidiactl, /dev/nvidia0..N, and the eventfd that
@@ -857,6 +873,17 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * straight through to the raw ioctl() in the stub — the kmd dispatches
 	 * on _IOC_NR, so that could reach a denied privileged escape.
 	 */
+	/* Graphics gate (defense-in-depth; handle_open already blocks the device
+	 * opens). Refuse all DRM ('d') and NVKMS ('m') ioctls on compute-only VMs. */
+	if (!nv->graphics &&
+	    (_IOC_TYPE(req->cmd) == 'd' || req->cmd == NVKVM_NVKMS_IOCTL_CMD)) {
+		resp->retval     = (uint64_t)(int64_t)(-EPERM);
+		resp->status     = 0;
+		resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+		resp->fault_addr = 0;
+		return 0;
+	}
+
 	if (_IOC_TYPE(req->cmd) == 'd') {
 		/* nvidia-drm render node (graphics).  Default-deny: only the
 		 * render/compute-relevant DRM ioctls are forwarded; display,
