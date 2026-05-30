@@ -173,7 +173,12 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 	case NV_ESC_RM_UNMAP_MEMORY:
 		return sizeof(struct nv_ioctl_nvos34_parameters);
 	case NV_ESC_RM_MAP_MEMORY_DMA:
-		return sizeof(struct nvos46_parameters);
+		/* #81/#84: NVOS46 grew +8B on V580 (Flags2 + KindOverride, the
+		 * latter carries the surface tiling kind libGLX sets for graphics
+		 * mappings).  Use the profile size or we forward the old 56B layout
+		 * — the V580 kernel then reads it misaligned (DmaOffset/Status
+		 * scrambled) and the surface DMA mapping is wrong. */
+		return nvkvm_prof()->nvos46_size;
 	case NV_ESC_RM_UNMAP_MEMORY_DMA:
 		return sizeof(struct nvos47_parameters);
 	case NV_ESC_RM_IDLE_CHANNELS:
