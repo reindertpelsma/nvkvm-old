@@ -75,7 +75,9 @@ struct isolate_cmd_ioctl {
 	uint32_t aux_size;    /* bytes of aux blob following param blob    */
 	uint32_t flags;       /* NVKVM_IOCTL_FL_* */
 	uint32_t txn_id;      /* echoed in response for in-flight matching */
-	uint32_t reserved;
+	uint32_t abi_profile; /* #81: nvkvm_abi_id of the host driver (stub uses
+	                       * it for version-variant offsets: UVM rm_ctrl_fd,
+	                       * NVOS46 status). 0 → stub falls back to 570/575. */
 };
 
 struct isolate_resp_ioctl {

@@ -1228,13 +1228,14 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 
 	/* Send command under write_lock. */
 	struct isolate_cmd_ioctl hdr = {
-		.type       = ISOLATE_CMD_IOCTL,
-		.handle_id  = handle_id,
-		.cmd        = (uint32_t)cmd,
-		.param_size = (uint32_t)param_size,
-		.aux_size   = (uint32_t)aux_size,
-		.flags      = flags,
-		.txn_id     = pending.txn_id,
+		.type        = ISOLATE_CMD_IOCTL,
+		.handle_id   = handle_id,
+		.cmd         = (uint32_t)cmd,
+		.param_size  = (uint32_t)param_size,
+		.aux_size    = (uint32_t)aux_size,
+		.flags       = flags,
+		.txn_id      = pending.txn_id,
+		.abi_profile = t->abi_profile,   /* #81 */
 	};
 
 	pthread_mutex_lock(&iso->write_lock);

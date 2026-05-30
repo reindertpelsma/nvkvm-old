@@ -35,6 +35,7 @@
 
 #include "stub_freestanding.h"
 #include "../common/nvkvm_isolate_proto.h"
+#include "../common/nvkvm_abi.h"
 
 /* ── Constants we'd otherwise pull from libc headers ─────────────────────── */
 
@@ -602,6 +603,7 @@ struct ioctl_job {
 	uint32_t handle_id;
 	uint32_t cmd;
 	uint32_t flags;
+	uint32_t abi_profile;   /* #81: host driver ABI id (version-variant offsets) */
 	/* param and aux blobs are malloc'd; worker frees them */
 	void    *param_buf;
 	uint32_t param_size;
@@ -849,12 +851,11 @@ static void worker_thread(void *arg)
 				uvm_has_embedded_fd = 1;
 				break;
 			case NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION:
-				/* V550 layout (driver >= 550.54.14, our 575.51.03 included):
-				 * base(8) + length(8) + offset(8) +
-				 * per_gpu_attributes[256] (256 * 36 = 9216) +
-				 * gpu_attributes_count(8) = 9248
-				 * → rm_ctrl_fd at offset 9248. */
-				uvm_embedded_fd_off = 9248;
+				/* #81: rm_ctrl_fd offset is version-variant — 9248 for
+				 * the V550 256-entry layout (550.54.14+, incl 575/580),
+				 * 68 for the pre-V550 1-entry layout (535). */
+				uvm_embedded_fd_off =
+					nvkvm_abi_by_id(job.abi_profile)->uvm_map_ext_fd_off;
 				uvm_has_embedded_fd = 1;
 				break;
 			}
@@ -1079,7 +1080,9 @@ static void worker_thread(void *arg)
 			case 0x4a: off = job.param_size - 4; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@end */
 			case 0x4e: off = 40; break; /* NV_ESC_RM_MAP_MEMORY: nvos33_with_fd 56B status@40, fd@48 */
 			case 0x4f: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY: nvos34 32B status@24 */
-			case 0x57: off = 48; break; /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 56B status@48 */
+			case 0x57: /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 status@48 (V580: @56, #81) */
+				off = (int)nvkvm_abi_by_id(job.abi_profile)->nvos46_status_off;
+				break;
 			case 0x58: off = 40; break; /* NV_ESC_RM_UNMAP_MEMORY_DMA: nvos47 48B status@40 (incl pad0+dmaOff+size) */
 			default:
 				/* Fall back to size-based heuristic for ioctls
@@ -1284,10 +1287,11 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 	}
 
 	struct ioctl_job job = {
-		.txn_id     = cmd->txn_id,
-		.handle_id  = cmd->handle_id,
-		.cmd        = cmd->cmd,
-		.flags      = cmd->flags,
+		.txn_id      = cmd->txn_id,
+		.handle_id   = cmd->handle_id,
+		.cmd         = cmd->cmd,
+		.flags       = cmd->flags,
+		.abi_profile = cmd->abi_profile,   /* #81 */
 		.param_size = cmd->param_size,
 		.aux_size   = cmd->aux_size,
 	};

@@ -976,6 +976,9 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	/* Initialize isolate/handle managers */
 	nvkvm_handle_table_init(&nv->handles);
 	nvkvm_isolate_table_init(&nv->isolates);
+	/* #81: stamp every forwarded IOCTL with the host driver's ABI id so the
+	 * stub uses matching version-variant offsets. */
+	nv->isolates.abi_profile = nv->abi ? nv->abi->id : NVKVM_ABI_570;
 
 	/* #66 admin subdevice (lazy; for GET_PID_INFO per-process VRAM) */
 	pthread_mutex_init(&nv->admin_lock, NULL);

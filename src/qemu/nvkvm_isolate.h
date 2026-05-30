@@ -83,6 +83,7 @@ struct nvkvm_isolate_table {
 	pthread_mutex_t      lock;
 	struct nvkvm_isolate isolates[NVKVM_ISOLATE_MAX];
 	uint32_t             next_id;
+	uint32_t             abi_profile;  /* #81: per-VM ABI id stamped into IOCTLs */
 };
 
 void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t);
