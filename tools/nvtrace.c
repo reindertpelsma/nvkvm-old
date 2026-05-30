@@ -72,6 +72,39 @@ static void hexdump(const char *label, const void *p, uint32_t n)
 	fputc('\n', logf);
 }
 
+/*
+ * Dump the CONTENT of every readable /dev/nvidia* / /dev/dri mapping by walking
+ * /proc/self/maps from inside the process (the libs mmap via raw syscall, so the
+ * mmap interposer never sees them — but the mappings are right here in our own
+ * address space). Triggered at a chosen ioctl so guest-vs-host content can be
+ * diffed at the exact decision point (#84: the "1 vs 5 events" count is computed
+ * from mapped GPU memory, the only input that still matches-or-not). HEAD bytes
+ * are where channel/engine counts live. */
+static void dump_gpu_maps(const char *why)
+{
+	FILE *m = fopen("/proc/self/maps", "r");
+	if (!m) return;
+	char line[512];
+	fprintf(logf, "=== GPU MAP DUMP (%s) ===\n", why);
+	while (fgets(line, sizeof line, m)) {
+		if (!strstr(line, "/dev/nvidia") && !strstr(line, "/dev/dri/"))
+			continue;
+		unsigned long lo, hi; char perms[8] = {0};
+		if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) != 3) continue;
+		if (perms[0] != 'r') continue;           /* readable only */
+		const char *path = strchr(line, '/');
+		char p[80]; snprintf(p, sizeof p, "%s", path ? path : "?");
+		char *nl = strchr(p, '\n'); if (nl) *nl = 0;
+		unsigned long len = hi - lo, n = len < 65536 ? len : 65536;
+		fprintf(logf, "  %s len=%#lx :", tag(p), len);
+		const unsigned char *b = (const unsigned char *)lo;
+		for (unsigned long i = 0; i < n; i++) fprintf(logf, "%02x", b[i]);
+		fputc('\n', logf);
+	}
+	fflush(logf);
+	fclose(m);
+}
+
 int ioctl(int fd, unsigned long request, ...)
 {
 	lazy();
@@ -136,6 +169,14 @@ int ioctl(int fd, unsigned long request, ...)
 
 	int ret = real_ioctl(fd, request, arg);
 
+	/* Dump GPU-mapped memory content at the 1st ALLOC_OS_EVENT (nr 0xce) —
+	 * the decision point where the lib computes the OS-event count. */
+	static int dumped;
+	if (track && type == 'F' && nr == 0xce && !dumped) {
+		dumped = 1;
+		dump_gpu_maps("first ALLOC_OS_EVENT");
+	}
+
 	if (track) {
 		if (is_ctrl) {
 			uint32_t status = 0;
@@ -151,6 +192,23 @@ int ioctl(int fd, unsigned long request, ...)
 		fflush(logf);
 	}
 	return ret;
+}
+
+
+/* Trigger a GPU-map dump the instant the lib reports the failure, so the
+ * event-notification region is captured fully populated, at the exact point
+ * the closed lib reads it and gives up (#84). */
+ssize_t write(int fd, const void *buf, size_t n)
+{
+	static ssize_t (*real_write)(int, const void *, size_t);
+	static int fired;
+	lazy();
+	if (!real_write) real_write = dlsym(RTLD_NEXT, "write");
+	if (!fired && buf && n >= 8 && memmem(buf, n, "semaphore event", 15)) {
+		fired = 1;
+		dump_gpu_maps("AT semaphore-event failure");
+	}
+	return real_write(fd, buf, n);
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)

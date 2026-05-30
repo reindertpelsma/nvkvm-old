@@ -1297,7 +1297,14 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = nvkvm_prof()->chan_alloc_size;    /* #81: base / V570 +8 */
 				break;
 			case NV01_EVENT_OS_EVENT:
+			case NV01_EVENT:   /* graphics path: outer hClass 0x0005, NV0005 params */
 				ap_size = sizeof(struct nv0005_alloc_parameters);
+				break;
+			case GF100_DISP_SW:
+				ap_size = NV9072_ALLOC_PARAMS_SIZE;
+				break;
+			case NV_MEMORY_MAPPER:
+				ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 				break;
 			case VOLTA_DMA_COPY_A:
 			case TURING_DMA_COPY_A:
@@ -1397,7 +1404,14 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = nvkvm_prof()->chan_alloc_size;    /* #81 */
 					break;
 				case NV01_EVENT_OS_EVENT:
+				case NV01_EVENT:
 					ap_size = sizeof(struct nv0005_alloc_parameters);
+					break;
+				case GF100_DISP_SW:
+					ap_size = NV9072_ALLOC_PARAMS_SIZE;
+					break;
+				case NV_MEMORY_MAPPER:
+					ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 					break;
 				case VOLTA_DMA_COPY_A:
 				case TURING_DMA_COPY_A:
@@ -1454,7 +1468,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * uvm_fd: replace the user-supplied guest fd with
 				 * its handle_id; the stub maps that to its local
 				 * /dev/nvidia* fd. */
-				if (alloc->h_class == NV01_EVENT_OS_EVENT &&
+				if ((alloc->h_class == NV01_EVENT_OS_EVENT ||
+				     alloc->h_class == NV01_EVENT) &&
 				    ap_size >= sizeof(struct nv0005_alloc_parameters)) {
 					struct nv0005_alloc_parameters *ep = aux_buf;
 					int user_fd = (int)(int32_t)ep->data;
