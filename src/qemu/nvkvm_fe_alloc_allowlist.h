@@ -49,6 +49,7 @@ static const uint32_t nvkvm_alloc_class_allowlist[] = {
 	0x00000000u,
 	0x00000001u,
 	0x00000002u,
+	0x00000005u,  /* NV01_EVENT (graphics/compute completion events) — #84 */
 	0x0000003eu,
 	0x00000040u,
 	0x00000041u,
@@ -103,6 +104,7 @@ static const uint32_t nvkvm_alloc_class_allowlist[] = {
 	0x0000c6c0u,
 	0x0000c6fau,
 	0x0000c761u,
+	0x0000c797u,  /* AMPERE_B (GA10x 3D/graphics class, e.g. RTX 3060) — #84 */
 	0x0000c7b0u,
 	0x0000c7b5u,
 	0x0000c7b7u,
