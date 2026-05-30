@@ -18,6 +18,7 @@
 #include <linux/list.h>
 
 #include "../../src/common/nvkvm_proto.h"
+#include "../../src/common/nvkvm_abi.h"
 #include "../../src/abi/nvgpu.h"
 
 /* virtio-nvgpu device ID.
@@ -249,6 +250,8 @@ struct nvkvm_state {
 
 	/* Host driver version (from shared memory ctrl block) */
 	char                    driver_version[64];
+	/* #81: per-version ABI profile, selected from driver_version at probe. */
+	const struct nvkvm_abi_profile *abi;
 
 	/* GPU mmap window — GPA range reserved for nvkvm_mmap_request() */
 	unsigned long           mmap_window_gpa_base;
@@ -258,6 +261,13 @@ struct nvkvm_state {
 /* ── Global module state (defined in nvkvm_main.c) ────────────────────────── */
 
 extern struct nvkvm_state nvkvm;
+
+/* #81: null-safe ABI profile accessor (defaults to the 570/575 layout set
+ * before probe has selected one from the host driver version). */
+static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
+{
+	return nvkvm.abi ? nvkvm.abi : nvkvm_abi_by_id(NVKVM_ABI_570);
+}
 
 /* ── Function declarations ─────────────────────────────────────────────────── */
 

@@ -557,6 +557,8 @@ int nvkvm_negotiate_version(struct nvkvm_state *state)
 	memcpy_fromio(state->driver_version, ctrl->driver_version,
 		      sizeof(state->driver_version));
 	state->driver_version[sizeof(state->driver_version) - 1] = '\0';
+	/* #81: pick the ABI profile for this host driver version. */
+	state->abi = nvkvm_abi_for_version(state->driver_version);
 
 	pr_info("nvkvm: host NVIDIA driver %s, slot_size=%zu\n",
 		state->driver_version, state->slot_size);

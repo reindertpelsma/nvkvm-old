@@ -938,6 +938,14 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	}
 	close(fd);
 
+	/* #81: select the per-version ABI profile from the host driver version.
+	 * The guest independently selects the same profile from the version
+	 * string we forward; QEMU also stamps the profile id into each
+	 * ISOLATE_CMD_IOCTL so the stub uses matching offsets. */
+	nv->abi = nvkvm_abi_for_version(nv->driver_version);
+	fprintf(stderr, "nvkvm: host driver %s → ABI profile %u\n",
+		nv->driver_version, nv->abi ? nv->abi->id : 0);
+
 	/* Allocate shared memory region */
 	nv->slot_size = NVKVM_SHM_SLOT_DEFAULT_SIZE;
 	nv->shm_size  = (size_t)NVKVM_SHM_NSLOTS * nv->slot_size;

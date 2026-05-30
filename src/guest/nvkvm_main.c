@@ -1057,15 +1057,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = sizeof(struct nv2080_alloc_parameters);
 				break;
 			case RM_USER_SHARED_DATA:
-				ap_size = sizeof(struct nv00de_alloc_parameters_v545);
+				ap_size = nvkvm_prof()->nv00de_alloc_size;  /* #81 */
 				break;
 			case FERMI_VASPACE_A:
-				ap_size = sizeof(struct nv_vaspace_allocation_parameters);
+				ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81: 48 / V580 56 */
 				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
-				ap_size = sizeof(struct nv_memory_allocation_params_v545);
+				ap_size = nvkvm_prof()->mem_alloc_size;     /* #81 */
 				break;
 			case KEPLER_CHANNEL_GROUP_A:
 				ap_size = sizeof(struct nv_channel_group_allocation_parameters);
@@ -1076,7 +1076,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case TURING_CHANNEL_GPFIFO_A:
 			case AMPERE_CHANNEL_GPFIFO_A:
 			case HOPPER_CHANNEL_GPFIFO_A:
-				ap_size = sizeof(struct nv_channel_alloc_params_v570);
+				ap_size = nvkvm_prof()->chan_alloc_size;    /* #81: base / V570 +8 */
 				break;
 			case NV01_EVENT_OS_EVENT:
 				ap_size = sizeof(struct nv0005_alloc_parameters);
@@ -1142,15 +1142,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = sizeof(struct nv2080_alloc_parameters);
 					break;
 				case RM_USER_SHARED_DATA:
-					ap_size = sizeof(struct nv00de_alloc_parameters_v545);
+					ap_size = nvkvm_prof()->nv00de_alloc_size;  /* #81 */
 					break;
 				case FERMI_VASPACE_A:
-					ap_size = sizeof(struct nv_vaspace_allocation_parameters);
+					ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81 */
 					break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
 				case NV01_MEMORY_SYSTEM:
-					ap_size = sizeof(struct nv_memory_allocation_params_v545);
+					ap_size = nvkvm_prof()->mem_alloc_size;     /* #81 */
 					break;
 				case KEPLER_CHANNEL_GROUP_A:
 					ap_size = sizeof(struct nv_channel_group_allocation_parameters);
@@ -1161,7 +1161,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case TURING_CHANNEL_GPFIFO_A:
 				case AMPERE_CHANNEL_GPFIFO_A:
 				case HOPPER_CHANNEL_GPFIFO_A:
-					ap_size = sizeof(struct nv_channel_alloc_params_v570);
+					ap_size = nvkvm_prof()->chan_alloc_size;    /* #81 */
 					break;
 				case NV01_EVENT_OS_EVENT:
 					ap_size = sizeof(struct nv0005_alloc_parameters);

@@ -43,6 +43,7 @@
 
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_isolate_proto.h"
+#include "../../src/common/nvkvm_abi.h"
 #include "nvkvm_log.h"
 #include "../../src/abi/nvgpu.h"
 #include "../../src/abi/uvm.h"
@@ -260,6 +261,8 @@ typedef struct VirtIONvgpu {
 
 	/* Host NVIDIA driver version (read at init) */
 	char                driver_version[64];
+	/* #81: per-version ABI profile selected from driver_version at realize. */
+	const struct nvkvm_abi_profile *abi;
 
 	/*
 	 * #66 — QEMU's own init-ns admin RM subdevice, used only to answer
