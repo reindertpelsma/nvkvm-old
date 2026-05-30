@@ -29,6 +29,15 @@
 #define NVKVM_NVKMS_PARAMS_SIZE 16u
 #define NVKVM_NVKMS_ADDR_OFF    8u
 
+/* NVKMS REGISTER_SURFACE (sub-cmd 17): inner params embed up to 3 plane fds
+ * (useFd=TRUE) that need handle_id→stub-fd translation.  Layout mirrors
+ * nvkvm_proto.h — keep in sync. */
+#define NVKVM_NVKMS_CMD_REGISTER_SURFACE 17u
+#define NVKVM_NVKMS_REGSURF_USEFD_OFF    4u
+#define NVKVM_NVKMS_REGSURF_PLANE0_OFF   16u
+#define NVKVM_NVKMS_REGSURF_PLANE_STRIDE 32u
+#define NVKVM_NVKMS_MAX_PLANES           3u
+
 /* ── Command types (QEMU → isolate) ─────────────────────────────────────── */
 
 #define ISOLATE_CMD_RECEIVE_FD   1   /* fd arrives via SCM_RIGHTS            */

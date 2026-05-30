@@ -760,6 +760,45 @@ static void worker_thread(void *arg)
 		}
 
 		/*
+		 * NVKMS REGISTER_SURFACE (sub-cmd 17): the inner params carry up
+		 * to 3 plane fds (useFd=TRUE) holding our handle_ids; resolve each
+		 * to the stub's local fd so NVKMS dups the real memory object.
+		 * Restore the handle_ids after the ioctl (never leak a stub fd).
+		 */
+		int     regsurf_off[NVKVM_NVKMS_MAX_PLANES];
+		int32_t regsurf_hid[NVKVM_NVKMS_MAX_PLANES];
+		int     regsurf_n = 0;
+		if (job.cmd == NVKVM_NVKMS_IOCTL_CMD && job.param_size >= 4 &&
+		    job.aux_size >= NVKVM_NVKMS_REGSURF_PLANE0_OFF +
+				    NVKVM_NVKMS_MAX_PLANES *
+				    NVKVM_NVKMS_REGSURF_PLANE_STRIDE) {
+			uint32_t subcmd;
+			__builtin_memcpy(&subcmd, job.param_buf, sizeof(subcmd));
+			if (subcmd == NVKVM_NVKMS_CMD_REGISTER_SURFACE &&
+			    *((unsigned char *)job.aux_buf +
+			      NVKVM_NVKMS_REGSURF_USEFD_OFF)) {
+				for (unsigned i = 0; i < NVKVM_NVKMS_MAX_PLANES; i++) {
+					unsigned off = NVKVM_NVKMS_REGSURF_PLANE0_OFF +
+						       i * NVKVM_NVKMS_REGSURF_PLANE_STRIDE;
+					int32_t hid;
+					__builtin_memcpy(&hid, (char *)job.aux_buf + off,
+							 sizeof(hid));
+					if (hid <= 0)
+						continue;
+					int lfd = handle_lookup((uint32_t)hid);
+					if (lfd >= 0) {
+						int32_t lfd32 = lfd;
+						__builtin_memcpy((char *)job.aux_buf + off,
+								 &lfd32, sizeof(lfd32));
+						regsurf_off[regsurf_n] = (int)off;
+						regsurf_hid[regsurf_n] = hid;
+						regsurf_n++;
+					}
+				}
+			}
+		}
+
+		/*
 		 * GET_BUILD_VERSION (inner cmd=0x101) has three embedded string
 		 * pointer fields (p_driver_version_buffer, p_version_buffer,
 		 * p_title_buffer) at aux_buf offsets 8, 16, 24.  The guest fills
@@ -1128,6 +1167,12 @@ static void worker_thread(void *arg)
 		if (export_fd_off >= 0)
 			__builtin_memcpy((char *)job.aux_buf + export_fd_off,
 					 &export_fd_saved, sizeof(export_fd_saved));
+
+		/* NVKMS REGISTER_SURFACE: restore handle_ids over the stub fds we
+		 * substituted into the plane slots (don't leak stub fds). */
+		for (int k = 0; k < regsurf_n; k++)
+			__builtin_memcpy((char *)job.aux_buf + regsurf_off[k],
+					 &regsurf_hid[k], sizeof(int32_t));
 
 		/*
 		 * Extract NvStatus from the response struct.

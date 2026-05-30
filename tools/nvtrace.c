@@ -94,6 +94,20 @@ int ioctl(int fd, unsigned long request, ...)
 		memcpy(&csize,   (char *)arg + 24, 4);
 	}
 
+	/* NVKMS wrapper ioctl (0xC0106D00): {u32 cmd@0; u32 size@4; u64 addr@8}.
+	 * Follow addr to dump the inner params (where the OUT fields live). */
+	void    *nvkms_inner = NULL;
+	uint32_t nvkms_size = 0, nvkms_cmd = 0;
+	int is_nvkms = (track && request == 0xC0106D00UL && arg && size == 16);
+	if (is_nvkms) {
+		uint64_t a = 0;
+		memcpy(&nvkms_cmd,  (char *)arg + 0, 4);
+		memcpy(&nvkms_size, (char *)arg + 4, 4);
+		memcpy(&a,          (char *)arg + 8, 8);
+		nvkms_inner = (void *)(uintptr_t)a;
+		if (nvkms_size > 4096) nvkms_size = 4096;
+	}
+
 	/* RM_ALLOC (nr 0x2b, NVOS21/64): hClass@12 (shared prefix). */
 	uint32_t aclass = 0;
 	if (track && type == 'F' && nr == 0x2b && arg && size >= 16)
@@ -111,11 +125,13 @@ int ioctl(int fd, unsigned long request, ...)
 		fprintf(logf, "IOCTL %-10s nr=0x%02x size=%u", tag(dev), nr, size);
 		if (is_ctrl) fprintf(logf, " ctrl=0x%08x psize=%u", cctrl, csize);
 		if (nr == 0x2b) fprintf(logf, " class=0x%04x apsize=%u", aclass, apsize);
+		if (is_nvkms) fprintf(logf, " nvkms_cmd=%u isz=%u", nvkms_cmd, nvkms_size);
 		fputc('\n', logf);
 		/* Full outer struct (defined _IOC_SIZE bytes only) + control/alloc inner. */
 		if (arg && size) hexdump("inS ", arg, size);
 		if (is_ctrl && cparams) hexdump("in  ", cparams, csize);
 		if (aparms && apsize) hexdump("aIN ", aparms, apsize);
+		if (is_nvkms && nvkms_inner) hexdump("kIN ", nvkms_inner, nvkms_size);
 	}
 
 	int ret = real_ioctl(fd, request, arg);
@@ -131,6 +147,7 @@ int ioctl(int fd, unsigned long request, ...)
 		if (arg && size) hexdump("outS", arg, size);
 		if (is_ctrl && cparams) hexdump("out ", cparams, csize);
 		if (aparms && apsize) hexdump("aOUT", aparms, apsize);
+		if (is_nvkms && nvkms_inner) hexdump("kOUT", nvkms_inner, nvkms_size);
 		fflush(logf);
 	}
 	return ret;
