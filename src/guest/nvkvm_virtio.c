@@ -631,6 +631,12 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	state->mmap_window_len = virtio_cread64(vdev,
 		offsetof(struct nvkvm_virtio_config, mmap_win_len));
 
+	/* QEMU dictates which capabilities this VM gets; graphics (DRM render
+	 * node + NVKMS) is opt-out for compute-only VMs. */
+	state->graphics_enabled = (virtio_cread64(vdev,
+		offsetof(struct nvkvm_virtio_config, flags)) &
+		NVKVM_CONFIG_F_GRAPHICS) != 0;
+
 	virtio_device_ready(vdev);
 	return 0;
 }

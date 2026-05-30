@@ -1109,6 +1109,13 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	nv->config_space.mmap_win_len = cpu_to_le64(
 		(NVKVM_SPARSE_GPA_BASE + NVKVM_SPARSE_GPA_SIZE) -
 		NVKVM_MMAP_WIN_GPA_BASE);
+
+	/* Advertise the graphics capability to the guest (QEMU dictates). */
+	nv->config_space.flags = cpu_to_le64(
+		nv->graphics ? NVKVM_CONFIG_F_GRAPHICS : 0);
+	if (!nv->graphics)
+		info_report("nvkvm: graphics disabled (compute-only): DRM render "
+			    "node + NVKMS modeset device + ioctls refused");
 }
 
 static void virtio_nvgpu_device_unrealize(DeviceState *dev)
@@ -1257,9 +1264,19 @@ static const TypeInfo virtio_nvgpu_info = {
 	.class_init    = NULL,     /* filled below */
 };
 
+static Property virtio_nvgpu_properties[] = {
+	/* graphics=on|off (default on): expose+forward the DRM render node and
+	 * NVKMS modeset device. off → compute-only VM, smaller attack surface. */
+	DEFINE_PROP_BOOL("graphics", VirtIONvgpu, graphics, true),
+	DEFINE_PROP_END_OF_LIST(),
+};
+
 static void virtio_nvgpu_class_init(ObjectClass *klass, void *data)
 {
+	DeviceClass *dc = DEVICE_CLASS(klass);
 	VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
+
+	device_class_set_props(dc, virtio_nvgpu_properties);
 
 	vdc->realize     = virtio_nvgpu_device_realize;
 	vdc->unrealize   = virtio_nvgpu_device_unrealize;

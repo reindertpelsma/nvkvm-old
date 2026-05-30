@@ -209,6 +209,9 @@ struct nvkvm_state {
 	bool           modeset_registered;
 	/* /dev/dri/renderD128 (nvidia-drm) — graphics device (real DRM driver) */
 	struct drm_device *drm_dev;
+	/* Graphics enabled by QEMU (NVKVM_CONFIG_F_GRAPHICS); read at probe.
+	 * When false the guest tears down modeset + skips the DRM render node. */
+	bool           graphics_enabled;
 
 	/* Session management */
 	struct mutex   sessions_lock;
