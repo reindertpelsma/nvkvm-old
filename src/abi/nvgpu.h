@@ -117,7 +117,15 @@ struct nv_gr_allocation_parameters {
 #define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR    0x00000071U
 #define NV50_MEMORY_VIRTUAL                 0x000050A0U
 /* Events */
+#define NV01_EVENT                          0x00000005U  /* NV0005 params; Data=fd (graphics path) */
 #define NV01_EVENT_OS_EVENT                 0x00000079U
+/* Graphics-path alloc classes that the Vulkan ICD allocates with
+ * alloc_parms_size=0 (size-by-hClass), so the forwarder MUST know their param
+ * sizes or the kernel rejects them NV_ERR_INVALID_ARGUMENT (#84). */
+#define GF100_DISP_SW                       0x00009072U  /* NV9072_ALLOCATION_PARAMETERS (12B) */
+#define NV_MEMORY_MAPPER                    0x000000feU  /* NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V555 (24B) */
+#define NV9072_ALLOC_PARAMS_SIZE            12U
+#define NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE  24U
 /* Context DMA */
 #define NV01_CONTEXT_DMA                    0x00000002U
 /* Subcontext */

@@ -1066,7 +1066,7 @@ static void worker_thread(void *arg)
 			__builtin_memcpy(&h_class,
 					 (char *)job.param_buf + 12, /* nvos21+nvos64 alias */
 					 sizeof(uint32_t));
-			if (h_class == 0x79) {
+			if (h_class == 0x79 || h_class == 0x05) {  /* OS_EVENT + NV01_EVENT */
 				uint64_t data64 = 0;
 				__builtin_memcpy(&data64,
 						 (char *)job.aux_buf + 16,
