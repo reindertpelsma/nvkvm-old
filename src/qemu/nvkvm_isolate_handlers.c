@@ -1629,8 +1629,38 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 					len, kvm_slot, gpa,
 					do_stub_mirror);
 	if (token == 0) {
-		fprintf(stderr, "nvkvm: iso_mmap_tbl full\n");
-		token = 0xdeadbeef; /* non-zero; munmap will fail gracefully */
+		/*
+		 * Table full: we cannot track this mapping for later teardown, so
+		 * tear it down NOW and fail the request — otherwise the GPA extent
+		 * + KVM slot + isolate mirror would leak (the guest gets a token it
+		 * can never munmap).  Mirrors the munmap/reap reclaim path.
+		 */
+		fprintf(stderr, "nvkvm: iso_mmap_tbl full — undoing mapping\n");
+		if (do_stub_mirror)
+			nvkvm_isolate_munmap(&nv->isolates, req->isolate_id,
+					     req->gva, (uint64_t)len);
+		if (kvm_slot == NVKVM_IN_WINDOW_SLOT) {
+			if (qva != MAP_FAILED && qva)
+				mmap(qva, len, PROT_READ | PROT_WRITE,
+				     MAP_ANONYMOUS | MAP_PRIVATE |
+				     MAP_NORESERVE | MAP_FIXED, -1, 0);
+		} else {
+			if (kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
+				struct nvkvm_kvm_mem_region mr = {
+					.slot        = (uint32_t)kvm_slot,
+					.memory_size = 0,
+				};
+				ioctl(nvkvm_kvm_vm_fd,
+				      KVM_SET_USER_MEMORY_REGION, &mr);
+				nvkvm_kvm_slot_release(kvm_slot);
+			}
+			if (qva != MAP_FAILED && qva)
+				munmap(qva, len);
+		}
+		if (gpa)
+			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
+		resp->status = ENOMEM;
+		return 0;
 	}
 
 	resp->mmap_token = token;
