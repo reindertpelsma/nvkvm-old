@@ -167,3 +167,39 @@ entering the handler or carrying an epoch.
 Round-2 confirmed CLEAN (no new findings): slot_blob bounding, UVM/REALIZE/
 READ_HOST_FILE/#66-admin/#73-interrupt bounds, handle table, sparse arithmetic,
 guest-trust-of-QEMU (guest copies back using its own sizes; gpa_base validated).
+
+## Round 3 (handlers + concurrency)
+
+Round-3 agent verified R2-H1/H2/M1 are correctly in place, and found:
+
+### C-1 — sock_fd close/reuse race: KILL (TX thread) vs in-flight IOCTL (pool worker)  ❌→✅ FIXED
+`nvkvm_isolate_kill` set `iso->sock_fd=-1`+`close()` under `iso->lock` while the
+thread-pool IOCTL path sends under `write_lock` (a different mutex, a different
+thread). A guest issuing IOCTL_ON_ISOLATE + KILL_ISOLATE on one isolate could
+race the close against a worker's send → write isolate bytes into a recycled fd.
+**Fix:** kill tears the fd down under `write_lock` (set -1, then close after
+unlock); the worker snapshots `sock_fd` under `write_lock` and skips (-EPIPE) if
+-1. Serialized; no close()+reuse window.
+
+### N-1 — WRITE/READ_MEMORY_HANDLE missing TYPE_MEMORY check  ❌→✅ FIXED
+Both did `pwrite/pread(h->fd,…)` checking only `fd>=0`; a guest could pass a
+TYPE_NVIDIA handle (open /dev/nvidia*/eventfd) and drive read/write fops + an
+arbitrary offset against a device fd. **Fix:** require
+`h->type == NVKVM_HANDLE_TYPE_MEMORY` in both (→ EBADF otherwise).
+
+### N-2 — MMAP_ON_ISOLATE page-align wrap  ❌→✅ FIXED
+`len=(req->length+4095)&~4095` was computed before the bound check; a length near
+SIZE_MAX wrapped to a small page-multiple. **Fix:** reject
+`req->length==0 || >sparse_size` before the round-up.
+
+### C-2 — KILL_ISOLATE 500 ms nanosleep stalled the whole TX thread  ❌→✅ FIXED
+Every teardown blocked all virtio processing for 0.5 s (CREATE/KILL loop = VM
+throughput DoS). **Fix:** poll `waitpid(WNOHANG)` in 10 ms steps and break as
+soon as the stub (already sent EXIT) exits — typical stall ~10 ms; SIGKILL only
+on budget overrun (no premature mid-ioctl kill, no added GPU-wedge risk).
+
+Round-3 CLEAN elsewhere: OPEN_NVIDIA_HANDLE / OPEN_MEMORY_HANDLE / CLOSE_HANDLE /
+CREATE/KILL_ISOLATE / COPY/CLOSE_HANDLE_ON_ISOLATE / POLL/UNPOLL / READ_HOST_FILE
+/ REALIZE all validated; handle-table fd lifetime (acquire_fd dup-under-lock)
+sound; the other lock domains (iso_mmap/sparse/kvm-slot/admin/client_allow) have
+no inversion (MMAP/MUNMAP/REALIZE are TX-thread-only).

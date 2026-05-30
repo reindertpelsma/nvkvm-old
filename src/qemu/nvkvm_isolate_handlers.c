@@ -1441,8 +1441,16 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
+	/* N-2: bound the raw length BEFORE the page-align round-up — a length
+	 * near SIZE_MAX would otherwise wrap to a small page-multiple that
+	 * passes the len<=sparse_size check below, giving the guest a mapping
+	 * far smaller than it asked for. */
+	if (req->length == 0 || req->length > nv->sparse_size) {
+		resp->status = EINVAL;
+		return 0;
+	}
 	size_t len = (size_t)req->length;
-	len = (len + 4095UL) & ~4095UL;  /* page-align */
+	len = (len + 4095UL) & ~4095UL;  /* page-align (no wrap: bounded above) */
 
 	/*
 	 * Audit M-1: this mmap runs in the privileged QEMU process against the
@@ -1697,6 +1705,13 @@ int nvkvm_req_write_memory_handle(VirtIONvgpu *nv,
 		resp->status = EBADF;
 		return 0;
 	}
+	/* N-1: only a memfd handle may be pwrite()'n. Reject device/eventfd
+	 * (TYPE_NVIDIA) handles so a guest can't drive read/write fops + an
+	 * arbitrary offset against a real /dev/nvidia* or eventfd fd. */
+	if (h->type != NVKVM_HANDLE_TYPE_MEMORY) {
+		resp->status = EBADF;
+		return 0;
+	}
 
 	ssize_t n = pwrite(h->fd, data_buf, req->size, (off_t)req->offset);
 	if (n < 0) {
@@ -1722,6 +1737,11 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
 
 	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
 	if (!h || h->fd < 0) {
+		resp->status = EBADF;
+		return 0;
+	}
+	/* N-1: only a memfd handle may be pread() — see write handler. */
+	if (h->type != NVKVM_HANDLE_TYPE_MEMORY) {
 		resp->status = EBADF;
 		return 0;
 	}

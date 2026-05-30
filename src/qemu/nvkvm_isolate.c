@@ -856,9 +856,20 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	}
 
 	iso->alive = false;
+	pthread_mutex_unlock(&iso->lock);
+
+	/*
+	 * Audit C-1: an IOCTL_ON_ISOLATE runs on a QEMU thread-pool worker and
+	 * sends on iso->sock_fd under write_lock, on a DIFFERENT thread than this
+	 * kill (the TX thread).  Tear the fd down under write_lock too, so we
+	 * either wait for an in-flight send to finish or a later one observes
+	 * sock_fd==-1 and skips — never a close()+reuse race where a worker
+	 * writes isolate bytes into a recycled fd.
+	 */
+	pthread_mutex_lock(&iso->write_lock);
 	int sock_fd = iso->sock_fd;
 	iso->sock_fd = -1;
-	pthread_mutex_unlock(&iso->lock);
+	pthread_mutex_unlock(&iso->write_lock);
 
 	/* Closing the socket makes the reader thread's recv() return 0/error. */
 	if (sock_fd >= 0)
@@ -877,9 +888,25 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	pid_t pid = iso->pid;
 	if (pid > 0) {
 		int status;
-		struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000000 };
-		nanosleep(&ts, NULL);
-		if (waitpid(pid, &status, WNOHANG) == 0) {
+		/*
+		 * C-2: KILL runs on the single TX thread, so a fixed 500 ms sleep
+		 * here stalled ALL virtio processing for the whole VM on every
+		 * teardown (a guest CREATE/KILL loop could wedge throughput).
+		 * The stub already got ISOLATE_CMD_EXIT + a closed socket, so it
+		 * exits promptly; poll for that in short steps and break as soon
+		 * as it's reaped — typical stall ~10 ms.  SIGKILL only if it
+		 * overstays the budget (avoids a premature mid-ioctl kill).
+		 */
+		int reaped = 0;
+		for (int i = 0; i < 50; i++) {     /* up to ~500 ms, 10 ms steps */
+			if (waitpid(pid, &status, WNOHANG) != 0) {
+				reaped = 1;
+				break;
+			}
+			struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+			nanosleep(&ts, NULL);
+		}
+		if (!reaped) {
 			kill(pid, SIGKILL);
 			waitpid(pid, &status, 0);
 		}
@@ -1207,11 +1234,16 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 	};
 
 	pthread_mutex_lock(&iso->write_lock);
-	ssize_t sr = sock_send_full(iso->sock_fd, &hdr, sizeof(hdr));
+	/* C-1: snapshot the fd under write_lock; kill() nulls it under the same
+	 * lock, so a concurrent teardown is either ordered before us (we see -1
+	 * and skip) or after (our send completes before close()). */
+	int sfd = iso->sock_fd;
+	ssize_t sr = (sfd < 0) ? -EPIPE
+			      : sock_send_full(sfd, &hdr, sizeof(hdr));
 	if (sr >= 0 && param_size > 0)
-		sr = sock_send_full(iso->sock_fd, param_buf, param_size);
+		sr = sock_send_full(sfd, param_buf, param_size);
 	if (sr >= 0 && aux_size > 0)
-		sr = sock_send_full(iso->sock_fd, aux_buf, aux_size);
+		sr = sock_send_full(sfd, aux_buf, aux_size);
 	pthread_mutex_unlock(&iso->write_lock);
 
 	/*
