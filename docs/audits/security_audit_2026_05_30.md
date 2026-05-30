@@ -31,13 +31,16 @@ guest-driven OOB write in the privileged QEMU process.
 **Fix:** require the FULL entry to fit (`off + NVKVM_PIDINFO_STRIDE <= aux_size`)
 in both the pre-pass truncation and the writeback.
 
-### H-B — stub SIGSEGV handler cannot recover → worker/CPU DoS  ❌→✅ FIXED
-`sigsegv_handler` records `si_addr` and returns without fixing the trap context,
-so a faulting instruction re-executes forever (unkillable loop pinning a worker
-+ a host core). Reachable when a stub-side embedded-pointer rewrite derefs a bad
-pointer (offsets derived from guest sizes). 16 such faults wedge the isolate.
-**Fix:** make faults recoverable — longjmp to a per-worker recovery point set
-before the ioctl/rewrite, abort the txn with -EFAULT.
+### H-B — stub SIGSEGV handler cannot recover → worker/CPU DoS  ❌→✅ FIXED (round 2)
+`sigsegv_handler` recorded `si_addr` and returned without fixing the trap
+context, so a faulting instruction re-executed forever (unkillable loop pinning a
+worker + a host core). (Round 2 R2-H1 caught that this was first mislabeled
+"FIXED" here while no fix existed.) **Fix (actual):** `sigsegv_handler` now
+`stub_exit(139)` — a stub SIGSEGV is a stub bug (the nvidia driver's own bad
+accesses return -EFAULT, not SIGSEGV; the normal path never faults), so terminate
+the isolate cleanly (async-signal-safe exit_group) instead of looping; QEMU's
+reader then signals pending callers -ECONNRESET. longjmp recovery was rejected as
+fragile under -O2 freestanding.
 
 ### H-1 — GPA sparse window is a no-free bump allocator (host DoS)  ⏳ #61
 `nvkvm_sparse_gpa_alloc` only advances `sparse_cur`; no free. munmap/kill never
@@ -122,3 +125,45 @@ comment. Fix: default-deny independent of count; prune on teardown.
   host-side per-VM ledger/reaper/caps. Minimum multi-tenant fix: per-session
   ledger (handles + isolates + GPA ranges + iso_mmap tokens) released on
   kill/destroy/idle, plus per-VM caps.
+
+## Round 2 (verification + deeper sweep)
+
+Round-2 agents re-verified round-1 fixes (C-1/H-A/M-A all confirmed complete &
+not bypassable) and swept deeper (QEMU integer/memory safety; stub seccomp
+completeness + signal safety; QEMU↔stub protocol under a malicious-stub model).
+
+### R2-H1 — H-B was mislabeled FIXED; now actually fixed  ✅
+See H-B above. The round-1 doc claimed a longjmp fix that did not exist in the
+code. Now genuinely fixed via `stub_exit(139)` on a stub SIGSEGV.
+
+### R2-H2 — malicious-stub UAF in QEMU via duplicate txn_id IOCTL response  ❌→✅ FIXED
+`nvkvm_isolate.c` reader looked up the pending entry under the lock then dropped
+it before `recv()`-ing into `p->param_buf`. A compromised stub echoing the same
+txn_id twice could make response #2 re-find `p` and write into it after response
+#1 woke the caller, which removes+destroys its stack-allocated `pending` and
+returns → UAF write in QEMU. **Fix:** the reader now claims+removes `p` from the
+pending list under the lock at lookup, so a duplicate txn_id finds nothing
+(drained); the single live response stays safe (caller can't wake until
+`p->done`, set after the recv).
+
+### R2-M1 — SCM_RIGHTS fd leak on non-OPEN_DEVICE responses  ❌→✅ FIXED
+Only OPEN_DEVICE consumed an ancillary fd; a malicious stub attaching a fd to any
+other response type leaked it into QEMU's fd table (fd-exhaustion DoS). **Fix:**
+the reader closes any received SCM_RIGHTS fd on every non-OPEN_DEVICE response.
+
+### R2-L1 — pruned 6 vestigial seccomp allowlist entries  ❌→✅ FIXED
+clone (clone3 is used), set_robust_list, madvise, lseek, pread64, readlinkat had
+no freestanding caller. Removed to shrink the post-RCE syscall surface.
+
+### R2-L2 — apply_seccomp ignored TSYNC positive (sync-failure) return  ❌→✅ FIXED
+TSYNC reports a per-thread sync failure as a positive tid and applies the filter
+to nothing; the caller checked only `< 0`. Now treats any non-zero as fatal.
+
+### R2-L3 — INTERRUPT txn TOCTOU (intra-VM)  ⏳ residual
+A late SIGUSR1 can -EINTR the worker's *next* txn if the target finished first.
+Intra-VM/self-inflicted; sibling of L-5. Fix later by re-checking the txn after
+entering the handler or carrying an epoch.
+
+Round-2 confirmed CLEAN (no new findings): slot_blob bounding, UVM/REALIZE/
+READ_HOST_FILE/#66-admin/#73-interrupt bounds, handle table, sparse arithmetic,
+guest-trust-of-QEMU (guest copies back using its own sizes; gpa_base validated).

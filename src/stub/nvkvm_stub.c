@@ -539,6 +539,19 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ctx)
 	(void)sig; (void)ctx;
 	int slot = worker_self_slot();
 	worker_fault_addr[slot] = (uint64_t)(uintptr_t)info->si_addr;
+	/*
+	 * Audit R2-H1: a SIGSEGV here is a *stub-side* bad dereference (a bug in
+	 * one of the embedded-pointer rewrites — the nvidia driver's own bad
+	 * accesses return -EFAULT, they don't raise SIGSEGV).  Returning from
+	 * this handler re-executes the faulting instruction → an infinite
+	 * SIGSEGV loop that pins the worker and a host core (a DoS).  The normal
+	 * forwarding path never faults (matmul/cuInit/7B are green), so instead
+	 * of looping we terminate the isolate cleanly: SYS_exit_group is
+	 * async-signal-safe, and QEMU's reader sees the dead socket and signals
+	 * every pending caller -ECONNRESET.  One isolate dies; no host-core burn,
+	 * no cross-tenant impact.
+	 */
+	stub_exit(139);  /* 128 + SIGSEGV */
 }
 
 static uint64_t get_fault_addr(void)
@@ -1620,17 +1633,14 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_rt_sigaction);
 	ALLOW_IF(__NR_rt_sigreturn);
 	ALLOW_IF(__NR_futex);
-	ALLOW_IF(__NR_clone);
 	ALLOW_IF(__NR_clone3);
-	ALLOW_IF(__NR_set_robust_list);
-	ALLOW_IF(__NR_madvise);
-	ALLOW_IF(__NR_lseek);
-	ALLOW_IF(__NR_pread64);
 	ALLOW_IF(__NR_openat);
 	ALLOW_IF(__NR_eventfd2);
 	ALLOW_IF(__NR_gettid);
 	ALLOW_IF(__NR_tgkill);   /* post SIGUSR1 to interrupt a worker's ioctl (#73) */
-	ALLOW_IF(__NR_readlinkat);
+	/* R2-L1: dropped vestigial entries with no freestanding caller —
+	 * clone (clone3 is used), set_robust_list, madvise, lseek, pread64,
+	 * readlinkat — to shrink the post-RCE syscall surface. */
 
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
 
@@ -1804,7 +1814,10 @@ int main(void)
 	 */
 	{
 		long sr = apply_seccomp();
-		if (sr < 0) {
+		/* R2-L2: TSYNC reports a per-thread sync failure as a POSITIVE
+		 * return (the offending tid) and applies the filter to nothing —
+		 * treat any non-zero as fatal, not just negative. */
+		if (sr != 0) {
 			fs_dprintf(STDERR_FD,
 				"nvkvm_stub: apply_seccomp failed: %ld\n",
 				sr);

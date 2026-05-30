@@ -399,6 +399,29 @@ static void *isolate_reader_fn(void *arg)
 		if (n <= 0)
 			break;
 
+		/*
+		 * R2-M1: only ISOLATE_RESP_OPEN_DEVICE legitimately carries an
+		 * SCM_RIGHTS fd.  A compromised stub could attach a fd to ANY
+		 * other response type; if we don't consume it, it leaks into
+		 * QEMU's fd table (eventual fd-exhaustion DoS of the VMM).  Close
+		 * any received fd on every non-OPEN_DEVICE response.  (cmsg_buf is
+		 * one-fd-sized, so the kernel already closed any truncated extras.)
+		 */
+		if (u.type != ISOLATE_RESP_OPEN_DEVICE) {
+			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
+			     cm = CMSG_NXTHDR(&msg, cm)) {
+				if (cm->cmsg_level == SOL_SOCKET &&
+				    cm->cmsg_type == SCM_RIGHTS) {
+					int nfd = (int)((cm->cmsg_len - CMSG_LEN(0)) /
+							sizeof(int));
+					int *fds = (int *)CMSG_DATA(cm);
+					for (int i = 0; i < nfd; i++)
+						if (fds[i] >= 0)
+							close(fds[i]);
+				}
+			}
+		}
+
 		switch (u.type) {
 		case ISOLATE_RESP_OK:
 			reader_signal_sync(iso, 0, 0);
@@ -420,11 +443,26 @@ static void *isolate_reader_fn(void *arg)
 			uint32_t param_size = u.ioctl.param_size;
 			uint32_t aux_size   = u.ioctl.aux_size;
 
-			/* Locate the pending caller (brief lock). */
+			/*
+			 * Locate the pending caller AND remove it from the list
+			 * under the lock (audit R2-H2).  A compromised stub could
+			 * echo the same txn_id twice; if we left the entry on the
+			 * list, the 2nd response could re-find `p` and recv() into
+			 * p->param_buf after the 1st response woke the caller, which
+			 * then removes+destroys its stack-allocated `pending` and
+			 * returns — a use-after-free write inside QEMU.  Claiming
+			 * (removing) the entry here makes a duplicate txn_id find
+			 * nothing (→ drained).  The single live response is safe:
+			 * the caller cannot wake until we set p->done below, which
+			 * happens only after the recv into p's buffers.
+			 */
 			pthread_mutex_lock(&iso->lock);
-			struct nvkvm_pending_ioctl *p = iso->pending_head;
-			while (p && p->txn_id != txn_id)
-				p = p->next;
+			struct nvkvm_pending_ioctl **pp = &iso->pending_head;
+			while (*pp && (*pp)->txn_id != txn_id)
+				pp = &(*pp)->next;
+			struct nvkvm_pending_ioctl *p = *pp;
+			if (p)
+				*pp = p->next;   /* claim: off the list */
 			pthread_mutex_unlock(&iso->lock);
 
 			/*
