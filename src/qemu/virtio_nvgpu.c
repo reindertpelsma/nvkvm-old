@@ -106,9 +106,12 @@ struct nvkvm_session *nvkvm_session_create(VirtIONvgpu *nv,
  *   - the session struct + its mutexes.
  *
  * Safe to free here: every control request runs serialised on the single TX
- * virtqueue thread, and we are only called once nisolates == 0 — i.e. after
- * every isolate (and its drained ioctl-pool workers) is gone, so no worker can
- * still hold this session pointer.
+ * virtqueue thread, and we are only called once nisolates == 0.  A pooled
+ * IOCTL worker (NVKVM_REQ_IOCTL_ON_ISOLATE) may still be unwinding after
+ * nvkvm_isolate_kill (which joins the isolate's reader thread, not the pool
+ * workers), but the worker only touches the static handle/isolate tables and
+ * its own stack — it never dereferences a nvkvm_session — so freeing the
+ * session struct here cannot UAF it.
  */
 void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session)
 {
