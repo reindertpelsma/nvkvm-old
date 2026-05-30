@@ -993,6 +993,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				switch (ctrl->cmd) {
 				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
 				case NV0080_CTRL_CMD_GR_GET_INFO:
+				case 0x00801301: /* NV0080_CTRL_CMD_FB_GET_INFO (device) — graphics #84 */
 				case NV2080_CTRL_CMD_BIOS_GET_INFO:
 				case NV2080_CTRL_CMD_GR_GET_INFO:
 				case NV2080_CTRL_CMD_FB_GET_INFO:
@@ -1546,6 +1547,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				switch (ctrl->cmd) {
 				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
 				case NV0080_CTRL_CMD_GR_GET_INFO:
+				case 0x00801301: /* NV0080_CTRL_CMD_FB_GET_INFO (device) — graphics #84 */
 				case NV2080_CTRL_CMD_BIOS_GET_INFO:
 				case NV2080_CTRL_CMD_GR_GET_INFO:
 				case NV2080_CTRL_CMD_FB_GET_INFO:

@@ -755,6 +755,7 @@ static void worker_thread(void *arg)
 			 * pointer again so we don't leak a host VA back to the guest. */
 			if (inner_cmd == 0x00410110U || /* NV0041_CTRL_CMD_GET_SURFACE_INFO */
 			    inner_cmd == 0x00801104U || /* NV0080_CTRL_CMD_GR_GET_INFO */
+			    inner_cmd == 0x00801301U || /* NV0080_CTRL_CMD_FB_GET_INFO (#84) */
 			    inner_cmd == 0x20800802U || /* NV2080_CTRL_CMD_BIOS_GET_INFO */
 			    inner_cmd == 0x20801201U || /* NV2080_CTRL_CMD_GR_GET_INFO */
 			    inner_cmd == 0x20801301U || /* NV2080_CTRL_CMD_FB_GET_INFO */
