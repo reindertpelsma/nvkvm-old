@@ -1213,6 +1213,10 @@ int nvkvm_virtio_read_host_file(__u32 file_id, __u32 shm_slot,
 	msg->req.file_id = cpu_to_le32(file_id);
 	msg->req.shm_slot = cpu_to_le32(shm_slot);
 	msg->req.max_len  = cpu_to_le32(max_len);
+	/* Single virtual GPU at guest BDF 0000:00:07.0 -> host GPU index 0.
+	 * Multi-GPU (several virtio-nvgpu devices) would thread a per-device
+	 * index here; QEMU already enumerates all host GPUs into its BDF list. */
+	msg->req.gpu_index = cpu_to_le32(0);
 
 	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0) {

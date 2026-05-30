@@ -1870,23 +1870,93 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
  * The path table is the security boundary.  Files are read fresh on every
  * call so callers see live state.
  */
-static const char *nvkvm_hfile_path(uint32_t id)
+/* Discovered host GPU BDFs.  Populated once by scanning the host's own
+ * /proc/driver/nvidia/gpus/ directory — the guest never supplies these, so a
+ * guest gpu_index can only ever resolve to a real, host-enumerated GPU path. */
+#define NVKVM_MAX_HOST_GPUS 16
+#define NVKVM_BDF_LEN       12   /* "0000:00:07.0" */
+static char  nvkvm_host_bdf[NVKVM_MAX_HOST_GPUS][NVKVM_BDF_LEN + 1];
+static int   nvkvm_host_gpu_count = -1;   /* -1 = not yet discovered */
+
+/* Strict BDF format check: DDDD:BB:DD.F (hex), exactly NVKVM_BDF_LEN chars.
+ * Rejects "..", slashes, and anything that isn't a canonical PCI address —
+ * defence in depth on top of the fact that these names come from readdir. */
+static bool nvkvm_bdf_valid(const char *s)
+{
+	if (strlen(s) != NVKVM_BDF_LEN)
+		return false;
+	for (int i = 0; i < NVKVM_BDF_LEN; i++) {
+		char c = s[i];
+		if (i == 4 || i == 7) {            /* ':' positions */
+			if (c != ':') return false;
+		} else if (i == 10) {              /* '.' position  */
+			if (c != '.') return false;
+		} else {                           /* hex digit     */
+			if (!((c >= '0' && c <= '9') ||
+			      (c >= 'a' && c <= 'f') ||
+			      (c >= 'A' && c <= 'F')))
+				return false;
+		}
+	}
+	return true;
+}
+
+static void nvkvm_discover_host_gpus(void)
+{
+	nvkvm_host_gpu_count = 0;
+	DIR *d = opendir("/proc/driver/nvidia/gpus");
+	if (!d)
+		return;
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL &&
+	       nvkvm_host_gpu_count < NVKVM_MAX_HOST_GPUS) {
+		if (!nvkvm_bdf_valid(de->d_name))
+			continue;
+		memcpy(nvkvm_host_bdf[nvkvm_host_gpu_count], de->d_name,
+		       NVKVM_BDF_LEN + 1);
+		nvkvm_host_gpu_count++;
+	}
+	closedir(d);
+	/* readdir order is arbitrary; sort so gpu_index is stable across calls. */
+	for (int i = 0; i < nvkvm_host_gpu_count; i++)
+		for (int j = i + 1; j < nvkvm_host_gpu_count; j++)
+			if (strcmp(nvkvm_host_bdf[j], nvkvm_host_bdf[i]) < 0) {
+				char tmp[NVKVM_BDF_LEN + 1];
+				memcpy(tmp, nvkvm_host_bdf[i], sizeof(tmp));
+				memcpy(nvkvm_host_bdf[i], nvkvm_host_bdf[j], sizeof(tmp));
+				memcpy(nvkvm_host_bdf[j], tmp, sizeof(tmp));
+			}
+}
+
+/* Build the host path for a host-file request into `buf`.  Per-GPU files
+ * resolve `gpu_index` against the discovered BDF list (never guest input).
+ * Returns false if the id is unknown or the index is out of range. */
+static bool nvkvm_hfile_path(uint32_t id, uint32_t gpu_index,
+			     char *buf, size_t buflen)
 {
 	switch (id) {
 	case NVKVM_HFILE_NVIDIA_PARAMS:
-		return "/proc/driver/nvidia/params";
+		return g_strlcpy(buf, "/proc/driver/nvidia/params", buflen) < buflen;
 	case NVKVM_HFILE_NVIDIA_INITSTATE:
-		return "/sys/module/nvidia/initstate";
+		return g_strlcpy(buf, "/sys/module/nvidia/initstate", buflen) < buflen;
 	case NVKVM_HFILE_NVIDIA_UVM_INITSTATE:
-		return "/sys/module/nvidia_uvm/initstate";
+		return g_strlcpy(buf, "/sys/module/nvidia_uvm/initstate", buflen) < buflen;
 	case NVKVM_HFILE_NVIDIA_NUMA_STATUS:
-		return "/proc/driver/nvidia/gpus/0000:00:07.0/numa_status";
 	case NVKVM_HFILE_NVIDIA_INFORMATION:
-		return "/proc/driver/nvidia/gpus/0000:00:07.0/information";
-	case NVKVM_HFILE_NVIDIA_REG_BASE:
-		return "/proc/driver/nvidia/gpus/0000:00:07.0/registry";
+	case NVKVM_HFILE_NVIDIA_REG_BASE: {
+		if (nvkvm_host_gpu_count < 0)
+			nvkvm_discover_host_gpus();
+		if (gpu_index >= (uint32_t)nvkvm_host_gpu_count)
+			return false;
+		const char *leaf = (id == NVKVM_HFILE_NVIDIA_NUMA_STATUS) ? "numa_status"
+				 : (id == NVKVM_HFILE_NVIDIA_INFORMATION)  ? "information"
+				 :                                            "registry";
+		int n = snprintf(buf, buflen, "/proc/driver/nvidia/gpus/%s/%s",
+				 nvkvm_host_bdf[gpu_index], leaf);
+		return n > 0 && (size_t)n < buflen;
+	}
 	default:
-		return NULL;
+		return false;
 	}
 }
 
@@ -1904,8 +1974,8 @@ int nvkvm_req_read_host_file(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	const char *path = nvkvm_hfile_path(req->file_id);
-	if (!path) {
+	char path[256];
+	if (!nvkvm_hfile_path(req->file_id, req->gpu_index, path, sizeof(path))) {
 		resp->status = EINVAL;
 		return 0;
 	}

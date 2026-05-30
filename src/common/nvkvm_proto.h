@@ -563,7 +563,10 @@ struct nvkvm_req_read_host_file {
 	__le32 file_id;        /* enum nvkvm_host_file */
 	__le32 shm_slot;       /* dest slot; content written starting at offset 0 */
 	__le32 max_len;        /* cap (must be <= NVKVM_HFILE_MAX_SIZE)            */
-	__le32 reserved;
+	__le32 gpu_index;      /* for per-GPU files (NUMA/INFORMATION/REGISTRY):
+	                        * index into QEMU's discovered host-BDF list.  The
+	                        * guest NEVER supplies a path or BDF string — only
+	                        * this integer — so path traversal is impossible. */
 };
 
 struct nvkvm_resp_read_host_file {

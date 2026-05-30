@@ -66,33 +66,10 @@ case "$cmd" in
             mkdir -p /tmp/build/abi && cp /mnt/nvkvm/src/abi/*.h /tmp/build/abi/
             gcc -O0 -g -Wall -I/tmp/build -o /tmp/test_ioctl_fwd /mnt/nvkvm/tests/integration/test_ioctl_fwd.c
             gcc -O0 -g -o /tmp/cuinit_test /mnt/nvkvm/tests/integration/cuinit_test.c -ldl
-            # Guest userspace MUST version-match the host driver or NVML/libcuda
-            # refuse to init ("Driver/library version mismatch" / cuInit 803).
-            # Two dirs matter: NVML/nvidia-smi resolve from the system multiarch
-            # dir, but CUDA apps resolve libcuda from /usr/local/nvidia-guest/lib
-            # (it is on the ld.so path via nvidia-guest.conf, AHEAD of the system
-            # dir).  Stage BOTH.  Host is on 580; derive the exact version from
-            # the bundle soname so a driver swap only needs the bundle updated.
-            GFXBUNDLE=/mnt/nvkvm/host-libs-580
-            V=$(ls $GFXBUNDLE/libcuda.so.* | sed "s#.*/libcuda.so.##" | head -1)
-            SYS=/usr/lib/x86_64-linux-gnu
-            CUDADIR=/usr/local/nvidia-guest/lib
-            # -- system dir: NVML for nvidia-smi --
-            sudo cp -f $GFXBUNDLE/libnvidia-ml.so.$V $SYS/ 2>/dev/null
-            sudo ln -sf libnvidia-ml.so.$V           $SYS/libnvidia-ml.so.1
-            sudo cp -f $GFXBUNDLE/libcuda.so.$V      $SYS/ 2>/dev/null
-            sudo ln -sf libcuda.so.$V                $SYS/libcuda.so.1
-            sudo rm -f $SYS/libcuda.so.575.51.03 $SYS/libnvidia-ml.so.575.51.03
-            # -- canonical CUDA dir: libcuda + allocator + ptxjit (what apps load) --
-            sudo cp -f $GFXBUNDLE/libcuda.so.$V                  $CUDADIR/ 2>/dev/null
-            sudo cp -f $GFXBUNDLE/libnvidia-allocator.so.$V      $CUDADIR/ 2>/dev/null
-            sudo cp -f $GFXBUNDLE/libnvidia-ptxjitcompiler.so.$V $CUDADIR/ 2>/dev/null
-            sudo ln -sf libcuda.so.$V                  $CUDADIR/libcuda.so.1
-            sudo ln -sf libnvidia-allocator.so.$V      $CUDADIR/libnvidia-allocator.so.1
-            sudo ln -sf libnvidia-ptxjitcompiler.so.$V $CUDADIR/libnvidia-ptxjitcompiler.so.1
-            sudo rm -f $CUDADIR/libcuda.so.575.51.03 $CUDADIR/libnvidia-allocator.so.575.51.03 $CUDADIR/libnvidia-ptxjitcompiler.so.575.51.03
-            [ -f $GFXBUNDLE/nvidia-smi-580 ] && sudo cp -f $GFXBUNDLE/nvidia-smi-580 /usr/local/bin/nvidia-smi && sudo chmod +x /usr/local/bin/nvidia-smi
-            sudo ldconfig
+            # Version-match guest userspace to the host driver (NVML + libcuda).
+            # Standalone script so its shell vars expand on the GUEST, not the
+            # local shell across the nested ssh hops.  See stage_guest_libs.sh.
+            bash /mnt/nvkvm/scripts/stage_guest_libs.sh
             echo READY
         '"
         ;;
