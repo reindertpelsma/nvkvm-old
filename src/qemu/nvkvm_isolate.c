@@ -204,9 +204,13 @@ static int nvkvm_child_enter_mount_ns(void)
 		close(dd);
 	}
 	/* Seal the root read-only now that the nvidia binds are in place (they are
-	 * separate mounts, unaffected, and stay openable). */
-	mount(NULL, "/", NULL,
-	      MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL);
+	 * separate mounts, unaffected, and stay openable).  Audit R4-L1: this used
+	 * to ignore the return — a silent partial fail-open (the stub would run
+	 * with a writable root tmpfs if the remount failed).  Fail closed: the
+	 * caller _exit(126)s the child, so a weakened sandbox never runs. */
+	if (mount(NULL, "/", NULL,
+		  MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL) < 0)
+		return -1;
 	return 0;
 }
 
@@ -399,6 +403,29 @@ static void *isolate_reader_fn(void *arg)
 		if (n <= 0)
 			break;
 
+		/*
+		 * R2-M1: only ISOLATE_RESP_OPEN_DEVICE legitimately carries an
+		 * SCM_RIGHTS fd.  A compromised stub could attach a fd to ANY
+		 * other response type; if we don't consume it, it leaks into
+		 * QEMU's fd table (eventual fd-exhaustion DoS of the VMM).  Close
+		 * any received fd on every non-OPEN_DEVICE response.  (cmsg_buf is
+		 * one-fd-sized, so the kernel already closed any truncated extras.)
+		 */
+		if (u.type != ISOLATE_RESP_OPEN_DEVICE) {
+			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
+			     cm = CMSG_NXTHDR(&msg, cm)) {
+				if (cm->cmsg_level == SOL_SOCKET &&
+				    cm->cmsg_type == SCM_RIGHTS) {
+					int nfd = (int)((cm->cmsg_len - CMSG_LEN(0)) /
+							sizeof(int));
+					int *fds = (int *)CMSG_DATA(cm);
+					for (int i = 0; i < nfd; i++)
+						if (fds[i] >= 0)
+							close(fds[i]);
+				}
+			}
+		}
+
 		switch (u.type) {
 		case ISOLATE_RESP_OK:
 			reader_signal_sync(iso, 0, 0);
@@ -420,11 +447,26 @@ static void *isolate_reader_fn(void *arg)
 			uint32_t param_size = u.ioctl.param_size;
 			uint32_t aux_size   = u.ioctl.aux_size;
 
-			/* Locate the pending caller (brief lock). */
+			/*
+			 * Locate the pending caller AND remove it from the list
+			 * under the lock (audit R2-H2).  A compromised stub could
+			 * echo the same txn_id twice; if we left the entry on the
+			 * list, the 2nd response could re-find `p` and recv() into
+			 * p->param_buf after the 1st response woke the caller, which
+			 * then removes+destroys its stack-allocated `pending` and
+			 * returns — a use-after-free write inside QEMU.  Claiming
+			 * (removing) the entry here makes a duplicate txn_id find
+			 * nothing (→ drained).  The single live response is safe:
+			 * the caller cannot wake until we set p->done below, which
+			 * happens only after the recv into p's buffers.
+			 */
 			pthread_mutex_lock(&iso->lock);
-			struct nvkvm_pending_ioctl *p = iso->pending_head;
-			while (p && p->txn_id != txn_id)
-				p = p->next;
+			struct nvkvm_pending_ioctl **pp = &iso->pending_head;
+			while (*pp && (*pp)->txn_id != txn_id)
+				pp = &(*pp)->next;
+			struct nvkvm_pending_ioctl *p = *pp;
+			if (p)
+				*pp = p->next;   /* claim: off the list */
 			pthread_mutex_unlock(&iso->lock);
 
 			/*
@@ -512,7 +554,7 @@ static void *isolate_reader_fn(void *arg)
 		}
 
 		default:
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm_isolate: unknown response type 0x%x\n",
 				u.type);
 			break;
@@ -771,10 +813,29 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	*isolate_id_out = id;
 
-	fprintf(stderr,
+	NVKVM_DBG(
 		"nvkvm_isolate: created isolate %u pid=%d sock=%d\n",
 		id, stub_pid, sv[0]);
 	return 0;
+}
+
+/*
+ * Return the host pid of a live isolate by id, or 0.  Used by the GET_PID_INFO
+ * translator to map a guest pid's owning isolate to the real host pid the kernel
+ * can resolve — QEMU thereby validates that a per-pid query targets a managed
+ * isolate of this VM, never an arbitrary host pid.
+ */
+pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
+{
+	pid_t pid = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return 0;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	pthread_mutex_lock(&iso->lock);
+	if (iso->in_use && iso->id == isolate_id && iso->alive)
+		pid = iso->pid;
+	pthread_mutex_unlock(&iso->lock);
+	return pid;
 }
 
 /* ── Kill isolate ───────────────────────────────────────────────────────── */
@@ -799,9 +860,20 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	}
 
 	iso->alive = false;
+	pthread_mutex_unlock(&iso->lock);
+
+	/*
+	 * Audit C-1: an IOCTL_ON_ISOLATE runs on a QEMU thread-pool worker and
+	 * sends on iso->sock_fd under write_lock, on a DIFFERENT thread than this
+	 * kill (the TX thread).  Tear the fd down under write_lock too, so we
+	 * either wait for an in-flight send to finish or a later one observes
+	 * sock_fd==-1 and skips — never a close()+reuse race where a worker
+	 * writes isolate bytes into a recycled fd.
+	 */
+	pthread_mutex_lock(&iso->write_lock);
 	int sock_fd = iso->sock_fd;
 	iso->sock_fd = -1;
-	pthread_mutex_unlock(&iso->lock);
+	pthread_mutex_unlock(&iso->write_lock);
 
 	/* Closing the socket makes the reader thread's recv() return 0/error. */
 	if (sock_fd >= 0)
@@ -820,9 +892,25 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	pid_t pid = iso->pid;
 	if (pid > 0) {
 		int status;
-		struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000000 };
-		nanosleep(&ts, NULL);
-		if (waitpid(pid, &status, WNOHANG) == 0) {
+		/*
+		 * C-2: KILL runs on the single TX thread, so a fixed 500 ms sleep
+		 * here stalled ALL virtio processing for the whole VM on every
+		 * teardown (a guest CREATE/KILL loop could wedge throughput).
+		 * The stub already got ISOLATE_CMD_EXIT + a closed socket, so it
+		 * exits promptly; poll for that in short steps and break as soon
+		 * as it's reaped — typical stall ~10 ms.  SIGKILL only if it
+		 * overstays the budget (avoids a premature mid-ioctl kill).
+		 */
+		int reaped = 0;
+		for (int i = 0; i < 50; i++) {     /* up to ~500 ms, 10 ms steps */
+			if (waitpid(pid, &status, WNOHANG) != 0) {
+				reaped = 1;
+				break;
+			}
+			struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+			nanosleep(&ts, NULL);
+		}
+		if (!reaped) {
 			kill(pid, SIGKILL);
 			waitpid(pid, &status, 0);
 		}
@@ -833,7 +921,7 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	iso->in_use = false;
 	pthread_mutex_unlock(&iso->lock);
 
-	fprintf(stderr, "nvkvm_isolate: killed isolate %u\n", isolate_id);
+	NVKVM_DBG( "nvkvm_isolate: killed isolate %u\n", isolate_id);
 	return 0;
 }
 
@@ -977,6 +1065,38 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	return ret;
 }
 
+int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
+			    uint32_t isolate_id, uint32_t target_txn)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	struct isolate_cmd_interrupt cmd = {
+		.type       = ISOLATE_CMD_INTERRUPT,
+		.target_txn = target_txn,
+	};
+
+	/*
+	 * Fire-and-forget under write_lock — no sync_lock, no response wait.
+	 * The reader thread is the sole reader; the stub posts SIGUSR1 to the
+	 * worker and the interrupted ioctl's result comes back on the normal
+	 * IOCTL response path.  write_lock just serialises this write against
+	 * concurrent command writers on the same socket.
+	 */
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive &&
+		     iso->sock_fd >= 0;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	return sr < 0 ? (int)sr : 0;
+}
+
 int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 			      uint32_t isolate_id, uint32_t handle_id,
 			      uint32_t dev_id, uint32_t flags,
@@ -1108,21 +1228,27 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 
 	/* Send command under write_lock. */
 	struct isolate_cmd_ioctl hdr = {
-		.type       = ISOLATE_CMD_IOCTL,
-		.handle_id  = handle_id,
-		.cmd        = (uint32_t)cmd,
-		.param_size = (uint32_t)param_size,
-		.aux_size   = (uint32_t)aux_size,
-		.flags      = flags,
-		.txn_id     = pending.txn_id,
+		.type        = ISOLATE_CMD_IOCTL,
+		.handle_id   = handle_id,
+		.cmd         = (uint32_t)cmd,
+		.param_size  = (uint32_t)param_size,
+		.aux_size    = (uint32_t)aux_size,
+		.flags       = flags,
+		.txn_id      = pending.txn_id,
+		.abi_profile = t->abi_profile,   /* #81 */
 	};
 
 	pthread_mutex_lock(&iso->write_lock);
-	ssize_t sr = sock_send_full(iso->sock_fd, &hdr, sizeof(hdr));
+	/* C-1: snapshot the fd under write_lock; kill() nulls it under the same
+	 * lock, so a concurrent teardown is either ordered before us (we see -1
+	 * and skip) or after (our send completes before close()). */
+	int sfd = iso->sock_fd;
+	ssize_t sr = (sfd < 0) ? -EPIPE
+			      : sock_send_full(sfd, &hdr, sizeof(hdr));
 	if (sr >= 0 && param_size > 0)
-		sr = sock_send_full(iso->sock_fd, param_buf, param_size);
+		sr = sock_send_full(sfd, param_buf, param_size);
 	if (sr >= 0 && aux_size > 0)
-		sr = sock_send_full(iso->sock_fd, aux_buf, aux_size);
+		sr = sock_send_full(sfd, aux_buf, aux_size);
 	pthread_mutex_unlock(&iso->write_lock);
 
 	/*

@@ -35,12 +35,14 @@
 
 #include "stub_freestanding.h"
 #include "../common/nvkvm_isolate_proto.h"
+#include "../common/nvkvm_abi.h"
 
 /* ── Constants we'd otherwise pull from libc headers ─────────────────────── */
 
 /* From <asm-generic/errno-base.h> — the kernel UAPI errno values we use. */
 #ifndef EPERM
 #define EPERM     1
+#define EINTR     4
 #define EIO       5
 #define EBADF     9
 #define ENOMEM   12
@@ -67,6 +69,7 @@
 #ifndef PROT_READ
 #define PROT_READ      0x1
 #define PROT_WRITE     0x2
+#define PROT_EXEC      0x4
 #endif
 #ifndef MAP_PRIVATE
 #define MAP_PRIVATE    0x02
@@ -91,6 +94,7 @@
 
 /* Signal numbers + sigaction shape (kernel ABI, not glibc-augmented). */
 #define SIGSEGV     11
+#define SIGUSR1     10
 #define SA_SIGINFO  0x00000004
 #define SA_RESTORER 0x04000000
 
@@ -222,6 +226,9 @@ struct nvkvm_stub_uvm_register_channel_params {
 
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER  (1UL << 3)
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC         (1UL << 0)
 #endif
 
 /*
@@ -438,6 +445,9 @@ static int send_full(const void *buf, size_t len)
 	const char *p = buf;
 	while (len > 0) {
 		long n = stub_write(SOCK_FD, p, len);
+		/* A stray SIGUSR1 (txn interrupt, #73) can hit a worker mid-send;
+		 * retry rather than corrupt the response framing. */
+		if (n == -EINTR) continue;
 		if (n <= 0) return -1;
 		p += n; len -= (size_t)n;
 	}
@@ -449,6 +459,7 @@ static int recv_full(void *buf, size_t len)
 	char *p = buf;
 	while (len > 0) {
 		long n = stub_read(SOCK_FD, p, len);
+		if (n == -EINTR) continue;
 		if (n <= 0) return -1;
 		p += n; len -= (size_t)n;
 	}
@@ -494,9 +505,25 @@ static int send_error(int err)
 static volatile int       worker_tids[WORKER_SLOT_MAX];      /* tid → slot */
 static volatile uint64_t  worker_fault_addr[WORKER_SLOT_MAX];
 
+/*
+ * txn currently executing in each worker's stub_ioctl (0 = idle).  Set by the
+ * worker immediately before the ioctl and cleared immediately after, so the
+ * reader thread can map an ISOLATE_CMD_INTERRUPT(target_txn) to the worker's
+ * tid and post SIGUSR1, making the in-flight host ioctl return -EINTR (#73).
+ */
+static volatile uint32_t  worker_inflight_txn[WORKER_SLOT_MAX];
+
+/* Our own pid (== tgid), cached before seccomp so tgkill needs no getpid. */
+static int stub_pid;
+
 static int stub_gettid(void)
 {
 	return (int)sc0(__NR_gettid);
+}
+
+static int stub_tgkill(int tgid, int tid, int sig)
+{
+	return (int)sc3(__NR_tgkill, tgid, tid, sig);
 }
 
 static int worker_self_slot(void)
@@ -513,6 +540,19 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ctx)
 	(void)sig; (void)ctx;
 	int slot = worker_self_slot();
 	worker_fault_addr[slot] = (uint64_t)(uintptr_t)info->si_addr;
+	/*
+	 * Audit R2-H1: a SIGSEGV here is a *stub-side* bad dereference (a bug in
+	 * one of the embedded-pointer rewrites — the nvidia driver's own bad
+	 * accesses return -EFAULT, they don't raise SIGSEGV).  Returning from
+	 * this handler re-executes the faulting instruction → an infinite
+	 * SIGSEGV loop that pins the worker and a host core (a DoS).  The normal
+	 * forwarding path never faults (matmul/cuInit/7B are green), so instead
+	 * of looping we terminate the isolate cleanly: SYS_exit_group is
+	 * async-signal-safe, and QEMU's reader sees the dead socket and signals
+	 * every pending caller -ECONNRESET.  One isolate dies; no host-core burn,
+	 * no cross-tenant impact.
+	 */
+	stub_exit(139);  /* 128 + SIGSEGV */
 }
 
 static uint64_t get_fault_addr(void)
@@ -525,6 +565,37 @@ static void clear_fault_addr(void)
 	worker_fault_addr[worker_self_slot()] = 0;
 }
 
+/*
+ * SIGUSR1 handler — deliberately empty.  Its only purpose is to interrupt a
+ * blocking ioctl(2): registered WITHOUT SA_RESTART so the syscall returns
+ * -EINTR instead of auto-restarting.  Posted by the reader thread (tgkill) to
+ * the worker running an interrupted txn (#73).
+ */
+static void sigusr1_handler(int sig, siginfo_t *info, void *ctx)
+{
+	(void)sig; (void)info; (void)ctx;
+}
+
+/*
+ * Find the worker currently executing target_txn and post SIGUSR1 to it.
+ * Called on the reader thread for ISOLATE_CMD_INTERRUPT.  Best-effort: if no
+ * worker holds the txn (already finished, or not yet entered the ioctl) we do
+ * nothing — the normal IOCTL response path still delivers a result.
+ */
+static void interrupt_txn(uint32_t target_txn)
+{
+	if (target_txn == 0)
+		return;
+	for (int i = 1; i < WORKER_SLOT_MAX; i++) {
+		if (worker_inflight_txn[i] == target_txn) {
+			int tid = worker_tids[i];
+			if (tid > 0)
+				stub_tgkill(stub_pid, tid, SIGUSR1);
+			return;
+		}
+	}
+}
+
 /* ── Thread pool ──────────────────────────────────────────────────────────── */
 
 struct ioctl_job {
@@ -532,6 +603,7 @@ struct ioctl_job {
 	uint32_t handle_id;
 	uint32_t cmd;
 	uint32_t flags;
+	uint32_t abi_profile;   /* #81: host driver ABI id (version-variant offsets) */
 	/* param and aux blobs are malloc'd; worker frees them */
 	void    *param_buf;
 	uint32_t param_size;
@@ -752,9 +824,6 @@ static void worker_thread(void *arg)
 			}
 		}
 
-		/* NV_ESC_CARD_INFO: log how many valid entries the driver returned */
-		int is_card_info = ((job.cmd & 0xff) == 0xc8 &&
-				    job.param_size > 0 && job.aux_size == 0);
 
 		/*
 		 * UVM ioctls with embedded fd fields carry a handle_id (assigned
@@ -782,12 +851,11 @@ static void worker_thread(void *arg)
 				uvm_has_embedded_fd = 1;
 				break;
 			case NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION:
-				/* V550 layout (driver >= 550.54.14, our 575.51.03 included):
-				 * base(8) + length(8) + offset(8) +
-				 * per_gpu_attributes[256] (256 * 36 = 9216) +
-				 * gpu_attributes_count(8) = 9248
-				 * → rm_ctrl_fd at offset 9248. */
-				uvm_embedded_fd_off = 9248;
+				/* #81: rm_ctrl_fd offset is version-variant — 9248 for
+				 * the V550 256-entry layout (550.54.14+, incl 575/580),
+				 * 68 for the pre-V550 1-entry layout (535). */
+				uvm_embedded_fd_off =
+					nvkvm_abi_by_id(job.abi_profile)->uvm_map_ext_fd_off;
 				uvm_has_embedded_fd = 1;
 				break;
 			}
@@ -918,96 +986,6 @@ static void worker_thread(void *arg)
 			}
 		}
 
-		/* DEBUG: dump full struct bytes for ALLOC_OS_EVENT and
-		 * NV01_EVENT_OS_EVENT alloc so we can compare bytes
-		 * exactly.  Per user: corruption is also possible. */
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    ((job.cmd & 0xff) == 0xce || (job.cmd & 0xff) == 0xcf) &&
-		    job.param_size >= 16) {
-			const uint8_t *p = (const uint8_t *)job.param_buf;
-			char hex[64] = {0};
-			for (int i = 0; i < 16; i++)
-				fs_snprintf(hex + i*3, sizeof(hex) - i*3,
-					 "%02x ", p[i]);
-			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: pre-ioctl 0x%x param[16]=%s\n",
-				job.cmd & 0xff, hex);
-		}
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    (job.cmd & 0xff) == 0x2b &&
-		    job.aux_size >= 24 && job.param_size >= 16) {
-			uint32_t hclass;
-			__builtin_memcpy(&hclass, (char *)job.param_buf + 12, 4);
-			if (hclass == 0x79) {
-				const uint8_t *p = (const uint8_t *)job.param_buf;
-				const uint8_t *a = (const uint8_t *)job.aux_buf;
-				char hex_p[160] = {0}, hex_a[80] = {0};
-				for (uint32_t i = 0; i < job.param_size && i < 48; i++)
-					fs_snprintf(hex_p + i*3, sizeof(hex_p) - i*3,
-						 "%02x ", p[i]);
-				for (uint32_t i = 0; i < 24; i++)
-					fs_snprintf(hex_a + i*3, sizeof(hex_a) - i*3,
-						 "%02x ", a[i]);
-				fs_dprintf(STDERR_FD,
-					"nvkvm_stub: pre-ioctl 0x79 param[%u]=%s\n",
-					job.param_size, hex_p);
-				fs_dprintf(STDERR_FD,
-					"nvkvm_stub: pre-ioctl 0x79 aux[24]  =%s\n",
-					hex_a);
-			}
-		}
-		/* DEBUG: dump the exact bytes the driver will see for the
-		 * ALLOC_OS_EVENT family + NV01_EVENT_OS_EVENT alloc, plus
-		 * a snapshot of /proc/self/fd so we can confirm the fd
-		 * value we're handing to the driver actually maps to a
-		 * real nvidia file in this process. */
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    ((job.cmd & 0xff) == 0xce || (job.cmd & 0xff) == 0xcf) &&
-		    job.param_size >= 16) {
-			uint32_t hc, hd, fdval, st;
-			__builtin_memcpy(&hc,    (char *)job.param_buf + 0, 4);
-			__builtin_memcpy(&hd,    (char *)job.param_buf + 4, 4);
-			__builtin_memcpy(&fdval, (char *)job.param_buf + 8, 4);
-			__builtin_memcpy(&st,    (char *)job.param_buf + 12, 4);
-			char path[64];
-			int n = fs_snprintf(path, sizeof(path),
-					 "/proc/self/fd/%u", fdval);
-			char link[128] = {0};
-			long lret = sc4(__NR_readlinkat, AT_FDCWD,
-					(long)path, (long)link,
-					(long)(sizeof(link)-1));
-			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: pre-ioctl 0x%x hClient=0x%x fd=%u status=0x%x /proc/self/fd/%u=%s (ret=%ld)\n",
-				job.cmd & 0xff, hc, fdval, st, fdval,
-				lret > 0 ? link : "<none>", lret);
-			(void)hd; (void)n;
-		}
-		if (((job.cmd >> 8) & 0xff) == 'F' &&
-		    (job.cmd & 0xff) == 0x2b &&
-		    job.aux_size >= 24 && job.param_size >= 16) {
-			uint32_t hclass;
-			__builtin_memcpy(&hclass, (char *)job.param_buf + 12, 4);
-			if (hclass == 0x79) {
-				uint32_t hpc, hsr, hcl;
-				uint64_t data;
-				__builtin_memcpy(&hpc,   (char *)job.aux_buf + 0, 4);
-				__builtin_memcpy(&hsr,   (char *)job.aux_buf + 4, 4);
-				__builtin_memcpy(&hcl,   (char *)job.aux_buf + 8, 4);
-				__builtin_memcpy(&data,  (char *)job.aux_buf + 16, 8);
-				uint32_t fdval = (uint32_t)data;
-				char path[64], link[128] = {0};
-				fs_snprintf(path, sizeof(path),
-					 "/proc/self/fd/%u", fdval);
-				long lret = sc4(__NR_readlinkat, AT_FDCWD,
-						(long)path, (long)link,
-						(long)(sizeof(link)-1));
-				fs_dprintf(STDERR_FD,
-					"nvkvm_stub: pre-ioctl NV01_EVENT_OS_EVENT hPC=0x%x hSR=0x%x data=%u /proc/self/fd/%u=%s (ret=%ld)\n",
-					hpc, hsr, fdval, fdval,
-					lret > 0 ? link : "<none>", lret);
-				(void)hcl;
-			}
-		}
 
 		/*
 		 * NV_ESC_RM_ALLOC_MEMORY + hClass==NV01_MEMORY_SYSTEM_OS_DESCRIPTOR
@@ -1019,7 +997,13 @@ static void worker_thread(void *arg)
 		 * stub-local backing allocation is needed here.
 		 */
 		clear_fault_addr();
+		/* Publish our in-flight txn so the reader can SIGUSR1 us if the
+		 * guest signals this ioctl (#73).  Cleared the instant the ioctl
+		 * returns so a late interrupt lands on a no-op handler, not on
+		 * the post-processing/send path. */
+		worker_inflight_txn[slot] = job.txn_id;
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
+		worker_inflight_txn[slot] = 0;
 		/* sc*: negative return is -errno, matching kernel convention. */
 		int  err  = (ret < 0) ? (int)(-ret) : 0;
 		if (ret < 0) ret = -1;  /* normalise to (-1, errno) for callers */
@@ -1039,19 +1023,6 @@ static void worker_thread(void *arg)
 		    job.param_size >= fe_embedded_fd_off + 4) {
 			__builtin_memcpy((char *)job.param_buf + fe_embedded_fd_off,
 					 &saved_fe_embedded_fd, sizeof(int32_t));
-		}
-
-		if (is_card_info) {
-			int n = 0;
-			size_t entry_sz = 80; /* sizeof(nv_ioctl_card_info) on x86-64 */
-			size_t count = job.param_size / entry_sz;
-			for (size_t i = 0; i < count && i < 32; i++) {
-				uint8_t valid = *((uint8_t *)job.param_buf + i * entry_sz);
-				if (valid) n++;
-			}
-			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: CARD_INFO ret=%ld err=%d param_size=%u valid_entries=%d\n",
-				ret, err, job.param_size, n);
 		}
 
 		/* Zero the embedded pointer field in nvos54 (don't leak host VA) */
@@ -1109,7 +1080,9 @@ static void worker_thread(void *arg)
 			case 0x4a: off = job.param_size - 4; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@end */
 			case 0x4e: off = 40; break; /* NV_ESC_RM_MAP_MEMORY: nvos33_with_fd 56B status@40, fd@48 */
 			case 0x4f: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY: nvos34 32B status@24 */
-			case 0x57: off = 48; break; /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 56B status@48 */
+			case 0x57: /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 status@48 (V580: @56, #81) */
+				off = (int)nvkvm_abi_by_id(job.abi_profile)->nvos46_status_off;
+				break;
 			case 0x58: off = 40; break; /* NV_ESC_RM_UNMAP_MEMORY_DMA: nvos47 48B status@40 (incl pad0+dmaOff+size) */
 			default:
 				/* Fall back to size-based heuristic for ioctls
@@ -1314,10 +1287,11 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 	}
 
 	struct ioctl_job job = {
-		.txn_id     = cmd->txn_id,
-		.handle_id  = cmd->handle_id,
-		.cmd        = cmd->cmd,
-		.flags      = cmd->flags,
+		.txn_id      = cmd->txn_id,
+		.handle_id   = cmd->handle_id,
+		.cmd         = cmd->cmd,
+		.flags       = cmd->flags,
+		.abi_profile = cmd->abi_profile,   /* #81 */
 		.param_size = cmd->param_size,
 		.aux_size   = cmd->aux_size,
 	};
@@ -1610,7 +1584,7 @@ cleanup:
  */
 static long apply_seccomp(void)
 {
-	struct sock_filter filter[64];
+	struct sock_filter filter[96];
 	int n = 0;
 
 #define EMIT(...) do { \
@@ -1619,6 +1593,24 @@ static long apply_seccomp(void)
 } while (0)
 #define ALLOW_IF(nr_val) do { \
 	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 1)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
+} while (0)
+/*
+ * M-3: allow nr_val (mmap/mprotect) ONLY if it does NOT request PROT_EXEC at
+ * all.  Plain W^X (deny only W+X together) is insufficient: an attacker can
+ * mmap a page RW, write shellcode, then mprotect it R-X — each step passes W^X
+ * but the result is executable attacker code.  The stub's own .text is mapped
+ * executable by the ELF loader BEFORE seccomp and it never JITs (libcuda runs
+ * in the guest), so no runtime mapping ever needs PROT_EXEC.  Deny it outright.
+ * prot is args[2]; on no-match we fall through with nr still loaded.
+ */
+#define ALLOW_IF_NO_EXEC(nr_val) do { \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 5)); \
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
+		      offsetof(struct seccomp_data, args[2]))); \
+	EMIT(BPF_STMT(BPF_ALU|BPF_AND|BPF_K, PROT_EXEC)); \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, PROT_EXEC, 0, 1)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM)); \
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
 } while (0)
 
@@ -1635,8 +1627,8 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_recvmsg);
 	ALLOW_IF(__NR_sendmsg);
 	ALLOW_IF(__NR_ioctl);
-	ALLOW_IF(__NR_mmap);
-	ALLOW_IF(__NR_mprotect);
+	ALLOW_IF_NO_EXEC(__NR_mmap);
+	ALLOW_IF_NO_EXEC(__NR_mprotect);
 	ALLOW_IF(__NR_munmap);
 	ALLOW_IF(__NR_ppoll);
 	ALLOW_IF(__NR_close);
@@ -1645,16 +1637,14 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_rt_sigaction);
 	ALLOW_IF(__NR_rt_sigreturn);
 	ALLOW_IF(__NR_futex);
-	ALLOW_IF(__NR_clone);
 	ALLOW_IF(__NR_clone3);
-	ALLOW_IF(__NR_set_robust_list);
-	ALLOW_IF(__NR_madvise);
-	ALLOW_IF(__NR_lseek);
-	ALLOW_IF(__NR_pread64);
 	ALLOW_IF(__NR_openat);
 	ALLOW_IF(__NR_eventfd2);
 	ALLOW_IF(__NR_gettid);
-	ALLOW_IF(__NR_readlinkat);
+	ALLOW_IF(__NR_tgkill);   /* post SIGUSR1 to interrupt a worker's ioctl (#73) */
+	/* R2-L1: dropped vestigial entries with no freestanding caller —
+	 * clone (clone3 is used), set_robust_list, madvise, lseek, pread64,
+	 * readlinkat — to shrink the post-RCE syscall surface. */
 
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
 
@@ -1666,7 +1656,14 @@ static long apply_seccomp(void)
 		.filter = filter,
 	};
 	stub_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-	return stub_seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
+	/* TSYNC: apply the filter to EVERY thread in the group, not just the
+	 * caller.  The worker pool is spawned before this runs (audit C-1); a
+	 * non-TSYNC filter would bind to the reader thread only and leave the
+	 * workers — which run all attacker-influenced ioctl handling —
+	 * completely unsandboxed.  TSYNC requires every thread to already have
+	 * no_new_privs, which main() sets before the worker-spawn loop. */
+	return stub_seccomp(SECCOMP_SET_MODE_FILTER,
+			    SECCOMP_FILTER_FLAG_TSYNC, &prog);
 }
 
 /* ── Self-relocation ─────────────────────────────────────────────────────── */
@@ -1737,6 +1734,9 @@ int main(void)
 	/* Reader thread reserves slot 0 in worker_tids[] so SIGSEGV from
 	 * inline (non-worker) ioctls is captured against the right slot. */
 	worker_tids[0] = stub_gettid();
+	/* Cache our pid (== tgid) for tgkill — gettid on the main thread IS the
+	 * tgid, and getpid would otherwise need a seccomp slot at runtime. */
+	stub_pid = worker_tids[0];
 
 	/* SIGSEGV handler — per-worker fault address via worker_fault_addr[] */
 	struct kernel_sigaction sa = {
@@ -1745,6 +1745,22 @@ int main(void)
 		.sa_restorer   = stub_sigreturn_trampoline,
 	};
 	stub_sigaction(SIGSEGV, &sa, NULL);
+
+	/* SIGUSR1 handler — interrupt a worker's blocking ioctl (#73).  No
+	 * SA_RESTART, so the ioctl returns -EINTR instead of auto-restarting.
+	 * Default SIGUSR1 action is terminate, so this MUST be installed before
+	 * any tgkill can arrive. */
+	struct kernel_sigaction sa_usr1 = {
+		.sa_handler_fn = sigusr1_handler,
+		.sa_flags      = SA_RESTORER,
+		.sa_restorer   = stub_sigreturn_trampoline,
+	};
+	stub_sigaction(SIGUSR1, &sa_usr1, NULL);
+
+	/* Set no_new_privs BEFORE spawning workers so they inherit it at clone
+	 * time — required for the TSYNC seccomp filter (audit C-1) to attach to
+	 * the whole thread group below. */
+	stub_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
 	/* Spawn worker threads via clone3.  Each worker gets a fresh stack
 	 * and a slot id stashed in worker_tids[] for fault-addr indexing.
@@ -1790,10 +1806,11 @@ int main(void)
 	 * Apply the seccomp allowlist before entering the main loop.  After
 	 * this point only the explicitly-allowed syscalls work; anything
 	 * else returns -EPERM (or, for the arch-mismatch case, kills the
-	 * process).  Audit C6: re-enabled after the debug period; until
-	 * tightening lands (the openat/mprotect-PROT_EXEC arg filters), the
-	 * coarse allowlist still blocks execve, ptrace, fork, prctl, init_-
-	 * module, etc. — the actually-dangerous escape primitives.
+	 * process).  Audit C6/M-3: the allowlist blocks execve, ptrace, fork,
+	 * prctl, init_module, etc. — the dangerous escape primitives — and the
+	 * mmap/mprotect entries now enforce W^X (no PROT_WRITE|PROT_EXEC), so a
+	 * compromised stub cannot map RWX to inject code.  (openat remains bounded
+	 * by the post-pivot /dev dirfd sandbox, which seccomp can't path-filter.)
 	 *
 	 * The NVKVM_STUB_NO_SECCOMP env hatch was dropped along with libc:
 	 * the parent calls clearenv() before exec so there is no environment
@@ -1801,7 +1818,10 @@ int main(void)
 	 */
 	{
 		long sr = apply_seccomp();
-		if (sr < 0) {
+		/* R2-L2: TSYNC reports a per-thread sync failure as a POSITIVE
+		 * return (the offending tid) and applies the filter to nothing —
+		 * treat any non-zero as fatal, not just negative. */
+		if (sr != 0) {
 			fs_dprintf(STDERR_FD,
 				"nvkvm_stub: apply_seccomp failed: %ld\n",
 				sr);
@@ -1836,6 +1856,7 @@ int main(void)
 			struct isolate_cmd_unpoll           unpoll_cmd;
 			struct isolate_cmd_open_device      open_dev;
 			struct isolate_cmd_realize_uvm_fd   realize;
+			struct isolate_cmd_interrupt        interrupt_cmd;
 		} cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
@@ -1848,6 +1869,8 @@ int main(void)
 		};
 
 		long n = stub_recvmsg(SOCK_FD, &msg_hdr, 0);
+		if (n == -EINTR)
+			continue;   /* stray SIGUSR1; not EOF/error */
 		if (n <= 0)
 			break;
 		if (n < (long)sizeof(uint32_t))
@@ -1915,6 +1938,11 @@ int main(void)
 			handle_realize_uvm_fd(r);
 			break;
 		}
+		case ISOLATE_CMD_INTERRUPT:
+			/* Fire-and-forget: signal the worker on this txn so its
+			 * in-flight ioctl returns -EINTR.  No response. (#73) */
+			interrupt_txn(cmd.interrupt_cmd.target_txn);
+			break;
 		case ISOLATE_CMD_EXIT:
 			goto done;
 		default:

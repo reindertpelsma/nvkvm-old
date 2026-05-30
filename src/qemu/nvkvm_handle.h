@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include "nvkvm_log.h"
 
 #define NVKVM_HANDLE_TYPE_NVIDIA  1   /* open /dev/nvidia* fd     */
 #define NVKVM_HANDLE_TYPE_MEMORY  2   /* memfd                    */

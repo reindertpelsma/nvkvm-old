@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio.h"
 #include "hw/qdev-properties.h"
+#include "hw/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
@@ -229,7 +230,7 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 
 	resp_msg.resp.fd_token = cpu_to_le32(hfd->token);
 	resp_msg.resp.status   = 0;
-	fprintf(stderr, "nvkvm: open: dev_id=%u session=%u token=%u host_fd=%d\n",
+	NVKVM_DBG( "nvkvm: open: dev_id=%u session=%u token=%u host_fd=%d\n",
 		dev_id, session->id, hfd->token, hfd->fd);
 
 send:
@@ -638,6 +639,10 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_kill_isolate,
 			    nvkvm_resp_kill_isolate,
 			    nvkvm_req_kill_isolate)
+		ISOLATE_REQ(NVKVM_REQ_INTERRUPT,
+			    nvkvm_req_interrupt,
+			    nvkvm_resp_interrupt,
+			    nvkvm_req_interrupt)
 		ISOLATE_REQ(NVKVM_REQ_COPY_HANDLE_TO_ISOLATE,
 			    nvkvm_req_copy_handle_to_isolate,
 			    nvkvm_resp_copy_handle_to_isolate,
@@ -814,6 +819,19 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 static void nvkvm_get_config(VirtIODevice *vdev, uint8_t *config)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
+	/*
+	 * #55: resolve the sparse window to the firmware-assigned reservation-BAR
+	 * GPA (and install the raw memslot there) the first time the guest reads
+	 * config — which happens during the guest's nvkvm probe, after PCI
+	 * enumeration has programmed the BAR.  Advertise that base/len as the
+	 * window the guest validates returned GPAs against.  Falls back to the
+	 * fixed base if there's no BAR (nvkvm_sparse_ensure handles both).
+	 */
+	uint64_t base = nvkvm_sparse_ensure(nv);
+	if (base) {
+		nv->config_space.mmap_win_gpa = cpu_to_le64(base);
+		nv->config_space.mmap_win_len = cpu_to_le64((uint64_t)nv->sparse_size);
+	}
 	memcpy(config, &nv->config_space, sizeof(nv->config_space));
 }
 
@@ -849,10 +867,16 @@ VirtIONvgpu *nvkvm_get_global_device(void)
 	return g_nvkvm_device;
 }
 
+/* Verbose per-operation tracing gate (nvkvm_log.h). Off unless NVKVM_DEBUG
+ * is set in the environment; errors and security DENY logs are unconditional. */
+int nvkvm_debug_enabled;
+
 static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 {
 	VirtIODevice *vdev = VIRTIO_DEVICE(dev);
 	VirtIONvgpu  *nv   = VIRTIO_NVGPU(dev);
+
+	nvkvm_debug_enabled = (getenv("NVKVM_DEBUG") != NULL);
 
 	g_nvkvm_device = nv;
 
@@ -877,7 +901,7 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 				if (strcmp(link, "anon_inode:kvm-vm") == 0) {
 					int fd = atoi(de->d_name);
 					nvkvm_set_kvm_vm_fd(fd);
-					fprintf(stderr,
+					NVKVM_DBG(
 						"nvkvm: registered KVM vm fd %d\n", fd);
 					break;
 				}
@@ -914,6 +938,14 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	}
 	close(fd);
 
+	/* #81: select the per-version ABI profile from the host driver version.
+	 * The guest independently selects the same profile from the version
+	 * string we forward; QEMU also stamps the profile id into each
+	 * ISOLATE_CMD_IOCTL so the stub uses matching offsets. */
+	nv->abi = nvkvm_abi_for_version(nv->driver_version);
+	fprintf(stderr, "nvkvm: host driver %s → ABI profile %u\n",
+		nv->driver_version, nv->abi ? nv->abi->id : 0);
+
 	/* Allocate shared memory region */
 	nv->slot_size = NVKVM_SHM_SLOT_DEFAULT_SIZE;
 	nv->shm_size  = (size_t)NVKVM_SHM_NSLOTS * nv->slot_size;
@@ -944,6 +976,15 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	/* Initialize isolate/handle managers */
 	nvkvm_handle_table_init(&nv->handles);
 	nvkvm_isolate_table_init(&nv->isolates);
+	/* #81: stamp every forwarded IOCTL with the host driver's ABI id so the
+	 * stub uses matching version-variant offsets. */
+	nv->isolates.abi_profile = nv->abi ? nv->abi->id : NVKVM_ABI_570;
+
+	/* #66 admin subdevice (lazy; for GET_PID_INFO per-process VRAM) */
+	pthread_mutex_init(&nv->admin_lock, NULL);
+	nv->admin_ctl_fd = -1;
+	nv->admin_gpu_fd = -1;
+	nv->admin_state  = 0;
 
 	/* Register shared memory as a KVM memory region at NVKVM_SHM_GPA_BASE.
 	 * The guest reads shm_base/shm_len from the virtio config space and maps
@@ -964,6 +1005,22 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	 * regions that don't yet have backing.  Lazy via MAP_NORESERVE +
 	 * a single big KVM region. */
 	nv->sparse_kvm_slot = -1;
+	/*
+	 * #55 interim safety: the GPA windows (shm @1TB, mmap @1.5TB, sparse
+	 * @2TB) squat on fixed GPAs above guest RAM.  That holds for any normal
+	 * config, but a guest configured with >=1 TB RAM would overlap the shm
+	 * window and silently corrupt — fail loudly instead.  The real fix is to
+	 * expose the window as a 64-bit PCI BAR so guest firmware assigns/reserves
+	 * the range (docs/design/gpa_window_pci_bar.md).
+	 */
+	if (current_machine && current_machine->ram_size >= NVKVM_SHM_GPA_BASE) {
+		error_setg(errp,
+			"nvkvm: guest RAM (0x%" PRIx64 ") overlaps the fixed GPA "
+			"windows at 0x%llx; reduce RAM or migrate to the PCI-BAR "
+			"window (#55)", (uint64_t)current_machine->ram_size,
+			(unsigned long long)NVKVM_SHM_GPA_BASE);
+		return;
+	}
 	if (nvkvm_sparse_init(nv) < 0)
 		fprintf(stderr, "nvkvm: sparse window unavailable; "
 			"memory-ioctl path will degrade\n");
@@ -995,6 +1052,12 @@ static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 	/* Tear down isolates and handles before shared memory */
 	nvkvm_isolate_table_fini(&nv->isolates);
 	nvkvm_handle_table_fini(&nv->handles);
+
+	/* #66 admin subdevice: closing the fds frees its RM objects. */
+	if (nv->admin_ctl_fd >= 0) close(nv->admin_ctl_fd);
+	if (nv->admin_gpu_fd >= 0) close(nv->admin_gpu_fd);
+	nv->admin_ctl_fd = nv->admin_gpu_fd = -1;
+	nv->admin_state = -1;
 
 	if (nv->shm_mr_registered) {
 		memory_region_del_subregion(get_system_memory(), &nv->shm_mr);

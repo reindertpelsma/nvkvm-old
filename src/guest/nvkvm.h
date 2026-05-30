@@ -18,6 +18,7 @@
 #include <linux/list.h>
 
 #include "../../src/common/nvkvm_proto.h"
+#include "../../src/common/nvkvm_abi.h"
 #include "../../src/abi/nvgpu.h"
 
 /* virtio-nvgpu device ID.
@@ -180,6 +181,11 @@ struct nvkvm_inflight {
 	/* extended fields for isolate-path responses */
 	__u64               fault_addr; /* GVA of SIGSEGV in isolate (IOCTL_ON_ISOLATE) */
 	__u32               nvstatus;   /* NvStatus from NVIDIA params              */
+	/* When nonzero, nvkvm_send_sync waits interruptibly and, on a pending
+	 * signal, asks this isolate to interrupt the in-flight ioctl (txn_id).
+	 * Set only on the IOCTL_ON_ISOLATE path; control-plane reqs leave it 0
+	 * and wait uninterruptibly. */
+	__u32               isolate_id;
 };
 
 /* ── Global module state ──────────────────────────────────────────────────── */
@@ -244,6 +250,8 @@ struct nvkvm_state {
 
 	/* Host driver version (from shared memory ctrl block) */
 	char                    driver_version[64];
+	/* #81: per-version ABI profile, selected from driver_version at probe. */
+	const struct nvkvm_abi_profile *abi;
 
 	/* GPU mmap window — GPA range reserved for nvkvm_mmap_request() */
 	unsigned long           mmap_window_gpa_base;
@@ -253,6 +261,13 @@ struct nvkvm_state {
 /* ── Global module state (defined in nvkvm_main.c) ────────────────────────── */
 
 extern struct nvkvm_state nvkvm;
+
+/* #81: null-safe ABI profile accessor (defaults to the 570/575 layout set
+ * before probe has selected one from the host driver version). */
+static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
+{
+	return nvkvm.abi ? nvkvm.abi : nvkvm_abi_by_id(NVKVM_ABI_570);
+}
 
 /* ── Function declarations ─────────────────────────────────────────────────── */
 
@@ -271,6 +286,7 @@ int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle(__u32 handle_id);
 int  nvkvm_virtio_kill_isolate(__u32 isolate_id);
+int  nvkvm_virtio_interrupt_isolate(__u32 isolate_id, __u32 target_txn);
 long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 				   unsigned int cmd,
 				   void *params_buf, size_t param_size,

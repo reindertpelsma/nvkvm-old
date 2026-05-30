@@ -112,6 +112,7 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_READ_MEMORY_HANDLE     24  /* memfd → shm_slot (writeback)   */
 #define NVKVM_REQ_REALIZE_UVM_MAPPING    25  /* state-machine mmap-realize     */
 #define NVKVM_REQ_READ_HOST_FILE         26  /* read live host proc/sys file   */
+#define NVKVM_REQ_INTERRUPT              27  /* interrupt an in-flight ioctl   */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -225,6 +226,23 @@ struct nvkvm_req_kill_isolate {
 
 struct nvkvm_resp_kill_isolate {
 	__le32 status;
+	__le32 reserved;
+};
+
+/* ── INTERRUPT ───────────────────────────────────────────────────────────────
+ * Sent by the guest when a task blocked in a forwarded ioctl receives a
+ * signal.  QEMU routes it to the named isolate, which posts SIGUSR1 to the
+ * worker thread running txn_id so its blocking host ioctl returns -EINTR.
+ * Best-effort: the guest still waits (uninterruptibly) for the descriptor to
+ * be reclaimed; the interrupt only shortens how long the host keeps working.
+ */
+struct nvkvm_req_interrupt {
+	__le32 isolate_id;  /* QEMU-managed isolate holding the in-flight ioctl */
+	__le32 target_txn;  /* txn_id of the ioctl to interrupt                 */
+};
+
+struct nvkvm_resp_interrupt {
+	__le32 status;      /* 0 = routed; nonzero = unknown isolate/txn        */
 	__le32 reserved;
 };
 

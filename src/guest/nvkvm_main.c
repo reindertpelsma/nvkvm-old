@@ -462,6 +462,86 @@ static int nvkvm_synth_get_pids(void *params_buf, __u32 param_size)
 }
 
 /*
+ * NV2080_CTRL_CMD_GPU_GET_PID_INFO (0x2080018e) — per-pid GPU memory, used by
+ * nvidia-smi after GET_PIDS.  The inner params (in aux_buf) hold pidInfoList[]:
+ * count @0, then 56-byte entries @8 (pid @+0).  The host RM can't resolve guest
+ * pids, so we translate each pid to a tag encoding its owning isolate
+ * (0x80000000 | isolate_id) which QEMU swaps for the real host pid (validated
+ * against this VM's isolates) before the kernel sees it; the kernel then fills
+ * real memory for that host pid.  pid-ns correctness: we match via pid_vnr() in
+ * the CALLER's ns, so only sessions visible in that ns resolve — a foreign or
+ * out-of-ns pid is zeroed (kernel returns NOT_FOUND, no cross-ns/tenant leak).
+ * Originals are saved and restored into aux_buf on the response so nvidia-smi
+ * sees the pid it asked about alongside the real memory.
+ */
+#define NVKVM_NV2080_GET_PID_INFO 0x2080018eu
+#define NVKVM_PIDINFO_LIST_OFF    8u
+/* sizeof(NV2080_CTRL_GPU_PID_INFO) = 72: pid@0,index@4,result@8,data@16
+ * (6×NvU64 vidMemUsage union), smcSubscription@64.  Verified via sizeof on the
+ * 575 open-driver SDK headers. */
+#define NVKVM_PIDINFO_STRIDE      72u
+#define NVKVM_PIDINFO_MAX         200u
+
+static void nvkvm_get_pid_info_tag(void *aux, __u32 aux_size,
+				   __u32 **save_out, __u32 *n_out)
+{
+	__u32 count = 0, i, n = 0;
+	__u32 *save;
+
+	*save_out = NULL;
+	*n_out = 0;
+	if (aux_size < NVKVM_PIDINFO_LIST_OFF + 4)
+		return;
+	memcpy(&count, aux, 4);
+	if (count > NVKVM_PIDINFO_MAX)
+		count = NVKVM_PIDINFO_MAX;
+	save = kzalloc((size_t)NVKVM_PIDINFO_MAX * sizeof(__u32), GFP_KERNEL);
+	if (!save)
+		return;
+
+	for (i = 0; i < count; i++) {
+		__u32 off = NVKVM_PIDINFO_LIST_OFF + i * NVKVM_PIDINFO_STRIDE;
+		__u32 pid, iso = 0, repl;
+		struct nvkvm_session *s;
+		int id;
+
+		if ((size_t)off + 4 > aux_size)
+			break;
+		memcpy(&pid, (char *)aux + off, 4);
+		save[i] = pid;
+		/* Reverse of GET_PIDS: which session's tgid, in the caller's pid
+		 * ns, equals this queried pid?  pid_vnr() is ns-relative. */
+		mutex_lock(&nvkvm.sessions_lock);
+		idr_for_each_entry(&nvkvm.sessions_idr, s, id) {
+			if (s->tgid_pid && s->isolate_id &&
+			    (__u32)pid_vnr(s->tgid_pid) == pid) {
+				iso = s->isolate_id;
+				break;
+			}
+		}
+		mutex_unlock(&nvkvm.sessions_lock);
+		/* tag → QEMU resolves to host pid; 0 → kernel NOT_FOUND (filtered). */
+		repl = iso ? (0x80000000u | (iso & 0x7fffffffu)) : 0u;
+		memcpy((char *)aux + off, &repl, 4);
+		n = i + 1;
+	}
+	*save_out = save;
+	*n_out = n;
+}
+
+static void nvkvm_get_pid_info_restore(void *aux, __u32 aux_size,
+				       __u32 *save, __u32 n)
+{
+	__u32 i;
+	for (i = 0; i < n; i++) {
+		__u32 off = NVKVM_PIDINFO_LIST_OFF + i * NVKVM_PIDINFO_STRIDE;
+		if ((size_t)off + 4 > aux_size)
+			break;
+		memcpy((char *)aux + off, &save[i], 4);
+	}
+}
+
+/*
  * nvkvm_ioctl — validate and forward an ioctl to the host.
  *
  * Security: we validate param_size against the known ABI size before copying
@@ -477,6 +557,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	void *aux_buf = NULL;
 	size_t aux_size = 0;
 	void __user *aux_uptr = NULL;
+	__u32 *gpi_save = NULL;          /* GET_PID_INFO original pids to restore */
+	__u32 gpi_n = 0;
 	long ret;
 
 	if (!ctx)
@@ -786,6 +868,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 			aux_size = ctrl->params_size;
 
+			/* GET_PID_INFO: tag each guest pid with its owning isolate
+			 * (ns-filtered) so QEMU can resolve the real host pid; save
+			 * originals to restore on the response. */
+			if (ctrl->cmd == NVKVM_NV2080_GET_PID_INFO)
+				nvkvm_get_pid_info_tag(aux_buf, aux_size,
+						       &gpi_save, &gpi_n);
+
 			/*
 			 * Commands that embed an `NvxxxCtrlXxxGetInfoParams` preamble
 			 * (info_list_size, pad, info_list pointer) at the start of the
@@ -936,6 +1025,19 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					aux_size = ext;
 				}
 			}
+
+			/*
+			 * #79: NV0000_CTRL_CMD_GPU_GET_ID_INFO (0x202) has an
+			 * output pointer szName@16 (a guest VA the host driver
+			 * can't write).  The name is optional — cuInit doesn't
+			 * need it and nvidia-smi gets the model elsewhere — so
+			 * zero the pointer rather than forward a raw guest VA the
+			 * stub would deref (the driver null-checks szName).  This
+			 * closes the last unsanitized embedded pointer among the
+			 * allowlisted control cmds.
+			 */
+			if (ctrl->cmd == 0x00000202u && ctrl->params_size >= 24)
+				*(__u64 *)((char *)aux_buf + 16) = 0;
 		}
 	} else if (_IOC_NR(cmd) == NV_ESC_RM_ALLOC &&
 		   param_size == sizeof(struct nvos21_parameters) && params_buf) {
@@ -955,15 +1057,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = sizeof(struct nv2080_alloc_parameters);
 				break;
 			case RM_USER_SHARED_DATA:
-				ap_size = sizeof(struct nv00de_alloc_parameters_v545);
+				ap_size = nvkvm_prof()->nv00de_alloc_size;  /* #81 */
 				break;
 			case FERMI_VASPACE_A:
-				ap_size = sizeof(struct nv_vaspace_allocation_parameters);
+				ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81: 48 / V580 56 */
 				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
-				ap_size = sizeof(struct nv_memory_allocation_params_v545);
+				ap_size = nvkvm_prof()->mem_alloc_size;     /* #81 */
 				break;
 			case KEPLER_CHANNEL_GROUP_A:
 				ap_size = sizeof(struct nv_channel_group_allocation_parameters);
@@ -974,7 +1076,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case TURING_CHANNEL_GPFIFO_A:
 			case AMPERE_CHANNEL_GPFIFO_A:
 			case HOPPER_CHANNEL_GPFIFO_A:
-				ap_size = sizeof(struct nv_channel_alloc_params_v570);
+				ap_size = nvkvm_prof()->chan_alloc_size;    /* #81: base / V570 +8 */
 				break;
 			case NV01_EVENT_OS_EVENT:
 				ap_size = sizeof(struct nv0005_alloc_parameters);
@@ -989,6 +1091,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			case GT200_DEBUGGER:
 				ap_size = sizeof(struct nv83de_alloc_parameters);
+				break;
+			case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
+			case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
+			case AMPERE_COMPUTE_B: case ADA_COMPUTE_A:
+			case HOPPER_COMPUTE_A: case BLACKWELL_COMPUTE_A:
+			case BLACKWELL_COMPUTE_B:
+			case VOLTA_A: case TURING_A: case AMPERE_A:
+			case AMPERE_B: case ADA_A: case HOPPER_A:
+				ap_size = sizeof(struct nv_gr_allocation_parameters);
 				break;
 			}
 			if (ap_size > 0) {
@@ -1031,15 +1142,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = sizeof(struct nv2080_alloc_parameters);
 					break;
 				case RM_USER_SHARED_DATA:
-					ap_size = sizeof(struct nv00de_alloc_parameters_v545);
+					ap_size = nvkvm_prof()->nv00de_alloc_size;  /* #81 */
 					break;
 				case FERMI_VASPACE_A:
-					ap_size = sizeof(struct nv_vaspace_allocation_parameters);
+					ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81 */
 					break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
 				case NV01_MEMORY_SYSTEM:
-					ap_size = sizeof(struct nv_memory_allocation_params_v545);
+					ap_size = nvkvm_prof()->mem_alloc_size;     /* #81 */
 					break;
 				case KEPLER_CHANNEL_GROUP_A:
 					ap_size = sizeof(struct nv_channel_group_allocation_parameters);
@@ -1050,7 +1161,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case TURING_CHANNEL_GPFIFO_A:
 				case AMPERE_CHANNEL_GPFIFO_A:
 				case HOPPER_CHANNEL_GPFIFO_A:
-					ap_size = sizeof(struct nv_channel_alloc_params_v570);
+					ap_size = nvkvm_prof()->chan_alloc_size;    /* #81 */
 					break;
 				case NV01_EVENT_OS_EVENT:
 					ap_size = sizeof(struct nv0005_alloc_parameters);
@@ -1065,6 +1176,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				case GT200_DEBUGGER:
 					ap_size = sizeof(struct nv83de_alloc_parameters);
+					break;
+				case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
+				case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
+				case AMPERE_COMPUTE_B: case ADA_COMPUTE_A:
+				case HOPPER_COMPUTE_A: case BLACKWELL_COMPUTE_A:
+				case BLACKWELL_COMPUTE_B:
+				case VOLTA_A: case TURING_A: case AMPERE_A:
+				case AMPERE_B: case ADA_A: case HOPPER_A:
+					ap_size = sizeof(struct nv_gr_allocation_parameters);
 					break;
 				}
 			}
@@ -1190,6 +1310,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 * copy of the page (e.g. DtoH data); copy it back to the guest.
 		 */
 		nvkvm_cpu_pages_writeback(ctx);
+
+		/* GET_PID_INFO: restore the caller's own pids into aux_buf (QEMU
+		 * had swapped them for host pids); the kernel-filled memory data
+		 * stays, so nvidia-smi sees its pid + real usage. */
+		if (gpi_save)
+			nvkvm_get_pid_info_restore(aux_buf, aux_size,
+						   gpi_save, gpi_n);
 	} else {
 		/* Open establishes ctx->handle_id and ctx->session->isolate_id;
 		 * an ioctl on a ctx missing either is a logic bug. The legacy
@@ -1440,6 +1567,7 @@ done_aux_copy:
 		;
 	}
 
+	kfree(gpi_save);
 	kfree(aux_buf);
 	kfree(params_buf);
 	return ret;

@@ -43,6 +43,8 @@
 
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_isolate_proto.h"
+#include "../../src/common/nvkvm_abi.h"
+#include "nvkvm_log.h"
 #include "../../src/abi/nvgpu.h"
 #include "../../src/abi/uvm.h"
 #include "nvkvm_handle.h"
@@ -220,6 +222,18 @@ typedef struct VirtIONvgpu {
 	int                 sparse_kvm_slot;
 	pthread_mutex_t     sparse_lock;
 
+	/*
+	 * #55: the sparse window's GPA is the firmware-assigned base of the
+	 * reservation BAR (so QEMU/PCI never place anything else there), not a
+	 * hardcoded constant.  The PCI proxy sets window_base_get to a callback
+	 * that returns the BAR's current GPA (0 until the guest programs it).
+	 * The raw KVM memslot is installed lazily once the base is known
+	 * (nvkvm_sparse_ensure); if no BAR/callback, we fall back to the fixed
+	 * NVKVM_SPARSE_GPA_BASE so a transport without the BAR still works.
+	 */
+	uint64_t          (*window_base_get)(void *opaque);
+	void               *window_base_opaque;
+
 	/* Session table */
 	TAILQ_HEAD(, nvkvm_session) sessions;
 	pthread_mutex_t             sessions_lock;
@@ -247,6 +261,22 @@ typedef struct VirtIONvgpu {
 
 	/* Host NVIDIA driver version (read at init) */
 	char                driver_version[64];
+	/* #81: per-version ABI profile selected from driver_version at realize. */
+	const struct nvkvm_abi_profile *abi;
+
+	/*
+	 * #66 — QEMU's own init-ns admin RM subdevice, used only to answer
+	 * GET_PID_INFO (per-process VRAM for nvidia-smi).  The stub queries from
+	 * inside CLONE_NEWPID/NEWUSER, where the driver attributes 0 bytes; QEMU
+	 * is in the host init ns, where GET_PID_INFO returns the real value.
+	 * Lazily allocated on first use; freed when the device's fd closes.
+	 */
+	pthread_mutex_t     admin_lock;
+	int                 admin_ctl_fd;   /* /dev/nvidiactl (QEMU's process) */
+	int                 admin_gpu_fd;   /* /dev/nvidia0                    */
+	uint32_t            admin_hclient;
+	uint32_t            admin_hsubdev;
+	int                 admin_state;    /* 0 untried, 1 ready, -1 failed   */
 } VirtIONvgpu;
 
 #define TYPE_VIRTIO_NVGPU  "virtio-nvgpu-device"
@@ -312,6 +342,9 @@ int nvkvm_req_create_isolate(VirtIONvgpu *nv,
 int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 			    struct nvkvm_req_kill_isolate *req,
 			    struct nvkvm_resp_kill_isolate *resp);
+int nvkvm_req_interrupt(VirtIONvgpu *nv,
+			struct nvkvm_req_interrupt *req,
+			struct nvkvm_resp_interrupt *resp);
 int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,
 				      struct nvkvm_req_copy_handle_to_isolate *req,
 				      struct nvkvm_resp_copy_handle_to_isolate *resp);
@@ -387,6 +420,10 @@ int   nvkvm_sparse_init(VirtIONvgpu *nv);
 void  nvkvm_sparse_fini(VirtIONvgpu *nv);
 uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
+/* #55: resolve the window base (BAR-assigned, or fixed fallback) and lazily
+ * install the raw KVM memslot there.  Idempotent; returns the base GPA (0 on
+ * failure).  Safe to call from get_config and the alloc path. */
+uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv);
 VirtIONvgpu *nvkvm_get_global_device(void);
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
 

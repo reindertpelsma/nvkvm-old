@@ -20,6 +20,8 @@
 #include <sys/ioctl.h>
 
 #include "virtio_nvgpu.h"
+#include "nvkvm_ctrl_allowlist.h"
+#include "nvkvm_fe_alloc_allowlist.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -30,16 +32,6 @@
  */
 #define NVKVM_ISO_MMAP_MAX  8192
 
-/*
- * UVM's kernel-internal RM client handle (H-2 scoped grant target).  The RM
- * server hands out client handles as RS_CLIENT_HANDLE_BASE (0xc1d00000) | index;
- * UVM allocates its session client at module init, before any guest, so it is
- * the first client → 0xc1d00001, deterministic for the module's lifetime.  Used
- * as the TYPE_CLIENT target so only UVM (not a host neighbour) may dup the VA
- * space.  Verified by: cuCtxCreate stays green; if it ever returns 800 this
- * constant is stale and must be re-discovered via an open-driver printk.
- */
-#define NVKVM_UVM_KERNEL_CLIENT  0xc1d00001u
 
 struct nvkvm_iso_mmap_entry {
 	bool     used;
@@ -353,6 +345,26 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 	return 0;
 }
 
+/*
+ * NVKVM_REQ_INTERRUPT — a guest task blocked on a forwarded ioctl received a
+ * signal.  Route a best-effort interrupt to the named isolate's worker.
+ *
+ * Access model: isolate_id is QEMU-managed and VM-scoped; a guest can only
+ * name isolates this device created.  target_txn is the guest's own in-flight
+ * ioctl — interrupting it is purely an intra-VM concern, so no cross-VM check
+ * is needed (the guest kernel owns intra-VM policy).  We simply forward and
+ * report whether the isolate was live.
+ */
+int nvkvm_req_interrupt(VirtIONvgpu *nv,
+			struct nvkvm_req_interrupt *req,
+			struct nvkvm_resp_interrupt *resp)
+{
+	int ret = nvkvm_isolate_interrupt(&nv->isolates,
+					  req->isolate_id, req->target_txn);
+	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
+	return 0;
+}
+
 /* ── Handle distribution ────────────────────────────────────────────────── */
 
 int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,
@@ -491,6 +503,43 @@ static void nvkvm_client_allow_add(VirtIONvgpu *nv, uint32_t hc)
 	pthread_mutex_unlock(&nv->client_allow_lock);
 }
 
+/*
+ * #76 — is this RM control command allowed?  Default-deny (nvproxy parity):
+ * the static allowlist covers the CUDA-compute surface; two rule-based
+ * passthroughs cover GSP-routed cmds with no app pointers (legacy mask + the
+ * NV2081_BINAPI class).  Everything else is denied.  This is a host/cross-VM
+ * attack-surface control, so it lives in QEMU (the guest module is untrusted).
+ */
+static bool nvkvm_ctrl_cmd_allowed(uint32_t cmd)
+{
+	if (cmd & 0x8000u)                       /* RM_GSS_LEGACY_MASK */
+		return true;
+	if (((cmd >> 16) & 0xffffu) == 0x2081u)  /* NV2081_BINAPI class */
+		return true;
+	for (size_t i = 0; i < NVKVM_CTRL_ALLOWLIST_N; i++)
+		if (nvkvm_ctrl_allowlist[i] == cmd)
+			return true;
+	return false;
+}
+
+/* #76b — frontend-ioctl NR allowlist (nvproxy parity, default-deny). */
+static bool nvkvm_fe_nr_allowed(unsigned nr)
+{
+	for (size_t i = 0; i < NVKVM_FE_NR_ALLOWLIST_N; i++)
+		if (nvkvm_fe_nr_allowlist[i] == nr)
+			return true;
+	return false;
+}
+
+/* #76b — RM_ALLOC class allowlist (nvproxy parity, default-deny). */
+static bool nvkvm_alloc_class_allowed(uint32_t cls)
+{
+	for (size_t i = 0; i < NVKVM_ALLOC_CLASS_ALLOWLIST_N; i++)
+		if (nvkvm_alloc_class_allowlist[i] == cls)
+			return true;
+	return false;
+}
+
 static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
 {
 	bool found = false;
@@ -503,6 +552,157 @@ static bool nvkvm_client_allow_has(VirtIONvgpu *nv, uint32_t hc)
 	}
 	pthread_mutex_unlock(&nv->client_allow_lock);
 	return found;
+}
+
+/* NV2080_CTRL_GPU_PID_INFO is 72 bytes (pid@0, index@4, result@8, data@16 =
+ * NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA[6×NvU64], smcSubscription@64);
+ * pidInfoList[] starts at +8 in the params struct.  Verified via sizeof on the
+ * 575 open-driver SDK headers. */
+#define NVKVM_PIDINFO_STRIDE 72u
+
+/* ── #66: per-process VRAM via QEMU's own init-ns admin subdevice ─────────────
+ *
+ * The stub services GET_PID_INFO from inside CLONE_NEWPID/NEWUSER, where the
+ * driver attributes 0 bytes (caller-context). QEMU runs in the host init ns,
+ * where GET_PID_INFO returns the real per-process VRAM (proven: host nvidia-smi
+ * uses exactly this). So we keep a small admin RM client+device+subdevice in
+ * QEMU's process and answer GET_PID_INFO from there, querying the validated
+ * isolate's own host tids (never an arbitrary guest-named pid).
+ */
+#define NVADM_IOWR(nr, sz) \
+	((unsigned long)(0xc0000000UL | ((unsigned long)(sz) << 16) | \
+			 (0x46UL << 8) | (unsigned long)(nr)))
+#define NV2080_CTRL_CMD_GPU_GET_PID_INFO 0x2080018eU
+
+static int admin_rm_alloc(int fd, uint32_t h_root, uint32_t h_parent,
+			  uint32_t h_new, uint32_t h_class, void *parms,
+			  uint32_t *out)
+{
+	struct nvos21_parameters a = {
+		.h_root = h_root, .h_object_parent = h_parent,
+		.h_object_new = h_new, .h_class = h_class,
+		.p_alloc_parms = (nvp64_t)(uintptr_t)parms,
+	};
+	if (ioctl(fd, NVADM_IOWR(NV_ESC_RM_ALLOC, sizeof a), &a) < 0)
+		return -errno;
+	if (a.status != 0)
+		return -1;
+	*out = a.h_object_new;
+	return 0;
+}
+
+/* Lazily build QEMU's admin client→device→subdevice on GPU0.  admin_lock held. */
+static int nvkvm_admin_ensure(VirtIONvgpu *nv)
+{
+	if (nv->admin_state != 0)
+		return nv->admin_state == 1 ? 0 : -1;
+
+	int ctl = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+	int gpu = open("/dev/nvidia0",  O_RDWR | O_CLOEXEC);
+	uint32_t client = 0, dev = 0, sub = 0;
+	struct nv0080_alloc_parameters dp = { .device_id = 0 };
+	struct nv2080_alloc_parameters sp = { .sub_device_id = 0 };
+
+	if (ctl < 0 || gpu < 0)
+		goto fail;
+	if (admin_rm_alloc(ctl, 0, 0, 0xad000001u, NV01_ROOT, NULL, &client))
+		goto fail;
+	if (admin_rm_alloc(ctl, client, client, 0xad000d00u,
+			   NV01_DEVICE_0, &dp, &dev))
+		goto fail;
+	if (admin_rm_alloc(ctl, client, dev, 0xad002080u,
+			   NV20_SUBDEVICE_0, &sp, &sub))
+		goto fail;
+
+	nv->admin_ctl_fd = ctl;
+	nv->admin_gpu_fd = gpu;
+	nv->admin_hclient = client;
+	nv->admin_hsubdev = sub;
+	nv->admin_state = 1;
+	return 0;
+fail:
+	if (ctl >= 0) close(ctl);
+	if (gpu >= 0) close(gpu);
+	nv->admin_state = -1;
+	return -1;
+}
+
+/*
+ * Sum a per-pid VRAM metric (memPrivate + memSharedOwned) for the host process
+ * group `tgid`, queried from QEMU's init-ns admin subdevice.  `index` selects
+ * the metric (VIDEO_MEMORY_USAGE).  *any_out set if >=1 tid returned NV_OK.
+ * Security: tgid is the validated isolate's own process; we only query tids
+ * under it, never an arbitrary guest-named pid.
+ */
+static uint64_t nvkvm_admin_get_pid_mem(VirtIONvgpu *nv, pid_t tgid,
+					uint32_t index, int *any_out)
+{
+	if (any_out)
+		*any_out = 0;
+
+	pthread_mutex_lock(&nv->admin_lock);
+	if (nvkvm_admin_ensure(nv) != 0) {
+		pthread_mutex_unlock(&nv->admin_lock);
+		return 0;
+	}
+	int ctl = nv->admin_ctl_fd;
+	uint32_t hcli = nv->admin_hclient, hsub = nv->admin_hsubdev;
+
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/task", (int)tgid);
+	DIR *d = opendir(path);
+	if (!d) {
+		pthread_mutex_unlock(&nv->admin_lock);
+		return 0;
+	}
+
+	uint64_t sum = 0;
+	int any = 0;
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		if (de->d_name[0] < '0' || de->d_name[0] > '9')
+			continue;
+		long tid = strtol(de->d_name, NULL, 10);
+		if (tid <= 0)
+			continue;
+
+		/* The driver's NV2080_CTRL_GPU_GET_PID_INFO_PARAMS is a FIXED-size
+		 * struct: pidInfoListCount@0, then pidInfoList[200]@8 inline
+		 * (200 * 72 = 14400 → 14408 total).  A short buffer fails the
+		 * kernel's paramsSize check (status != 0).  Send the full size with
+		 * count=1 and only entry[0] populated. */
+		uint8_t p[8 + 200 * NVKVM_PIDINFO_STRIDE];
+		memset(p, 0, sizeof(p));
+		uint32_t one = 1, t32 = (uint32_t)tid;
+		memcpy(p + 0, &one, 4);
+		memcpy(p + 8 + 0, &t32, 4);     /* entry.pid (init-ns host tid) */
+		memcpy(p + 8 + 4, &index, 4);   /* entry.index                 */
+
+		struct nvos54_parameters c = {
+			.h_client = hcli, .h_object = hsub,
+			.cmd = NV2080_CTRL_CMD_GPU_GET_PID_INFO,
+			.params = (nvp64_t)(uintptr_t)p,
+			.params_size = (uint32_t)sizeof(p),
+		};
+		int r = ioctl(ctl, NVADM_IOWR(NV_ESC_RM_CONTROL, sizeof c), &c);
+		if (r < 0 || c.status != 0)
+			continue;
+
+		uint32_t result = 0;
+		uint64_t priv = 0, shOwned = 0;
+		memcpy(&result,  p + 8 + 8,  4);
+		memcpy(&priv,    p + 8 + 16, 8);
+		memcpy(&shOwned, p + 8 + 24, 8);
+		if (result == 0) {              /* NV_OK */
+			sum += priv + shOwned;
+			any = 1;
+		}
+	}
+	closedir(d);
+	pthread_mutex_unlock(&nv->admin_lock);
+	if (any_out)
+		*any_out = any;
+	return sum;
 }
 
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
@@ -542,7 +742,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			 * the UVM allowlist; refuse anything not described. */
 			const struct nvkvm_uvm_desc *d = nvkvm_uvm_lookup(req->cmd);
 			if (!d) {
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: DENY unschemaed UVM ioctl cmd=0x%x "
 					"(default-deny)\n", req->cmd);
 				resp->retval     = (uint64_t)(int64_t)(-EPERM);
@@ -553,7 +753,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			}
 			if (req->param_size < d->min_size ||
 			    (d->min_size > 0 && !param_buf)) {
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: DENY UVM cmd=0x%x short param_size=%u "
 					"(<%u)\n", req->cmd, req->param_size,
 					d->min_size);
@@ -622,6 +822,26 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			return 0;
 		}
 	}
+
+	/*
+	 * M-A (audit 2026-05-30): default-deny any non-'F'-type cmd here.  UVM
+	 * handles (type 0) already returned in the schema block above; every
+	 * legitimate RM ioctl on nvidiactl/nvidia0 is _IOC_TYPE 'F'.  Without
+	 * this, a guest crafting a cmd with a non-'F' type would skip ALL the
+	 * frontend allowlists below (they all guard on type=='F') and fall
+	 * straight through to the raw ioctl() in the stub — the kmd dispatches
+	 * on _IOC_NR, so that could reach a denied privileged escape.
+	 */
+	if (_IOC_TYPE(req->cmd) != 'F') {
+		NVKVM_DBG("nvkvm: DENY non-'F' cmd 0x%x (type=0x%x)\n",
+			  req->cmd, _IOC_TYPE(req->cmd));
+		resp->retval     = (uint64_t)(int64_t)(-EPERM);
+		resp->status     = 0;
+		resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+		resp->fault_addr = 0;
+		return 0;
+	}
+
 	/*
 	 * REGISTER_FD now runs inside the isolate (stub) along with every
 	 * other RM ioctl: the stub allocated the pClient (NV01_ROOT_CLIENT)
@@ -639,7 +859,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	    (_IOC_NR(req->cmd) == 0xce || _IOC_NR(req->cmd) == 0xcf) &&
 	    param_buf && req->param_size >= 16) {
 		const uint8_t *p = param_buf;
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm qemu pre 0x%x param[16]= "
 			"%02x %02x %02x %02x %02x %02x %02x %02x "
 			"%02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -654,7 +874,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&hclass, (char *)param_buf + 12, 4);
 		if (hclass == 0x79) {
 			const uint8_t *a = aux_buf;
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm qemu pre 0x79 aux[24]= "
 				"%02x %02x %02x %02x  %02x %02x %02x %02x "
 				"%02x %02x %02x %02x  %02x %02x %02x %02x "
@@ -662,6 +882,60 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],
 				a[8],a[9],a[10],a[11],a[12],a[13],a[14],a[15],
 				a[16],a[17],a[18],a[19],a[20],a[21],a[22],a[23]);
+		}
+	}
+
+	/*
+	 * #76b default-deny frontend-ioctl + alloc-class allowlists (nvproxy
+	 * parity).  A 'F' ioctl whose NR is outside the known RM frontend set, or
+	 * an RM_ALLOC of a class outside the permitted set, is refused before it
+	 * reaches the host driver.  Host/cross-VM attack-surface control → QEMU.
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F') {
+		unsigned nr = _IOC_NR(req->cmd);
+		if (!nvkvm_fe_nr_allowed(nr)) {
+			fprintf(stderr, "nvkvm: DENY frontend ioctl nr=0x%02x\n", nr);
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
+		}
+		/* RM_ALLOC (nvos21/nvos64): hClass at param+12 (shared prefix). */
+		if (nr == 0x2b && param_buf && req->param_size >= 16) {
+			uint32_t cls = 0;
+			memcpy(&cls, (char *)param_buf + 12, 4);
+			if (!nvkvm_alloc_class_allowed(cls)) {
+				fprintf(stderr, "nvkvm: DENY alloc class 0x%08x\n", cls);
+				resp->retval     = (uint64_t)(int64_t)(-EACCES);
+				resp->status     = 0;
+				resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+				resp->fault_addr = 0;
+				return 0;
+			}
+		}
+	}
+
+	/*
+	 * #76 default-deny RM control-command allowlist (nvproxy parity).  Reject
+	 * any control cmd outside the CUDA-compute surface before it reaches the
+	 * host driver — closes reg-ops / HWPM / debug / fabric / power surfaces a
+	 * guest could otherwise drive on any client it owns.  Also bound the inner
+	 * params size (1 MiB) as nvproxy does (our 64K slots already cap it, but be
+	 * explicit).
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL &&
+	    param_buf && req->param_size >= 12) {
+		uint32_t cc = 0;
+		memcpy(&cc, (char *)param_buf + 8, 4);
+		if (!nvkvm_ctrl_cmd_allowed(cc) || req->aux_size > (1u << 20)) {
+			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
+				"(not in allowlist / oversize)\n", cc);
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
 		}
 	}
 
@@ -681,7 +955,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&h_client_src, (char *)param_buf + 12, 4);
 		if (h_client_src != 0 && h_client_src != (uint32_t)-1 &&
 		    !nvkvm_client_allow_has(nv, h_client_src)) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: DENY DUP_OBJECT foreign h_client_src=0x%x "
 				"(not a client of this VM)\n", h_client_src);
 			resp->retval     = (uint64_t)(int64_t)(-EACCES);
@@ -729,7 +1003,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			}
 			if (!is_root_alloc && hc != 0 && hc != (uint32_t)-1 &&
 			    !nvkvm_client_allow_has(nv, hc)) {
-				fprintf(stderr,
+				NVKVM_DBG(
 					"nvkvm: DENY ioctl NR=0x%x foreign hClient=0x%x "
 					"(not a client of this VM)\n", nr, hc);
 				resp->retval     = (uint64_t)(int64_t)(-EACCES);
@@ -737,6 +1011,65 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
 				resp->fault_addr = 0;
 				return 0;
+			}
+		}
+	}
+
+	/*
+	 * GET_PID_INFO (#66): NV2080_CTRL_CMD_GPU_GET_PID_INFO (inner cmd
+	 * 0x2080018e) carries pidInfoList[] in aux_buf (count@0, 56-byte entries
+	 * @8, pid@+0).  The guest tagged each pid it owns with 0x80000000|
+	 * isolate_id (ns-filtered).  We validate the isolate belongs to THIS VM and
+	 * write its stub-process tgid into the pid field so the baseline forward
+	 * resolves a known process (NV_OK).  Because nvidia attributes vidmem to the
+	 * worker *tid* that owns each RM client — and our pool spreads ownership
+	 * across the stub's worker tids — the tgid query returns 0 bytes; we fix
+	 * that up post-forward by summing per-tid (nvkvm_get_pid_info_sum).  QEMU
+	 * thus validates pids against managed isolates: a guest can never make the
+	 * privileged stub query an arbitrary host pid.  The guest restores its own
+	 * pids into the response, so nvidia-smi sees its pid + the real usage.
+	 */
+	bool     gpi_active = false;
+	uint32_t gpi_count  = 0;
+	static __thread uint32_t gpi_iso[200];   /* per-entry isolate (0 = skip) */
+	if (_IOC_TYPE(req->cmd) == 'F' &&
+	    _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL &&
+	    param_buf && req->param_size >= 12 &&
+	    aux_buf && req->aux_size >= 8 + NVKVM_PIDINFO_STRIDE) {
+		uint32_t icmd = 0;
+		memcpy(&icmd, (char *)param_buf + 8, 4);
+		if (icmd == 0x2080018eu) {        /* NV2080_CTRL_CMD_GPU_GET_PID_INFO */
+			uint32_t count = 0;
+			memcpy(&count, aux_buf, 4);
+			if (count > 200)
+				count = 200;
+			gpi_active = true;
+			gpi_count  = count;
+			for (uint32_t i = 0; i < count; i++) {
+				uint32_t off = 8 + i * NVKVM_PIDINFO_STRIDE;
+				uint32_t v = 0, repl = 0;
+				gpi_iso[i] = 0;
+				/* Require the FULL 72-byte entry to fit: the
+				 * post-forward fixup writes result@off+8 and
+				 * sum@off+16 (out to off+24).  Validating only
+				 * off+4 here let a guest (aux_size=84,count=2)
+				 * drive a ~20-byte OOB write in QEMU (audit H-A). */
+				if ((uint64_t)off + NVKVM_PIDINFO_STRIDE >
+				    req->aux_size) {
+					gpi_count = i;
+					break;
+				}
+				memcpy(&v, (char *)aux_buf + off, 4);
+				if (v & 0x80000000u) {
+					uint32_t iso = v & 0x7fffffffu;
+					pid_t hp = nvkvm_isolate_host_pid(
+						&nv->isolates, iso);
+					if (hp > 0) {
+						repl = (uint32_t)hp;
+						gpi_iso[i] = iso;
+					}
+				}
+				memcpy((char *)aux_buf + off, &repl, 4);
 			}
 		}
 	}
@@ -757,6 +1090,34 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	resp->status     = (ret == -EFAULT && fault_addr) ? EFAULT : 0;
 	resp->nvstatus   = nvstatus;
 	resp->fault_addr = fault_addr;
+
+	/*
+	 * GET_PID_INFO fixup (#66): the baseline forward queried each entry's stub
+	 * tgid and got NV_OK with 0 bytes (vidmem is tid-attributed).  For every
+	 * entry that mapped to a validated isolate, sum the metric across that
+	 * isolate's worker tids and overwrite the entry's data union, marking it
+	 * NV_OK so nvidia-smi reports the real per-process usage.
+	 */
+	if (gpi_active && ret == 0) {
+		for (uint32_t i = 0; i < gpi_count; i++) {
+			if (gpi_iso[i] == 0)
+				continue;
+			uint32_t off = 8 + i * NVKVM_PIDINFO_STRIDE;
+			pid_t tgid = nvkvm_isolate_host_pid(&nv->isolates,
+							    gpi_iso[i]);
+			if (tgid <= 0)
+				continue;
+			uint32_t index = 0;
+			memcpy(&index, (char *)aux_buf + off + 4, 4);
+			int any = 0;
+			/* #66: query from QEMU's init-ns admin subdevice — the
+			 * stub's pid-ns caller-context attributes 0 bytes. */
+			uint64_t sum = nvkvm_admin_get_pid_mem(nv, tgid, index, &any);
+			uint32_t result = any ? 0u : 0xffffu; /* NV_OK / NOT_FOUND */
+			memcpy((char *)aux_buf + off + 8, &result, 4);
+			memcpy((char *)aux_buf + off + 16, &sum, 8);
+		}
+	}
 
 	/*
 	 * Phase 4 — record this VM's RM client handles.  Every successful 'F'
@@ -865,28 +1226,35 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			} share = {
 				.hClient    = hClient,
 				.hObject    = hObjNew,
-				/* Phase 4 step 3 (H-2) — narrow the grant from
-				 * host-wide TYPE_ALL to TYPE_CLIENT scoped to the
-				 * ONLY legitimate consumer: UVM's kernel RM client
-				 * (UVM runs in QEMU — only the VM maps guest GPA —
-				 * so the dup is performed by UVM's internal client,
-				 * not QEMU's task; TYPE_PID(QEMU) was tried and
-				 * failed for that reason).  rs_resource.c matches
-				 * TYPE_CLIENT when target == invoking client's
-				 * hClient, so a host neighbour (any other client)
-				 * no longer matches → the cross-tenant DUP hole is
-				 * closed at the kernel, not just in our gate.
+				/*
+				 * Grant RS_ACCESS_DUP_OBJECT so UVM (the legitimate
+				 * consumer, running in QEMU/the isolate) can dup this
+				 * VA-space/memory object during cuCtxCreate's UVM map.
 				 *
-				 * NVKVM_UVM_KERNEL_CLIENT is the first RM client the
-				 * server allocates (RS_CLIENT_HANDLE_BASE | 1) — UVM
-				 * inits before any guest, so it is deterministic for
-				 * the module's lifetime.  If a future driver/init
-				 * order changes it, cuCtxCreate returns 800 and we
-				 * discover the live value via an open-driver printk
-				 * in the dup access path (rs_client.c rights check). */
-				.target     = NVKVM_UVM_KERNEL_CLIENT,
+				 * Share type = RS_SHARE_TYPE_ALL.  This is NOT a
+				 * cross-tenant hole: cross-VM/host containment comes
+				 * from the handle NAMESPACE (reach-gating), not the
+				 * share type.  A foreign client cannot RESOLVE another
+				 * client's object — the dup fails at
+				 * clientGetResourceRef (NV_ERR_OBJECT_NOT_FOUND, 0x57)
+				 * BEFORE the share policy is consulted.  Proven by
+				 * tests/security/poc_cross_proc_dup: an unprivileged
+				 * host neighbour, with a valid device parent, naming
+				 * the exact live (hClientSrc,hObjectSrc) of a guest
+				 * VRAM object, is denied 0x57 EVEN UNDER TYPE_ALL —
+				 * i.e. even when ALL grants it the DUP right, it still
+				 * can't reach the object.  So the right is irrelevant
+				 * to neighbours; only legitimate consumers can reach.
+				 *
+				 * This replaces the former TYPE_CLIENT(0xc1d00001) grant
+				 * (H-2), which depended on a hardcoded "UVM is the first
+				 * RM client" assumption that broke on any reboot/init-
+				 * order change (stale handle → SHARE 0x33 → cuCtxCreate
+				 * 800 → all GPU tests blocked).  H-2 guarded a
+				 * theoretical hole the reach-gate already closes. */
+				.target     = 0,     /* unused for TYPE_ALL */
 				.accessMask = 0x1,   /* RS_ACCESS_DUP_OBJECT */
-				.type       = 3,     /* RS_SHARE_TYPE_CLIENT */
+				.type       = 1,     /* RS_SHARE_TYPE_ALL */
 				.action     = 0,     /* grant (no REVOKE/REQUIRE/COMPOSE) */
 				.status     = 0,
 			};
@@ -901,7 +1269,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 						       0,
 						       &share_nvstatus,
 						       &share_fault);
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: post-alloc SHARE hClient=0x%x hClass=0x%x "
 				"hObj=0x%x ret=%d nvstatus=0x%x status=0x%x\n",
 				hClient, hClass, hObjNew, sret, share_nvstatus,
@@ -934,7 +1302,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		memcpy(&mm_status,(char *)param_buf + 40, sizeof(uint32_t));
 		memcpy(&flags,    (char *)param_buf + 44, sizeof(uint32_t));
 		memcpy(&fd,       (char *)param_buf + 48, sizeof(int32_t));
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: RM_MAP_MEMORY: h_client=0x%x h_device=0x%x "
 			"h_memory=0x%x offset=0x%llx length=0x%llx flags=0x%x "
 			"fd=%d -> pLinear=0x%llx status=0x%x\n",
@@ -957,7 +1325,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		uint32_t aps = 0;
 		if (req->param_size == sizeof(struct nvos64_parameters))
 			memcpy(&aps, (char *)param_buf + 32, sizeof(uint32_t));
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: RM_ALLOC failed: hClient=0x%x hParent=0x%x "
 			"hObjNew=0x%x hClass=0x%x alloc_parms_size=%u aux_size=%u "
 			"nvstatus=0x%x\n",
@@ -976,13 +1344,13 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	}
 
 	if (inner_cmd) {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: ioctl_on_isolate: isolate=%u handle=%u cmd=0x%x "
 			"inner=0x%x ret=%lld nvstatus=0x%x fault=0x%llx\n",
 			req->isolate_id, req->handle_id, req->cmd, inner_cmd,
 			(long long)ret, nvstatus, (unsigned long long)fault_addr);
 	} else {
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: ioctl_on_isolate: isolate=%u handle=%u cmd=0x%x "
 			"ret=%lld nvstatus=0x%x fault=0x%llx\n",
 			req->isolate_id, req->handle_id, req->cmd,
@@ -1011,7 +1379,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		    req->param_size >= rm_status_off + 4) {
 			uint32_t rmst = 0;
 			memcpy(&rmst, (char *)param_buf + rm_status_off, 4);
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: ioctl_on_isolate UVM: cmd=0x%x rm_status=0x%x\n",
 				req->cmd, rmst);
 		}
@@ -1073,8 +1441,16 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
+	/* N-2: bound the raw length BEFORE the page-align round-up — a length
+	 * near SIZE_MAX would otherwise wrap to a small page-multiple that
+	 * passes the len<=sparse_size check below, giving the guest a mapping
+	 * far smaller than it asked for. */
+	if (req->length == 0 || req->length > nv->sparse_size) {
+		resp->status = EINVAL;
+		return 0;
+	}
 	size_t len = (size_t)req->length;
-	len = (len + 4095UL) & ~4095UL;  /* page-align */
+	len = (len + 4095UL) & ~4095UL;  /* page-align (no wrap: bounded above) */
 
 	/*
 	 * Audit M-1: this mmap runs in the privileged QEMU process against the
@@ -1115,7 +1491,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		gpa = nvkvm_sparse_gpa_alloc(nv, len);
 		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
 		if (!target) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: mmap_on_isolate: sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);
@@ -1126,7 +1502,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			   MAP_SHARED | MAP_FIXED, h->fd, (off_t)req->offset);
 		if (qva == MAP_FAILED) {
 			int se = errno;
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: mmap_on_isolate(window) FAIL fd=%d "
 				"dev_id=%d prot=0x%x len=%lu off=0x%lx "
 				"gpa=0x%llx errno=%d (%s)\n",
@@ -1165,7 +1541,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		gpa = nvkvm_sparse_gpa_alloc(nv, len);
 		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
 		if (!target) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: mmap_on_isolate(uvm): sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);
@@ -1329,6 +1705,13 @@ int nvkvm_req_write_memory_handle(VirtIONvgpu *nv,
 		resp->status = EBADF;
 		return 0;
 	}
+	/* N-1: only a memfd handle may be pwrite()'n. Reject device/eventfd
+	 * (TYPE_NVIDIA) handles so a guest can't drive read/write fops + an
+	 * arbitrary offset against a real /dev/nvidia* or eventfd fd. */
+	if (h->type != NVKVM_HANDLE_TYPE_MEMORY) {
+		resp->status = EBADF;
+		return 0;
+	}
 
 	ssize_t n = pwrite(h->fd, data_buf, req->size, (off_t)req->offset);
 	if (n < 0) {
@@ -1354,6 +1737,11 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
 
 	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
 	if (!h || h->fd < 0) {
+		resp->status = EBADF;
+		return 0;
+	}
+	/* N-1: only a memfd handle may be pread() — see write handler. */
+	if (h->type != NVKVM_HANDLE_TYPE_MEMORY) {
 		resp->status = EBADF;
 		return 0;
 	}

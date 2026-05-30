@@ -409,14 +409,17 @@ static void test_rm_control_wrong_size(void)
     int saved_errno = errno;
 
     /*
-     * We expect failure: ret == -1 and errno is EINVAL or ENOTTY.
-     * Either is acceptable — the important thing is the ioctl was rejected.
+     * We expect failure: ret == -1 and the ioctl is rejected.  Accept EINVAL/
+     * ENOTTY/EBADMSG (size/path rejection) OR EACCES — the zeroed params carry
+     * control cmd 0, which the QEMU default-deny control allowlist (#76) refuses
+     * with NV_ERR_NOT_SUPPORTED → EACCES before it can reach the host driver.
+     * Any of these means the malformed control was correctly rejected.
      */
     int rejected = (ret == -1) &&
                    (saved_errno == EINVAL || saved_errno == ENOTTY ||
-                    saved_errno == EBADMSG);
+                    saved_errno == EBADMSG || saved_errno == EACCES);
     CHECK(rejected,
-          "NV_ESC_RM_CONTROL with wrong size is rejected (EINVAL/ENOTTY)");
+          "NV_ESC_RM_CONTROL with wrong size is rejected (EINVAL/ENOTTY/EACCES)");
     if (!rejected)
         printf("  note: ret=%d errno=%d (%s)\n",
                ret, saved_errno, strerror(saved_errno));

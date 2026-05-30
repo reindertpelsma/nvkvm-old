@@ -168,7 +168,7 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		struct nvkvm_handle *uvm_h =
 			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->uvm_fd);
 		if (!uvm_h || uvm_h->fd < 0) {
-			fprintf(stderr,
+			NVKVM_DBG(
 				"nvkvm: UVM_MM_INITIALIZE: handle_id %d not found\n",
 				p->uvm_fd);
 			return -EBADF;
@@ -176,7 +176,7 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		int saved = p->uvm_fd;
 		p->uvm_fd = (int32_t)uvm_h->fd;
 		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		fprintf(stderr,
+		NVKVM_DBG(
 			"nvkvm: UVM_MM_INITIALIZE (legacy): handle_id=%d host_fd=%d "
 			"ret=%d rm_status=0x%x\n",
 			saved, uvm_h->fd, ret, p->rm_status);

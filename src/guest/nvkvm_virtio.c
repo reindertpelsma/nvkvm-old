@@ -376,7 +376,34 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 		return ret;
 	}
 
-	wait_for_completion(&inf->done);
+	/*
+	 * Interruptible wait — but ONLY for the IOCTL_ON_ISOLATE path
+	 * (inf->isolate_id != 0), which can block arbitrarily long on a real
+	 * GPU operation in the stub.  Control-plane requests leave isolate_id
+	 * zero and wait uninterruptibly (they are fast and interrupting them
+	 * mid-teardown would be wrong).
+	 *
+	 * On a pending signal we must NOT abandon the descriptor: req_buf and
+	 * inf->resp_buf are still owned by the virtqueue and QEMU will write
+	 * the response into resp_buf when the stub finishes.  Freeing now would
+	 * be a use-after-free.  Instead we ask the isolate to interrupt the
+	 * in-flight host ioctl (so it returns -EINTR promptly), then wait
+	 * uninterruptibly for the descriptor to come back, and finally report
+	 * -ERESTARTSYS so the guest syscall is restarted/interrupted normally.
+	 */
+	if (inf->isolate_id) {
+		if (wait_for_completion_interruptible(&inf->done) == -ERESTARTSYS) {
+			nvkvm_virtio_interrupt_isolate(inf->isolate_id,
+						       inf->txn_id);
+			wait_for_completion(&inf->done);
+			inflight_dequeue(state, inf);
+			kfree(inf->resp_buf);
+			inf->resp_buf = NULL;
+			return -ERESTARTSYS;
+		}
+	} else {
+		wait_for_completion(&inf->done);
+	}
 	inflight_dequeue(state, inf);
 
 	kfree(inf->resp_buf);
@@ -530,6 +557,8 @@ int nvkvm_negotiate_version(struct nvkvm_state *state)
 	memcpy_fromio(state->driver_version, ctrl->driver_version,
 		      sizeof(state->driver_version));
 	state->driver_version[sizeof(state->driver_version) - 1] = '\0';
+	/* #81: pick the ABI profile for this host driver version. */
+	state->abi = nvkvm_abi_for_version(state->driver_version);
 
 	pr_info("nvkvm: host NVIDIA driver %s, slot_size=%zu\n",
 		state->driver_version, state->slot_size);
@@ -758,6 +787,28 @@ int nvkvm_virtio_kill_isolate(__u32 isolate_id)
 }
 
 /*
+ * nvkvm_virtio_interrupt_isolate — ask QEMU to interrupt an in-flight ioctl.
+ *
+ * Called from nvkvm_send_sync when a task blocked on a forwarded ioctl
+ * receives a signal.  This is itself a control-plane request (isolate_id is
+ * NOT set on its own inflight record) so it waits uninterruptibly for QEMU's
+ * ack — QEMU only routes the interrupt to the stub and replies immediately;
+ * it does not wait for the host ioctl to actually return.
+ */
+int nvkvm_virtio_interrupt_isolate(__u32 isolate_id, __u32 target_txn)
+{
+	struct {
+		struct nvkvm_hdr           hdr;
+		struct nvkvm_req_interrupt req;
+	} msg = {};
+
+	msg.req.isolate_id = cpu_to_le32(isolate_id);
+	msg.req.target_txn = cpu_to_le32(target_txn);
+
+	return simple_req(NVKVM_REQ_INTERRUPT, &msg, sizeof(msg), NULL);
+}
+
+/*
  * nvkvm_virtio_ioctl_on_isolate — forward ioctl through the isolate path.
  *
  * VMA whitelist (all VMAs in the current mm) is collected here and sent in a
@@ -791,6 +842,9 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 		kfree(msg);
 		return -ENOMEM;
 	}
+	/* Mark this wait interruptible: on a guest signal, send_sync will ask
+	 * this isolate to interrupt the in-flight host ioctl. */
+	inf->isolate_id = ctx->session->isolate_id;
 
 	/* Param slot */
 	if (param_size > 0) {

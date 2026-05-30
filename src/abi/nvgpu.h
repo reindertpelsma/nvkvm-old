@@ -57,10 +57,24 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define TURING_CHANNEL_GPFIFO_A             0x0000C46FU
 #define AMPERE_CHANNEL_GPFIFO_A             0x0000C56FU
 #define HOPPER_CHANNEL_GPFIFO_A             0x0000C86FU
-/* Compute objects */
-#define TURING_COMPUTE_A                    0x0000C4B1U
-#define AMPERE_COMPUTE_A                    0x0000C6B1U
-#define HOPPER_COMPUTE_A                    0x0000CBB1U
+/* Compute objects (hClass verified against the 575 open-driver SDK class
+ * headers; the prior 0x*B1 codes were bogus). Use NV_GR_ALLOCATION_PARAMETERS. */
+#define VOLTA_COMPUTE_A                     0x0000C3C0U
+#define VOLTA_COMPUTE_B                     0x0000C4C0U
+#define TURING_COMPUTE_A                    0x0000C5C0U
+#define AMPERE_COMPUTE_A                    0x0000C6C0U
+#define AMPERE_COMPUTE_B                    0x0000C7C0U
+#define ADA_COMPUTE_A                       0x0000C9C0U
+#define HOPPER_COMPUTE_A                    0x0000CBC0U
+#define BLACKWELL_COMPUTE_A                 0x0000CDC0U
+#define BLACKWELL_COMPUTE_B                 0x0000CEC0U
+/* Graphics/3D objects (same NV_GR_ALLOCATION_PARAMETERS) */
+#define VOLTA_A                             0x0000C397U
+#define TURING_A                            0x0000C597U
+#define AMPERE_A                            0x0000C697U
+#define AMPERE_B                            0x0000C797U
+#define ADA_A                               0x0000C997U
+#define HOPPER_A                            0x0000CB97U
 /* DMA copy */
 #define VOLTA_DMA_COPY_A                    0x0000C3B5U
 #define TURING_DMA_COPY_A                   0x0000C5B5U
@@ -81,6 +95,18 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 struct nvb0b5_allocation_parameters {
 	__u32 version;
 	__u32 engine_type;
+};
+/* NV_GR_ALLOCATION_PARAMETERS (nvos.h) — alloc params for every compute and
+ * graphics/3D class (VOLTA..BLACKWELL _COMPUTE_A/B and _A/_B).  sizeof = 16,
+ * verified on the 575 open-driver SDK.  The kernel binds these classes with
+ * RS_OPTIONAL(NV_GR_ALLOCATION_PARAMETERS): libcuda may pass alloc_parms_size=0
+ * and rely on by-class sizing — without an entry the ap_size==0 fallback sends
+ * 0 bytes and the kernel rejects the alloc. */
+struct nv_gr_allocation_parameters {
+	__u32 version;
+	__u32 flags;
+	__u32 size;
+	__u32 caps;
 };
 /* Memory classes */
 #define NV01_MEMORY_SYSTEM                  0x0000003EU

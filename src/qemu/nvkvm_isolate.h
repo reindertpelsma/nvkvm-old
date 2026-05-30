@@ -83,6 +83,7 @@ struct nvkvm_isolate_table {
 	pthread_mutex_t      lock;
 	struct nvkvm_isolate isolates[NVKVM_ISOLATE_MAX];
 	uint32_t             next_id;
+	uint32_t             abi_profile;  /* #81: per-VM ABI id stamped into IOCTLs */
 };
 
 void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t);
@@ -102,6 +103,19 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
  * and free the slot. All in-flight IOCTL callers receive -ECONNRESET.
  */
 int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+
+/* Host pid of a live isolate by id (0 if none) — for GET_PID_INFO pid mapping. */
+pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+
+/*
+ * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently
+ * running target_txn so its in-flight host ioctl returns -EINTR.  Returns 0 if
+ * the command was written to a live isolate, -ENOENT for an unknown/dead one.
+ * Does NOT wait for the ioctl to actually return — the normal IOCTL response
+ * path delivers the (now -EINTR) result.
+ */
+int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
+			    uint32_t isolate_id, uint32_t target_txn);
 
 /*
  * Send a handle's fd to the isolate via SCM_RIGHTS.
