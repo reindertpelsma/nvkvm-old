@@ -18,6 +18,17 @@
 
 #include <stdint.h>
 
+/*
+ * NVKMS wrapper ioctl on /dev/nvidia-modeset (NVKVM_DEV_MODESET).  Mirrors the
+ * defines in nvkvm_proto.h, duplicated here because the freestanding stub and
+ * QEMU include only this header.  _IOWR('m', 0, struct NvKmsIoctlParams) where
+ * NvKmsIoctlParams = { u32 cmd; u32 size; u64 address }; the single embedded
+ * user pointer `address` (offset 8) points at `size` bytes of inner params.
+ */
+#define NVKVM_NVKMS_IOCTL_CMD   0xC0106D00u
+#define NVKVM_NVKMS_PARAMS_SIZE 16u
+#define NVKVM_NVKMS_ADDR_OFF    8u
+
 /* ── Command types (QEMU → isolate) ─────────────────────────────────────── */
 
 #define ISOLATE_CMD_RECEIVE_FD   1   /* fd arrives via SCM_RIGHTS            */

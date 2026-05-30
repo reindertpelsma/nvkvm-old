@@ -409,6 +409,33 @@ static struct fs_mutex write_mutex  = FS_MUTEX_INIT;
 static struct fs_mutex fd_mutex     = FS_MUTEX_INIT;
 
 
+/* RM_CONTROL commands with an embedded { u32 count@0; pad; NvP64 ptr@8 } list
+ * the driver writes through. Returns one element's size in bytes (8 for the
+ * GET_INFO family, 1 for the GET_CAPS family whose count is a byte length), or
+ * 0 if none. MUST stay in sync with the guest nvkvm_ctrl_list_entry_size(). */
+static uint32_t nvkvm_ctrl_list_entry_size(uint32_t cmd)
+{
+	switch (cmd) {
+	case 0x00410110U: /* NV0041_CTRL_CMD_GET_SURFACE_INFO */
+	case 0x00801104U: /* NV0080_CTRL_CMD_GR_GET_INFO */
+	case 0x20800802U: /* NV2080_CTRL_CMD_BIOS_GET_INFO */
+	case 0x20801201U: /* NV2080_CTRL_CMD_GR_GET_INFO */
+	case 0x20801301U: /* NV2080_CTRL_CMD_FB_GET_INFO */
+	case 0x20801802U: /* NV2080_CTRL_CMD_BUS_GET_INFO */
+		return 8;
+	case 0x20800123U: /* NV2080_CTRL_CMD_GPU_GET_ENGINES (engineList NvU32[]) */
+		return 4;
+	case 0x00801102U: /* NV0080_CTRL_CMD_GR_GET_CAPS */
+	case 0x00801301U: /* NV0080_CTRL_CMD_FB_GET_CAPS */
+	case 0x00801401U: /* NV0080_CTRL_CMD_HOST_GET_CAPS */
+	case 0x00801701U: /* NV0080_CTRL_CMD_FIFO_GET_CAPS */
+	case 0x00801b01U: /* NV0080_CTRL_CMD_MSENC_GET_CAPS */
+	case 0x00801c02U: /* NV0080_CTRL_CMD_BSP_GET_CAPS_V2 */
+		return 1;
+	}
+	return 0;
+}
+
 /* ── Handle fd table ─────────────────────────────────────────────────────── */
 
 static int handle_fds[MAX_HANDLES];
@@ -714,7 +741,19 @@ static void worker_thread(void *arg)
 		 * slot; we restore the host-accessible address here so the
 		 * driver can dereference it.
 		 */
-		if (job.aux_size > 0 && job.param_size >= 24) {
+		unsigned job_type = (job.cmd >> 8) & 0xff;
+		unsigned job_nr   = job.cmd & 0xff;
+		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper and the
+		 * DRM SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) both carry
+		 * their single user ptr there. */
+		if (job.aux_size > 0 &&
+		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
+		     (job_type == 'd' && job_nr == 0x54 && job.param_size >= 16))) {
+			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
+			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
+					 &aux_ptr, sizeof(uint64_t));
+		} else if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
 			__builtin_memcpy((char *)job.param_buf + 16, &aux_ptr,
 					 sizeof(uint64_t));
@@ -736,6 +775,10 @@ static void worker_thread(void *arg)
 		uint32_t str_sz = 0;
 		uint32_t info_list_size = 0; /* if non-zero, info_list pointer must be re-zeroed after the ioctl */
 		uint32_t info_list_base = 0; /* base offset of info_list area in aux_buf */
+		/* EXPORT_OBJECT_TO_FD (inner ctrl 0x3d05): handle_id→local fd at
+		 * aux offset 16; restore the handle_id after the ioctl. */
+		int      export_fd_off   = -1;
+		int32_t  export_fd_saved = 0;
 		if ((job.cmd & 0xff) == 0x2a &&        /* NV_ESC_RM_CONTROL */
 		    job.aux_size > 0 && job.param_size >= 12) {
 			uint32_t inner_cmd;
@@ -749,18 +792,17 @@ static void worker_thread(void *arg)
 			 * point info_list at the extension area so the host driver
 			 * writes into our own memory. After the ioctl we zero the
 			 * pointer again so we don't leak a host VA back to the guest. */
-			if (inner_cmd == 0x00410110U || /* NV0041_CTRL_CMD_GET_SURFACE_INFO */
-			    inner_cmd == 0x00801104U || /* NV0080_CTRL_CMD_GR_GET_INFO */
-			    inner_cmd == 0x20800802U || /* NV2080_CTRL_CMD_BIOS_GET_INFO */
-			    inner_cmd == 0x20801201U || /* NV2080_CTRL_CMD_GR_GET_INFO */
-			    inner_cmd == 0x20801301U || /* NV2080_CTRL_CMD_FB_GET_INFO */
-			    inner_cmd == 0x20801802U) { /* NV2080_CTRL_CMD_BUS_GET_INFO */
+			uint32_t list_esz = nvkvm_ctrl_list_entry_size(inner_cmd);
+			if (list_esz) {
+				/* GET_INFO family → 8-byte entries; GET_CAPS family
+				 * → 1-byte (the count is a byte length). Mirrors the
+				 * guest nvkvm_ctrl_list_entry_size(). */
 				uint32_t ls = 0;
 				__builtin_memcpy(&ls, job.aux_buf, sizeof(uint32_t));
 				/* base_size is whatever the guest sent before the
-				 * extension; we recover it as aux_size - ls*8. */
-				if (ls > 0 && (size_t)ls * 8 < job.aux_size) {
-					uint32_t base = (uint32_t)(job.aux_size - (size_t)ls * 8);
+				 * extension; we recover it as aux_size - ls*esz. */
+				if (ls > 0 && (size_t)ls * list_esz < job.aux_size) {
+					uint32_t base = (uint32_t)(job.aux_size - (size_t)ls * list_esz);
 					if (base >= 16) {
 						uint64_t list_va =
 							(uint64_t)(uintptr_t)
@@ -770,6 +812,26 @@ static void worker_thread(void *arg)
 						info_list_size = ls;
 						info_list_base = base;
 					}
+				}
+			}
+			if (inner_cmd == 0x00003d05U &&
+			    job.aux_size >= 20) {
+				/* NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD:
+				 * frontend fd at aux offset 16 carries a handle_id
+				 * (guest translated it); map to our local fd so the
+				 * kernel associates the object with a real fd in this
+				 * process.  Restore the handle_id after the ioctl. */
+				int32_t hid;
+				__builtin_memcpy(&hid,
+						 (char *)job.aux_buf + 16,
+						 sizeof(hid));
+				export_fd_saved = hid;
+				int lfd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
+				if (lfd >= 0) {
+					int32_t lfd32 = lfd;
+					__builtin_memcpy((char *)job.aux_buf + 16,
+							 &lfd32, sizeof(lfd32));
+					export_fd_off = 16;
 				}
 			}
 			if (inner_cmd == 0x0080170dU) {
@@ -1025,8 +1087,17 @@ static void worker_thread(void *arg)
 					 &saved_fe_embedded_fd, sizeof(int32_t));
 		}
 
-		/* Zero the embedded pointer field in nvos54 (don't leak host VA) */
-		if (job.aux_size > 0 && job.param_size >= 24) {
+		/* Zero the embedded pointer field (don't leak host VA): nvos54/
+		 * nvos64 at offset 16, NVKMS wrapper at offset 8. */
+		if (job.aux_size > 0 &&
+		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
+		     (((job.cmd >> 8) & 0xff) == 'd' &&
+		      (job.cmd & 0xff) == 0x54 && job.param_size >= 16))) {
+			uint64_t zero = 0;
+			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
+					 &zero, sizeof(uint64_t));
+		} else if (job.aux_size > 0 && job.param_size >= 24) {
 			uint64_t zero = 0;
 			__builtin_memcpy((char *)job.param_buf + 16, &zero,
 					 sizeof(uint64_t));
@@ -1051,6 +1122,12 @@ static void worker_thread(void *arg)
 				__builtin_memcpy((char *)job.aux_buf + 16, &z, 8);
 		}
 		(void)info_list_base;
+
+		/* EXPORT_OBJECT_TO_FD: put the handle_id back at aux+16 (the guest
+		 * then restores its own fd) — never leak the stub's local fd. */
+		if (export_fd_off >= 0)
+			__builtin_memcpy((char *)job.aux_buf + export_fd_off,
+					 &export_fd_saved, sizeof(export_fd_saved));
 
 		/*
 		 * Extract NvStatus from the response struct.
@@ -1077,7 +1154,7 @@ static void worker_thread(void *arg)
 				break;
 			case 0x34: off = 24; break; /* NV_ESC_RM_DUP_OBJECT: nvos55 28B status@24 (575 SDK) */
 			case 0x35: off = 20; break; /* NV_ESC_RM_SHARE: nvos57 24B status@20 */
-			case 0x4a: off = job.param_size - 4; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@end */
+			case 0x4a: off = 20; break; /* NV_ESC_RM_VID_HEAP_CONTROL: nvos32 status@20 (184B struct) */
 			case 0x4e: off = 40; break; /* NV_ESC_RM_MAP_MEMORY: nvos33_with_fd 56B status@40, fd@48 */
 			case 0x4f: off = 24; break; /* NV_ESC_RM_UNMAP_MEMORY: nvos34 32B status@24 */
 			case 0x57: /* NV_ESC_RM_MAP_MEMORY_DMA: nvos46 status@48 (V580: @56, #81) */
@@ -1176,6 +1253,23 @@ static int dev_id_to_path(uint32_t dev_id, char *buf, size_t buflen)
 			buf[7] = '0' + (char)(n % 10);
 			buf[8] = 0;
 		}
+		return 0;
+	}
+	if (dev_id == 48) {            /* NVKVM_DEV_MODESET */
+		if (buflen < sizeof("nvidia-modeset")) return -1;
+		__builtin_memcpy(buf, "nvidia-modeset", sizeof("nvidia-modeset"));
+		return 0;
+	}
+	if (dev_id >= 32 && dev_id < 32 + 16) {   /* NVKVM_DEV_DRM_RD(n) */
+		/* renderD(128+n) under dri/ — relative to the host /dev dirfd. */
+		unsigned minor = 128 + (dev_id - 32);
+		/* "dri/renderD" + up to 3 digits + NUL = 15 bytes */
+		if (buflen < 15) return -1;
+		__builtin_memcpy(buf, "dri/renderD", 11);
+		buf[11] = '0' + (char)(minor / 100);
+		buf[12] = '0' + (char)((minor / 10) % 10);
+		buf[13] = '0' + (char)(minor % 10);
+		buf[14] = 0;
 		return 0;
 	}
 	return -1;

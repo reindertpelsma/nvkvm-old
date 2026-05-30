@@ -57,7 +57,11 @@ func TestFrontendStructSizes(t *testing.T) {
 		{"nvos54_parameters (RM_CONTROL)", Sizes.Nvos54, 32},
 		{"nvos55_parameters (RM_DUP_OBJECT)", Sizes.Nvos55, 28}, // 575 SDK: 7 fields
 		{"nvos57_parameters (RM_SHARE)", Sizes.Nvos57, 16},
-		{"nvos32_parameters (RM_VID_HEAP_CONTROL)", Sizes.Nvos32, 88},
+		// nvos32: real ABI is 184 (prefix + union). The earlier 88-byte def
+		// truncated the AllocSize union (size/offset/address at +88), so the
+		// legacy graphics allocation path (libGLX) got size=0 / no address and
+		// bailed. status is at +20.
+		{"nvos32_parameters (RM_VID_HEAP_CONTROL)", Sizes.Nvos32, 184},
 		// nvos46_parameters: must be 56 — includes DmaOffset (out) at +40
 		// and Status at +48. Earlier 40-byte def truncated the writeback,
 		// so libcuda saw status=0 from a different field and OBJECT_NOT_FOUND

@@ -45,6 +45,12 @@
  */
 size_t nvkvm_ioctl_param_size(unsigned int cmd)
 {
+	/* NVKMS (/dev/nvidia-modeset): the single wrapper ioctl. Its 16-byte
+	 * NvKmsIoctlParams is the outer struct; the inner params live behind
+	 * the embedded address ptr and are staged in the aux slot. */
+	if (cmd == NVKVM_NVKMS_IOCTL_CMD)
+		return NVKVM_NVKMS_PARAMS_SIZE;
+
 	/* UVM ioctls — identified by full command word */
 	switch (cmd) {
 	case UVM_INITIALIZE:
@@ -132,6 +138,12 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 	}
 	case NV_ESC_WAIT_OPEN_COMPLETE:
 		return sizeof(struct nv_ioctl_wait_open_complete);
+	case NV_ESC_ATTACH_GPUS_TO_FD:
+		/* NvU32 gpuId[NV_MAX_DEVICES] — flat array, no embedded pointers,
+		 * no status field (the ioctl return value is the result).  libGLX
+		 * issues this to bind the GPU to the fd during graphics init; the
+		 * size is version-dependent so trust the cmd's encoded _IOC_SIZE. */
+		return _IOC_SIZE(cmd);
 	case NV_ESC_RM_ALLOC_MEMORY:
 		return sizeof(struct nv_ioctl_nvos02_parameters_with_fd);
 	case NV_ESC_RM_FREE:
@@ -408,11 +420,11 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		break;
 	}
 
-	case NV_ESC_RM_VID_HEAP_CONTROL: {
-		struct nvos32_parameters *p = buf;
-		p->p_memory = 0;
+	case NV_ESC_RM_VID_HEAP_CONTROL:
+		/* NVOS32: the legacy ALLOC_SIZE path libGLX uses has no embedded
+		 * input pointer (its `address` field is [OUT]-only), so there is
+		 * nothing to translate.  Forward opaquely (status@20, full 184B). */
 		break;
-	}
 
 	case NV_ESC_RM_IDLE_CHANNELS: {
 		struct nv_ioctl_idle_channels *p = buf;

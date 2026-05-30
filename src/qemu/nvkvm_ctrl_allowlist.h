@@ -156,6 +156,42 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0xcb330104u,
 	0xcb33010bu,
 	0xcb33010cu,
+	/* #84 graphics (Vulkan/EGL) control surface — additional RM control
+	 * commands libGLX_nvidia issues during device enumeration that the
+	 * compute-only set above lacked.  Empirically captured from the host's
+	 * own vulkaninfo RM ioctl stream (tools/nvtrace.c).  Still default-deny
+	 * host/cross-VM: these are GR/subdevice/device query+config controls,
+	 * no reg-ops/HWPM/debug/fabric. */
+	0x00000301u,
+	0x00003d05u,
+	0x00730101u,
+	0x00801102u, /* NV0080 device controls */
+	0x00801104u,
+	0x00801301u,
+	0x00801401u, /* NV0080_CTRL_CMD_HOST_GET_CAPS (#84 graphics) */
+	0x00801701u,
+	0x00801707u,
+	0x00801b01u,
+	0x00801c02u,
+	0x00da0002u,
+	0x00da0006u,
+	0x20800123u, /* NV2080 subdevice controls */
+	0x20800147u,
+	0x20801206u,
+	0x20801208u,
+	0x20801301u,
+	0x20801315u,
+	0x20801320u,
+	0x20801352u,
+	0x20802a02u,
+	0x20803d07u,
+	0x2080a0d1u,
+	0x20810107u,
+	0x90960101u, /* NV9096 GR/zbc controls */
+	0x90960106u,
+	0x90960107u,
+	0xa06f0104u, /* channel (GPFIFO) controls */
+	0xc36f010au,
 };
 #define NVKVM_CTRL_ALLOWLIST_N \
 	(sizeof(nvkvm_ctrl_allowlist) / sizeof(nvkvm_ctrl_allowlist[0]))

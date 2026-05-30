@@ -83,6 +83,20 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_DEV_CTL        0          /* /dev/nvidiactl                */
 #define NVKVM_DEV_UVM        1          /* /dev/nvidia-uvm               */
 #define NVKVM_DEV_GPU(n)     (16 + (n)) /* /dev/nvidia0 → /dev/nvidia15  */
+#define NVKVM_DEV_DRM_RD(n)  (32 + (n)) /* /dev/dri/renderD128+n (nvidia-drm) */
+#define NVKVM_DEV_MODESET    48         /* /dev/nvidia-modeset (NVKMS)    */
+
+/*
+ * NVKMS wrapper ioctl: the ONLY ioctl on /dev/nvidia-modeset.
+ *   _IOWR(NVKMS_IOCTL_MAGIC 'm', NVKMS_IOCTL_CMD 0, struct NvKmsIoctlParams)
+ *   = (3<<30) | (16<<16) | ('m'<<8) | 0 = 0xC0106D00.
+ * NvKmsIoctlParams = { u32 cmd@0; u32 size@4; u64 address@8 } (16 bytes); the
+ * kernel reads/writes `size` bytes at `address` (a single embedded user ptr).
+ * See nvkms-ioctl.h.
+ */
+#define NVKVM_NVKMS_IOCTL_CMD   0xC0106D00u
+#define NVKVM_NVKMS_PARAMS_SIZE 16u   /* sizeof(struct NvKmsIoctlParams) */
+#define NVKVM_NVKMS_ADDR_OFF    8u    /* offset of the embedded address ptr */
 #define NVKVM_DEV_EVENTFD    0xFF       /* eventfd2() — for NV01_EVENT_OS_EVENT */
 
 /* ── Request types ───────────────────────────────────────────────────────── */
@@ -563,7 +577,10 @@ struct nvkvm_req_read_host_file {
 	__le32 file_id;        /* enum nvkvm_host_file */
 	__le32 shm_slot;       /* dest slot; content written starting at offset 0 */
 	__le32 max_len;        /* cap (must be <= NVKVM_HFILE_MAX_SIZE)            */
-	__le32 reserved;
+	__le32 gpu_index;      /* for per-GPU files (NUMA/INFORMATION/REGISTRY):
+	                        * index into QEMU's discovered host-BDF list.  The
+	                        * guest NEVER supplies a path or BDF string — only
+	                        * this integer — so path traversal is impossible. */
 };
 
 struct nvkvm_resp_read_host_file {

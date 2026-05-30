@@ -167,6 +167,32 @@ static int __init register_devices(void)
 	device_create(nvkvm.class, NULL,
 		      MKDEV(nvkvm.uvm_major, 1), NULL, "nvidia-uvm-tools");
 
+	/*
+	 * /dev/nvidia-modeset (major 195, minor 254) — NVKMS config device.
+	 * libnvidia-glsi opens it during EGL/Vulkan device init.  Non-fatal if
+	 * registration fails (e.g. minor already taken): graphics degrades but
+	 * the compute path is unaffected.  nvkvm_devnode() makes it 0666 so an
+	 * unprivileged guest process can open it.
+	 */
+	{
+		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
+				   NV_MINOR_DEVICE_NUMBER_MODESET);
+		if (register_chrdev_region(mdev, 1, "nvidia-modeset") == 0) {
+			cdev_init(&nvkvm.modeset_cdev, &nvkvm_fops);
+			nvkvm.modeset_cdev.owner = THIS_MODULE;
+			if (cdev_add(&nvkvm.modeset_cdev, mdev, 1) == 0) {
+				device_create(nvkvm.class, NULL, mdev, NULL,
+					      "nvidia-modeset");
+				nvkvm.modeset_registered = true;
+			} else {
+				unregister_chrdev_region(mdev, 1);
+				pr_warn("nvkvm: nvidia-modeset cdev_add failed\n");
+			}
+		} else {
+			pr_warn("nvkvm: could not reserve nvidia-modeset (195:254)\n");
+		}
+	}
+
 	pr_info("nvkvm: registered nvidiactl (major %u), nvidia0-%d (major %u), nvidia-uvm/uvm-tools (major %u)\n",
 		nvkvm.ctl_major, nvkvm.num_gpus - 1, nvkvm.gpu_major,
 		nvkvm.uvm_major);
@@ -195,6 +221,14 @@ err_class:
 static void unregister_devices(void)
 {
 	int i;
+
+	if (nvkvm.modeset_registered) {
+		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
+				   NV_MINOR_DEVICE_NUMBER_MODESET);
+		device_destroy(nvkvm.class, mdev);
+		cdev_del(&nvkvm.modeset_cdev);
+		unregister_chrdev_region(mdev, 1);
+	}
 
 	device_destroy(nvkvm.class, MKDEV(nvkvm.uvm_major, 1));
 	device_destroy(nvkvm.class, nvkvm.uvm_devno);
@@ -238,39 +272,31 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 	return ret;
 }
 
-static int nvkvm_open(struct inode *inode, struct file *filp)
+/*
+ * Build a forwarding fd-context for dev_id: get/create the per-mm session,
+ * ensure its isolate, and open the device handle on the stub.  Shared by the
+ * char-device open path (nvkvm_open) and the DRM render-node driver
+ * (nvkvm_drm.c) so both share the SAME session/isolate for a given mm — that
+ * is what lets the renderD128 handle correlate with the process's /dev/nvidia0
+ * RM device.  Returns ERR_PTR on failure.  Does NOT allocate UVM state; the
+ * UVM caller adds it.
+ */
+struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 {
 	struct nvkvm_fd_ctx *ctx;
-	int dev_id;
+	__u32 handle_id = 0;
 	int ret;
-
-	/*
-	 * Determine which device is being opened.
-	 *
-	 * nvidiactl and nvidia0..N share major 195 (NV_NVIDIA_MAJOR) so we MUST
-	 * check BOTH major AND minor to identify nvidiactl (minor=255).  Checking
-	 * major alone incorrectly classifies every nvidia0 open as NVKVM_DEV_CTL.
-	 *
-	 * nvidia-uvm has a dynamic (distinct) major so major comparison is enough.
-	 */
-	if (imajor(inode) == nvkvm.ctl_major &&
-	    iminor(inode) == NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
-		dev_id = NVKVM_DEV_CTL;
-	else if (imajor(inode) == nvkvm.uvm_major)
-		dev_id = NVKVM_DEV_UVM;
-	else
-		dev_id = NVKVM_DEV_GPU(iminor(inode));
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	ctx->dev_id  = dev_id;
 	ctx->session = nvkvm_session_get_or_create(current->mm, current->tgid);
 	if (IS_ERR(ctx->session)) {
 		ret = PTR_ERR(ctx->session);
 		kfree(ctx);
-		return ret;
+		return ERR_PTR(ret);
 	}
 	init_waitqueue_head(&ctx->poll_wq);
 	atomic_set(&ctx->poll_events, 0);
@@ -279,62 +305,26 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 	mutex_init(&ctx->cpu_pages_lock);
 	INIT_LIST_HEAD(&ctx->cpu_pages);
 
-	/* State-machine state for UVM fds — see docs/STATE_MACHINE_PLAN.md. */
-	if (dev_id == NVKVM_DEV_UVM) {
-		ctx->uvm_state = kzalloc(sizeof(*ctx->uvm_state), GFP_KERNEL);
-		if (!ctx->uvm_state) {
-			nvkvm_session_put(ctx->session);
-			kfree(ctx);
-			return -ENOMEM;
-		}
-		mutex_init(&ctx->uvm_state->lock);
-		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
-		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
-		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
-		INIT_LIST_HEAD(&ctx->uvm_state->intents);
-		INIT_LIST_HEAD(&ctx->uvm_state->realizations);
-	}
-
-	/*
-	 * Open flow: spawn the isolate (creates the QEMU-side session as
-	 * a side effect) and then open the device via the stub so its
-	 * nvfp/mm lineage is the isolate process.
-	 */
-	{
-		__u32 handle_id = 0;
-
-		ret = nvkvm_ensure_isolate(ctx->session);
-		if (ret) {
-			nvkvm_session_put(ctx->session);
-			kfree(ctx);
-			return ret;
-		}
-
-		ret = nvkvm_virtio_open_nvidia_handle(dev_id, filp->f_flags,
-						      (unsigned int)ctx->session->id,
-						      &handle_id);
-		if (ret) {
-			nvkvm_session_put(ctx->session);
-			kfree(ctx);
-			return ret;
-		}
-		ctx->handle_id = handle_id;
-	}
-
-	filp->private_data = ctx;
-	pr_debug("nvkvm: opened dev_id=%d handle_id=%u isolate_id=%u tgid=%d\n",
-		 dev_id, ctx->handle_id,
-		 ctx->session->isolate_id, current->tgid);
-	return 0;
+	ret = nvkvm_ensure_isolate(ctx->session);
+	if (ret)
+		goto err;
+	ret = nvkvm_virtio_open_nvidia_handle(dev_id, flags,
+					      (unsigned int)ctx->session->id,
+					      &handle_id);
+	if (ret)
+		goto err;
+	ctx->handle_id = handle_id;
+	return ctx;
+err:
+	nvkvm_session_put(ctx->session);
+	kfree(ctx);
+	return ERR_PTR(ret);
 }
 
-static int nvkvm_release(struct inode *inode, struct file *filp)
+/* Tear down a context built by nvkvm_fd_ctx_open_dev (also the body of the
+ * char-device release path). */
+void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
 {
-	struct nvkvm_fd_ctx *ctx = filp->private_data;
-
-	if (!ctx)
-		return 0;
-
 	if (ctx->handle_id && ctx->session->isolate_id)
 		nvkvm_virtio_close_handle_on_isolate(ctx->handle_id,
 						     ctx->session->isolate_id);
@@ -380,6 +370,67 @@ static int nvkvm_release(struct inode *inode, struct file *filp)
 
 	nvkvm_session_put(ctx->session);
 	kfree(ctx);
+}
+
+static int nvkvm_open(struct inode *inode, struct file *filp)
+{
+	struct nvkvm_fd_ctx *ctx;
+	int dev_id;
+
+	/*
+	 * Determine which device is being opened.
+	 *
+	 * nvidiactl and nvidia0..N share major 195 (NV_NVIDIA_MAJOR) so we MUST
+	 * check BOTH major AND minor to identify nvidiactl (minor=255).  Checking
+	 * major alone incorrectly classifies every nvidia0 open as NVKVM_DEV_CTL.
+	 *
+	 * nvidia-uvm has a dynamic (distinct) major so major comparison is enough.
+	 */
+	if (imajor(inode) == nvkvm.ctl_major &&
+	    iminor(inode) == NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
+		dev_id = NVKVM_DEV_CTL;
+	else if (imajor(inode) == NV_MAJOR_DEVICE_NUMBER &&
+		 iminor(inode) == NV_MINOR_DEVICE_NUMBER_MODESET)
+		dev_id = NVKVM_DEV_MODESET;
+	else if (imajor(inode) == nvkvm.uvm_major)
+		dev_id = NVKVM_DEV_UVM;
+	else
+		dev_id = NVKVM_DEV_GPU(iminor(inode));
+
+	ctx = nvkvm_fd_ctx_open_dev(dev_id, filp->f_flags);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	/* State-machine state for UVM fds — see docs/STATE_MACHINE_PLAN.md. */
+	if (dev_id == NVKVM_DEV_UVM) {
+		ctx->uvm_state = kzalloc(sizeof(*ctx->uvm_state), GFP_KERNEL);
+		if (!ctx->uvm_state) {
+			nvkvm_fd_ctx_close(ctx);
+			return -ENOMEM;
+		}
+		mutex_init(&ctx->uvm_state->lock);
+		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
+		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
+		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
+		INIT_LIST_HEAD(&ctx->uvm_state->intents);
+		INIT_LIST_HEAD(&ctx->uvm_state->realizations);
+	}
+
+	filp->private_data = ctx;
+	pr_debug("nvkvm: opened dev_id=%d handle_id=%u isolate_id=%u tgid=%d\n",
+		 dev_id, ctx->handle_id,
+		 ctx->session->isolate_id, current->tgid);
+	return 0;
+}
+
+static int nvkvm_release(struct inode *inode, struct file *filp)
+{
+	struct nvkvm_fd_ctx *ctx = filp->private_data;
+
+	if (!ctx)
+		return 0;
+
+	nvkvm_fd_ctx_close(ctx);
 	filp->private_data = NULL;
 	return 0;
 }
@@ -548,6 +599,40 @@ static void nvkvm_get_pid_info_restore(void *aux, __u32 aux_size,
  * from userspace. Pointer fields in the parameter blob are zeroed or replaced
  * with offsets into the aux slot; the host never receives raw guest VA values.
  */
+/*
+ * RM_CONTROL commands whose inner params begin with an embedded list preamble
+ * { u32 count@0; pad@4; NvP64 ptr@8 } that the driver writes through. Returns
+ * the size in bytes of ONE list element, or 0 if the command has no such list.
+ *
+ *   GET_INFO family  → 8 bytes/entry (NvxxxCtrlXxxInfo = {u32 index; u32 data})
+ *   GET_CAPS family  → 1 byte/entry  (the count field is a byte length)
+ *
+ * The two families are structurally identical (u32@0, ptr@8); only the unit of
+ * the count differs, so they share one handler parameterised by this size.
+ */
+static unsigned int nvkvm_ctrl_list_entry_size(__u32 cmd)
+{
+	switch (cmd) {
+	case NV0041_CTRL_CMD_GET_SURFACE_INFO:
+	case NV0080_CTRL_CMD_GR_GET_INFO:
+	case NV2080_CTRL_CMD_BIOS_GET_INFO:
+	case NV2080_CTRL_CMD_GR_GET_INFO:
+	case NV2080_CTRL_CMD_FB_GET_INFO:
+	case NV2080_CTRL_CMD_BUS_GET_INFO:
+		return NVXXX_CTRL_XXX_INFO_ENTRY_SIZE; /* 8 */
+	case NV2080_CTRL_CMD_GPU_GET_ENGINES:
+		return 4; /* engineList is NvU32[engineCount] */
+	case NV0080_CTRL_CMD_GR_GET_CAPS:
+	case NV0080_CTRL_CMD_FB_GET_CAPS:
+	case NV0080_CTRL_CMD_HOST_GET_CAPS:
+	case NV0080_CTRL_CMD_FIFO_GET_CAPS:
+	case NV0080_CTRL_CMD_MSENC_GET_CAPS:
+	case NV0080_CTRL_CMD_BSP_GET_CAPS_V2:
+		return 1; /* capsTblSize is a byte count */
+	}
+	return 0;
+}
+
 static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct nvkvm_fd_ctx *ctx = filp->private_data;
@@ -567,9 +652,19 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	/* Validate and get the expected parameter size for this ioctl */
 	param_size = nvkvm_ioctl_param_size(cmd);
 	if (param_size == (size_t)-1) {
-		pr_debug("nvkvm: unknown ioctl cmd=0x%x\n", cmd);
+		pr_warn("nvkvm: AUDIT unknown ioctl cmd=0x%x type=0x%x nr=0x%x iocsz=%u\n",
+			cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd));
 		return -ENOTTY;
 	}
+
+	/* PARANOID forwarding-fidelity audit (#84): if our param_size differs
+	 * from the size the caller encoded in the cmd (_IOC_SIZE), we will
+	 * forward a TRUNCATED/over-long, malformed buffer to the host kernel —
+	 * the low bytes match but the call is wrong (cf. the NVOS32 88-vs-184
+	 * bug).  Log every mismatch so EGL/graphics-path ioctls get caught. */
+	if (_IOC_SIZE(cmd) && (size_t)_IOC_SIZE(cmd) != param_size)
+		pr_warn("nvkvm: AUDIT param_size MISMATCH cmd=0x%x type=0x%x nr=0x%x iocsz=%u our=%zu\n",
+			cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd), param_size);
 
 	if (param_size > NVKVM_SHM_SLOT_DEFAULT_SIZE)
 		return -EINVAL;
@@ -741,6 +836,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	bool have_uvm_mm_init     = false;
 	__u32 orig_uvm_rm_ctrl_fd = 0;
 	bool have_uvm_rm_ctrl     = false;
+	/* EXPORT_OBJECT_TO_FD (ctrl 0x3d05): frontend fd embedded in the INNER
+	 * control params (aux) at offset 16 — translate guest-fd→handle_id, save
+	 * the caller's fd to restore on the response (fd is IN/OUT, value kept). */
+	__s32 orig_export_fd = 0;
+	bool have_export_fd  = false;
 	/* Embedded-fd fields in frontend ioctls: sanitizer overwrites these
 	 * with handle_ids; capture the caller's original guest-fd so the
 	 * response round-trips libcuda's value unchanged. */
@@ -748,7 +848,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	__u32 orig_fe_os_evt_fd = 0;  bool have_fe_os_evt_fd = false;  /* ALLOC/FREE_OS_EVT */
 	__s32 orig_fe_nvos02_fd = 0;  bool have_fe_nvos02_fd = false;  /* RM_ALLOC_MEMORY   */
 	__s32 orig_fe_nvos33_fd = 0;  bool have_fe_nvos33_fd = false;  /* RM_MAP_MEMORY     */
-	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
+	u64 orig_modeset_addr = 0;    bool have_modeset = false;       /* NVKMS address ptr */
+	if (ctx->dev_id == NVKVM_DEV_MODESET && params_buf &&
+	    param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+		orig_modeset_addr =
+			*(u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF);
+		have_modeset = true;
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf &&
 	    param_size == sizeof(struct nvos54_parameters)) {
 		orig_nvos54_params =
 			((struct nvos54_parameters *)params_buf)->params;
@@ -848,7 +954,39 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * NV_ESC_RM_ALLOC (NVOS64): secondary buffer = class-specific alloc params
 	 *   (input only; alloc_parms_size tells us the size).
 	 */
-	if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
+	/*
+	 * NVKMS (/dev/nvidia-modeset): the wrapper's single embedded user ptr
+	 * `address` (offset 8) points at `size` (offset 4) bytes of inner params
+	 * the host kernel reads AND writes.  Stage them in the aux slot exactly
+	 * like RM_CONTROL: copy in, zero the ptr (the stub substitutes a host VA
+	 * at offset 8), copy back after the ioctl via the generic aux writeback.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_MODESET && params_buf &&
+	    param_size >= NVKVM_NVKMS_PARAMS_SIZE) {
+		__u32 inner_sz  = *(__u32 *)((char *)params_buf + 4);
+		__u64 inner_ptr = *(__u64 *)((char *)params_buf +
+					     NVKVM_NVKMS_ADDR_OFF);
+		if (inner_sz > 0 && inner_ptr != 0) {
+			if (inner_sz > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+				kfree(params_buf);
+				return -EINVAL;
+			}
+			aux_uptr = (void __user *)(uintptr_t)inner_ptr;
+			aux_buf = kzalloc(inner_sz, GFP_KERNEL);
+			if (!aux_buf) {
+				kfree(params_buf);
+				return -ENOMEM;
+			}
+			if (copy_from_user(aux_buf, aux_uptr, inner_sz)) {
+				kfree(aux_buf);
+				kfree(params_buf);
+				return -EFAULT;
+			}
+			aux_size = inner_sz;
+			/* Zero the ptr so we never forward a guest VA. */
+			*(__u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF) = 0;
+		}
+	} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && params_buf) {
 		struct nvos54_parameters *ctrl = params_buf;
 		if (ctrl->params_size > 0 && ctrl->params != 0) {
 			if (ctrl->params_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
@@ -874,6 +1012,25 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			if (ctrl->cmd == NVKVM_NV2080_GET_PID_INFO)
 				nvkvm_get_pid_info_tag(aux_buf, aux_size,
 						       &gpi_save, &gpi_n);
+
+			/* NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD (0x3d05): the
+			 * inner params carry a frontend fd at offset 16 (the "empty
+			 * fd" libGLX exports the object onto).  Like REGISTER_FD, the
+			 * stub needs our handle_id there so it can resolve its own
+			 * local fd; save the caller's guest fd to restore on response
+			 * (fd is IN/OUT, value unchanged by the export). */
+			if (ctrl->cmd == 0x3d05 && aux_size >= 20) {
+				__s32 gfd;
+				memcpy(&gfd, (char *)aux_buf + 16, sizeof(gfd));
+				orig_export_fd = gfd;
+				have_export_fd = true;
+				if (gfd >= 0) {
+					__s32 hid = guest_fd_to_handle_id(gfd);
+					if (hid >= 0)
+						memcpy((char *)aux_buf + 16, &hid,
+						       sizeof(hid));
+				}
+			}
 
 			/*
 			 * Commands that embed an `NvxxxCtrlXxxGetInfoParams` preamble
@@ -941,25 +1098,16 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 
 			{
-				int has_info_list = 0;
-				switch (ctrl->cmd) {
-				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
-				case NV0080_CTRL_CMD_GR_GET_INFO:
-				case NV2080_CTRL_CMD_BIOS_GET_INFO:
-				case NV2080_CTRL_CMD_GR_GET_INFO:
-				case NV2080_CTRL_CMD_FB_GET_INFO:
-				case NV2080_CTRL_CMD_BUS_GET_INFO:
-					has_info_list = 1;
-					break;
-				}
-				if (has_info_list &&
+				unsigned int entry_size =
+					nvkvm_ctrl_list_entry_size(ctrl->cmd);
+				if (entry_size &&
 				    ctrl->params_size >= 16 /* size(4)+pad(4)+ptr(8) */) {
 					__u32 list_size = *(__u32 *)aux_buf;
 					__u64 list_ptr  = *(__u64 *)((char *)aux_buf + 8);
-					if (list_size > 0 && list_size <= 4096 && list_ptr != 0) {
+					if (list_size > 0 && list_size <= 65536 && list_ptr != 0) {
 						size_t list_bytes =
 							(size_t)list_size *
-							NVXXX_CTRL_XXX_INFO_ENTRY_SIZE;
+							entry_size;
 						size_t ext = ctrl->params_size + list_bytes;
 						void *ext_buf = kzalloc(ext, GFP_KERNEL);
 						if (!ext_buf) {
@@ -1062,6 +1210,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case FERMI_VASPACE_A:
 				ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81: 48 / V580 56 */
 				break;
+			case NV01_MEMORY_VIRTUAL:
+				/* 0x70: NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS is 24B and
+				 * distinct from the mem_alloc_size (NV_MEMORY_ALLOCATION_
+				 * PARAMS) group below.  libGLX's EGL device enum allocs
+				 * this with alloc_parms_size=0; without this case we copy
+				 * 0 bytes -> kernel sees hVASpace=0 -> NV_ERR_INVALID_
+				 * ARGUMENT (#84). */
+				ap_size = sizeof(struct nv_memory_virtual_allocation_params);
+				break;
+			case NV_SEMAPHORE_SURFACE:
+				/* 0xda: 16B; same alloc_parms_size=0 path as 0x70 in the
+				 * EGL device-enum sequence (#84). Without this the kernel
+				 * sees empty params -> NV_ERR_INVALID_ARGUMENT (0x1f) and
+				 * libnvidia-eglcore later NULL-derefs the missing object. */
+				ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -1146,6 +1310,21 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				case FERMI_VASPACE_A:
 					ap_size = nvkvm_prof()->vaspace_alloc_size; /* #81 */
+					break;
+				case NV01_MEMORY_VIRTUAL:
+					/* 0x70: 24B NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS,
+					 * distinct from the mem_alloc_size group.  libGLX's
+					 * EGL enum allocs this (nvos64) with size=0; without
+					 * this the kernel sees hVASpace=0 -> INVALID_ARGUMENT
+					 * and graphics bails (#84). */
+					ap_size = sizeof(struct nv_memory_virtual_allocation_params);
+					break;
+				case NV_SEMAPHORE_SURFACE:
+					/* 0xda: 16B; libGLX EGL enum allocs this (nvos64)
+					 * with size=0. Without it the kernel sees empty
+					 * params -> NV_ERR_INVALID_ARGUMENT (0x1f) and
+					 * libnvidia-eglcore NULL-derefs later (#84). */
+					ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
 					break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
@@ -1317,6 +1496,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (gpi_save)
 			nvkvm_get_pid_info_restore(aux_buf, aux_size,
 						   gpi_save, gpi_n);
+
+		/* EXPORT_OBJECT_TO_FD: restore the caller's own fd in the inner
+		 * params (we swapped it for a handle_id; the export keeps the fd
+		 * value, so libGLX must read its own fd back). */
+		if (have_export_fd && aux_buf && aux_size >= 20)
+			memcpy((char *)aux_buf + 16, &orig_export_fd,
+			       sizeof(orig_export_fd));
 	} else {
 		/* Open establishes ctx->handle_id and ctx->session->isolate_id;
 		 * an ioctl on a ctx missing either is a logic bug. The legacy
@@ -1333,7 +1519,12 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * caller's pointer should round-trip.
 	 */
 	if (params_buf && ret != -ENOMEM && ret != -ENOSPC && ret != -EFAULT) {
-		if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && orig_nvos54_params &&
+		if (have_modeset) {
+			/* NVKMS: restore the caller's address ptr (round-trips
+			 * unchanged; the inner params came back via the aux slot). */
+			*(u64 *)((char *)params_buf + NVKVM_NVKMS_ADDR_OFF) =
+				orig_modeset_addr;
+		} else if (_IOC_NR(cmd) == NV_ESC_RM_CONTROL && orig_nvos54_params &&
 		    param_size == sizeof(struct nvos54_parameters)) {
 			((struct nvos54_parameters *)params_buf)->params =
 				orig_nvos54_params;
@@ -1470,18 +1661,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 
 			{
-				int has_info_list = 0;
-				switch (ctrl->cmd) {
-				case NV0041_CTRL_CMD_GET_SURFACE_INFO:
-				case NV0080_CTRL_CMD_GR_GET_INFO:
-				case NV2080_CTRL_CMD_BIOS_GET_INFO:
-				case NV2080_CTRL_CMD_GR_GET_INFO:
-				case NV2080_CTRL_CMD_FB_GET_INFO:
-				case NV2080_CTRL_CMD_BUS_GET_INFO:
-					has_info_list = 1;
-					break;
-				}
-				if (has_info_list &&
+				unsigned int entry_size =
+					nvkvm_ctrl_list_entry_size(ctrl->cmd);
+				if (entry_size &&
 				    ctrl->params_size >= 16 &&
 				    aux_size > ctrl->params_size) {
 					struct {
@@ -1493,7 +1675,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					    orig.list_size > 0 && orig.list_ptr != 0) {
 						size_t list_bytes =
 							(size_t)orig.list_size *
-							NVXXX_CTRL_XXX_INFO_ENTRY_SIZE;
+							entry_size;
 						if (aux_size >= ctrl->params_size + list_bytes) {
 							copy_to_user(
 								(void __user *)(uintptr_t)orig.list_ptr,
@@ -1644,11 +1826,17 @@ static int nvkvm_virtio_probe(struct virtio_device *vdev)
 		return ret;
 	}
 
+	/* nvidia-drm render node for graphics (Vulkan/EGL).  Non-fatal: compute
+	 * works without it.  Parent = the virtio device so the DRM core builds
+	 * /sys/.../<virtio-dev>/drm/renderD128 that the NVIDIA ICD requires. */
+	nvkvm_drm_init(&vdev->dev);
+
 	return 0;
 }
 
 static void nvkvm_virtio_remove(struct virtio_device *vdev)
 {
+	nvkvm_drm_fini();
 	nvkvm_virtio_fini(&nvkvm);
 }
 

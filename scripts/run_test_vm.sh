@@ -69,6 +69,11 @@ exec "$QEMU" \
     \
     -device virtio-nvgpu-pci-non-transitional \
     \
+    `# Identity-only NVIDIA PCI device at slot 7 (0000:00:07.0) — gives the` \
+    `# DRM render node an NVIDIA-vendor parent so the Vulkan ICD binds it.` \
+    `# No BARs/DMA; all GPU I/O still flows through virtio-nvgpu forwarding.` \
+    -device nvkvm-gpu,addr=7 \
+    \
     -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped \
     \
     -serial stdio \

@@ -21,6 +21,8 @@
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio.h"
 #include "hw/qdev-properties.h"
+#include "hw/pci/pci.h"          /* nvkvm-gpu PCI identity device */
+#include "hw/pci/pci_device.h"
 #include "hw/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -1134,6 +1136,118 @@ static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 	virtio_cleanup(VIRTIO_DEVICE(dev));
 }
 
+/* ── nvkvm-gpu: emulated NVIDIA PCI identity device ──────────────────────────
+ *
+ * The NVIDIA Vulkan/EGL userspace enumerates the GPU through the DRM render
+ * node and, before opening it, walks renderD128 -> device -> parent PCI device
+ * and reads its vendor/device/subsystem IDs, requiring vendor 0x10DE.  The
+ * virtio-nvgpu transport must keep vendor 0x1AF4 (or the guest virtio-pci
+ * driver won't bind), so we expose a SEPARATE, identity-only PCI device that
+ * the guest's nvkvm-drm driver uses as the render node's sysfs parent.
+ *
+ * IDENTITY ONLY — no BARs, no MMIO, no DMA.  All real GPU I/O (compute and the
+ * DRM render path alike) continues through the virtio device's GPA-window
+ * mmap forwarding; this device never touches the data path.  IDs are read from
+ * the host GPU's sysfs so they track the actual hardware across driver/GPU
+ * changes (falls back to a generic NVIDIA id if the host can't be read). */
+
+#define TYPE_NVKVM_GPU "nvkvm-gpu"
+typedef struct NvkvmGpu { PCIDevice parent_obj; } NvkvmGpu;
+DECLARE_INSTANCE_CHECKER(NvkvmGpu, NVKVM_GPU, TYPE_NVKVM_GPU)
+
+/* Read a hex value (e.g. "0x10de\n") from a host sysfs PCI attribute.
+ * Returns def on any failure. */
+static unsigned nvkvm_sysfs_hex(const char *bdf, const char *attr, unsigned def)
+{
+	char path[128];
+	unsigned val;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/%s", bdf, attr);
+	f = fopen(path, "r");
+	if (!f)
+		return def;
+	if (fscanf(f, "%x", &val) != 1)
+		val = def;
+	fclose(f);
+	return val;
+}
+
+/* First host GPU BDF (scan /proc/driver/nvidia/gpus/); NULL if none. */
+static const char *nvkvm_first_host_gpu_bdf(char *buf, size_t buflen)
+{
+	DIR *d = opendir("/proc/driver/nvidia/gpus");
+	struct dirent *de;
+	const char *out = NULL;
+
+	if (!d)
+		return NULL;
+	while ((de = readdir(d))) {
+		if (de->d_name[0] == '.')
+			continue;
+		if (strlen(de->d_name) < buflen) {
+			memcpy(buf, de->d_name, strlen(de->d_name) + 1);
+			out = buf;
+		}
+		break;
+	}
+	closedir(d);
+	return out;
+}
+
+static void nvkvm_gpu_realize(PCIDevice *pdev, Error **errp)
+{
+	char bdf[32];
+	const char *b = nvkvm_first_host_gpu_bdf(bdf, sizeof(bdf));
+	uint16_t vendor = 0x10de, device = 0x2504, svid = 0x10de, sdid = 0x0000;
+	uint8_t  revision = 0xa1;
+	(void)errp;
+
+	if (b) {
+		vendor   = nvkvm_sysfs_hex(b, "vendor", 0x10de);
+		device   = nvkvm_sysfs_hex(b, "device", 0x2504);
+		svid     = nvkvm_sysfs_hex(b, "subsystem_vendor", vendor);
+		sdid     = nvkvm_sysfs_hex(b, "subsystem_device", 0x0000);
+		revision = nvkvm_sysfs_hex(b, "revision", 0xa1);
+	}
+
+	pci_config_set_vendor_id(pdev->config, vendor);
+	pci_config_set_device_id(pdev->config, device);
+	pci_config_set_revision(pdev->config, revision);
+	/* Match the host GPU's PCI class exactly (VGA 0x0300 for a GeForce) — the
+	 * ICD compares the device's class against what it expects for an NVIDIA
+	 * GPU.  Secondary VGA with no ROM is harmless (SeaBIOS skips it). */
+	pci_config_set_class(pdev->config, PCI_CLASS_DISPLAY_VGA);
+	pci_set_word(pdev->config + PCI_SUBSYSTEM_VENDOR_ID, svid);
+	pci_set_word(pdev->config + PCI_SUBSYSTEM_ID, sdid);
+}
+
+static void nvkvm_gpu_class_init(ObjectClass *klass, void *data)
+{
+	DeviceClass    *dc = DEVICE_CLASS(klass);
+	PCIDeviceClass *k  = PCI_DEVICE_CLASS(klass);
+	(void)data;
+
+	k->realize   = nvkvm_gpu_realize;
+	k->vendor_id = 0x10de;                 /* overridden from host in realize */
+	k->device_id = 0x2504;
+	k->revision  = 0xa1;
+	k->class_id  = PCI_CLASS_DISPLAY_VGA;
+	dc->desc     = "nvkvm emulated NVIDIA GPU PCI identity (no BARs)";
+	set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+}
+
+static const TypeInfo nvkvm_gpu_info = {
+	.name          = TYPE_NVKVM_GPU,
+	.parent        = TYPE_PCI_DEVICE,
+	.instance_size = sizeof(NvkvmGpu),
+	.class_init    = nvkvm_gpu_class_init,
+	.interfaces    = (InterfaceInfo[]) {
+		{ INTERFACE_CONVENTIONAL_PCI_DEVICE },
+		{ },
+	},
+};
+
 /* ── QEMU type registration ──────────────────────────────────────────────── */
 
 static const TypeInfo virtio_nvgpu_info = {
@@ -1158,6 +1272,7 @@ static void virtio_nvgpu_register_types(void)
 	TypeInfo info = virtio_nvgpu_info;
 	info.class_init = virtio_nvgpu_class_init;
 	type_register_static(&info);
+	type_register_static(&nvkvm_gpu_info);
 }
 
 type_init(virtio_nvgpu_register_types);
