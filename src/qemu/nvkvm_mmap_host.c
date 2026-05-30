@@ -168,6 +168,9 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 	nv->sparse_vmm_va   = va;
 	nv->sparse_cur      = 0;
 	nv->sparse_kvm_slot = -1;
+	/* #80/H-1: window free-list (recycled extents). */
+	nv->sparse_free   = g_new0(struct nvkvm_gpa_extent, NVKVM_GPA_FREE_MAX);
+	nv->sparse_free_n = 0;
 	NVKVM_DBG("nvkvm_sparse_init: %llu GiB VMM buffer %p (memslot deferred to BAR base)\n",
 		  (unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30), va);
 	return 0;
@@ -226,6 +229,9 @@ void nvkvm_sparse_fini(VirtIONvgpu *nv)
 	if (nv->sparse_kvm_slot >= 0) kvm_remove_memory_region(nv->sparse_kvm_slot);
 	munmap(nv->sparse_vmm_va, nv->sparse_size);
 	nv->sparse_vmm_va = NULL;
+	g_free(nv->sparse_free);
+	nv->sparse_free   = NULL;
+	nv->sparse_free_n = 0;
 	pthread_mutex_destroy(&nv->sparse_lock);
 }
 
@@ -237,6 +243,38 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 	if (nvkvm_sparse_ensure(nv) == 0) return 0;
 	size = (size + 4095) & ~4095ULL;
 	pthread_mutex_lock(&nv->sparse_lock);
+
+	/*
+	 * #80/H-1: first-fit reuse from the free-list before advancing the bump
+	 * pointer, so a mmap/munmap (or cuMemAlloc/Free) loop recycles window
+	 * space instead of leaking it.  Prefer the smallest sufficient extent to
+	 * limit fragmentation; on an oversize extent, carve from its front and
+	 * leave the remainder on the list.
+	 */
+	if (nv->sparse_free) {
+		uint32_t best = nv->sparse_free_n;
+		for (uint32_t i = 0; i < nv->sparse_free_n; i++) {
+			if (nv->sparse_free[i].len >= size &&
+			    (best == nv->sparse_free_n ||
+			     nv->sparse_free[i].len < nv->sparse_free[best].len))
+				best = i;
+		}
+		if (best < nv->sparse_free_n) {
+			uint64_t off = nv->sparse_free[best].off;
+			if (nv->sparse_free[best].len == size) {
+				/* exact: drop the slot (swap-remove) */
+				nv->sparse_free[best] =
+					nv->sparse_free[--nv->sparse_free_n];
+			} else {
+				/* carve from the front, keep the remainder */
+				nv->sparse_free[best].off += size;
+				nv->sparse_free[best].len -= size;
+			}
+			pthread_mutex_unlock(&nv->sparse_lock);
+			return nv->sparse_gpa_base + off;
+		}
+	}
+
 	uint64_t off = (nv->sparse_cur + 4095) & ~4095ULL;
 	if (off + size > nv->sparse_size) {
 		pthread_mutex_unlock(&nv->sparse_lock);
@@ -251,6 +289,75 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 			(unsigned long long)(nv->sparse_size >> 20));
 	pthread_mutex_unlock(&nv->sparse_lock);
 	return nv->sparse_gpa_base + off;
+}
+
+/*
+ * #80/H-1: return [gpa, gpa+size) to the window free-list.  Coalesces with the
+ * bump watermark (fast path for LIFO free, keeps the free-list empty under
+ * same-size churn) and with an adjacent free extent; otherwise appends.  If the
+ * free-list is full it logs once and leaks the extent — bounded degradation,
+ * never a crash.
+ */
+void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size)
+{
+	if (!nv->sparse_vmm_va || !nv->sparse_free) return;
+	if (gpa < nv->sparse_gpa_base) return;
+	uint64_t off = gpa - nv->sparse_gpa_base;
+	size = (size + 4095) & ~4095ULL;
+	if (size == 0 || off + size > nv->sparse_size) return;
+
+	pthread_mutex_lock(&nv->sparse_lock);
+
+	/* Fast path: freeing the current tail just lowers the watermark, then
+	 * absorbs any free extents that became adjacent to it. */
+	if (off + size == nv->sparse_cur) {
+		nv->sparse_cur = off;
+		bool merged = true;
+		while (merged) {
+			merged = false;
+			for (uint32_t i = 0; i < nv->sparse_free_n; i++) {
+				if (nv->sparse_free[i].off + nv->sparse_free[i].len
+				    == nv->sparse_cur) {
+					nv->sparse_cur = nv->sparse_free[i].off;
+					nv->sparse_free[i] =
+						nv->sparse_free[--nv->sparse_free_n];
+					merged = true;
+					break;
+				}
+			}
+		}
+		pthread_mutex_unlock(&nv->sparse_lock);
+		return;
+	}
+
+	/* Coalesce with an adjacent existing free extent. */
+	for (uint32_t i = 0; i < nv->sparse_free_n; i++) {
+		if (nv->sparse_free[i].off + nv->sparse_free[i].len == off) {
+			nv->sparse_free[i].len += size;       /* extend upward   */
+			pthread_mutex_unlock(&nv->sparse_lock);
+			return;
+		}
+		if (off + size == nv->sparse_free[i].off) {
+			nv->sparse_free[i].off  = off;        /* extend downward */
+			nv->sparse_free[i].len += size;
+			pthread_mutex_unlock(&nv->sparse_lock);
+			return;
+		}
+	}
+
+	if (nv->sparse_free_n < NVKVM_GPA_FREE_MAX) {
+		nv->sparse_free[nv->sparse_free_n].off = off;
+		nv->sparse_free[nv->sparse_free_n].len = size;
+		nv->sparse_free_n++;
+	} else {
+		static bool warned;
+		if (!warned) {
+			fprintf(stderr, "nvkvm: GPA free-list full (%d); "
+				"leaking a window extent\n", NVKVM_GPA_FREE_MAX);
+			warned = true;
+		}
+	}
+	pthread_mutex_unlock(&nv->sparse_lock);
 }
 
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size)

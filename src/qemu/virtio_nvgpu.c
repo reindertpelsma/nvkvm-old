@@ -93,6 +93,67 @@ struct nvkvm_session *nvkvm_session_create(VirtIONvgpu *nv,
 	return s;
 }
 
+/*
+ * #80 (audit H-2/H-3): destroy a session whose last isolate has been killed.
+ * Unlinks it from the table first (so no later lookup races a free), then
+ * reclaims everything the guest is no longer able to close itself:
+ *   - all host /dev/nvidia* + memfd fds for the session (force, ignoring
+ *     isolate_refcount — the isolates are gone), which releases the kernel RM
+ *     objects + GPU memory;
+ *   - the QEMU-side RM object graph (clients[]);
+ *   - the legacy fd / mmap lists (empty in the handle-based model, drained
+ *     defensively);
+ *   - the session struct + its mutexes.
+ *
+ * Safe to free here: every control request runs serialised on the single TX
+ * virtqueue thread, and we are only called once nisolates == 0 — i.e. after
+ * every isolate (and its drained ioctl-pool workers) is gone, so no worker can
+ * still hold this session pointer.
+ */
+void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session)
+{
+	if (!session)
+		return;
+
+	pthread_mutex_lock(&nv->sessions_lock);
+	TAILQ_REMOVE(&nv->sessions, session, link);
+	pthread_mutex_unlock(&nv->sessions_lock);
+
+	/* Force-close host fds → releases kernel RM objects + GPU memory. */
+	nvkvm_handle_close_session(&nv->handles, session->id);
+
+	/* Free the QEMU-side RM object graph. */
+	pthread_mutex_lock(&session->clients_lock);
+	for (int i = 0; i < session->nclients; i++) {
+		if (session->clients[i]) {
+			nvkvm_client_free(session, session->clients[i]);
+			session->clients[i] = NULL;
+		}
+	}
+	session->nclients = 0;
+	pthread_mutex_unlock(&session->clients_lock);
+
+	/* Drain the legacy fd list (dead in the handle model; defensive). */
+	while (!TAILQ_EMPTY(&session->fds)) {
+		struct nvkvm_host_fd *hfd = TAILQ_FIRST(&session->fds);
+		TAILQ_REMOVE(&session->fds, hfd, link);
+		if (hfd->fd >= 0)
+			close(hfd->fd);
+		g_free(hfd->clients);
+		pthread_mutex_destroy(&hfd->clients_lock);
+		g_free(hfd);
+	}
+	while (!TAILQ_EMPTY(&session->mmaps)) {
+		struct nvkvm_mmap_region *mr = TAILQ_FIRST(&session->mmaps);
+		TAILQ_REMOVE(&session->mmaps, mr, link);
+		g_free(mr);
+	}
+
+	pthread_mutex_destroy(&session->lock);
+	pthread_mutex_destroy(&session->clients_lock);
+	g_free(session);
+}
+
 struct nvkvm_host_fd *nvkvm_fd_lookup(struct nvkvm_session *session,
 				      uint32_t fd_token)
 {

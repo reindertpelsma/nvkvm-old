@@ -155,6 +155,9 @@ struct nvkvm_mmap_region {
 
 #define NVKVM_MAX_FDS_PER_SESSION  256
 
+/* #80/H-1: capacity of the per-VM sparse-window free-list (recycled extents). */
+#define NVKVM_GPA_FREE_MAX 16384
+
 struct nvkvm_session {
 	uint32_t  id;
 	pid_t     guest_tgid;
@@ -221,6 +224,18 @@ typedef struct VirtIONvgpu {
 	uint64_t            sparse_cur;
 	int                 sparse_kvm_slot;
 	pthread_mutex_t     sparse_lock;
+
+	/*
+	 * #80 / audit H-1: free-list of returned GPA extents (offsets into the
+	 * sparse window).  Without this, sparse_cur was a no-free bump pointer:
+	 * a guest looping mmap/munmap (or cuMemAlloc/Free) leaked window space
+	 * irrecoverably until all GPU mmaps failed (host-visible DoS, hits even
+	 * a well-behaved long-lived guest).  munmap + isolate-kill now return
+	 * extents here; alloc reuses them (first-fit) before advancing sparse_cur.
+	 * Guarded by sparse_lock.
+	 */
+	struct nvkvm_gpa_extent { uint64_t off; uint64_t len; } *sparse_free;
+	uint32_t            sparse_free_n;
 
 	/*
 	 * #55: the sparse window's GPA is the firmware-assigned base of the
@@ -419,7 +434,14 @@ void nvkvm_set_kvm_vm_fd(int fd);
 int   nvkvm_sparse_init(VirtIONvgpu *nv);
 void  nvkvm_sparse_fini(VirtIONvgpu *nv);
 uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
+/* #80/H-1: return a GPA extent to the window free-list (recycled by alloc). */
+void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size);
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
+
+/* #80/H-2: tear down a session — close its handles, free its RM object graph,
+ * fd list, and the struct itself.  Called when the session's last isolate is
+ * killed.  Caller must NOT hold nv->sessions_lock. */
+void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session);
 /* #55: resolve the window base (BAR-assigned, or fixed fallback) and lazily
  * install the raw KVM memslot there.  Idempotent; returns the base GPA (0 on
  * failure).  Safe to call from get_config and the alloc path. */

@@ -88,6 +88,10 @@ static bool iso_mmap_free(uint32_t token, struct nvkvm_iso_mmap_entry *out)
 	return true;
 }
 
+/* #80 (audit H-3/M-E): reclaim a killed isolate's still-mapped iso_mmap_tbl
+ * entries (defined below, after the munmap helper it mirrors). */
+static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id);
+
 /* ── Device enumeration ──────────────────────────────────────────────────── */
 
 int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
@@ -319,13 +323,27 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 	int ret = nvkvm_isolate_kill(&nv->isolates, req->isolate_id);
 
 	/*
+	 * #80 (audit H-3/M-E): the isolate is now drained and dead.  Reclaim any
+	 * GPU mappings it still held — the guest may have killed it (or gone
+	 * silent) without sending MUNMAP_ON_ISOLATE, which previously leaked the
+	 * GPA window space, KVM slots and iso_mmap_tbl entries irrecoverably.
+	 */
+	nvkvm_iso_mmap_reap_isolate(nv, req->isolate_id);
+
+	/*
 	 * Walk every session and prune the killed isolate from its
 	 * isolate_ids[] list. Without this, session_first_isolate
 	 * later returns a stale (dead) isolate_id and the OPEN_DEVICE
 	 * round-trip fails — the session can outlive its isolate in
 	 * the test-cycle case (session_id is reused after the guest
 	 * idr_remove + new alloc lands the same id).
+	 *
+	 * #80 (audit H-2/H-3): collect sessions whose LAST isolate just died so
+	 * we can destroy them (close host fds + free RM objects + the struct)
+	 * after dropping sessions_lock — nvkvm_session_destroy re-takes it.
 	 */
+	struct nvkvm_session *to_destroy[16];
+	int n_destroy = 0;
 	pthread_mutex_lock(&nv->sessions_lock);
 	struct nvkvm_session *s;
 	TAILQ_FOREACH(s, &nv->sessions, link) {
@@ -336,10 +354,16 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 				s->isolate_ids[dst++] = s->isolate_ids[i];
 			}
 		}
+		bool became_empty = (dst == 0 && s->nisolates > 0);
 		s->nisolates = dst;
 		pthread_mutex_unlock(&s->lock);
+		if (became_empty && n_destroy < 16)
+			to_destroy[n_destroy++] = s;
 	}
 	pthread_mutex_unlock(&nv->sessions_lock);
+
+	for (int i = 0; i < n_destroy; i++)
+		nvkvm_session_destroy(nv, to_destroy[i]);
 
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
 	return 0;
@@ -1656,8 +1680,60 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 			munmap(e.qva, e.len);
 	}
 
+	/* #80/H-1: return the GPA extent to the window free-list so a
+	 * mmap/munmap loop recycles window space instead of leaking it. */
+	if (e.gpa)
+		nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+
 	resp->status = 0;
 	return 0;
+}
+
+/*
+ * #80 (audit H-3/M-E): on isolate kill, reclaim every iso_mmap_tbl entry the
+ * isolate still holds (guest killed/went silent without MUNMAP_ON_ISOLATE).
+ * Mirrors nvkvm_req_munmap_on_isolate's per-entry teardown but skips the
+ * isolate-side munmap (the isolate is gone).  Returns the count reclaimed.
+ */
+static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
+{
+	int reaped = 0;
+	pthread_mutex_lock(&iso_mmap_lock);
+	for (uint32_t i = 1; i < NVKVM_ISO_MMAP_MAX; i++) {
+		if (!iso_mmap_tbl[i].used ||
+		    iso_mmap_tbl[i].isolate_id != isolate_id)
+			continue;
+		struct nvkvm_iso_mmap_entry e = iso_mmap_tbl[i];
+		iso_mmap_tbl[i].used = false;
+		/* Drop the lock for the slow mmap/ioctl/munmap; the entry is
+		 * already detached so nothing else can touch it. */
+		pthread_mutex_unlock(&iso_mmap_lock);
+
+		if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT) {
+			if (e.qva)
+				mmap(e.qva, e.len, PROT_READ | PROT_WRITE,
+				     MAP_ANONYMOUS | MAP_PRIVATE |
+				     MAP_NORESERVE | MAP_FIXED, -1, 0);
+		} else {
+			if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
+				struct nvkvm_kvm_mem_region mr = {
+					.slot        = (uint32_t)e.kvm_slot,
+					.memory_size = 0,
+				};
+				ioctl(nvkvm_kvm_vm_fd,
+				      KVM_SET_USER_MEMORY_REGION, &mr);
+				nvkvm_kvm_slot_release(e.kvm_slot);
+			}
+			if (e.qva)
+				munmap(e.qva, e.len);
+		}
+		if (e.gpa)
+			nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+		reaped++;
+		pthread_mutex_lock(&iso_mmap_lock);
+	}
+	pthread_mutex_unlock(&iso_mmap_lock);
+	return reaped;
 }
 
 /* ── Poll on isolate ─────────────────────────────────────────────────────── */

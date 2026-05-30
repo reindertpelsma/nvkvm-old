@@ -237,3 +237,38 @@ Beyond R4-L1 (fixed), no new exploitable cross-boundary finding across 4 rounds;
 severity declined critical→high→med→low→(1 low). Remaining open = the documented
 multi-tenant resource-teardown blockers (#61/#80: H-1/H-2/H-3/M-E) and intra-VM
 robustness mediums (M-C/M-D/M-F), all tracked.
+
+---
+
+## #80 teardown hardening — H-1 / H-2 / H-3 / M-E FIXED (2026-05-30)
+
+Implemented the documented "minimum multi-tenant fix": a host-side reaper on
+the kill path plus a window free-list. All on the serialised TX virtqueue
+thread; session structs are freed only once `nisolates == 0` (after every
+isolate and its drained ioctl-pool workers are gone), so no worker can hold a
+stale pointer.
+
+- **H-1 (GPA no-free bump → DoS):** `nvkvm_sparse_gpa_free()` returns extents to
+  a per-VM free-list (`sparse_free`, first-fit reuse + tail/adjacent coalesce).
+  Called from `MUNMAP_ON_ISOLATE` and the kill reaper. `nvkvm_sparse_gpa_alloc`
+  reuses freed extents before advancing `sparse_cur`.
+- **M-E + H-3 (mmap/slot leak on kill):** `nvkvm_iso_mmap_reap_isolate()` scans
+  `iso_mmap_tbl` on `KILL_ISOLATE`, restoring anon backing (in-window) or
+  releasing the per-mmap KVM slot (legacy), and frees the GPA extent.
+- **H-3 + H-2 (handle/fd/RM-object + session-struct leak):** when a session's
+  last isolate is killed, `nvkvm_session_destroy()` force-closes all its host
+  fds (`nvkvm_handle_close_session`, ignoring isolate_refcount → releases kernel
+  RM objects + GPU memory), frees the RM object graph, drains the legacy
+  fd/mmap lists, and frees the session struct + mutexes (TAILQ_REMOVE).
+
+**Validation (RTX 3060 / 580.159.04):** 12× matmul back-to-back drove ~18 000
+cumulative device mappings through the 8192-entry `iso_mmap_tbl` with **0**
+`iso_mmap_tbl full` / `window exhausted` events (pre-fix, run ~6 would wedge);
+test_ioctl_fwd 48/48; Qwen2.5-7B coherent. Each matmul is a full session
+create→map→kill→destroy cycle.
+
+**Residual (lower severity, follow-up):** no idle/timeout reaper for a guest
+that goes silent without `KILL_ISOLATE` — its resources are bounded to its own
+per-VM QEMU and fully reclaimed when the VM stops (process exit). Per-VM caps
+are implicit in the fixed table sizes. M-F (allowlist default-deny independent
+of count) is a separate DiD finding, untouched here.
