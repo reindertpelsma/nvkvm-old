@@ -204,9 +204,13 @@ static int nvkvm_child_enter_mount_ns(void)
 		close(dd);
 	}
 	/* Seal the root read-only now that the nvidia binds are in place (they are
-	 * separate mounts, unaffected, and stay openable). */
-	mount(NULL, "/", NULL,
-	      MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL);
+	 * separate mounts, unaffected, and stay openable).  Audit R4-L1: this used
+	 * to ignore the return — a silent partial fail-open (the stub would run
+	 * with a writable root tmpfs if the remount failed).  Fail closed: the
+	 * caller _exit(126)s the child, so a weakened sandbox never runs. */
+	if (mount(NULL, "/", NULL,
+		  MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL) < 0)
+		return -1;
 	return 0;
 }
 

@@ -203,3 +203,37 @@ CREATE/KILL_ISOLATE / COPY/CLOSE_HANDLE_ON_ISOLATE / POLL/UNPOLL / READ_HOST_FIL
 / REALIZE all validated; handle-table fd lifetime (acquire_fd dup-under-lock)
 sound; the other lock domains (iso_mmap/sparse/kvm-slot/admin/client_allow) have
 no inversion (MMAP/MUNMAP/REALIZE are TX-thread-only).
+
+## Round 4 (transport front-end + spawn hardening) — converging
+
+Verified round-3 fixes (C-1/N-1/N-2/C-2) all correct, no regression/deadlock.
+- **virtio front-end (virtio_nvgpu.c): CLEAN** — every iov_to_buf/iov_from_buf
+  is iov-length-bounded; a malformed/short/zero descriptor chain leaves
+  {0}-init'd request fields (handlers validate) and cannot over-read QEMU memory;
+  response aggregates are zero-init'd with no padding → no uninitialized-memory
+  disclosure; elem ownership correct (no double-free/leak); EVENT_IDX masked off.
+- **isolate spawn/sandbox: fail-CLOSED** at every hard gate (mount-ns/pivot,
+  cap-drop, userns-map); NVKVM_ISOLATE_NO_HARDEN / debug hatches are host-env,
+  not guest-reachable; memfd/fexecve (MFD_CLOEXEC, empty envp, post-pivot dirfd)
+  sound; seccomp ordering (no_new_privs-before-spawn + TSYNC) re-verified.
+
+### R4-L1 — RO-root remount return silently ignored (partial fail-open)  ❌→✅ FIXED
+`nvkvm_child_enter_mount_ns` discarded the `mount(MS_REMOUNT|MS_RDONLY,"/")`
+result, so a failed remount left the stub on a writable root tmpfs. LOW (256k
+NOEXEC tmpfs, seccomp blocks execve, caps dropped, /dev/nvidia* are separate
+binds). **Fix:** check the return and `return -1` (caller `_exit(126)`s) — fail
+closed. VM-verified: the remount succeeds on the target kernel (matmul still
+PASS), so fail-closing is safe.
+
+### Mediums verdict (M-B/M-C/M-D/M-F): correctly deferred
+All confirmed single-tenant/intra-VM or kernel-reach-gated — none a cross-tenant
+exploit on its own. M-B mitigated (bounds-checked + H-B exit-on-fault); M-C/M-2
+(blind +16 write) intra-VM robustness; M-D (framing) intra-VM, dup-txn already
+neutralized by R2-H2; M-F (client_allow fail-open-while-empty) narrow pre-first-
+alloc window, kernel-gated. Worth tightening for robustness, not boundary fixes.
+
+## Convergence
+Beyond R4-L1 (fixed), no new exploitable cross-boundary finding across 4 rounds;
+severity declined critical→high→med→low→(1 low). Remaining open = the documented
+multi-tenant resource-teardown blockers (#61/#80: H-1/H-2/H-3/M-E) and intra-VM
+robustness mediums (M-C/M-D/M-F), all tracked.
