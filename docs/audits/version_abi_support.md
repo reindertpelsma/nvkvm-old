@@ -395,3 +395,31 @@ customer needs them.
   (channel base/_V570), `:367-371` (VASPACE);
   `gvisor/pkg/abi/nvgpu/uvm.go:303,332-337,790-794` (UVM base/_V550);
   `gvisor/pkg/abi/nvgpu/frontend.go:625,654` (NVOS46 / _V580).
+
+---
+
+## Live multi-driver validation (2026-05-30)
+
+The version-keyed `abi_profile` system (commits cbcdd65, 4ba139b) was validated
+on **real hardware** (vast.ai RTX 3060 / GA106) across two distinct open driver
+**major versions**, by physically swapping the host kernel module + GSP firmware
+and matching the guest libcuda:
+
+| Host driver (open) | Detected profile | matmul | test_ioctl_fwd | Qwen2.5-7B |
+|---|---|---|---|---|
+| 575.51.03 | 570 | PASS | 48/48 | PASS (prior) |
+| **580.159.04** | **580** | **PASS** | **48/48** | **PASS** |
+
+QEMU auto-detected each version from `CHECK_VERSION_STR` and logged
+`nvkvm: host driver <v> → ABI profile <id>` with **zero code changes** between
+runs — only the host driver and guest libcuda were swapped. The 580 run
+exercises the hardest profile deltas vs 575: `FERMI_VASPACE_A` params 48→56B
+(+`Pasid`) and `NVOS46` 56→64B with `status` moving 48→56. Both flowed correctly
+through guest→QEMU→stub via the `abi_profile` field in `ISOLATE_CMD_IOCTL`.
+
+**Conclusion:** the profile-570 (V550-era: 535-derived-but-V550) ↔ profile-580
+range is hardware-proven end-to-end including a 7B LLM. The profile-535
+(pre-V550) branch is wired in the table but **not yet hardware-validated** — it
+needs the guest to additionally emit the 1-entry (vs 256-entry) UVM array layout
+for `UVM_MAP_EXTERNAL_ALLOCATION` / `ALLOC_SEMAPHORE_POOL`, which the current
+guest builds V550-only. That is the next increment for full 3-version coverage.
