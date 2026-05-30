@@ -98,15 +98,24 @@ int ioctl(int fd, unsigned long request, ...)
 	uint32_t aclass = 0;
 	if (track && type == 'F' && nr == 0x2b && arg && size >= 16)
 		memcpy(&aclass, (char *)arg + 12, 4);
+	/* NVOS64 (size 48): inner alloc params at pAllocParms@16, size@32. Dump
+	 * exactly that many bytes (no stack noise) to catch writeback diffs. */
+	void    *aparms = NULL;
+	uint32_t apsize = 0;
+	if (track && type == 'F' && nr == 0x2b && arg && size == 48) {
+		memcpy(&aparms, (char *)arg + 16, 8);
+		memcpy(&apsize, (char *)arg + 32, 4);
+	}
 
 	if (track) {
 		fprintf(logf, "IOCTL %-10s nr=0x%02x size=%u", tag(dev), nr, size);
 		if (is_ctrl) fprintf(logf, " ctrl=0x%08x psize=%u", cctrl, csize);
-		if (nr == 0x2b) fprintf(logf, " class=0x%04x", aclass);
+		if (nr == 0x2b) fprintf(logf, " class=0x%04x apsize=%u", aclass, apsize);
 		fputc('\n', logf);
-		/* Full outer struct (defined _IOC_SIZE bytes only) + control inner. */
+		/* Full outer struct (defined _IOC_SIZE bytes only) + control/alloc inner. */
 		if (arg && size) hexdump("inS ", arg, size);
 		if (is_ctrl && cparams) hexdump("in  ", cparams, csize);
+		if (aparms && apsize) hexdump("aIN ", aparms, apsize);
 	}
 
 	int ret = real_ioctl(fd, request, arg);
@@ -121,6 +130,7 @@ int ioctl(int fd, unsigned long request, ...)
 		}
 		if (arg && size) hexdump("outS", arg, size);
 		if (is_ctrl && cparams) hexdump("out ", cparams, csize);
+		if (aparms && apsize) hexdump("aOUT", aparms, apsize);
 		fflush(logf);
 	}
 	return ret;
