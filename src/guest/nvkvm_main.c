@@ -676,8 +676,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * from the size the caller encoded in the cmd (_IOC_SIZE), we will
 	 * forward a TRUNCATED/over-long, malformed buffer to the host kernel —
 	 * the low bytes match but the call is wrong (cf. the NVOS32 88-vs-184
-	 * bug).  Log every mismatch so EGL/graphics-path ioctls get caught. */
-	if (_IOC_SIZE(cmd) && (size_t)_IOC_SIZE(cmd) != param_size)
+	 * bug).  Log every mismatch so EGL/graphics-path ioctls get caught.
+	 *
+	 * Skip UVM cmds (_IOC_TYPE == 0): UVM's command numbers (0x3000xxxx)
+	 * encode a bogus _IOC_SIZE (e.g. UVM_INITIALIZE 0x30000001 → 0x3000)
+	 * that the UVM driver ignores — it reads its own per-cmd struct.  These
+	 * are false positives that would otherwise mask a real 'F'/'d'/'m'
+	 * mismatch in the log. */
+	if (_IOC_TYPE(cmd) != 0 &&
+	    _IOC_SIZE(cmd) && (size_t)_IOC_SIZE(cmd) != param_size)
 		pr_warn("nvkvm: AUDIT param_size MISMATCH cmd=0x%x type=0x%x nr=0x%x iocsz=%u our=%zu\n",
 			cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd), param_size);
 
