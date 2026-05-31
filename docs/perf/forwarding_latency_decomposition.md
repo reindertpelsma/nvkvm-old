@@ -175,3 +175,25 @@ instead of a bulk copy-engine DMA; the guest blocks in poll waiting for it.
 DtoH-slow and the cuMemAllocManaged err=999 are the SAME root area (UVM path).
 Next: trace the host-side UVM migration during DtoH (why per-page 0x48, can it
 be bulk/copy-engine) — that's the real lever, not the copy transport or poll.
+
+## DtoH fix investigation (2026-06-01) — confirmed mechanism, found the lever, hit a wall
+
+Goal: fix pageable cuMemcpyDtoH (100x slow). Findings:
+- **Pinned (copy-engine) DtoH is ~instant: ~1857 GB/s vs pageable 0.1 GB/s.** So
+  the copy-engine path is fine; only the pageable path is pathological.
+- **Pageable slowness = per-page UVM_VALIDATE_VA_RANGE (0x48): ~6118 forwarded
+  ioctls/copy.** libcuda routes pageable cuMemcpy through UVM's pageable-access
+  path. DtoH correctness verified byte-exact.
+- **cuMemHostAlloc (pinned) has an ~8MB cap**: works ≤8MB, FAILS ≥16MB with
+  err=304 (OPERATING_SYSTEM). Separate bug; smells like a slot/mmap size limit.
+  (libcuda's internal bounce buffers are small, so this doesn't block the fix.)
+- **The fix lever**: make libcuda use the copy-engine/bounce path for pageable.
+  TRIED forcing pageable-access UNSUPPORTED via the UVM_PAGEABLE_MEM_ACCESS(39)
+  + _ON_GPU(70) ioctl response → **NO effect** (pageable DtoH still 0.1). So
+  libcuda's pageable-copy decision is NOT gated on that UVM ioctl.
+- **STUCK / next**: the decision is gated on the device attribute
+  PAGEABLE_MEMORY_ACCESS (CUdeviceGetAttribute 88, =1 in guest, from an
+  RM_CONTROL) or an internal libcuda decision. Need to identify the exact
+  RM_CONTROL/field that reports pageable support and override it to 0, then
+  re-test — OR fix the ~8MB pinned cap so apps using pinned go fast directly.
+  Both are source-level digs (libcuda decision tracing / RM control byte-diff).

@@ -50,6 +50,8 @@ typedef void *CUevent;
 static CUresult (*cuEventCreate)(CUevent *, unsigned);
 static CUresult (*cuEventRecord)(CUevent, CUstream);
 static CUresult (*cuEventSynchronize)(CUevent);
+static CUresult (*cuMemHostAlloc)(void **, size_t, unsigned);
+static CUresult (*cuMemFreeHost)(void *);
 
 #define CHK(call) do { CUresult _r=(call); if(_r){fprintf(stderr,#call" failed: %d\n",_r); return 1;} } while(0)
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec/1e9; }
@@ -92,6 +94,8 @@ int main(int argc, char **argv)
 	*(void**)(&cuEventCreate)=dlsym(h,"cuEventCreate");
 	*(void**)(&cuEventRecord)=dlsym(h,"cuEventRecord");
 	*(void**)(&cuEventSynchronize)=dlsym(h,"cuEventSynchronize");
+	*(void**)(&cuMemHostAlloc)=dlsym(h,"cuMemHostAlloc");
+	*(void**)(&cuMemFreeHost)=dlsym(h,"cuMemFreeHost");
 
 	CUdevice dev; CUcontext ctx;
 	CHK(cuInit(0)); CHK(cuDeviceGet(&dev,0)); CHK(cuCtxCreate(&ctx,0,dev));
@@ -123,6 +127,16 @@ int main(int argc, char **argv)
 	  printf("   DtoH %.1f GB/s", (double)sz*M/t/1e9);
 	  size_t bad=0; for(size_t i=0;i<sz/4;i++) if(vb[i]!=hb[i]) bad++;
 	  printf("   DtoH correctness: %s (%zu/%zu mismatched)\n", bad?"FAIL":"OK", bad, sz/4);
+	  /* 3b: PINNED host buffer — copy-engine path, no UVM pageable per-page validate */
+	  if(cuMemHostAlloc){
+	    void *pin=NULL; CUresult pr=cuMemHostAlloc(&pin,sz,0);
+	    if(pr==0 && pin){
+	      cuMemcpyDtoH(pin,d,sz); /* warm */
+	      t=now(); for(int i=0;i<M;i++) CHK(cuMemcpyDtoH(pin,d,sz)); t=now()-t;
+	      printf("3b pinned DtoH: %.1f GB/s (pinned host buf, copy-engine path)\n", (double)sz*M/t/1e9);
+	      cuMemFreeHost(pin);
+	    } else printf("3b pinned DtoH: cuMemHostAlloc failed (err=%d)\n", pr);
+	  } else printf("3b pinned DtoH: cuMemHostAlloc symbol missing\n");
 	  cuMemFree(d); free(hb); free(vb); }
 
 	/* ---- 4: launch + sync (doorbell + completion fence) ---- */
