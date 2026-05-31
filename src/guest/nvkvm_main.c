@@ -402,11 +402,28 @@ static int nvkvm_ring_wait_resp(struct nvkvm_session *s, u32 txn,
  * virtqueue.  Controls needing guest- or QEMU-side handling (GET_PID_INFO,
  * EXPORT) are excluded by the caller before reaching here.
  */
+/*
+ * Runtime toggle for the SPSC command-buffer fast path.  Default OFF: the ring
+ * is correct + validated (HW: 1446 flat RM_CONTROLs/decode offloaded, byte-exact
+ * matmul, 4x multi-proc, zero regression) but measurement showed it does NOT
+ * improve LLM decode throughput — control-RTT is only ~1-2% of per-token time
+ * (the bottleneck is GPU compute + the mapped doorbell/fence launch path), and
+ * keeping the isolate spinning costs host CPU.  Enable it for workloads that ARE
+ * control-latency-bound:  echo 1 > /sys/module/nvkvm_guest/parameters/ring_enable
+ * See docs/design/command_buffer.md "Measured results".
+ */
+static bool nvkvm_ring_enable;   /* default false */
+module_param_named(ring_enable, nvkvm_ring_enable, bool, 0644);
+MODULE_PARM_DESC(ring_enable, "route flat RM_CONTROLs over the SPSC fast ring (default off)");
+
 int nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
 			   void *params_buf, size_t param_size,
 			   void *aux_buf, size_t aux_size, u32 *nvstatus_out)
 {
 	struct nvkvm_session *s = ctx->session;
+
+	if (!nvkvm_ring_enable)
+		return NVKVM_RING_TRY_PUNT;
 	struct nvkvm_ring_ioctl_req rh;
 	u32 payload, txn;
 	u64 total;
@@ -455,19 +472,6 @@ int nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
 	rc = nvkvm_ring_wait_resp(s, txn, params_buf, param_size,
 				  aux_buf, aux_size, nvstatus_out);
 	mutex_unlock(&s->ring_lock);
-
-	/* Lightweight liveness stats (proves the fast path is actually used). */
-	{
-		static atomic_t ring_exec = ATOMIC_INIT(0);
-		static atomic_t ring_punt = ATOMIC_INIT(0);
-		int e, p;
-		if (rc == NVKVM_RING_TRY_PUNT)
-			p = atomic_inc_return(&ring_punt), e = atomic_read(&ring_exec);
-		else
-			e = atomic_inc_return(&ring_exec), p = atomic_read(&ring_punt);
-		if (e == 1 || p == 1 || ((e + p) % 500) == 0)
-			pr_info("nvkvm: ring stats: exec=%d punt=%d\n", e, p);
-	}
 	return rc;
 }
 

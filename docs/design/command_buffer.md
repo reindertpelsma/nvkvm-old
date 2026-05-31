@@ -266,3 +266,46 @@ QEMU-only ops are the residual bottleneck after Phases 2–6.
   swap to a larger memfd, resume. No need to resize under load — fall-back to
   the virtqueue absorbs bursts. So resize is an optional throughput tweak, not a
   correctness requirement.
+
+---
+
+## Measured results (2026-05-31, vast.ai RTX 3060, driver 580.159.04)
+
+The full data path is built and HW-validated end-to-end (stub consumer loop +
+QEMU `enter_loop` offload + guest pump/producer):
+
+- **Correctness**: 1024² fp32 matmul byte-exact through the ring (exec=36,
+  punt=1 for a single run); 4× concurrent matmul all PASS; cuInit PASS; LLM
+  decode runs clean. Zero regression vs the virtqueue path.
+- **Ring is actually used**: during LLM decode the ring carries the bulk of the
+  hot controls — e.g. **exec=1446, punt=54** over ~120 tokens (~12 flat
+  RM_CONTROLs/token), with the slow path seeing only ~40 ioctls total (setup).
+- **Batching works**: `enter_loop` fired <100 times for ~482 ring controls in a
+  decode (≈5–10+ controls per round-trip) — the stub stays spinning across a
+  burst, so per-control cost is a memory write + a µs-scale busy-wait, not a
+  full virtqueue round-trip.
+
+**But it does not improve decode throughput.** A/B with
+`ring_enable={0,1}`: **~28 t/s either way** (within run-to-run noise). The
+reason: control-RTT is only ~1–2 % of per-token wall-clock. At ~28 t/s a token
+is ~35 ms; ~12 controls × ~45 µs saved ≈ 0.5 ms ≈ 1.5 %. The decode bottleneck
+is GPU compute plus the **launch/sync path, which is not ioctl-bound** — a
+`gpu_bench` noop-launch loop issues *zero* per-launch RM_CONTROLs (work is
+submitted via the mapped pushbuffer/doorbell and completion is polled on a
+mapped fence, all direct memory, no forwarded ioctl). So the original premise
+(decode is dominated by control-RTT *volume*) does not hold for these workloads.
+
+**Cost.** Keeping the isolate spinning during a burst (and the guest producer
+busy-waiting for its response) trades host/guest CPU for control latency. Since
+latency is not the bottleneck here, that trade is a net negative for
+compute/decode workloads — hence **`ring_enable` defaults OFF**.
+
+**When it would pay off** (left enabled-on-demand via the param): workloads that
+*are* control-latency-bound — very high token-rate tiny models, speculative
+decode, or any path where a synchronous burst of small RM_CONTROLs sits on the
+critical path. The transport is also a reusable building block (a guest↔QEMU
+control ring for mmap-class ops was always a separate, planned use).
+
+**Not pursued here** (the real decode optimisation): the launch/sync path is
+mapped-memory, not ioctl — so accelerating it is a different effort (doorbell/
+fence trap behaviour, vCPU scheduling), not a command-forwarding problem.
