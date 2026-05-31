@@ -48,7 +48,11 @@ read is always conservatively safe.
 - **Pad-to-end on wrap**: if a record would straddle `N`, emit a skip record so
   every record is contiguous (no split reads).
 - Producer: free-space check (acquire other's counter) → write payload →
-  **release-store** own counter `+= len`. Full ⇒ adaptive spin then block.
+  **release-store** own counter `+= len`. **Doesn't fit (ring full, or record
+  > N) ⇒ fall back to the virtqueue transaction for that one ioctl** — the
+  virtqueue is always the correct path, so the ring is a pure optimization and
+  the producer NEVER blocks on a full ring (no producer-stall deadlock, and
+  oversized/rare ioctls naturally take the slow path they'd want anyway).
 - Consumer: acquire other's counter; while not empty: read `len` at `head%N`,
   **bounds-check** (`len ≤ available`, `≤ N`, aligned) → **copy record to
   private memory** → validate (fast-path allowlist) → execute → **release-store
@@ -152,4 +156,10 @@ The guest must know the isolate has seen every command before it sleeps:
   inline-vs-worker thresholds (next step).
 - Confirm which isolate-serviceable ioctls are genuinely slow (event-waits) so
   they take the worker path.
-- Grow policy (when/by how much to resize a full ring) + back-pressure.
+- Grow policy: the ring is a fixed mmap; **resize only at quiescence** (no
+  in-flight ring txns). Mechanism: the producer notices chronic
+  fall-back-to-virtqueue (ring too small), requests a grow over the control
+  channel; the consumer drains to empty (sync confirms `head==tail`), both sides
+  swap to a larger memfd, resume. No need to resize under load — fall-back to
+  the virtqueue absorbs bursts. So resize is an optional throughput tweak, not a
+  correctness requirement.
