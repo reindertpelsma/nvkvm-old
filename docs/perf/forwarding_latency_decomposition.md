@@ -80,3 +80,43 @@ tunable (higher burns idle-vCPU CPU, only worth it for latency-bound deployments
 The residual software floor would only fall to the transport rework (collapse hops
 / host kernel module) — justified ONLY if a real workload is setup-latency-bound,
 which decode/compute are not (already at host parity).
+
+## Decode is 14× slower than host — root causes (2026-05-31)
+
+Got the missing host baseline: same model/llama-cli on the host = **387 t/s** vs
+guest **28 t/s** — decode is **14× slower**, NOT at parity. (Earlier "parity" was
+matmul = ONE big compute-bound kernel; decode = hundreds of tiny launches/token,
+so it's launch/exit-bound, a totally different regime.)
+
+KVM exit profile during guest decode (`kvm:kvm_mmio` ftrace + debugfs counters)
+found three culprits, in order discovered:
+
+1. **HPET clocksource (70% of MMIO exits).** `-cpu host,hypervisor=off` cleared
+   the hypervisor CPUID bit → guest never discovered kvm-clock → fell back to
+   HPET → every clock read is a VM-exit (~3800/token). The `hypervisor=off` was
+   to hide the VM from NVIDIA Code-43 detection, but in the FORWARDING model the
+   NVIDIA driver runs on the host, not the guest — nothing to fool.
+   **Fix: drop `hypervisor=off` → kvm-clock.** Forwarding + matmul still pass.
+
+2. **virtio-nvgpu on legacy shared INTx, not MSI-X.** Every completion interrupt
+   triggered shared-line ISR-status demux MMIO reads (~2150/token at the *net*
+   device's BAR, sharing the line) + fasteoi. The block devices already used
+   MSI-X; the nvgpu PCI wrapper left `nvectors` at the struct default 0 (not
+   DEV_NVECTORS_UNSPECIFIED) so the usual idiom never enabled it.
+   **Fix: force `vpci_dev->nvectors = 4` (3 VQs + config) before qdev_realize**
+   (msix_init runs during device_plugged, so a later set is ignored). MSI-X
+   Enable+ Count=4 confirmed; mmio_exits 2155→366/token.
+
+**But single-stream decode barely moved (28 → 32 t/s).** Both fixes are real
+(HPET 114k→0 exits; mmio 5×↓) and cut host-CPU/VM-exits per token — a density /
+multi-tenant win — but they did NOT move single-stream throughput, and neither
+did `halt_poll_ns` (0/200µs/2ms/8ms all ~32 t/s). So the 12× residual is **NOT**
+VM-exit, interrupt, clocksource, or halt-scheduling bound. It's **per-launch
+latency**: ~570 launches/token × ~54 µs/launch (vs 6.65 µs host) ≈ 31 ms/token.
+Host view shows decode is single-threaded, one vCPU ~67% busy (~1/3 blocked) —
+latency-bound in the launch+sync path itself, not exit-bound.
+
+**Open (next investigation, guest-side):** where does the ~54 µs/launch go if not
+exits/interrupts/halts? Candidates: doorbell-write path, completion-fence
+visibility/coherency (PCIe-read vs cached), or guest-module CPU in the forward
+hot path. Needs guest-side per-launch profiling, not host exit-counting.

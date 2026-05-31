@@ -59,7 +59,7 @@ exec "$QEMU" \
     -enable-kvm \
     -m 4G \
     -smp 4 \
-    -cpu host,hypervisor=off \
+    -cpu host \
     \
     -drive file="$IMG",format=qcow2,if=virtio \
     -drive file="$SEED",format=raw,if=virtio,readonly=on \
