@@ -23,6 +23,7 @@
 #include "nvkvm_ctrl_allowlist.h"
 #include "nvkvm_fe_alloc_allowlist.h"
 #include "nvkvm_drm_allowlist.h"
+#include "nvkvm_nvkms_allowlist.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -900,11 +901,24 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			return 0;
 		}
 	} else if (req->cmd == NVKVM_NVKMS_IOCTL_CMD) {
-		/* NVKMS (/dev/nvidia-modeset): the ONE allowed modeset ioctl
-		 * (_IOWR('m',0,NvKmsIoctlParams)).  Default-deny otherwise — any
-		 * other 'm'-type cmd is rejected by the non-'F' branch below.
-		 * Falls through to the generic forward path (the 'F' frontend
-		 * allowlists below all guard on type=='F', so they're skipped). */
+		/* NVKMS (/dev/nvidia-modeset): the ONE allowed outer ioctl
+		 * (_IOWR('m',0,NvKmsIoctlParams)).  Audit G-1: also default-deny
+		 * on the INNER cmdType (wrapper {cmdType@0,size@4,address@8}) —
+		 * otherwise a guest can drive any NVKMS command (incl. the
+		 * cross-client GRANT/ACQUIRE/REVOKE_PERMISSIONS and GRANT_SURFACE
+		 * verbs) on a host-global display device.  Allow only the
+		 * cmdTypes a real Vulkan/EGL session issues; see
+		 * nvkvm_nvkms_allowlist.h. */
+		uint32_t nvkms_cmd = (param_buf && req->param_size >= 4)
+			? *(const uint32_t *)param_buf : 0xffffffffu;
+		if (!nvkvm_nvkms_cmd_allowed(nvkms_cmd)) {
+			fprintf(stderr, "nvkvm: DENY nvkms cmdType=%u\n", nvkms_cmd);
+			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
+		}
 	} else if (_IOC_TYPE(req->cmd) != 'F') {
 		NVKVM_DBG("nvkvm: DENY non-'F' cmd 0x%x (type=0x%x)\n",
 			  req->cmd, _IOC_TYPE(req->cmd));

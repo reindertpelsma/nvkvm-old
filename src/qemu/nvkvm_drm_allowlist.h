@@ -28,16 +28,24 @@ static inline bool nvkvm_drm_nr_allowed(unsigned nr)
 	case 0x00: /* DRM_IOCTL_VERSION (synthesized guest-side) */
 	case 0x09: /* DRM_IOCTL_GEM_CLOSE */
 	/* nvidia private (DRM_COMMAND_BASE + DRM_NVIDIA_*) */
-	case NVKVM_DRM_COMMAND_BASE + 0x02: /* GEM_IMPORT_USERSPACE_MEMORY */
 	case NVKVM_DRM_COMMAND_BASE + 0x03: /* GET_DEV_INFO (enumeration key) */
 	case NVKVM_DRM_COMMAND_BASE + 0x04: /* FENCE_SUPPORTED */
 	case NVKVM_DRM_COMMAND_BASE + 0x05: /* PRIME_FENCE_CONTEXT_CREATE */
 	case NVKVM_DRM_COMMAND_BASE + 0x06: /* GEM_PRIME_FENCE_ATTACH */
 	case NVKVM_DRM_COMMAND_BASE + 0x08: /* GET_CLIENT_CAPABILITY */
-	case NVKVM_DRM_COMMAND_BASE + 0x0a: /* GEM_MAP_OFFSET */
-	case NVKVM_DRM_COMMAND_BASE + 0x0d: /* GEM_EXPORT_DMABUF_MEMORY */
-	case NVKVM_DRM_COMMAND_BASE + 0x0e: /* GEM_IDENTIFY_OBJECT */
 	case NVKVM_DRM_COMMAND_BASE + 0x0f: /* DMABUF_SUPPORTED */
+	/*
+	 * Audit G-3: GEM_IMPORT_USERSPACE_MEMORY (0x02), GEM_MAP_OFFSET (0x0a),
+	 * GEM_EXPORT_DMABUF_MEMORY (0x0d) and GEM_IDENTIFY_OBJECT (0x0e) are
+	 * deliberately NOT allowed.  They carry raw guest VAs / mint mappings
+	 * with no guest-VA marshalling — a guest VA forwarded to the host
+	 * render node is pinned in the stub's address space (stub-heap info
+	 * disclosure).  The legitimate guest DRM proxy (nvkvm_drm.c) never
+	 * issues them (its ioctl table wires only GET_DEV_INFO / DMABUF_SUPPORTED
+	 * / SEMSURF_FENCE_* + GEM_CLOSE), so denying them is regression-free.
+	 * EXPORT_DMABUF (0x0d) will be re-added WITH marshalling when the
+	 * dma-buf present path lands (docs/design/virtual_modeset.md Piece 1).
+	 */
 	/* Semaphore-surface fences — render-path GPU synchronisation primitives
 	 * (pair with NV_SEMAPHORE_SURFACE); NOT display/permissions.  The Vulkan
 	 * ICD uses them for cross-queue/cross-process sync (#84). */
