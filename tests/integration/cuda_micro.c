@@ -119,17 +119,26 @@ int main(int argc, char **argv)
 	  printf("4 launch_sync : %d launch+sync    %.2f us/launch\n", launch_iters, t/launch_iters*1e6); }
 
 	/* ---- 5: UVM managed alloc + CPU touch ---- */
+	int uvm_ok = 0;
 	if(cuMemAllocManaged){
-	  size_t sz=1<<20;
-	  for(int i=0;i<20;i++){CUdeviceptr p; cuMemAllocManaged(&p,sz,1); memset((void*)(uintptr_t)p,1,4096); cuMemFree(p);}
-	  t=now(); for(int i=0;i<uvm_iters;i++){CUdeviceptr p; CHK(cuMemAllocManaged(&p,sz,1)); memset((void*)(uintptr_t)p,1,4096); CHK(cuMemFree(p));} t=now()-t;
-	  printf("5 uvm_alloc   : %d managed+touch   %.2f us/op\n", uvm_iters, t/uvm_iters*1e6);
+	  size_t sz=1<<20; CUdeviceptr probe=0;
+	  CUresult mr = cuMemAllocManaged(&probe, sz, 1);
+	  if(mr || !probe){
+	    printf("5 uvm_alloc   : cuMemAllocManaged FAILED (err=%d ptr=0x%llx) — skipping UVM\n",
+		   mr, (unsigned long long)probe);
+	  } else {
+	    cuMemFree(probe);
+	    uvm_ok = 1;
+	    for(int i=0;i<20;i++){CUdeviceptr p=0; if(cuMemAllocManaged(&p,sz,1)||!p)break; memset((void*)(uintptr_t)p,1,4096); cuMemFree(p);}
+	    t=now(); for(int i=0;i<uvm_iters;i++){CUdeviceptr p=0; CHK(cuMemAllocManaged(&p,sz,1)); if(!p){fprintf(stderr,"null managed ptr\n");return 1;} memset((void*)(uintptr_t)p,1,4096); CHK(cuMemFree(p));} t=now()-t;
+	    printf("5 uvm_alloc   : %d managed+touch   %.2f us/op\n", uvm_iters, t/uvm_iters*1e6);
+	  }
 	} else printf("5 uvm_alloc   : (cuMemAllocManaged unavailable)\n");
 
 	/* ---- 6: UVM migration thrash (GPU-write then CPU-write each iter) ---- */
-	if(cuMemAllocManaged){
-	  size_t sz=4<<20; unsigned n=sz/4; CUdeviceptr p;
-	  CHK(cuMemAllocManaged(&p,sz,1));
+	if(uvm_ok){
+	  size_t sz=4<<20; unsigned n=sz/4; CUdeviceptr p=0;
+	  CHK(cuMemAllocManaged(&p,sz,1)); if(!p){fprintf(stderr,"null managed ptr\n");return 1;}
 	  unsigned blk=256, grid=(n+blk-1)/blk; void *args[]={&p,&n};
 	  for(int i=0;i<5;i++){ cuLaunchKernel(wr,grid,1,1,blk,1,1,0,0,args,0); cuCtxSynchronize(); memset((void*)(uintptr_t)p,2,sz);}
 	  t=now();
