@@ -44,14 +44,40 @@ spin** on shared completion memory (no vCPU deschedule, no IRQ wakeup). A
 QEMU↔isolate-only fast-path buys ~2% and is not worth building. The guest-side
 half is the prize.
 
-## Next experiment (cheap, confirms the hypothesis)
+## Experiment 2: guest-side completion spin — NEGATIVE (vCPU-wakeup ruled out)
 
-Make the guest module **bounded-spin** on ioctl completion instead of
-`wait_for_completion` (mirrors the adaptive spin→block we'd build anyway), and
-measure decode t/s. If it jumps toward host, the vCPU-wakeup is confirmed as the
-bottleneck and the guest-side command-buffer spin is justified. If not, the cost
-is in the host driver under contention or elsewhere — measure further before
-building.
+Made the guest module bounded-spin (~600 µs budget, `try_wait_for_completion` +
+`cpu_relax`) on the forwarded-ioctl completion before blocking. Result: decode
+**unchanged at ~28 t/s** (same as the non-spin baseline; the original "24" was
+pre-security-fix noise). So keeping the vCPU running (no idle→IRQ→wakeup) buys
+**nothing** → the guest-side vCPU wakeup is **NOT** the bottleneck.
+
+## Reframed bottleneck (after ruling out socketpair AND guest-wakeup)
+
+The ~1.6 ms/ioctl overhead (≈37 ms/token ÷ ~20 ioctls) is on the **host side**,
+in QEMU's machinery between receiving the virtqueue kick and producing the
+response — candidates, none yet isolated:
+- thread-pool dispatch latency (`thread_pool_submit_aio`) getting the ioctl work
+  to a pool thread under load;
+- the reader-thread → worker pthread_cond handoff for the response;
+- the completion callback (`nvkvm_ioctl_work_done`) running under the **BQL** —
+  if vCPUs hold the BQL, the completion is delayed (ms-scale under contention);
+- per-ioctl serialization on QEMU/stub locks.
+
+A spin on the host side wasn't tested; the **command buffer (guest↔isolate,
+bypassing QEMU entirely)** removes ALL of the above — the isolate's spin-thread
+does recv→ioctl→send inline with no thread-pool, no cond handoff, no BQL. So the
+command buffer remains the likely fix, now for a host-QEMU reason rather than a
+guest-wakeup one.
+
+## Next experiment (localize the host-side cost before building)
+
+Add timestamps in QEMU: t0=kick received (tx_handler), t1=worker starts (after
+pool dispatch), t2=sock_send to stub, t3=response received, t4=writeback/BQL
+completion; and in the stub: recv→ioctl-start→ioctl-done→send. Run decode, dump
+the per-ioctl breakdown. This pinpoints whether the ~1.6 ms is pool dispatch,
+the cond handoff, BQL contention, or response production — and confirms the
+command buffer would remove it, before committing to the build.
 
 ## Probable fixes (ranked by expected payoff, pending the next experiment)
 
