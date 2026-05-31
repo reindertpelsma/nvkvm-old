@@ -91,6 +91,18 @@ Ring = ioctls the isolate fully services with **no QEMU/KVM/fd mediation** and
   an embedded fd → off-ring or worker; the rest → ring/inline). Tightens
   `nvkvm_ctrl_allowlist.h`.
 
+  **MEASURED 2026-05-31** (cmd-distribution probe over a decode run, 679
+  RM_CONTROLs / 64 tokens): the hot path is ~6 control cmds repeating ~once per
+  token — all `NV2080` subdevice + channel (`906f`/`c36f`) controls:
+  `0x2080a084 0x2080a026 0x20809064 0x20809009 0x20809001` (92× each),
+  `0x20802209` (46×), then `0x00000d01 0x906f0101 0x20801303 0xc36f0108
+  0x0080170d 0x20801218` (tail). All are fast scheduling/fence/query controls —
+  isolate-serviceable, no QEMU/fd, non-blocking → **the entire decode
+  RM_CONTROL stream is ring + inline**; no slow control on the hot path, so the
+  inline-vs-worker split doesn't bite decode. The ring control-allowlist =
+  this observed set (a subset of the existing ctrl allowlist). The stub latency
+  measurement remains only to catch a rare slow control before it rides inline.
+
 ## Sync / drain protocol (lost-wakeup-safe)
 
 The guest must know the isolate has seen every command before it sleeps:
