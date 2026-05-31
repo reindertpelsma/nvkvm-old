@@ -105,7 +105,18 @@ zoo. Its job is to be the cheapest harness that drives real present-based apps
 find the next round of RM-semantic bugs — plus a modest real feature (Linux
 desktop-in-VM). Accept it is partly throwaway under Mode 2.
 
-## Piece 3 — NVKMS forwarding (REJECTED)
+## Piece 3 — NVKMS forwarding (REJECTED as target; LIVE as interim — REMOVE)
+
+**Current status (2026-05-31):** NVKMS forwarding is *live* in the code
+(commit a895f95, added to unblock `vkCreateDevice`). The wrapper ioctl
+`0xC0106D00` is forwarded with only an outer-ioctl gate — **no inner-`cmdType`
+allowlist** (security audit 2026-05-31 finding G-1). Practical severity is LOW
+(unprivileged sandboxed stub + NVKMS modeset-ownership/CAP_SYS_ADMIN gating in
+the kernel + headless hosts have no display), but it widens reachable kernel
+parser surface, violating our default-deny principle. **Action: remove the
+forward path entirely once Piece 2 (guest virtual head) lands; interim, gate to
+the minimal cmdTypes the UMD needs.** The text below is the target rationale.
+
 
 Forwarding `/dev/nvidia-modeset` is the worst option on both axes:
 - **Attack surface**: ~70 NVKMS command types (HDCP, EDID parse, mode validation,
