@@ -289,9 +289,16 @@ static void unregister_devices(void)
  * re-evaluation (the pump re-checks has_work after every enter_loop) is the
  * lost-wakeup-free keystone — see the design doc.
  */
-#define NVKVM_RING_PUMP_IDLE_US      0u       /* 0 → stub default idle window */
 #define NVKVM_RING_WAIT_SPIN_TIGHT   200000u  /* tight cpu_relax spins        */
 #define NVKVM_RING_WAIT_MAX_RESCHED  5000u    /* resched rounds before giving up */
+
+/* Tunable idle window passed to the stub (spin iterations before the consumer
+ * loop exits).  0 → stub default (2000).  Crank it up to keep the isolate
+ * spinning across inter-control gaps so one enter_loop batches many controls —
+ * the lever to test whether virtqueue-txn count actually drops. */
+static unsigned int nvkvm_ring_idle_us;
+module_param_named(ring_idle_us, nvkvm_ring_idle_us, uint, 0644);
+MODULE_PARM_DESC(ring_idle_us, "stub consumer-loop idle window in spin iters (0=default; capped in stub)");
 
 static int nvkvm_pump_fn(void *data)
 {
@@ -305,7 +312,7 @@ static int nvkvm_pump_fn(void *data)
 		       s->req_ring && nvkvm_ring_has_work(s->req_ring)) {
 			u64 head = 0;
 			int ret = nvkvm_virtio_enter_loop((unsigned int)s->id,
-							  NVKVM_RING_PUMP_IDLE_US,
+							  nvkvm_ring_idle_us,
 							  &head);
 			if (ret) {
 				/* dead isolate / missing ring → stop driving */

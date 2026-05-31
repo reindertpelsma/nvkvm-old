@@ -1906,6 +1906,9 @@ union stub_cmd {
 #define MSG_DONTWAIT 0x40
 #endif
 #define NVKVM_RING_IDLE_DEFAULT   2000u   /* idle spin iterations before exit  */
+#define NVKVM_RING_IDLE_MAX       1000000u /* hard cap so a huge idle_us can't
+                                           * wedge guest teardown (kthread_stop
+                                           * blocks on the in-flight enter_loop) */
 #define NVKVM_RING_RESP_FULL_SPIN 100000u /* bound resp-ring backpressure spins */
 
 static inline void ring_cpu_relax(void)
@@ -2096,6 +2099,12 @@ static uint64_t ring_consumer_loop(uint32_t idle_us)
 
 	uint32_t idle_budget = idle_us ? idle_us : NVKVM_RING_IDLE_DEFAULT;
 	uint32_t idle = 0;
+
+	/* Cap the idle window: enter_loop stays in flight for the whole budget,
+	 * and the guest pump's kthread_stop blocks on it during teardown — an
+	 * unbounded value would wedge teardown.  ~1e6 iters ≈ <1s worst case. */
+	if (idle_budget > NVKVM_RING_IDLE_MAX)
+		idle_budget = NVKVM_RING_IDLE_MAX;
 
 	for (;;) {
 		uint8_t *pay;

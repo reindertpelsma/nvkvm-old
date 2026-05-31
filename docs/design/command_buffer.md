@@ -309,3 +309,25 @@ control ring for mmap-class ops was always a separate, planned use).
 **Not pursued here** (the real decode optimisation): the launch/sync path is
 mapped-memory, not ioctl — so accelerating it is a different effort (doorbell/
 fence trap behaviour, vCPU scheduling), not a command-forwarding problem.
+
+### Batching validated (the virtqueue-txn test)
+
+Follow-up A/B (runtime `ring_enable`/`ring_idle_us` toggles, no module reload):
+
+- **Steady-state decode**: ~**29 ring controls per `enter_loop`** (window:
+  ring_exec +147, enter_loop +5) — the stub stays spinning across a token's
+  control burst, so 29 control-ioctls collapse to ONE virtqueue round-trip.
+- **Cumulative incl. setup**: ring_exec=2000 / enter_loop=531 / slow_fwd=2823 →
+  total guest→QEMU virtqueue txns ≈ 3354 with the ring vs ≈ 4823 without
+  (~30 % fewer; the 2000 ring controls alone drop from 2000 txns to 531).
+- **Throughput unchanged anyway**: ~28 t/s ring on or off.
+
+This is the decisive check: virtqueue transactions drop ~29× for ring-routed
+controls (and ~30 % overall), yet throughput does not move — confirming the
+control-forwarding path is genuinely not the decode bottleneck (it's GPU compute
++ the mapped doorbell/fence launch path). Stability: matmul ×3, 4× concurrent
+matmul, and repeated decode all PASS with the ring on (no `rmmod` cycling). The
+earlier VM hang was a test-harness artifact — an absurd `ring_idle_us` (~50 s
+stub spin) blocking the pump's `kthread_stop`, compounded by `rmmod`+`insmod`
+(forbidden per the iteration model). Fixed by capping the stub idle budget
+(`NVKVM_RING_IDLE_MAX`) so no parameter value can wedge guest teardown.
