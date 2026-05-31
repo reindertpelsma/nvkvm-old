@@ -152,3 +152,26 @@ most frequent per-token op) and possibly DtoH if results are copied back — NOT
 launches. Fix priority: (1) the DtoH writeback bug (asymmetric, surprising),
 (2) control/alloc round-trip (transport), (3) UVM managed (separate). Tool:
 tests/integration/cuda_micro.c (driver API, dlopen libcuda, runs host+guest).
+
+## Subtest 7 (poll_sync) + corrected DtoH picture (2026-05-31)
+
+Added a poll-heavy subtest: CU_EVENT_BLOCKING_SYNC makes cuEventSynchronize block
+on the event fd via poll() (vs the default spin). Loop: noop launch + event record
++ blocking sync.
+
+| | host | guest | ratio |
+|---|---|---|---|
+| 4 launch_sync (spin)        | 6.1 µs  | 13.1 µs  | 2.1× |
+| 7 poll_sync (blocking event)| 72.8 µs | 130.7 µs | **1.8×** |
+
+**The poll/blocking-completion path is only 1.8× slower in the guest — NOT a
+bottleneck.** This refutes the "poll dominates DtoH" reading: the ~92ms-per-poll
+seen during DtoH was the poll *waiting* for slow migration work to finish, not
+poll overhead. DtoH correctness verified OK (byte-exact).
+
+So DtoH's real cost is the **host-side UVM per-page migration**: a plain
+cuMemAlloc + cuMemcpyDtoH issues ~6118 `uvm 0x48` ioctls (per-page migration)
+instead of a bulk copy-engine DMA; the guest blocks in poll waiting for it.
+DtoH-slow and the cuMemAllocManaged err=999 are the SAME root area (UVM path).
+Next: trace the host-side UVM migration during DtoH (why per-page 0x48, can it
+be bulk/copy-engine) — that's the real lever, not the copy transport or poll.

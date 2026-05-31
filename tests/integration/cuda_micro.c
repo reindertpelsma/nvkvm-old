@@ -46,6 +46,10 @@ static CUresult (*cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned,
 				  CUstream, void **, void **);
 static CUresult (*cuCtxSynchronize)(void);
 static CUresult (*cuMemAllocManaged)(CUdeviceptr *, size_t, unsigned);
+typedef void *CUevent;
+static CUresult (*cuEventCreate)(CUevent *, unsigned);
+static CUresult (*cuEventRecord)(CUevent, CUstream);
+static CUresult (*cuEventSynchronize)(CUevent);
 
 #define CHK(call) do { CUresult _r=(call); if(_r){fprintf(stderr,#call" failed: %d\n",_r); return 1;} } while(0)
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec/1e9; }
@@ -72,6 +76,7 @@ int main(int argc, char **argv)
 	int launch_iters = argc>4?atoi(argv[4]):5000;
 	int uvm_iters    = argc>5?atoi(argv[5]):2000;
 	int mig_iters    = argc>6?atoi(argv[6]):500;
+	int poll_iters   = argc>7?atoi(argv[7]):5000;
 
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: survive a crash mid-suite */
 	void *h = dlopen("libcuda.so.1", RTLD_NOW);
@@ -84,6 +89,9 @@ int main(int argc, char **argv)
 	*(void**)(&cuModuleGetFunction)=dlsym(h,"cuModuleGetFunction");
 	*(void**)(&cuLaunchKernel)=dlsym(h,"cuLaunchKernel");
 	*(void**)(&cuCtxSynchronize)=dlsym(h,"cuCtxSynchronize");
+	*(void**)(&cuEventCreate)=dlsym(h,"cuEventCreate");
+	*(void**)(&cuEventRecord)=dlsym(h,"cuEventRecord");
+	*(void**)(&cuEventSynchronize)=dlsym(h,"cuEventSynchronize");
 
 	CUdevice dev; CUcontext ctx;
 	CHK(cuInit(0)); CHK(cuDeviceGet(&dev,0)); CHK(cuCtxCreate(&ctx,0,dev));
@@ -103,15 +111,19 @@ int main(int argc, char **argv)
 	  t=now(); for(int i=0;i<alloc_iters;i++){CUdeviceptr p; CHK(cuMemAlloc(&p,65536)); CHK(cuMemFree(p));} t=now()-t;
 	  printf("2 alloc       : %d alloc+free     %.2f us/pair\n", alloc_iters, t/alloc_iters*1e6); }
 
-	/* ---- 3: bulk DMA bandwidth ---- */
-	{ size_t sz=(size_t)bw_mb<<20; CUdeviceptr d; void *hb=malloc(sz);
-	  CHK(cuMemAlloc(&d,sz)); memset(hb,1,sz);
+	/* ---- 3: bulk DMA bandwidth + DtoH correctness ---- */
+	{ size_t sz=(size_t)bw_mb<<20; CUdeviceptr d; unsigned *hb=malloc(sz), *vb=malloc(sz);
+	  CHK(cuMemAlloc(&d,sz));
+	  for(size_t i=0;i<sz/4;i++) hb[i]=(unsigned)(i*2654435761u);  /* pattern */
 	  cuMemcpyHtoD(d,hb,sz); /* warm */
 	  int M=8; t=now(); for(int i=0;i<M;i++) CHK(cuMemcpyHtoD(d,hb,sz)); t=now()-t;
 	  printf("3 bandwidth   : HtoD %d MB x%d     %.1f GB/s", bw_mb, M, (double)sz*M/t/1e9);
-	  t=now(); for(int i=0;i<M;i++) CHK(cuMemcpyDtoH(hb,d,sz)); t=now()-t;
-	  printf("   DtoH %.1f GB/s\n", (double)sz*M/t/1e9);
-	  cuMemFree(d); free(hb); }
+	  memset(vb,0,sz);
+	  t=now(); for(int i=0;i<M;i++) CHK(cuMemcpyDtoH(vb,d,sz)); t=now()-t;
+	  printf("   DtoH %.1f GB/s", (double)sz*M/t/1e9);
+	  size_t bad=0; for(size_t i=0;i<sz/4;i++) if(vb[i]!=hb[i]) bad++;
+	  printf("   DtoH correctness: %s (%zu/%zu mismatched)\n", bad?"FAIL":"OK", bad, sz/4);
+	  cuMemFree(d); free(hb); free(vb); }
 
 	/* ---- 4: launch + sync (doorbell + completion fence) ---- */
 	{ for(int i=0;i<50;i++){cuLaunchKernel(noop,1,1,1,1,1,1,0,0,0,0); cuCtxSynchronize();}
@@ -152,6 +164,24 @@ int main(int argc, char **argv)
 		 mig_iters, t/mig_iters*1e6, (int)(sz>>20));
 	  cuMemFree(p);
 	} else printf("6 uvm_migrate : (cuMemAllocManaged unavailable)\n");
+
+	/* ---- 7: poll-heavy — blocking-sync event wait (poll on the event fd) ----
+	 * CU_EVENT_BLOCKING_SYNC makes cuEventSynchronize block the thread on the
+	 * OS event (poll/ppoll) instead of spinning, isolating the completion-wait
+	 * relay path that dominated DtoH (~92ms/poll). */
+	if(cuEventCreate && cuEventRecord && cuEventSynchronize){
+	  CUevent ev;
+	  CHK(cuEventCreate(&ev, 0x1 /*CU_EVENT_BLOCKING_SYNC*/));
+	  for(int i=0;i<50;i++){ cuLaunchKernel(noop,1,1,1,1,1,1,0,0,0,0); cuEventRecord(ev,0); cuEventSynchronize(ev); }
+	  t=now();
+	  for(int i=0;i<poll_iters;i++){
+		CHK(cuLaunchKernel(noop,1,1,1,1,1,1,0,0,0,0));
+		CHK(cuEventRecord(ev,0));
+		CHK(cuEventSynchronize(ev));   /* blocks via poll() on the event fd */
+	  }
+	  t=now()-t;
+	  printf("7 poll_sync   : %d blk-event sync %.2f us/sync\n", poll_iters, t/poll_iters*1e6);
+	} else printf("7 poll_sync   : (cuEvent* unavailable)\n");
 
 	return 0;
 }
