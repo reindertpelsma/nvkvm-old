@@ -79,6 +79,8 @@ struct nvkvm_isolate {
 	uint32_t    sync_realize_rm_status;
 	/* SETUP_RING probe echo — reader fills before signaling. */
 	uint64_t    sync_ring_probe;
+	/* ENTER_LOOP result — reader fills before signaling. */
+	uint64_t    sync_loop_head;
 
 	/*
 	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
@@ -157,6 +159,19 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 int nvkvm_isolate_ring_info(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 			    uint64_t *gpa, uint32_t *region_size,
 			    uint32_t *resp_off, uint32_t *ring_bytes);
+
+/*
+ * Drive the isolate's SPSC consumer loop (docs/design/command_buffer.md).
+ * Sends ISOLATE_CMD_ENTER_LOOP and BLOCKS until the loop idles out, then
+ * returns 0 and fills *head_out with the request-ring head at exit
+ * (last_processed).  The guest pump compares it to the published tail to decide
+ * whether to re-enter.  Returns -errno on a dead isolate / missing ring.
+ *
+ * MUST be called off QEMU's main loop (it blocks for the whole loop lifetime) —
+ * the virtio dispatch offloads it to the thread pool.
+ */
+int nvkvm_isolate_enter_loop(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     uint32_t idle_us, uint64_t *head_out);
 
 /*
  * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently

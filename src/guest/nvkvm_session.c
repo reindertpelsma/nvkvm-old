@@ -71,6 +71,8 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 	session->refcount   = 1;
 	session->isolate_id = 0;
 	mutex_init(&session->isolate_lock);
+	mutex_init(&session->ring_lock);
+	init_waitqueue_head(&session->pump_wq);
 
 	id = idr_alloc(&nvkvm.sessions_idr, session, 1, 0, GFP_KERNEL);
 	if (id < 0) {
@@ -110,6 +112,11 @@ void nvkvm_session_put(struct nvkvm_session *session)
 	mutex_unlock(&nvkvm.sessions_lock);
 
 	if (last) {
+		/* Stop the pump before unmapping/killing: it must reach its
+		 * wait_event and exit while the isolate is still alive so any
+		 * in-flight ENTER_LOOP completes (req_ring is already NULL above,
+		 * so the pump sees no work and idles out). */
+		nvkvm_session_stop_pump(session);
 		/* Drop our ring mapping; QEMU frees the GPA + memfd on isolate kill. */
 		if (ring_base)
 			memunmap(ring_base);

@@ -39,6 +39,8 @@
 #include <linux/poll.h>
 #include <linux/mm.h>
 #include <linux/io.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/scatterlist.h>
@@ -277,6 +279,185 @@ static void unregister_devices(void)
  * optimisation: any failure leaves ring_base NULL and the session keeps using
  * the virtqueue path.  Called once, under isolate_lock.
  */
+/* ── Command-buffer fast path (docs/design/command_buffer.md, Phase 4c) ──────
+ *
+ * Producers (any guest thread issuing a flat RM_CONTROL) serialise on
+ * ring_lock, so the request ring has ONE producer and the response ring ONE
+ * consumer (the lock holder reads back its own response) — SPSC preserved.
+ * A per-session pump kthread keeps the isolate spinning via ENTER_LOOP while
+ * work is queued; producers wake it after publishing.  Level-triggered
+ * re-evaluation (the pump re-checks has_work after every enter_loop) is the
+ * lost-wakeup-free keystone — see the design doc.
+ */
+#define NVKVM_RING_PUMP_IDLE_US      0u       /* 0 → stub default idle window */
+#define NVKVM_RING_WAIT_SPIN_TIGHT   200000u  /* tight cpu_relax spins        */
+#define NVKVM_RING_WAIT_MAX_RESCHED  5000u    /* resched rounds before giving up */
+
+static int nvkvm_pump_fn(void *data)
+{
+	struct nvkvm_session *s = data;
+
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(s->pump_wq,
+			kthread_should_stop() ||
+			(s->req_ring && nvkvm_ring_has_work(s->req_ring)));
+		while (!kthread_should_stop() &&
+		       s->req_ring && nvkvm_ring_has_work(s->req_ring)) {
+			u64 head = 0;
+			int ret = nvkvm_virtio_enter_loop((unsigned int)s->id,
+							  NVKVM_RING_PUMP_IDLE_US,
+							  &head);
+			if (ret) {
+				/* dead isolate / missing ring → stop driving */
+				if (!kthread_should_stop())
+					msleep(2);
+				break;
+			}
+		}
+	}
+	return 0;
+}
+
+void nvkvm_session_stop_pump(struct nvkvm_session *session)
+{
+	if (session->pump_task) {
+		kthread_stop(session->pump_task);   /* wakes + waits for exit */
+		session->pump_task = NULL;
+	}
+}
+
+/*
+ * Spin on the response ring for txn's reply; copy param/aux back in place.
+ * Caller holds ring_lock (sole consumer).  Returns 0/-errno, or
+ * NVKVM_RING_TRY_PUNT if the stub declined to execute (use the slow path).
+ */
+static int nvkvm_ring_wait_resp(struct nvkvm_session *s, u32 txn,
+				void *params_buf, size_t param_size,
+				void *aux_buf, size_t aux_size,
+				u32 *nvstatus_out)
+{
+	u32 tight = 0, resched = 0;
+
+	for (;;) {
+		u8 *pay;
+		u32 len;
+		u64 total;
+		int rc = nvkvm_ring_peek(s->resp_ring, &pay, &len, &total);
+
+		if (rc == NVKVM_RING_OK) {
+			struct nvkvm_ring_ioctl_resp rh;
+			int out = NVKVM_RING_TRY_PUNT;
+
+			if (len >= sizeof(rh)) {
+				memcpy(&rh, pay, sizeof(rh));
+				if (rh.txn_id == txn) {
+					if (rh.flags & NVKVM_RING_RESP_PUNT) {
+						out = NVKVM_RING_TRY_PUNT;
+					} else {
+						if (rh.param_size &&
+						    rh.param_size <= param_size &&
+						    sizeof(rh) + rh.param_size <= len)
+							memcpy(params_buf,
+							       pay + sizeof(rh),
+							       rh.param_size);
+						if (rh.aux_size &&
+						    rh.aux_size <= aux_size &&
+						    sizeof(rh) + rh.param_size +
+							    rh.aux_size <= len)
+							memcpy(aux_buf,
+							       pay + sizeof(rh) +
+								     rh.param_size,
+							       rh.aux_size);
+						if (nvstatus_out)
+							*nvstatus_out = rh.nvstatus;
+						out = (rh.retval < 0) ?
+							rh.retval : 0;
+					}
+					nvkvm_ring_pop(s->resp_ring, total);
+					return out;
+				}
+			}
+			/* malformed / stale record → drop and keep looking */
+			nvkvm_ring_pop(s->resp_ring, total);
+			continue;
+		}
+		if (rc == NVKVM_RING_BAD)
+			return -EIO;
+
+		if (++tight < NVKVM_RING_WAIT_SPIN_TIGHT) {
+			cpu_relax();
+			continue;
+		}
+		tight = 0;
+		if (++resched > NVKVM_RING_WAIT_MAX_RESCHED)
+			return -EIO;   /* stub wedged */
+		cond_resched();
+	}
+}
+
+/*
+ * Try to forward a flat RM_CONTROL over the SPSC ring.  Eligibility mirrors the
+ * stub's accept set; the stub PUNTs anything needing per-control marshalling
+ * (InfoList/GET_BUILD_VERSION/EXPORT) and the caller falls back to the
+ * virtqueue.  Controls needing guest- or QEMU-side handling (GET_PID_INFO,
+ * EXPORT) are excluded by the caller before reaching here.
+ */
+int nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
+			   void *params_buf, size_t param_size,
+			   void *aux_buf, size_t aux_size, u32 *nvstatus_out)
+{
+	struct nvkvm_session *s = ctx->session;
+	struct nvkvm_ring_ioctl_req rh;
+	u32 payload, txn;
+	u64 total;
+	u8 *p;
+	int rc;
+
+	if (!s->req_ring || !s->pump_task)
+		return NVKVM_RING_TRY_PUNT;
+	if (_IOC_NR(cmd) != NV_ESC_RM_CONTROL ||
+	    param_size != sizeof(struct nvos54_parameters) ||
+	    param_size > NVKVM_RING_MAX_PARAM ||
+	    aux_size > NVKVM_RING_MAX_AUX)
+		return NVKVM_RING_TRY_PUNT;
+
+	mutex_lock(&s->ring_lock);
+	if (!s->req_ring) {
+		mutex_unlock(&s->ring_lock);
+		return NVKVM_RING_TRY_PUNT;
+	}
+
+	payload = (u32)sizeof(rh) + (u32)param_size + (u32)aux_size;
+	p = nvkvm_ring_reserve(s->req_ring, payload, &total);
+	if (!p) {                       /* ring full → slow path this time */
+		mutex_unlock(&s->ring_lock);
+		return NVKVM_RING_TRY_PUNT;
+	}
+
+	txn = ++s->ring_txn_next;
+	if (!txn)
+		txn = ++s->ring_txn_next;
+	rh.txn_id      = txn;
+	rh.handle_id   = ctx->handle_id;
+	rh.cmd         = cmd;
+	rh.param_size  = (u32)param_size;
+	rh.aux_size    = (u32)aux_size;
+	rh.abi_profile = 0;   /* RM_CONTROL nvstatus offset is fixed (nvos54@28) */
+	memcpy(p, &rh, sizeof(rh));
+	if (param_size)
+		memcpy(p + sizeof(rh), params_buf, param_size);
+	if (aux_size)
+		memcpy(p + sizeof(rh) + param_size, aux_buf, aux_size);
+	nvkvm_ring_commit(s->req_ring, total);
+
+	wake_up(&s->pump_wq);   /* drive the stub */
+
+	rc = nvkvm_ring_wait_resp(s, txn, params_buf, param_size,
+				  aux_buf, aux_size, nvstatus_out);
+	mutex_unlock(&s->ring_lock);
+	return rc;
+}
+
 static void nvkvm_session_setup_ring(struct nvkvm_session *session)
 {
 	u64 gpa = 0;
@@ -331,6 +512,17 @@ static void nvkvm_session_setup_ring(struct nvkvm_session *session)
 			session->id, gpa, ring_bytes,
 			(unsigned long long)session->req_ring->size,
 			(unsigned long long)session->resp_ring->size);
+		/* Start the pump that keeps the isolate spinning on the ring. */
+		session->pump_task = kthread_run(nvkvm_pump_fn, session,
+						 "nvkvm-pump-%d", session->id);
+		if (IS_ERR(session->pump_task)) {
+			pr_warn("nvkvm: session %d pump start failed — disabling ring\n",
+				session->id);
+			session->pump_task = NULL;
+			memunmap(base);
+			session->ring_base = NULL;
+			session->req_ring = session->resp_ring = NULL;
+		}
 	} else {
 		pr_warn("nvkvm: session %d ring readback mismatch (req.size=%llu resp.size=%llu want=%u) — disabling ring\n",
 			session->id,
@@ -1614,6 +1806,24 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		__u32 ioctl_flags = 0;
 		__u64 fault_addr  = 0;
 		int retries;
+		int ring_rc = NVKVM_RING_TRY_PUNT;
+
+		/*
+		 * Command-buffer fast path: flat RM_CONTROLs that need no guest-
+		 * or QEMU-side special handling ride the SPSC ring (the hot
+		 * decode-poll controls).  GET_PID_INFO (gpi_save) and
+		 * EXPORT_OBJECT_TO_FD (have_export_fd) are excluded — they need
+		 * host-VMM handling; everything else the stub PUNTs if it requires
+		 * per-control marshalling, and we drop to the virtqueue below.
+		 */
+		if (!gpi_save && !have_export_fd)
+			ring_rc = nvkvm_session_ring_try(ctx, cmd,
+							 params_buf, param_size,
+							 aux_buf, aux_size, NULL);
+		if (ring_rc != NVKVM_RING_TRY_PUNT) {
+			ret = ring_rc;
+			goto forwarded;
+		}
 
 #define NVKVM_MAX_EFAULT_RETRIES 128
 		for (retries = 0; retries < NVKVM_MAX_EFAULT_RETRIES; retries++) {
@@ -1633,6 +1843,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			}
 		}
+forwarded:;
 
 		/*
 		 * Write back any CPU pages migrated during this ioctl.

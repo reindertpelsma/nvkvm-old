@@ -20,6 +20,7 @@
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_abi.h"
 #include "../../src/common/nvkvm_ring.h"
+#include "../../src/common/nvkvm_ring_ioctl.h"
 #include "../../src/abi/nvgpu.h"
 
 /* virtio-nvgpu device ID.
@@ -82,6 +83,20 @@ struct nvkvm_session {
 	u32     ring_bytes;         /* per-ring data bytes                    */
 	struct nvkvm_ring *req_ring;  /* guest→isolate (we produce)           */
 	struct nvkvm_ring *resp_ring; /* isolate→guest (we consume)           */
+
+	/*
+	 * Fast-path producer/consumer state (docs/design/command_buffer.md).
+	 * ring_lock serialises guest producers so the request ring has a single
+	 * producer AND the response ring a single consumer (the lock holder
+	 * reads back its own response) — preserving the SPSC contract regardless
+	 * of how many guest threads issue fast controls.  The pump kthread keeps
+	 * the isolate spinning via ENTER_LOOP while there is queued work; it is a
+	 * pure observer of the rings (reads tail via has_work, never their data).
+	 */
+	struct mutex      ring_lock;
+	u32               ring_txn_next;  /* producer-private txn id counter   */
+	struct task_struct *pump_task;    /* per-session ENTER_LOOP pump       */
+	wait_queue_head_t pump_wq;        /* woken when a producer publishes   */
 };
 
 /* ── Per-FD context (one per open(/dev/nvidia*)) ──────────────────────────── */
@@ -314,6 +329,8 @@ int  nvkvm_virtio_create_isolate(unsigned int session_id,
 				 __u32 *isolate_id_out);
 int  nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
 			     u32 *ring_bytes_out);
+int  nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us,
+			     u64 *head_out);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
 int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);
@@ -376,6 +393,16 @@ void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
  * pages that alias libcuda's guest userspace pages. */
 int  nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 				   __u64 gva, __u64 len, unsigned long prot);
+
+/* Command-buffer fast path (nvkvm_main.c).  ring_try forwards a flat
+ * RM_CONTROL over the SPSC ring; returns 0/-errno on success/failure, or
+ * NVKVM_RING_TRY_PUNT if the control is not ring-eligible or the stub punted
+ * (the caller then forwards on the virtqueue — the control was NOT executed). */
+#define NVKVM_RING_TRY_PUNT 1
+int  nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
+			    void *params_buf, size_t param_size,
+			    void *aux_buf, size_t aux_size, u32 *nvstatus_out);
+void nvkvm_session_stop_pump(struct nvkvm_session *session);
 
 /* nvkvm_session.c */
 struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,

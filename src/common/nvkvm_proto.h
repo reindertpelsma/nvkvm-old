@@ -159,6 +159,7 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_READ_HOST_FILE         26  /* read live host proc/sys file   */
 #define NVKVM_REQ_INTERRUPT              27  /* interrupt an in-flight ioctl   */
 #define NVKVM_REQ_SETUP_RING             28  /* fetch this session's command-buffer ring GPA */
+#define NVKVM_REQ_ENTER_LOOP             29  /* drive the isolate's SPSC consumer loop */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -312,6 +313,25 @@ struct nvkvm_resp_setup_ring {
 	__le32 resp_off;      /* offset of response-ring control block             */
 	__le32 ring_bytes;    /* per-ring data bytes                               */
 	__le32 status;        /* 0 = ok; errno otherwise                           */
+	__le32 reserved;
+};
+
+/* ── ENTER_LOOP ──────────────────────────────────────────────────────────────
+ * The guest's per-session "pump" issues this to keep the isolate spinning on
+ * the SPSC request ring (docs/design/command_buffer.md).  It is a BLOCKING
+ * virtqueue request: QEMU offloads it to a worker that forwards ENTER_LOOP to
+ * the stub and blocks until the loop idles out, then completes the request with
+ * `head` (the consumer's last-processed free-running byte count).  The pump
+ * re-enters when head < the request ring's published tail.
+ */
+struct nvkvm_req_enter_loop {
+	__le32 session_id;
+	__le32 idle_us;       /* idle window before the stub exits (0 = default) */
+};
+
+struct nvkvm_resp_enter_loop {
+	__le64 head;          /* request-ring head at loop exit (last_processed) */
+	__le32 status;        /* 0 = ok; errno otherwise (no ring / dead isolate) */
 	__le32 reserved;
 };
 

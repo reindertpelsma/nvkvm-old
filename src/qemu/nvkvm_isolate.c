@@ -399,6 +399,7 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_open_device     open_dev;
 		struct isolate_resp_realize_uvm     realize;
 		struct isolate_resp_ring_ready      ring_ready;
+		struct isolate_resp_loop_exited     loop_exited;
 	} u;
 
 	for (;;) {
@@ -555,6 +556,16 @@ static void *isolate_reader_fn(void *arg)
 			iso->sync_ring_probe = u.ring_ready.probe_seen;
 			iso->sync_error      = u.ring_ready.error;
 			iso->sync_done       = true;
+			pthread_cond_signal(&iso->sync_cond);
+			pthread_mutex_unlock(&iso->sync_lock);
+			break;
+		}
+
+		case ISOLATE_RESP_LOOP_EXITED: {
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_loop_head = u.loop_exited.head;
+			iso->sync_error     = u.loop_exited.error;
+			iso->sync_done      = true;
 			pthread_cond_signal(&iso->sync_cond);
 			pthread_mutex_unlock(&iso->sync_lock);
 			break;
@@ -1366,6 +1377,56 @@ int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
 	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
 	pthread_mutex_unlock(&iso->write_lock);
 	return sr < 0 ? (int)sr : 0;
+}
+
+int nvkvm_isolate_enter_loop(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     uint32_t idle_us, uint64_t *head_out)
+{
+	if (head_out)
+		*head_out = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive &&
+		     iso->ring_ready && iso->sock_fd >= 0;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENODEV;
+
+	struct isolate_cmd_enter_loop cmd = {
+		.type    = ISOLATE_CMD_ENTER_LOOP,
+		.idle_us = idle_us,
+	};
+
+	/*
+	 * Sync send: this BLOCKS until the stub's consumer loop idles out and
+	 * replies LOOP_EXITED (which the reader thread delivers via sync_cond).
+	 * The caller runs on QEMU's thread pool, so a long loop does not stall
+	 * the main loop.  Slow-path IOCTLs that arrive while the stub loops use
+	 * the independent per-txn pending mechanism, not sync_lock.
+	 */
+	pthread_mutex_lock(&iso->sync_lock);
+	iso->sync_done      = false;
+	iso->sync_error     = 0;
+	iso->sync_loop_head = 0;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->sync_lock);
+		return (int)sr;
+	}
+
+	while (!iso->sync_done)
+		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
+	int err = iso->sync_error;
+	if (head_out)
+		*head_out = iso->sync_loop_head;
+	pthread_mutex_unlock(&iso->sync_lock);
+	return err;
 }
 
 int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,

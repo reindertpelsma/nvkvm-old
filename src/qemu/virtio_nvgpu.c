@@ -676,6 +676,43 @@ static void nvkvm_ioctl_work_done(void *opaque, int ret)
 	g_free(w);
 }
 
+/*
+ * ENTER_LOOP offload.  nvkvm_isolate_enter_loop blocks for the whole consumer-
+ * loop lifetime (until the stub idles out), so it must NOT run on the main loop.
+ * Mirror the IOCTL offload: a thread-pool worker blocks, the completion pushes
+ * the response.  Holding one pool thread per active isolate's pump is fine at
+ * our scale (the pool grows to 64) and the short idle window cycles it.
+ */
+struct nvkvm_enter_loop_work {
+	VirtIONvgpu                  *nv;
+	VirtQueue                    *vq;
+	VirtQueueElement             *elem;
+	struct nvkvm_hdr              hdr;
+	struct nvkvm_req_enter_loop   req;
+	struct nvkvm_resp_enter_loop  resp;
+};
+
+static int nvkvm_enter_loop_work_fn(void *opaque)
+{
+	struct nvkvm_enter_loop_work *w = opaque;
+	nvkvm_req_enter_loop(w->nv, &w->req, &w->resp);
+	return 0;
+}
+
+static void nvkvm_enter_loop_work_done(void *opaque, int ret)
+{
+	struct nvkvm_enter_loop_work *w = opaque;
+	struct { struct nvkvm_hdr h;
+		 struct nvkvm_resp_enter_loop r; } out;
+	out.h = w->hdr;
+	out.r = w->resp;
+	iov_from_buf(w->elem->in_sg, w->elem->in_num, 0, &out, sizeof(out));
+	virtqueue_push(w->vq, w->elem, sizeof(out));
+	virtio_notify(VIRTIO_DEVICE(w->nv), w->vq);
+	g_free(w->elem);
+	g_free(w);
+}
+
 static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
@@ -744,6 +781,23 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_setup_ring,
 			    nvkvm_resp_setup_ring,
 			    nvkvm_req_setup_ring)
+
+		case NVKVM_REQ_ENTER_LOOP: {
+			/* Blocks for the whole consumer-loop lifetime → offload to
+			 * the thread pool; completion pushes the response. Ownership
+			 * of `elem` transfers to the work item (we `continue`). */
+			struct nvkvm_enter_loop_work *w =
+				g_new0(struct nvkvm_enter_loop_work, 1);
+			w->nv   = nv;
+			w->vq   = vq;
+			w->elem = elem;
+			w->hdr  = hdr;
+			iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr),
+				   &w->req, sizeof(w->req));
+			thread_pool_submit_aio(nvkvm_enter_loop_work_fn, w,
+					       nvkvm_enter_loop_work_done, w);
+			continue;
+		}
 		ISOLATE_REQ(NVKVM_REQ_COPY_HANDLE_TO_ISOLATE,
 			    nvkvm_req_copy_handle_to_isolate,
 			    nvkvm_resp_copy_handle_to_isolate,

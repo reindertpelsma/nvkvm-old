@@ -52,6 +52,7 @@
 #define ISOLATE_CMD_REALIZE_UVM_FD 10 /* full UVM realize: init+register+intent+mmap */
 #define ISOLATE_CMD_INTERRUPT    11   /* post SIGUSR1 to the worker on txn_id  */
 #define ISOLATE_CMD_SETUP_RING   12   /* mint per-isolate SPSC ring pair; memfd via SCM_RIGHTS */
+#define ISOLATE_CMD_ENTER_LOOP   13   /* drive the SPSC consumer loop until idle */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -63,6 +64,7 @@
 #define ISOLATE_RESP_OPEN_DEVICE 0x15  /* open result + fd via SCM_RIGHTS    */
 #define ISOLATE_RESP_REALIZE_UVM 0x16  /* realize result: host VA + rmStatus */
 #define ISOLATE_RESP_RING_READY  0x17  /* SPSC ring mapped + self-test echo  */
+#define ISOLATE_RESP_LOOP_EXITED 0x18  /* consumer loop drained + idled out  */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -301,6 +303,29 @@ struct isolate_resp_ring_ready {
 
 /* Self-test mask (see SETUP_RING comment above). */
 #define NVKVM_RING_PROBE_MASK 0x5a5a5a5a5a5a5a5aULL
+
+/* ── ENTER_LOOP ───────────────────────────────────────────────────────────
+ * QEMU forwards this (offloaded to its thread pool — it blocks for the whole
+ * loop) to drive the isolate's reader thread into the SPSC consumer loop.  The
+ * loop drains the request ring, executes flat RM_CONTROLs inline, writes
+ * responses to the response ring, and — while looping — still polls the socket
+ * at each drain edge so slow-path commands (IOCTL/INTERRUPT/EXIT) are serviced.
+ * It exits after `idle_us` of no ring work AND no socket traffic, re-checking
+ * nvkvm_ring_has_work() once more before committing to exit (the lost-wakeup-
+ * free exit edge).  LOOP_EXITED carries the consumer's `head` (last_processed
+ * free-running byte count) so the guest can compare it against last_published
+ * and re-enter if the loop exited with work still queued.
+ */
+struct isolate_cmd_enter_loop {
+	uint32_t type;        /* ISOLATE_CMD_ENTER_LOOP */
+	uint32_t idle_us;     /* idle window before exit (0 → stub default) */
+};
+
+struct isolate_resp_loop_exited {
+	uint32_t type;        /* ISOLATE_RESP_LOOP_EXITED */
+	int32_t  error;       /* 0, or -errno if no ring is set up */
+	uint64_t head;        /* request-ring head at exit (last_processed) */
+};
 
 /*
  * When the isolate is hardened with an empty mount namespace, /dev is no

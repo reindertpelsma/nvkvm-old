@@ -435,6 +435,23 @@ int nvkvm_req_setup_ring(VirtIONvgpu *nv,
 	return 0;
 }
 
+int nvkvm_req_enter_loop(VirtIONvgpu *nv,
+			 struct nvkvm_req_enter_loop *req,
+			 struct nvkvm_resp_enter_loop *resp)
+{
+	uint32_t iso_id = session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		resp->status = ENODEV;
+		return 0;
+	}
+	uint64_t head = 0;
+	int ret = nvkvm_isolate_enter_loop(&nv->isolates, iso_id,
+					   req->idle_us, &head);
+	resp->head   = head;
+	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
+	return 0;
+}
+
 /* ── Handle distribution ────────────────────────────────────────────────── */
 
 int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,

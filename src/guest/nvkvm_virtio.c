@@ -246,6 +246,12 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->nvstatus = le32_to_cpu(resp->ring_bytes); /* ring_bytes */
 			break;
 		}
+		case NVKVM_REQ_ENTER_LOOP: {
+			struct nvkvm_resp_enter_loop *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			inf->retval = le64_to_cpu(resp->head);   /* last_processed */
+			break;
+		}
 		case NVKVM_REQ_COPY_HANDLE_TO_ISOLATE: {
 			struct nvkvm_resp_copy_handle_to_isolate *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -792,6 +798,52 @@ int nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
 			if (ring_gpa_out)   *ring_gpa_out   = inf->retval;
 			if (ring_bytes_out) *ring_bytes_out = inf->nvstatus;
 		}
+	}
+	inflight_free(&nvkvm, inf);
+	kfree(buf);
+	return ret;
+}
+
+int nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us, u64 *head_out)
+{
+	struct {
+		struct nvkvm_hdr            hdr;
+		struct nvkvm_req_enter_loop req;
+	} msg = {};
+	struct nvkvm_inflight *inf;
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	void *buf;
+	int ret;
+
+	if (txn_id == 0)
+		return -EBUSY;
+
+	buf = kmalloc(sizeof(msg), GFP_KERNEL);
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	msg.req.session_id = cpu_to_le32(session_id);
+	msg.req.idle_us    = cpu_to_le32(idle_us);
+	memcpy(buf, &msg, sizeof(msg));
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(NVKVM_REQ_ENTER_LOOP);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
+
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	/* Blocks until the isolate's consumer loop idles out (QEMU offloads the
+	 * forward so this is just a normal virtqueue wait, uninterruptible — the
+	 * pump kthread owns it and exits via kthread_stop). */
+	ret = nvkvm_send_sync(&nvkvm, buf, sizeof(msg), inf);
+	if (ret == 0) {
+		if (inf->status)
+			ret = -(int)inf->status;
+		else if (head_out)
+			*head_out = inf->retval;
 	}
 	inflight_free(&nvkvm, inf);
 	kfree(buf);
