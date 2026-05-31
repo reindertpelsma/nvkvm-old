@@ -150,6 +150,20 @@ The guest must know the isolate has seen every command before it sleeps:
    ioctls; wire the per-cmd classification.
 6. Measure decode end-to-end; expect `work` → ~10 µs, decode → toward host rate.
 
+## Future (Phase 7, measure-gated): a guest↔QEMU ring for QEMU-only ops
+
+After the isolate ring lands, the residual decode overhead is the QEMU-only ops
+(some UVM / bookkeeping) still on the virtqueue (~a few per token). A second ring
+*instance* — guest↔QEMU, QEMU runs a spin-thread polling it — would bring the
+**pure-QEMU-bookkeeping** subset to ~µs too, reusing this exact ring primitive
+(no new concurrency code). DO NOT build speculatively: only if measurement shows
+QEMU-only ops are the residual bottleneck after Phases 2–6.
+- Caveat: UVM ops that install KVM memslots can't be ringed — the memslot
+  install is genuine main-loop/BQL work, not transport — so those stay on the
+  virtqueue. The QEMU-ring helps only the no-KVM, no-mmap QEMU-only subset.
+- Net transport lines per guest then: virtqueue (control/setup/relief/memslot) +
+  isolate ring (isolate-serviceable ops) + QEMU ring (pure-QEMU fast ops).
+
 ## Open items
 
 - Run the per-cmd latency measurement to lock the ring control-cmd allowlist +
