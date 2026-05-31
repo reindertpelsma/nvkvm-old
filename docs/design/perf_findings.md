@@ -70,14 +70,70 @@ does recv→ioctl→send inline with no thread-pool, no cond handoff, no BQL. So
 command buffer remains the likely fix, now for a host-QEMU reason rather than a
 guest-wakeup one.
 
-## Next experiment (localize the host-side cost before building)
+## Experiment 3: host-side stage breakdown — LOCALIZED (the round-trip)
 
-Add timestamps in QEMU: t0=kick received (tx_handler), t1=worker starts (after
-pool dispatch), t2=sock_send to stub, t3=response received, t4=writeback/BQL
-completion; and in the stub: recv→ioctl-start→ioctl-done→send. Run decode, dump
-the per-ioctl breakdown. This pinpoints whether the ~1.6 ms is pool dispatch,
-the cond handoff, BQL contention, or response production — and confirms the
-command buffer would remove it, before committing to the build.
+QEMU timestamps around the three host-side stages, averaged over decode:
+
+```
+avg_us   dispatch = 59.1   work = 883.8   complete = 52.8
+```
+
+- **dispatch** (kick → pool thread starts): 59 µs — minor
+- **complete** (worker exit → BQL completion callback): 53 µs — minor
+- **work** (`nvkvm_req_ioctl_on_isolate`: send to stub → response received):
+  **884 µs — 89% of the per-ioctl cost.**
+
+The standalone socketpair is ~30 µs and the host ioctl ~7 µs, so the 884 µs is
+neither the wire nor the driver — it is the **chain of sleeping-thread wakeups**
+in the round-trip:
+
+```
+QEMU worker --send--> stub RECEIVER (recvmsg wakeup) --enqueue--> stub WORKER
+  (queue_cond wakeup) --ioctl--> stub WORKER --send--> QEMU READER
+  (recvmsg wakeup) --signal--> QEMU WORKER (pthread_cond wakeup) --> response
+```
+
+~4 sleeping-thread wakeups, ~220 µs each under decode's scheduler contention
+(consistent with the same-core-loaded ping-pong ~123 µs). ~36 ioctls/token ×
+~884 µs ≈ 32 ms/token = the bulk of the 36 ms/token decode time.
+
+## Verdict: the command buffer is justified (and is the only clean fix)
+
+All three non-round-trip suspects are minor (socketpair ~2%, guest-wakeup 0,
+dispatch+complete ~110 µs). The cost is the **four-thread-wakeup round-trip**,
+and the only thing that removes all four at once is replacing trap-and-defer
+with **poll-and-handle-inline** — the command buffer: the isolate's spin-thread
+reads the command inline, runs the ioctl inline, writes the result back inline;
+the guest reads it inline. No socketpair, no receiver/worker/reader handoffs.
+`work` collapses from 884 µs toward the ~10 µs floor (host ioctl + cache
+transfer) → decode approaches host rate (~368 t/s); ~15× for single-stream.
+Piecemeal busy-poll of the four handoffs would burn cores, capture only part,
+and approach the command buffer's complexity anyway — so it is NOT preferable.
+
+## Command-buffer build plan (next milestone, multi-week)
+
+1. **Per-isolate shared command ring** — host mints a memfd, maps it into the
+   guest GPA (like other GPU mmaps) AND passes it to the isolate via SCM_RIGHTS;
+   both map it. Header = ring indices + per-slot {cmd, sizes, txn, status}.
+2. **Fast-path classification** — only ioctls the isolate fully services without
+   QEMU (no KVM memslot install, no fd creation): RM_CONTROL (no embedded fd),
+   RM_FREE, query controls. Everything else stays on the virtqueue path.
+   Default-deny.
+3. **Isolate spin-thread** (per isolate) — polls the ring; on a command:
+   copy-in to private buffer (TOCTOU, audit P2-2), run gates, `stub_ioctl`,
+   write result + status back, advance the ring. Adaptive: spin while busy,
+   block (futex on a ring doorbell) when idle.
+4. **Guest side** — write command, then adaptive spin (bounded) on the result
+   slot, fall back to a virtqueue SYNC ("wake me on completion") to sleep
+   without burning a vCPU. Lost-wakeup-safe (futex compare-value).
+5. **Interrupt path** — mirror SIGUSR1: mark the ring slot + signal the isolate
+   spin-thread, guarded like the current model.
+6. **Security invariants** — copy-in before check (P2-2), treat ring head/tail
+   as hostile (bound every index), per-isolate ring (no cross-tenant), never
+   expose privileged pages.
+
+Ceiling ≈ host rate (the isolate still runs ~36 real ioctls/token). Adaptive
+spin needed so idle/many-tenant cases don't burn cores.
 
 ## Probable fixes (ranked by expected payoff, pending the next experiment)
 
