@@ -625,8 +625,39 @@ struct nvkvm_ioctl_work {
 static int nvkvm_ioctl_work_fn(void *opaque)
 {
 	struct nvkvm_ioctl_work *w = opaque;
+	/*
+	 * Audit P2-2: param_buf/aux_buf point into the guest-shared SHM slot,
+	 * and this worker runs on the thread pool CONCURRENTLY with the guest
+	 * vCPUs.  The handler's allowlist gates (NVKMS cmdType, alloc class,
+	 * ctrl cmd, and crucially the cross-VM DUP_OBJECT src-client + hClient
+	 * gates) read these bytes, then the very same bytes are shipped to the
+	 * stub — a second vCPU can flip an allowed value to a denied one in the
+	 * window between (a classic double-fetch that defeats the cross-tenant
+	 * gates).  Snapshot the slot into a worker-private buffer ONCE up front
+	 * so every gate checks, and the stub receives, the SAME bytes; copy the
+	 * host writebacks back to the SHM slot afterwards (param/aux are in/out).
+	 */
+	void *shm_param = w->param_buf, *shm_aux = w->aux_buf;
+	void *priv_param = NULL, *priv_aux = NULL;
+	if (w->req.param_size > 0 && shm_param) {
+		priv_param = g_malloc(w->req.param_size);
+		memcpy(priv_param, shm_param, w->req.param_size);
+	}
+	if (w->req.aux_size > 0 && shm_aux) {
+		priv_aux = g_malloc(w->req.aux_size);
+		memcpy(priv_aux, shm_aux, w->req.aux_size);
+	}
 	nvkvm_req_ioctl_on_isolate(w->nv, &w->req, &w->resp,
-				   w->param_buf, w->aux_buf);
+				   priv_param ? priv_param : shm_param,
+				   priv_aux   ? priv_aux   : shm_aux);
+	if (priv_param) {
+		memcpy(shm_param, priv_param, w->req.param_size);
+		g_free(priv_param);
+	}
+	if (priv_aux) {
+		memcpy(shm_aux, priv_aux, w->req.aux_size);
+		g_free(priv_aux);
+	}
 	return 0;
 }
 

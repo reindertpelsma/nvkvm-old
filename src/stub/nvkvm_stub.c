@@ -1022,6 +1022,23 @@ static void worker_thread(void *arg)
 				break;
 			}
 		}
+		/*
+		 * Audit P2-1 (live-path G-2): neutralise NV_ESC_RM_IDLE_CHANNELS
+		 * (nr 0x41) HERE, at the stub boundary.  The earlier dispatch.c
+		 * fix was dead code (never wired into the IOCTL_ON_ISOLATE path),
+		 * so the guest-controlled NvP64 array pointers were reaching the
+		 * host driver, which would walk them as user pointers in the
+		 * stub's address space.  We do not marshal the per-channel arrays
+		 * (NVOS30 num_channels@12, p_clients@16, p_devices@24,
+		 * p_channels@32); force the single-channel form by zeroing
+		 * num_channels and the three array pointers.  job.param_buf is a
+		 * private recv'd copy, so this is race-free (not subject to the
+		 * SHM double-fetch, audit P2-2). */
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    (job.cmd & 0xff) == 0x41 /* NV_ESC_RM_IDLE_CHANNELS */ &&
+		    job.param_size >= 40) {
+			__builtin_memset((char *)job.param_buf + 12, 0, 28);
+		}
 		if (fe_has_embedded_fd &&
 		    job.param_size >= fe_embedded_fd_off + 4) {
 			int32_t hid;

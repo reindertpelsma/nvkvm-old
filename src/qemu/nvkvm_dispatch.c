@@ -351,6 +351,11 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 	}
 
 	case NV_ESC_RM_IDLE_CHANNELS: {
+		/* NOTE (audit P2-1): this dispatch path is NOT wired into the
+		 * live IOCTL_ON_ISOLATE flow (handle_ioctl is static/unused).
+		 * The authoritative IDLE_CHANNELS pointer-sanitisation lives in
+		 * the stub (nvkvm_stub.c, nr 0x41 block).  Kept here for the
+		 * (currently dead) synchronous path; do not rely on it. */
 		struct nv_ioctl_idle_channels *p = ctx->params_buf;
 		uint32_t n  = p->num_channels;
 		int ret;
