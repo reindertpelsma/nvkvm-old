@@ -57,6 +57,26 @@ struct nvkvm_ring {
 
 #define NVKVM_RING_DATA(r) ((uint8_t *)((struct nvkvm_ring *)(r) + 1))
 
+/* ── Ring-pair region layout (command-buffer transport) ───────────────────
+ * QEMU mints one memfd holding two back-to-back [control + data] rings:
+ *   request ring  (guest→isolate) at offset 0
+ *   response ring (isolate→guest) at nvkvm_ring_resp_off(ring_bytes)
+ * Each ring's data region immediately follows its own control block, so the
+ * SAME producer/consumer helpers work on an nvkvm_ring* aimed at either
+ * offset (NVKVM_RING_DATA does the right thing for both).
+ */
+#define NVKVM_RING_DEFAULT_BYTES (64u * 1024u)   /* per-ring data bytes */
+
+static inline uint64_t nvkvm_ring_resp_off(uint32_t ring_bytes)
+{
+	return (uint64_t)sizeof(struct nvkvm_ring) + ring_bytes;
+}
+
+static inline uint64_t nvkvm_ring_region_size(uint32_t ring_bytes)
+{
+	return 2ull * ((uint64_t)sizeof(struct nvkvm_ring) + ring_bytes);
+}
+
 static inline uint32_t nvkvm_ring_roundup(uint32_t x)
 {
 	return (x + (NVKVM_RING_ALIGN - 1)) & ~(NVKVM_RING_ALIGN - 1);

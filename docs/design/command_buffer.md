@@ -158,9 +158,16 @@ After the isolate ring lands, the residual decode overhead is the QEMU-only ops
 **pure-QEMU-bookkeeping** subset to ~µs too, reusing this exact ring primitive
 (no new concurrency code). DO NOT build speculatively: only if measurement shows
 QEMU-only ops are the residual bottleneck after Phases 2–6.
-- Caveat: UVM ops that install KVM memslots can't be ringed — the memslot
-  install is genuine main-loop/BQL work, not transport — so those stay on the
-  virtqueue. The QEMU-ring helps only the no-KVM, no-mmap QEMU-only subset.
+- Caveat (precise): only the ops that install a **KVM memslot**
+  (`KVM_SET_USER_MEMORY_REGION`) are genuine main-loop/BQL work and must stay on
+  the virtqueue. But memslot install is **window setup, not per-mmap** — the KVM
+  user-memory region is a single big GPA *window*, not one slot per mapping.
+  The common path — `mmap`-ing a GPA into the VMM's VA inside the
+  already-installed window (a `MAP_FIXED` slice) — is just an `mmap` syscall:
+  fast, no BQL, and the ring tolerates its (rare) blocking. So those per-mmap
+  UVM/RM ops **can** ride the QEMU ring; only the infrequent window-grow /
+  memslot-install stays on the virtqueue. The QEMU-ring helps the no-memslot
+  QEMU-only subset, which includes most mmaps.
 - Net transport lines per guest then: virtqueue (control/setup/relief/memslot) +
   isolate ring (isolate-serviceable ops) + QEMU ring (pure-QEMU fast ops).
 

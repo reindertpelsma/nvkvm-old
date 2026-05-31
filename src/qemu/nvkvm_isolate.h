@@ -77,6 +77,26 @@ struct nvkvm_isolate {
 	uint64_t    sync_realize_length;
 	uint64_t    sync_realize_token;
 	uint32_t    sync_realize_rm_status;
+	/* SETUP_RING probe echo — reader fills before signaling. */
+	uint64_t    sync_ring_probe;
+
+	/*
+	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
+	 * QEMU mints one memfd holding both rings, keeps its own MAP_SHARED
+	 * mapping (for init / the grow handshake / a future QEMU-side ring), and
+	 * hands a copy to the isolate which maps the same memfd.  ring_ready is
+	 * set once the bidirectional probe self-test passes.  ring_gpa /
+	 * ring_kvm_slot are filled in Phase 4 when the region is installed into
+	 * the guest's physical address space.  ring_memfd < 0 ⇒ no ring (the
+	 * isolate keeps serving ioctls over the existing path).
+	 */
+	int         ring_memfd;
+	void       *ring_qva;
+	uint64_t    ring_region_size;
+	uint32_t    ring_bytes;
+	uint64_t    ring_gpa;
+	int         ring_kvm_slot;
+	bool        ring_ready;
 };
 
 struct nvkvm_isolate_table {
@@ -106,6 +126,18 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 
 /* Host pid of a live isolate by id (0 if none) — for GET_PID_INFO pid mapping. */
 pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+
+/*
+ * Set up the per-isolate SPSC command-buffer ring (docs/design/command_buffer.md).
+ * Mints a memfd holding the request+response rings, maps it in QEMU,
+ * initialises both control blocks, hands a copy to the isolate via SCM_RIGHTS,
+ * and runs a bidirectional shared-memory probe self-test.  On success the
+ * isolate has the ring mapped and ready (Phase 3 spins a consumer on it).
+ *
+ * The ring is a pure optimisation: a non-zero return is logged and ignored by
+ * the caller — the isolate keeps serving every ioctl over the existing path.
+ */
+int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 
 /*
  * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently

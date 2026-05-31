@@ -51,6 +51,7 @@
 #define ISOLATE_CMD_OPEN_DEVICE  9   /* stub opens /dev/nvidia*, replies w/ SCM_RIGHTS fd */
 #define ISOLATE_CMD_REALIZE_UVM_FD 10 /* full UVM realize: init+register+intent+mmap */
 #define ISOLATE_CMD_INTERRUPT    11   /* post SIGUSR1 to the worker on txn_id  */
+#define ISOLATE_CMD_SETUP_RING   12   /* mint per-isolate SPSC ring pair; memfd via SCM_RIGHTS */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -61,6 +62,7 @@
 #define ISOLATE_RESP_POLL_EVENT  0x14  /* async: fd became ready             */
 #define ISOLATE_RESP_OPEN_DEVICE 0x15  /* open result + fd via SCM_RIGHTS    */
 #define ISOLATE_RESP_REALIZE_UVM 0x16  /* realize result: host VA + rmStatus */
+#define ISOLATE_RESP_RING_READY  0x17  /* SPSC ring mapped + self-test echo  */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -258,6 +260,47 @@ struct isolate_resp_realize_uvm {
 	uint64_t length;      /* echo                                       */
 	uint64_t realize_token;/* opaque (currently == host_va for now)     */
 };
+
+/* ── SETUP_RING ───────────────────────────────────────────────────────────
+ * QEMU mints ONE memfd holding the request + response SPSC rings
+ * (docs/design/command_buffer.md): it maps the memfd, initialises both ring
+ * control blocks, then hands a copy of the memfd to the isolate via SCM_RIGHTS
+ * in the same sendmsg.  The isolate maps it MAP_SHARED so QEMU, the isolate
+ * (and, from Phase 4, the guest via a KVM memslot) all share the same pages.
+ *
+ * Before the ring is trusted a probe word round-trips through the shared data
+ * region to prove BIDIRECTIONAL visibility: QEMU writes `probe` at the start
+ * of the request data region; the isolate echoes it back in the response
+ * (proves QEMU→isolate) and writes `probe ^ NVKVM_RING_PROBE_MASK` at the
+ * start of the response data region (QEMU re-reads it → proves isolate→QEMU).
+ *
+ * The ring is a PURE OPTIMISATION: if setup fails the isolate keeps serving
+ * every ioctl over the existing IOCTL/MMAP path, so SETUP_RING failure is
+ * non-fatal to the isolate.
+ *
+ * Layout (see nvkvm_ring.h helpers): req ring control block at req_off (=0),
+ * its data immediately after; resp ring control block at resp_off, its data
+ * immediately after.  region_size is the whole memfd the isolate must mmap.
+ */
+struct isolate_cmd_setup_ring {
+	uint32_t type;         /* ISOLATE_CMD_SETUP_RING */
+	uint32_t region_size;  /* total memfd bytes the isolate must mmap */
+	uint32_t req_off;      /* offset of request-ring control block (=0) */
+	uint32_t resp_off;     /* offset of response-ring control block */
+	uint32_t ring_bytes;   /* per-ring data bytes (power of two, >= 64) */
+	uint32_t reserved;
+	/* memfd attached via SCM_RIGHTS in the same sendmsg. */
+};
+
+struct isolate_resp_ring_ready {
+	uint32_t type;         /* ISOLATE_RESP_RING_READY */
+	int32_t  error;        /* 0 on success; -errno on failure */
+	uint64_t probe_seen;   /* value the isolate read from the request data
+	                        * region — QEMU checks it equals what it wrote */
+};
+
+/* Self-test mask (see SETUP_RING comment above). */
+#define NVKVM_RING_PROBE_MASK 0x5a5a5a5a5a5a5a5aULL
 
 /*
  * When the isolate is hardened with an empty mount namespace, /dev is no

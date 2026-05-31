@@ -35,6 +35,7 @@
 
 #include "stub_freestanding.h"
 #include "../common/nvkvm_isolate_proto.h"
+#include "../common/nvkvm_ring.h"
 #include "../common/nvkvm_abi.h"
 
 /* ── Constants we'd otherwise pull from libc headers ─────────────────────── */
@@ -72,10 +73,14 @@
 #define PROT_EXEC      0x4
 #endif
 #ifndef MAP_PRIVATE
+#define MAP_SHARED     0x01
 #define MAP_PRIVATE    0x02
 #define MAP_FIXED      0x10
 #define MAP_ANONYMOUS  0x20
 #define MAP_GROWSDOWN  0x0100
+#endif
+#ifndef MAP_SHARED
+#define MAP_SHARED     0x01
 #endif
 #define MAP_FAILED ((void *)-1L)
 
@@ -436,6 +441,18 @@ static uint32_t nvkvm_ctrl_list_entry_size(uint32_t cmd)
 	return 0;
 }
 
+/* ── Command-buffer ring (docs/design/command_buffer.md) ─────────────────────
+ * QEMU mints a memfd holding the request + response SPSC rings and sends it
+ * via SCM_RIGHTS (ISOLATE_CMD_SETUP_RING).  We mmap the same memfd MAP_SHARED;
+ * the guest sees the same pages through a KVM memslot (Phase 4).  Phase 2 only
+ * maps + self-tests it; Phase 3 spins a consumer thread on g_req_ring.
+ */
+static void              *g_ring_base;       /* base of the mmapped region    */
+static uint64_t           g_ring_region_size;
+static struct nvkvm_ring *g_req_ring;        /* guest→isolate (we consume)    */
+static struct nvkvm_ring *g_resp_ring;       /* isolate→guest (we produce)    */
+static uint32_t           g_ring_bytes;
+
 /* ── Handle fd table ─────────────────────────────────────────────────────── */
 
 static int handle_fds[MAX_HANDLES];
@@ -511,6 +528,16 @@ static int send_error(int err)
 {
 	struct isolate_resp_error r = {
 		.type = ISOLATE_RESP_ERROR, .err = err < 0 ? -err : err };
+	return locked_send(&r, sizeof(r));
+}
+
+static int send_ring_ready(int error, uint64_t probe_seen)
+{
+	struct isolate_resp_ring_ready r = {
+		.type       = ISOLATE_RESP_RING_READY,
+		.error      = error,
+		.probe_seen = probe_seen,
+	};
 	return locked_send(&r, sizeof(r));
 }
 
@@ -1290,6 +1317,78 @@ static void *blob_alloc(size_t size)
 	return (p == MAP_FAILED) ? NULL : p;
 }
 
+/*
+ * ISOLATE_CMD_SETUP_RING: map the QEMU-minted ring memfd (delivered via
+ * SCM_RIGHTS) and run the bidirectional probe self-test.  QEMU is trusted, but
+ * the geometry is validated defensively before mmap so a bad size can never
+ * blow up the stub.  Phase 2 maps + self-tests only; Phase 3 spins a consumer
+ * thread on g_req_ring.  Failure replies RING_READY{error<0} and the isolate
+ * keeps serving every ioctl over the existing socket path.
+ */
+static void handle_setup_ring(const struct isolate_cmd_setup_ring *cmd,
+			      struct msghdr *msg_hdr, long msg_len)
+{
+	struct cmsghdr *cm = CMSG_FIRSTHDR(msg_hdr);
+	if (!cm || cm->cmsg_level != SOL_SOCKET ||
+	    cm->cmsg_type != SCM_RIGHTS ||
+	    cm->cmsg_len != CMSG_LEN(sizeof(int))) {
+		send_ring_ready(-EINVAL, 0);
+		return;
+	}
+	int fd;
+	__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+
+	if (msg_len < (long)sizeof(*cmd) || g_ring_base) {   /* malformed / dup */
+		stub_close(fd);
+		send_ring_ready(-EINVAL, 0);
+		return;
+	}
+
+	uint32_t ring_bytes = cmd->ring_bytes;
+	uint32_t region     = cmd->region_size;
+	uint32_t resp_off   = cmd->resp_off;
+
+	/* Geometry: power-of-two ring, layout matches the shared helpers, the
+	 * region holds both [control + data] halves, bounded total size. */
+	if (!nvkvm_ring_size_ok(ring_bytes) ||
+	    cmd->req_off != 0 ||
+	    resp_off != (uint32_t)nvkvm_ring_resp_off(ring_bytes) ||
+	    region < (uint32_t)nvkvm_ring_region_size(ring_bytes) ||
+	    region > (16u << 20)) {                          /* 16 MiB cap */
+		stub_close(fd);
+		send_ring_ready(-EINVAL, 0);
+		return;
+	}
+
+	void *base = stub_mmap(NULL, region, PROT_READ | PROT_WRITE,
+			       MAP_SHARED, fd, 0);
+	stub_close(fd);                  /* the mapping keeps the memfd alive */
+	if (base == MAP_FAILED) {
+		send_ring_ready(-ENOMEM, 0);
+		return;
+	}
+
+	struct nvkvm_ring *req  = (struct nvkvm_ring *)base;
+	struct nvkvm_ring *resp = (struct nvkvm_ring *)((uint8_t *)base + resp_off);
+	uint8_t *req_data  = (uint8_t *)req  + sizeof(struct nvkvm_ring);
+	uint8_t *resp_data = (uint8_t *)resp + sizeof(struct nvkvm_ring);
+
+	/* Probe: read QEMU's word (proves QEMU→isolate when echoed), write the
+	 * masked reply (proves isolate→QEMU when QEMU re-reads it). */
+	uint64_t v;
+	__builtin_memcpy(&v, req_data, sizeof(v));
+	uint64_t reply = v ^ NVKVM_RING_PROBE_MASK;
+	__builtin_memcpy(resp_data, &reply, sizeof(reply));
+
+	g_ring_base        = base;
+	g_ring_region_size = region;
+	g_req_ring         = req;
+	g_resp_ring        = resp;
+	g_ring_bytes       = ring_bytes;
+
+	send_ring_ready(0, v);
+}
+
 /* ── Command handlers (reader thread) ───────────────────────────────────── */
 
 /*
@@ -2035,6 +2134,7 @@ int main(void)
 			struct isolate_cmd_open_device      open_dev;
 			struct isolate_cmd_realize_uvm_fd   realize;
 			struct isolate_cmd_interrupt        interrupt_cmd;
+			struct isolate_cmd_setup_ring       setup_ring;
 		} cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
@@ -2120,6 +2220,9 @@ int main(void)
 			/* Fire-and-forget: signal the worker on this txn so its
 			 * in-flight ioctl returns -EINTR.  No response. (#73) */
 			interrupt_txn(cmd.interrupt_cmd.target_txn);
+			break;
+		case ISOLATE_CMD_SETUP_RING:
+			handle_setup_ring(&cmd.setup_ring, &msg_hdr, n);
 			break;
 		case ISOLATE_CMD_EXIT:
 			goto done;

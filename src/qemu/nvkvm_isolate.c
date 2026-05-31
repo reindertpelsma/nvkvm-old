@@ -243,6 +243,7 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 #include "virtio_nvgpu.h"
 
 #include "../../src/common/nvkvm_isolate_proto.h"
+#include "../../src/common/nvkvm_ring.h"
 
 #ifdef NVKVM_STUB_EMBEDDED
 #include "nvkvm_stub_bin.h"
@@ -397,6 +398,7 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_poll_event      poll_event;
 		struct isolate_resp_open_device     open_dev;
 		struct isolate_resp_realize_uvm     realize;
+		struct isolate_resp_ring_ready      ring_ready;
 	} u;
 
 	for (;;) {
@@ -548,6 +550,16 @@ static void *isolate_reader_fn(void *arg)
 			break;
 		}
 
+		case ISOLATE_RESP_RING_READY: {
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_ring_probe = u.ring_ready.probe_seen;
+			iso->sync_error      = u.ring_ready.error;
+			iso->sync_done       = true;
+			pthread_cond_signal(&iso->sync_cond);
+			pthread_mutex_unlock(&iso->sync_lock);
+			break;
+		}
+
 		case ISOLATE_RESP_OPEN_DEVICE: {
 			int got_fd = -1;
 			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
@@ -646,6 +658,13 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->sync_done    = false;
 			iso->sync_open_fd = -1;
 			iso->reader_started = false;
+			iso->ring_memfd   = -1;
+			iso->ring_qva     = NULL;
+			iso->ring_region_size = 0;
+			iso->ring_bytes   = 0;
+			iso->ring_gpa     = 0;
+			iso->ring_kvm_slot = -1;
+			iso->ring_ready   = false;
 			*id_out = id;
 			return iso;
 		}
@@ -827,6 +846,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	}
 	iso->reader_started = true;
 
+	/*
+	 * Set up the command-buffer ring (docs/design/command_buffer.md).
+	 * Pure optimisation: failure is logged and ignored — the isolate keeps
+	 * serving every ioctl over the existing IOCTL/MMAP path.  NVKVM_RING_DISABLE
+	 * skips it entirely (debugging / A-B perf comparison).
+	 */
+	if (getenv("NVKVM_RING_DISABLE") == NULL) {
+		int rret = nvkvm_isolate_ring_setup(t, id);
+		if (rret != 0)
+			NVKVM_DBG(
+				"nvkvm_isolate: ring setup for isolate %u failed: %d "
+				"(falling back to socket path)\n", id, rret);
+	}
+
 	*isolate_id_out = id;
 
 	NVKVM_DBG(
@@ -932,10 +965,31 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 		}
 	}
 
+	/*
+	 * Tear down the command-buffer ring.  The stub is already dead (its
+	 * mapping went with it), so we only release QEMU's own mapping + memfd
+	 * and, once Phase 4 installs it, the guest KVM memslot.
+	 */
 	pthread_mutex_lock(&iso->lock);
+	void *ring_qva   = iso->ring_qva;
+	uint64_t ring_sz = iso->ring_region_size;
+	int ring_mfd     = iso->ring_memfd;
+	int ring_slot    = iso->ring_kvm_slot;
+	iso->ring_qva    = NULL;
+	iso->ring_memfd  = -1;
+	iso->ring_kvm_slot = -1;
+	iso->ring_ready  = false;
+	iso->ring_gpa    = 0;
 	iso->pid    = 0;
 	iso->in_use = false;
 	pthread_mutex_unlock(&iso->lock);
+
+	if (ring_slot >= 0)
+		nvkvm_kvm_slot_release(ring_slot);   /* Phase 4 installs the slot */
+	if (ring_qva && ring_qva != MAP_FAILED && ring_sz)
+		munmap(ring_qva, ring_sz);
+	if (ring_mfd >= 0)
+		close(ring_mfd);
 
 	NVKVM_DBG( "nvkvm_isolate: killed isolate %u\n", isolate_id);
 	return 0;
@@ -1079,6 +1133,116 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	if (ret == 0)
 		nvkvm_handle_ref_isolate(ht, handle_id);
 	return ret;
+}
+
+/* ── Command-buffer ring setup ──────────────────────────────────────────── */
+
+int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool ok = iso->in_use && iso->id == isolate_id && iso->alive &&
+		  iso->ring_memfd < 0;   /* not already set up */
+	pthread_mutex_unlock(&iso->lock);
+	if (!ok)
+		return -EINVAL;
+
+	uint32_t ring_bytes = NVKVM_RING_DEFAULT_BYTES;
+	uint64_t region = nvkvm_ring_region_size(ring_bytes);
+	region = (region + 4095) & ~4095ULL;   /* page-round for mmap/ftruncate */
+
+	int mfd = nvkvm_memfd_create("nvkvm-ring", MFD_CLOEXEC);
+	if (mfd < 0)
+		return -errno;
+	if (ftruncate(mfd, (off_t)region) < 0) {
+		int e = -errno; close(mfd); return e;
+	}
+
+	void *qva = mmap(NULL, region, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, mfd, 0);
+	if (qva == MAP_FAILED) {
+		int e = -errno; close(mfd); return e;
+	}
+
+	/* Initialise both ring control blocks: head==tail==0 ⇒ empty. */
+	uint64_t resp_off = nvkvm_ring_resp_off(ring_bytes);
+	struct nvkvm_ring *req  = (struct nvkvm_ring *)qva;
+	struct nvkvm_ring *resp = (struct nvkvm_ring *)((uint8_t *)qva + resp_off);
+	memset(req, 0, sizeof(*req));   req->size  = ring_bytes;
+	memset(resp, 0, sizeof(*resp)); resp->size = ring_bytes;
+
+	/* Bidirectional shared-memory self-test probe (see proto header). */
+	uint64_t probe = 0x6e766b766d000000ULL | isolate_id;   /* "nvkvm\0\0\0" | id */
+	uint8_t *req_data  = (uint8_t *)req  + sizeof(struct nvkvm_ring);
+	uint8_t *resp_data = (uint8_t *)resp + sizeof(struct nvkvm_ring);
+	memcpy(req_data, &probe, sizeof(probe));
+	memset(resp_data, 0, sizeof(uint64_t));
+
+	struct isolate_cmd_setup_ring hdr = {
+		.type        = ISOLATE_CMD_SETUP_RING,
+		.region_size = (uint32_t)region,
+		.req_off     = 0,
+		.resp_off    = (uint32_t)resp_off,
+		.ring_bytes  = ring_bytes,
+	};
+	struct msghdr msg = { 0 };
+	struct iovec  iov = { .iov_base = &hdr, .iov_len = sizeof(hdr) };
+	char          cbuf[CMSG_SPACE(sizeof(int))];
+	msg.msg_iov        = &iov;
+	msg.msg_iovlen     = 1;
+	msg.msg_control    = cbuf;
+	msg.msg_controllen = sizeof(cbuf);
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type  = SCM_RIGHTS;
+	cm->cmsg_len   = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &mfd, sizeof(int));
+
+	int ret = sync_sendmsg_recv(iso, &msg);   /* reader fills sync_ring_probe */
+	if (ret != 0) {
+		munmap(qva, region); close(mfd); return ret;
+	}
+
+	/* Verify QEMU→isolate (probe echoed) and isolate→QEMU (resp_data). */
+	pthread_mutex_lock(&iso->sync_lock);
+	uint64_t echoed = iso->sync_ring_probe;
+	pthread_mutex_unlock(&iso->sync_lock);
+	uint64_t back = 0;
+	memcpy(&back, resp_data, sizeof(back));
+	if (echoed != probe || back != (probe ^ NVKVM_RING_PROBE_MASK)) {
+		NVKVM_DBG(
+			"nvkvm_isolate: ring %u self-test FAILED "
+			"(echo=0x%llx back=0x%llx want_echo=0x%llx want_back=0x%llx)\n",
+			isolate_id,
+			(unsigned long long)echoed, (unsigned long long)back,
+			(unsigned long long)probe,
+			(unsigned long long)(probe ^ NVKVM_RING_PROBE_MASK));
+		munmap(qva, region); close(mfd); return -EPROTO;
+	}
+
+	/* Self-test passed — wipe the probe so the data regions start clean. */
+	memset(req_data, 0, sizeof(uint64_t));
+	memset(resp_data, 0, sizeof(uint64_t));
+
+	pthread_mutex_lock(&iso->lock);
+	iso->ring_memfd       = mfd;
+	iso->ring_qva         = qva;
+	iso->ring_region_size = region;
+	iso->ring_bytes       = ring_bytes;
+	iso->ring_gpa         = 0;     /* Phase 4: install into guest GPA space */
+	iso->ring_kvm_slot    = -1;
+	iso->ring_ready       = true;
+	pthread_mutex_unlock(&iso->lock);
+
+	NVKVM_DBG(
+		"nvkvm_isolate: ring %u ready (region=%llu B, ring_bytes=%u, "
+		"resp_off=%llu) — bidirectional probe OK\n",
+		isolate_id, (unsigned long long)region, ring_bytes,
+		(unsigned long long)resp_off);
+	return 0;
 }
 
 int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
