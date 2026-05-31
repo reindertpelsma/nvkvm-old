@@ -1058,10 +1058,15 @@ static void worker_thread(void *arg)
 		 */
 		int32_t saved_alloc_event_fd = 0;
 		int     have_alloc_event_fd  = 0;
+		/* Audit G-5: only the nvos64 RM_ALLOC form (param_size 48 > the
+		 * 32-byte nvos21 form) carries a guest-translated handle_id in
+		 * Data; the guest's nvos21 branch leaves Data as a raw guest fd.
+		 * Gate on the nvos64 size so a raw nvos21 fd is never misread as
+		 * a handle_id (intra-VM fd/handle confusion). */
 		if (((job.cmd >> 8) & 0xff) == 'F' &&
 		    (job.cmd & 0xff) == 0x2b /* NV_ESC_RM_ALLOC */ &&
 		    job.aux_size >= sizeof(uint64_t) * 3 &&
-		    job.param_size >= 16) {
+		    job.param_size > 32) {
 			uint32_t h_class = 0;
 			__builtin_memcpy(&h_class,
 					 (char *)job.param_buf + 12, /* nvos21+nvos64 alias */

@@ -102,6 +102,15 @@ static int nvkvm_gem_proxy_create(struct drm_file *file,
 		return -ENOMEM;
 	drm_gem_private_object_init(file->minor->dev, &ng->base, PAGE_SIZE);
 	ng->base.funcs = &nvkvm_gem_funcs;
+	/*
+	 * Audit G-6 (latent): ng->ctx is cached WITHOUT a refcount.  Safe today
+	 * because guest GEM handles are released before nvkvm_drm_postclose
+	 * closes the ctx (normal drm_release ordering).  BUT once a dma-buf
+	 * export / FLINK path lets a GEM object outlive its drm_file, a later
+	 * nvkvm_gem_free would deref a freed ctx → guest-kernel UAF.  When the
+	 * dma-buf present path (docs/design/virtual_modeset.md) wires export,
+	 * take a ref on ctx here and drop it in nvkvm_gem_free.
+	 */
 	ng->ctx        = ctx;
 	ng->stub_handle = stub_handle;
 	ret = drm_gem_handle_create(file, &ng->base, guest_handle);
