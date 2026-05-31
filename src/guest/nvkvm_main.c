@@ -455,6 +455,19 @@ int nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
 	rc = nvkvm_ring_wait_resp(s, txn, params_buf, param_size,
 				  aux_buf, aux_size, nvstatus_out);
 	mutex_unlock(&s->ring_lock);
+
+	/* Lightweight liveness stats (proves the fast path is actually used). */
+	{
+		static atomic_t ring_exec = ATOMIC_INIT(0);
+		static atomic_t ring_punt = ATOMIC_INIT(0);
+		int e, p;
+		if (rc == NVKVM_RING_TRY_PUNT)
+			p = atomic_inc_return(&ring_punt), e = atomic_read(&ring_exec);
+		else
+			e = atomic_inc_return(&ring_exec), p = atomic_read(&ring_punt);
+		if (e == 1 || p == 1 || ((e + p) % 500) == 0)
+			pr_info("nvkvm: ring stats: exec=%d punt=%d\n", e, p);
+	}
 	return rc;
 }
 
