@@ -120,3 +120,35 @@ latency-bound in the launch+sync path itself, not exit-bound.
 exits/interrupts/halts? Candidates: doorbell-write path, completion-fence
 visibility/coherency (PCIe-read vs cached), or guest-module CPU in the forward
 hot path. Needs guest-side per-launch profiling, not host exit-counting.
+
+## Per-subsystem microbenchmark (cuda_micro.c) — host vs guest, 2026-05-31
+
+Driver-API microbenches, each isolating ONE subsystem (the right way to localize
+the gap instead of inferring from LLM decode). Same binary, host vs guest:
+
+| subtest | host | guest | ratio |
+|---|---|---|---|
+| 1 rm_control (cuMemGetInfo)   | 13.3 µs | 807 µs   | **60×** |
+| 2 alloc+free (cuMemAlloc)     | 134 µs  | 3761 µs  | **28×** |
+| 3 bandwidth HtoD              | 13.2 GB/s | 12.0 GB/s | ~parity |
+| 3 bandwidth **DtoH**          | 10.2 GB/s | **0.1 GB/s** | **~100× slower** |
+| 4 launch_sync (noop+sync)     | 6.5 µs  | 13.3 µs  | **2×** |
+| 5 uvm_alloc (cuMemAllocManaged)| 163 µs | **fails (null→crash)** | broken |
+| 6 uvm_migrate (CPU<->GPU)     | 3742 µs | (n/a, alloc fails) | broken |
+
+Findings (several overturning earlier guesses):
+- **DtoH is ~100× slower than HtoD** (0.1 vs 12 GB/s) while HtoD is at parity —
+  an asymmetric bug in the device→host writeback path (memfd→shm readback),
+  almost certainly unbatched/per-page. HIGH priority, was completely unsuspected.
+- **rm_control 60× / alloc 28×** = the ~800 µs forwarding round-trip per ioctl
+  (matches the earlier decomposition); the transport work targets this.
+- **launch_sync only 2×** — the doorbell+fence path is NOT the big problem;
+  this REFUTES the earlier "decode is launch-bound (~54µs/launch)" inference.
+- **UVM managed memory is broken** — cuMemAllocManaged returns null in the guest
+  (CPU-touch then segfaults); the managed/demand-paged path isn't supported.
+
+Implication for decode: it's a MIX dominated by control round-trips (60×, the
+most frequent per-token op) and possibly DtoH if results are copied back — NOT
+launches. Fix priority: (1) the DtoH writeback bug (asymmetric, surprising),
+(2) control/alloc round-trip (transport), (3) UVM managed (separate). Tool:
+tests/integration/cuda_micro.c (driver API, dlopen libcuda, runs host+guest).
