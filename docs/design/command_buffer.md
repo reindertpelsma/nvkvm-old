@@ -77,6 +77,44 @@ spin:
   ring reader. The fast/slow split lives HERE (inline vs worker), fed by the
   per-cmd latency measurement — it is NOT a ring-vs-virtqueue split.
 
+## Doorbell — sleep when idle, never a 100% spin (Phase 3, BUILT)
+
+The consumer must NOT burn a core spinning when the guest is idle (explicit
+constraint). So it **spins a bounded budget, then blocks on a futex**:
+
+```
+consumer: spin BUDGET × cpu_relax() on an empty ring        # hot path, no syscall
+          still empty → presleep(): store SLEEPING (seq_cst), RE-CHECK tail
+              raced-in work → clear SLEEPING, keep draining
+              still empty   → FUTEX_WAIT(consumer_sleeping, SLEEPING)
+          woken → clear SLEEPING, drain
+```
+
+The wake is **asymmetric**: a guest producer cannot `FUTEX_WAKE` a host thread.
+So the producer, after `commit()`, calls `take_wake()` — an atomic
+exchange that clears `consumer_sleeping` and tells it whether the consumer was
+asleep. If asleep, the guest **kicks the virtqueue** (its only VM-exit lever)
+and QEMU does the `FUTEX_WAKE` on the shared `consumer_sleeping` word (it maps
+the same memfd). Crucially:
+- **Hot path pays nothing**: while the consumer is actively draining (spinning),
+  `consumer_sleeping == AWAKE`, so `take_wake()` returns "no wake needed" → the
+  guest issues **no kick, no VM exit**. The exit happens only on the
+  idle→active edge.
+- **Lost-wakeup-free**: `take_wake()` clears the flag to AWAKE *before* the wake
+  syscall, and the consumer's `FUTEX_WAIT` is issued with expected value
+  SLEEPING. If the wake fires in the gap between the consumer's presleep store
+  and its `FUTEX_WAIT`, the kernel sees AWAKE ≠ SLEEPING and `FUTEX_WAIT` returns
+  `EAGAIN` immediately instead of blocking on a wake that already happened. The
+  presleep re-check of `tail` closes the symmetric window (work committed just
+  before we slept). Proven in `tests/unit/ring_doorbell_test.c` (TSan-clean):
+  gappy run 494 real sleeps / 494 wakes; **hammer 2 M back-to-back records
+  triggers the presleep/commit race 379× with zero loss, in order**.
+
+Helpers are in `nvkvm_ring.h` (`nvkvm_ring_producer_take_wake`,
+`nvkvm_ring_consumer_presleep`, `nvkvm_ring_consumer_wake_self`) — portable
+atomics only; the `FUTEX_WAIT`/`FUTEX_WAKE` syscalls live in the stub (raw),
+QEMU (the kick handler), and the test, since the syscall surface differs.
+
 ## Classification — what rides the ring
 
 Ring = ioctls the isolate fully services with **no QEMU/KVM/fd mediation** and
@@ -143,7 +181,11 @@ The guest must know the isolate has seen every command before it sleeps:
 2. **Per-isolate ring setup over the virtqueue** (memfd mint → GPA install +
    SCM_RIGHTS to isolate; both map) + the grow handshake.
 3. **Isolate spin-thread**: ring read → copy-out → validate → inline ioctl →
-   response ring; integrate the sync/doorbell.
+   response ring; integrate the sync/doorbell. *(Doorbell concurrency core
+   BUILT + TSan-proven: `nvkvm_ring.h` helpers + `ring_doorbell_test.c`. The
+   remaining wiring — spawn the spin-thread, route reads into the real
+   `stub_ioctl`, and the guest-kick→QEMU-`FUTEX_WAKE` path — is GPU/guest-
+   coupled and lands with Phase 4.)*
 4. **Guest side**: ring producer/consumer + the sync-driven big loop; route
    fast-class ioctls to the ring, the rest to the virtqueue.
 5. **Inline-vs-worker** dispatch in the isolate for slow isolate-serviceable

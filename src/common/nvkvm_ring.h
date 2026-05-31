@@ -206,4 +206,72 @@ static inline void nvkvm_ring_pop(struct nvkvm_ring *r, uint64_t total)
 	__atomic_store_n(&r->head, r->head + total, __ATOMIC_RELEASE);
 }
 
+/* ── Doorbell ─────────────────────────────────────────────────────────────
+ * The consumer (isolate) spins a budget on an empty ring (the decode hot path:
+ * no syscall, no VM exit), and only sleeps when idle.  Sleeping is published
+ * by storing 1 to `consumer_sleeping`; the consumer FUTEX_WAITs on that word.
+ * The wake is asymmetric: a guest producer cannot FUTEX_WAKE a host thread, so
+ * it KICKS the virtqueue and QEMU does the FUTEX_WAKE on the shared word.
+ *
+ * The two helpers below are the PORTABLE half (plain atomics, no futex) so the
+ * guest kernel, QEMU and the host test all share them.  The actual
+ * FUTEX_WAIT/FUTEX_WAKE stay in the respective C files (raw syscall in the
+ * freestanding stub, glibc/QEMU elsewhere) because the syscall surface differs.
+ *
+ * consumer_sleeping states: 0 = awake/spinning, 1 = asleep (wants a wake).
+ */
+#define NVKVM_RING_AWAKE    0u
+#define NVKVM_RING_SLEEPING 1u
+
+/*
+ * Producer side (guest / QEMU): call AFTER commit().  Atomically clears the
+ * sleeping flag and returns non-zero iff the consumer had published that it is
+ * asleep — in which case the caller must wake it (kick the virtqueue → QEMU
+ * FUTEX_WAKEs the shared word).
+ *
+ * Clearing the flag BEFORE the wake syscall is what makes the wake un-loseable:
+ * the consumer's FUTEX_WAIT is issued with the expected value SLEEPING, so if
+ * this exchange runs in the gap between the consumer's presleep store and its
+ * FUTEX_WAIT, the kernel sees the word is now AWAKE and FUTEX_WAIT returns
+ * immediately (EAGAIN) instead of blocking on a wake that already fired.
+ */
+static inline int nvkvm_ring_producer_take_wake(struct nvkvm_ring *r)
+{
+	return __atomic_exchange_n(&r->consumer_sleeping, NVKVM_RING_AWAKE,
+				   __ATOMIC_SEQ_CST) == NVKVM_RING_SLEEPING;
+}
+
+/*
+ * Consumer side: publish the intent to sleep, then RE-CHECK for work before
+ * actually blocking.  Returns non-zero if the caller should FUTEX_WAIT on
+ * `consumer_sleeping` with expected value NVKVM_RING_SLEEPING (ring still empty
+ * after publishing); zero if a record raced in (caller keeps draining; the flag
+ * is already cleared back to AWAKE).
+ *
+ * Ordering (lost-wakeup-free): the SEQ_CST store of SLEEPING is followed by a
+ * SEQ_CST load of the producer's `tail`.  A producer that committed before our
+ * tail-load is seen here (tail != head → we abort the sleep); a producer that
+ * commits after our tail-load necessarily observes our SLEEPING store on its
+ * take_wake exchange (→ it wakes us).  No interleaving drops the wakeup.
+ */
+static inline int nvkvm_ring_consumer_presleep(struct nvkvm_ring *r)
+{
+	__atomic_store_n(&r->consumer_sleeping, NVKVM_RING_SLEEPING,
+			 __ATOMIC_SEQ_CST);
+	uint64_t tail = __atomic_load_n(&r->tail, __ATOMIC_SEQ_CST);
+	uint64_t head = r->head;                  /* consumer-owned */
+	if (tail != head) {                       /* work raced in — don't sleep */
+		__atomic_store_n(&r->consumer_sleeping, NVKVM_RING_AWAKE,
+				 __ATOMIC_RELEASE);
+		return 0;
+	}
+	return 1;
+}
+
+/* Consumer side: clear the sleeping flag (after a spurious FUTEX wake). */
+static inline void nvkvm_ring_consumer_wake_self(struct nvkvm_ring *r)
+{
+	__atomic_store_n(&r->consumer_sleeping, NVKVM_RING_AWAKE, __ATOMIC_RELEASE);
+}
+
 #endif /* NVKVM_RING_H */
