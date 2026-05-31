@@ -77,43 +77,74 @@ spin:
   ring reader. The fast/slow split lives HERE (inline vs worker), fed by the
   per-cmd latency measurement — it is NOT a ring-vs-virtqueue split.
 
-## Doorbell — sleep when idle, never a 100% spin (Phase 3, BUILT)
+## Wait / wake — virtqueue lifecycle, NO futex (Phase 3)
 
-The consumer must NOT burn a core spinning when the guest is idle (explicit
-constraint). So it **spins a bounded budget, then blocks on a futex**:
+The consumer must NOT burn a core when the guest is idle (explicit constraint),
+**and** we want one wait primitive, not a futex that can't be combined with the
+isolate's `recvmsg`. So the blocking lives **entirely on the guest side**, over
+the virtqueue, and the isolate's idle state is just its existing blocking
+`recvmsg`. There is **no shared synchronisation word in guest memory** — a
+security win over a futex flag (which the guest could scribble; DoS-only, but
+unnecessary surface).
 
+Two long-running virtqueue calls, **at most one of each in flight per isolate**:
+
+1. **`enter_loop`** — tells the isolate to enter its ring consumer loop; the
+   virtqueue transaction **stays in flight until the isolate EXITS the loop**
+   (after X idle cycles, ~hundreds of µs), and completes returning the
+   **last-processed ring txn id**. The guest issues this once when it starts a
+   busy phase; it stays in flight across the whole phase, so the hot path is
+   **pure ring, zero per-record virtqueue cost**.
+2. **`wait_on_ring`** — blocks the guest until one ring response completes (like
+   poll), or returns immediately if everything published is already done.
+
+Isolate threading (one thread, no futex, no spinner thread):
 ```
-consumer: spin BUDGET × cpu_relax() on an empty ring        # hot path, no syscall
-          still empty → presleep(): store SLEEPING (seq_cst), RE-CHECK tail
-              raced-in work → clear SLEEPING, keep draining
-              still empty   → FUTEX_WAIT(consumer_sleeping, SLEEPING)
-          woken → clear SLEEPING, drain
+idle:  blocking recvmsg(socket)                       # 0% CPU, the existing state
+on enter_loop:
+  loop:
+     drain request ring: inline-fast → response ring; slow → worker
+     ring EMPTY → check socket once (MSG_DONTWAIT); dispatch any normal cmd
+     ring idle X cycles AND socket idle → COMMIT-TO-EXIT (see invariant)
+  complete enter_loop(last_processed_txn)              # back to blocking recvmsg
 ```
+Only one socket syscall at the *drain edge* (not per spin iteration). During
+active decode the loop spins continuously (right latency tradeoff while the GPU
+is busy); when truly idle it exits → blocking `recvmsg` → 0% CPU.
 
-The wake is **asymmetric**: a guest producer cannot `FUTEX_WAKE` a host thread.
-So the producer, after `commit()`, calls `take_wake()` — an atomic
-exchange that clears `consumer_sleeping` and tells it whether the consumer was
-asleep. If asleep, the guest **kicks the virtqueue** (its only VM-exit lever)
-and QEMU does the `FUTEX_WAKE` on the shared `consumer_sleeping` word (it maps
-the same memfd). Crucially:
-- **Hot path pays nothing**: while the consumer is actively draining (spinning),
-  `consumer_sleeping == AWAKE`, so `take_wake()` returns "no wake needed" → the
-  guest issues **no kick, no VM exit**. The exit happens only on the
-  idle→active edge.
-- **Lost-wakeup-free**: `take_wake()` clears the flag to AWAKE *before* the wake
-  syscall, and the consumer's `FUTEX_WAIT` is issued with expected value
-  SLEEPING. If the wake fires in the gap between the consumer's presleep store
-  and its `FUTEX_WAIT`, the kernel sees AWAKE ≠ SLEEPING and `FUTEX_WAIT` returns
-  `EAGAIN` immediately instead of blocking on a wake that already happened. The
-  presleep re-check of `tail` closes the symmetric window (work committed just
-  before we slept). Proven in `tests/unit/ring_doorbell_test.c` (TSan-clean):
-  gappy run 494 real sleeps / 494 wakes; **hammer 2 M back-to-back records
-  triggers the presleep/commit race 379× with zero loss, in order**.
+### The exit-edge invariant (this is the critical section)
 
-Helpers are in `nvkvm_ring.h` (`nvkvm_ring_producer_take_wake`,
-`nvkvm_ring_consumer_presleep`, `nvkvm_ring_consumer_wake_self`) — portable
-atomics only; the `FUTEX_WAIT`/`FUTEX_WAKE` syscalls live in the stub (raw),
-QEMU (the kick handler), and the test, since the syscall surface differs.
+`enter_loop`'s lost-wakeup-freedom rests on two orderings — the direct analog
+of a futex presleep re-check, carried over the virtqueue completion instead of a
+shared word:
+
+- **Consumer:** after deciding to exit (X idle cycles), mark "exiting" then
+  **RE-CHECK the request ring** (`nvkvm_ring_has_work`, an acquire-load of
+  `tail` vs `head`). If a record raced in, **abort the exit** and keep looping.
+  Complete `enter_loop` only if the ring is empty *at this commit point*.
+- **Guest:** order **publish T (release-store tail) → THEN check whether
+  `enter_loop` is still in flight.** On completion with `last_processed < T`,
+  **re-enter** (issue a fresh `enter_loop`).
+
+Every interleaving is then safe: either the consumer sees T on its final
+re-check (stays), or it has already exited completing with `last < T` (guest
+re-enters). The dangerous middle — guest sees "in flight" while the consumer has
+silently exited past T — is foreclosed by the consumer's final re-check. Omit
+the re-check and the race returns. This replaces the earlier single `sync`
+command (which conflated "keep the consumer alive" with "wait for progress").
+
+For decode this is clean because the **entire hot stream is fast/inline** (see
+Classification): the consumer loop itself produces every response, so
+"loop exited" ⟺ "all responses done" ⟺ `wait_on_ring` reports done. The only
+wrinkle is a *slow* ring op handed to a worker — its response can land after the
+loop exits, so the worker must also be able to satisfy `wait_on_ring`; decode
+has none, so build the inline-only model first.
+
+(Superseded design — kept for history: an in-memory futex on a guest-shared
+`consumer_sleeping` word with guest-kick→QEMU-`FUTEX_WAKE`. Dropped because it
+needs a second thread + a guest-writable sync word and can't share the
+isolate's `recvmsg` wait. The lost-wakeup analysis carried over to the
+exit-edge re-check above.)
 
 ## Classification — what rides the ring
 
@@ -145,20 +176,18 @@ Ring = ioctls the isolate fully services with **no QEMU/KVM/fd mediation** and
   this observed set (a subset of the existing ctrl allowlist). The stub latency
   measurement remains only to catch a rare slow control before it rides inline.
 
-## Sync / drain protocol (lost-wakeup-safe)
+## Guest-side flow (puts it together)
 
-The guest must know the isolate has seen every command before it sleeps:
-- A **sync** command (on the virtqueue) reports the **last-completed txn_id** and
-  **blocks until ≥1 cmd completes OR the request ring is empty**.
-- Guest flow: publish first command → issue sync **async** (don't wait) → enter
-  the big loop: publish new requests + read responses off the response ring in
-  real time (pure ring, no virtqueue, the fast path). When the guest wants to
-  stop, it reads/awaits the sync response: if `last-completed == last-published`
-  → drained, exit; else reloop. Sync blocking is the only place the guest sleeps
-  — off the hot path, so its virtqueue latency is irrelevant.
-- This is the futex-compare-value pattern: compare last-completed vs
-  last-published to close the lost-wakeup window. Isolate→guest sync is not
-  needed (with no in-flight txns the isolate cannot add to the response ring).
+- Busy phase: issue `enter_loop` (async, stays in flight) → publish requests to
+  the request ring + read responses off the response ring in real time (pure
+  ring, no virtqueue — the hot path). Keep `enter_loop` in flight the whole time.
+- If `enter_loop` completes (isolate hit its idle timeout) while the guest still
+  has unprocessed txns (`last_processed < last_published`), re-enter — per the
+  exit-edge invariant this never drops a record.
+- Drain/idle: when the guest has published everything and only awaits the last
+  responses, call `wait_on_ring` to block its vCPU (KVM deschedules it) until a
+  response lands or all published txns are done. This is the only place the
+  guest sleeps, and it is off the hot path.
 
 ## Security invariants
 
@@ -169,25 +198,31 @@ The guest must know the isolate has seen every command before it sleeps:
   never the host). Corruption by an untrusted producer = **DoS-only**.
 - **Forward progress / no infinite loop**: bound the consumer's walk to
   `N / min_record` per pass; `sched_yield` if a race-reloop spins too long.
-- **acquire/release** on counters, sleep flag, record publish.
-- **Per-isolate** rings + per-isolate spin-thread → a stalled/abused ring hurts
-  only that guest; its virtqueue path keeps working.
+- **acquire/release** on the `head`/`tail` counters and record publish.
+- **No guest-writable sync word**: the wait/wake lifecycle is owned by the
+  trusted isolate + QEMU (`enter_loop`/`wait_on_ring`); the guest influences it
+  only by producing records and issuing the (permitted) virtqueue calls.
+- **Per-isolate** rings → a stalled/abused ring hurts only that guest; its
+  virtqueue path keeps working.
 - Offsets are **in-buffer**, never global pointers.
 
 ## Build phases
 
-1. **Ring primitive + tests** (host-only unit test, SPSC, wrap, bounds, the
-   adaptive spin/sleep doorbell, lost-wakeup soak). No GPU.
+1. **Ring primitive + tests** (host-only unit test: SPSC, wrap, bounds, hostile
+   fuzz, the `enter_loop` exit-edge lost-wakeup soak). No GPU.
 2. **Per-isolate ring setup over the virtqueue** (memfd mint → GPA install +
    SCM_RIGHTS to isolate; both map) + the grow handshake.
-3. **Isolate spin-thread**: ring read → copy-out → validate → inline ioctl →
-   response ring; integrate the sync/doorbell. *(Doorbell concurrency core
-   BUILT + TSan-proven: `nvkvm_ring.h` helpers + `ring_doorbell_test.c`. The
-   remaining wiring — spawn the spin-thread, route reads into the real
-   `stub_ioctl`, and the guest-kick→QEMU-`FUTEX_WAKE` path — is GPU/guest-
-   coupled and lands with Phase 4.)*
-4. **Guest side**: ring producer/consumer + the sync-driven big loop; route
-   fast-class ioctls to the ring, the rest to the virtqueue.
+3. **Isolate consumer loop** (driven by `enter_loop`): ring read → copy-out →
+   validate → inline ioctl → response ring; the exit-edge re-check + idle
+   timeout; one thread also polls the socket at the drain edge. *(Exit-edge
+   concurrency core BUILT + TSan-proven: `nvkvm_ring_has_work` +
+   `ring_loop_test.c` — the consumer loop lifecycle + guest re-enter, lost-
+   wakeup-free. The remaining wiring — route reads into the real `stub_ioctl`,
+   and the `enter_loop`/`wait_on_ring` virtqueue calls + their QEMU async
+   completion — is GPU/guest-coupled and lands with Phase 4.)*
+4. **Guest side**: ring producer/consumer + the `enter_loop`/`wait_on_ring`
+   lifecycle (re-enter on `last_processed < last_published`); route fast-class
+   ioctls to the ring, the rest to the virtqueue.
 5. **Inline-vs-worker** dispatch in the isolate for slow isolate-serviceable
    ioctls; wire the per-cmd classification.
 6. Measure decode end-to-end; expect `work` → ~10 µs, decode → toward host rate.
