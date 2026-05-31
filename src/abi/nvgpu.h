@@ -356,14 +356,28 @@ struct nvos47_parameters {
 
 /* ── NV_ESC_RM_IDLE_CHANNELS ─────────────────────────────────────────────── */
 
+/*
+ * NVOS30_PARAMETERS — 56 bytes.  Field order matches the driver exactly
+ * (audit G-2: a previous 40-byte, pointers-first layout caused the host driver
+ * to read 56B from a 40B buffer (OOB read of stub heap) and to interpret
+ * guest scalar fields as the phClients/phDevices/phChannels pointers, then
+ * dereference those guest-controlled values).  h_client/h_device/h_channel
+ * carry the single-channel form; the p_* arrays carry the multi-channel form.
+ * The guest sanitizer forces the single-channel form (num_channels = 0, arrays
+ * dropped) so no guest pointer is ever forwarded — see nvkvm_sanitize_ioctl_params.
+ */
 struct nv_ioctl_idle_channels {
-	nvp64_t    p_clients;       /* pointer to array of client handles   */
-	nvp64_t    p_devices;       /* pointer to array of device handles   */
-	nvp64_t    p_channels;      /* pointer to array of channel handles  */
-	__u32      num_channels;
-	__u32      notify_clients;
-	__u32      timeout_us;
-	__u32      status;
+	nvhandle_t h_client;        /* [in] */
+	nvhandle_t h_device;        /* [in] */
+	nvhandle_t h_channel;       /* [in] single-channel form */
+	__u32      num_channels;    /* [in] 0 = idle single h_channel */
+	nvp64_t    p_clients;       /* [in] array of num_channels client handles */
+	nvp64_t    p_devices;       /* [in] array of num_channels device handles */
+	nvp64_t    p_channels;      /* [in] array of num_channels channel handles*/
+	__u32      flags;           /* [in] */
+	__u32      timeout;         /* [in] */
+	__u32      status;          /* [out] */
+	__u32      pad;             /* align to 56 */
 };
 
 /* ── NV_ESC_CARD_INFO ────────────────────────────────────────────────────── */

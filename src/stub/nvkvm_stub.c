@@ -1435,9 +1435,26 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 		.aux_size   = cmd->aux_size,
 	};
 
-	/* Read param+aux blobs into per-job buffers */
+	/* Read param+aux blobs into per-job buffers.
+	 *
+	 * Audit G-8 (defense-in-depth): the host driver reads _IOC_SIZE(cmd)
+	 * bytes regardless of the guest-supplied param_size.  blob_alloc
+	 * already page-rounds (so today's <4 KiB structs are covered), but
+	 * make the invariant explicit and future-proof: map at least
+	 * _IOC_SIZE bytes (the tail is zero-filled) so an under-sized guest
+	 * buffer can never make the driver read past the mapping.  param_size
+	 * stays the logical guest size used by the embedded-field bounds
+	 * checks; only the allocation is widened.  _IOC_SIZE is capped at one
+	 * page so the page-rounded size never changes (keeps every munmap
+	 * site, which rounds param_size, consistent). */
 	if (cmd->param_size > 0) {
-		job.param_buf = blob_alloc(cmd->param_size);
+		unsigned ioc_sz = (cmd->cmd >> 16) & 0x3fff;
+		size_t   alloc_sz = cmd->param_size;
+		if (ioc_sz > 4096u)
+			ioc_sz = 4096u;
+		if (ioc_sz > alloc_sz)
+			alloc_sz = ioc_sz;
+		job.param_buf = blob_alloc(alloc_sz);
 		if (!job.param_buf || recv_full(job.param_buf, cmd->param_size) < 0) {
 			stub_munmap(job.param_buf,
 				    (cmd->param_size + 4095) & ~4095UL);

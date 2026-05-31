@@ -16,6 +16,10 @@
 
 #define NV_IOC_NR(cmd)  _IOC_NR(cmd)
 
+/* Audit G-2: hard cap on NV_ESC_RM_IDLE_CHANNELS array length so a malicious
+ * guest can neither overflow the aux-size check nor demand an unbounded read. */
+#define NVKVM_IDLE_MAX_CHANNELS  4096u
+
 /* ── Expected parameter sizes ─────────────────────────────────────────────── */
 
 size_t nvkvm_ioctl_expected_param_size(unsigned int cmd)
@@ -350,14 +354,26 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		struct nv_ioctl_idle_channels *p = ctx->params_buf;
 		uint32_t n  = p->num_channels;
 		int ret;
-		/* Aux slot must hold 3 arrays of n handles each */
+		/*
+		 * Audit G-2: the boundary (not the untrusted guest) must ensure
+		 * no guest pointer is ever forwarded.  Always overwrite the
+		 * p_* fields: when num_channels>0 they point into the aux slot
+		 * (3 arrays of n handles), otherwise they are zeroed.  Use
+		 * 64-bit math and a hard cap so a malicious guest cannot
+		 * overflow the size check (3*n*sizeof in 32-bit wraps for
+		 * n≈0x55555556, which would push p_devices/p_channels past the
+		 * aux buffer → host OOB read).
+		 */
 		if (n > 0) {
-			size_t needed = 3 * n * sizeof(nvhandle_t);
-			if (!ctx->aux_buf || ctx->aux_size < needed)
+			size_t needed = (size_t)3u * n * sizeof(nvhandle_t);
+			if (n > NVKVM_IDLE_MAX_CHANNELS ||
+			    !ctx->aux_buf || ctx->aux_size < needed)
 				return -EINVAL;
 			p->p_clients  = (nvp64_t)(uintptr_t)ctx->aux_buf;
-			p->p_devices  = p->p_clients + n * sizeof(nvhandle_t);
-			p->p_channels = p->p_devices + n * sizeof(nvhandle_t);
+			p->p_devices  = p->p_clients + (size_t)n * sizeof(nvhandle_t);
+			p->p_channels = p->p_devices + (size_t)n * sizeof(nvhandle_t);
+		} else {
+			p->p_clients = p->p_devices = p->p_channels = 0;
 		}
 		ret = nvkvm_handle_simple_ioctl(ctx, cmd);
 		p->p_clients = p->p_devices = p->p_channels = 0;
