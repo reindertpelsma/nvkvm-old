@@ -1022,6 +1022,23 @@ static void worker_thread(void *arg)
 				break;
 			}
 		}
+		/*
+		 * Audit P2-1 (live-path G-2): neutralise NV_ESC_RM_IDLE_CHANNELS
+		 * (nr 0x41) HERE, at the stub boundary.  The earlier dispatch.c
+		 * fix was dead code (never wired into the IOCTL_ON_ISOLATE path),
+		 * so the guest-controlled NvP64 array pointers were reaching the
+		 * host driver, which would walk them as user pointers in the
+		 * stub's address space.  We do not marshal the per-channel arrays
+		 * (NVOS30 num_channels@12, p_clients@16, p_devices@24,
+		 * p_channels@32); force the single-channel form by zeroing
+		 * num_channels and the three array pointers.  job.param_buf is a
+		 * private recv'd copy, so this is race-free (not subject to the
+		 * SHM double-fetch, audit P2-2). */
+		if (((job.cmd >> 8) & 0xff) == 'F' &&
+		    (job.cmd & 0xff) == 0x41 /* NV_ESC_RM_IDLE_CHANNELS */ &&
+		    job.param_size >= 40) {
+			__builtin_memset((char *)job.param_buf + 12, 0, 28);
+		}
 		if (fe_has_embedded_fd &&
 		    job.param_size >= fe_embedded_fd_off + 4) {
 			int32_t hid;
@@ -1058,10 +1075,15 @@ static void worker_thread(void *arg)
 		 */
 		int32_t saved_alloc_event_fd = 0;
 		int     have_alloc_event_fd  = 0;
+		/* Audit G-5: only the nvos64 RM_ALLOC form (param_size 48 > the
+		 * 32-byte nvos21 form) carries a guest-translated handle_id in
+		 * Data; the guest's nvos21 branch leaves Data as a raw guest fd.
+		 * Gate on the nvos64 size so a raw nvos21 fd is never misread as
+		 * a handle_id (intra-VM fd/handle confusion). */
 		if (((job.cmd >> 8) & 0xff) == 'F' &&
 		    (job.cmd & 0xff) == 0x2b /* NV_ESC_RM_ALLOC */ &&
 		    job.aux_size >= sizeof(uint64_t) * 3 &&
-		    job.param_size >= 16) {
+		    job.param_size > 32) {
 			uint32_t h_class = 0;
 			__builtin_memcpy(&h_class,
 					 (char *)job.param_buf + 12, /* nvos21+nvos64 alias */
@@ -1435,9 +1457,26 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 		.aux_size   = cmd->aux_size,
 	};
 
-	/* Read param+aux blobs into per-job buffers */
+	/* Read param+aux blobs into per-job buffers.
+	 *
+	 * Audit G-8 (defense-in-depth): the host driver reads _IOC_SIZE(cmd)
+	 * bytes regardless of the guest-supplied param_size.  blob_alloc
+	 * already page-rounds (so today's <4 KiB structs are covered), but
+	 * make the invariant explicit and future-proof: map at least
+	 * _IOC_SIZE bytes (the tail is zero-filled) so an under-sized guest
+	 * buffer can never make the driver read past the mapping.  param_size
+	 * stays the logical guest size used by the embedded-field bounds
+	 * checks; only the allocation is widened.  _IOC_SIZE is capped at one
+	 * page so the page-rounded size never changes (keeps every munmap
+	 * site, which rounds param_size, consistent). */
 	if (cmd->param_size > 0) {
-		job.param_buf = blob_alloc(cmd->param_size);
+		unsigned ioc_sz = (cmd->cmd >> 16) & 0x3fff;
+		size_t   alloc_sz = cmd->param_size;
+		if (ioc_sz > 4096u)
+			ioc_sz = 4096u;
+		if (ioc_sz > alloc_sz)
+			alloc_sz = ioc_sz;
+		job.param_buf = blob_alloc(alloc_sz);
 		if (!job.param_buf || recv_full(job.param_buf, cmd->param_size) < 0) {
 			stub_munmap(job.param_buf,
 				    (cmd->param_size + 4095) & ~4095UL);

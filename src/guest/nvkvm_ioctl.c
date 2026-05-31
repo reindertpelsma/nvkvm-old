@@ -433,10 +433,20 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 
 	case NV_ESC_RM_IDLE_CHANNELS: {
 		struct nv_ioctl_idle_channels *p = buf;
-		/* These three are pointers to arrays; moved to aux slot */
-		p->p_clients  = 0;
-		p->p_devices  = 0;
-		p->p_channels = 0;
+		/*
+		 * Audit G-2: the p_* fields are guest user pointers to handle
+		 * arrays.  We do NOT marshal them (the single-aux-slot path
+		 * can't carry three arrays), so never forward them — the host
+		 * driver would dereference a guest VA in the stub's address
+		 * space.  Force the single-channel form (idle just
+		 * h_client/h_device/h_channel); multi-channel idle degrades to
+		 * a best-effort single-channel drain, which is fine for the
+		 * pre-teardown use libcuda makes of this call.
+		 */
+		p->p_clients    = 0;
+		p->p_devices    = 0;
+		p->p_channels   = 0;
+		p->num_channels = 0;
 		break;
 	}
 

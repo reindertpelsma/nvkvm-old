@@ -31,7 +31,12 @@ static const uint8_t nvkvm_fe_nr_allowlist[] = {
 	0x57,
 	0x58,
 	0x5e,
-	0x70,
+	/* 0x70 NV_ESC_EXPORT_TO_DMABUF_FD removed (audit G-7): it is allowlisted
+	 * but unhandled — the stub would create a real dma-buf fd that nothing
+	 * closes and nothing passes back, leaking a stub fd per call
+	 * (self-isolate fd-exhaustion) and returning a meaningless fd to the
+	 * guest.  Re-add WITH fd passback + teardown tracking at the dma-buf
+	 * present milestone (docs/design/virtual_modeset.md). */
 	0xc8,
 	0xc9,
 	0xce,
