@@ -211,7 +211,12 @@ Ring = ioctls the isolate fully services with **no QEMU/KVM/fd mediation** and
 1. **Ring primitive + tests** (host-only unit test: SPSC, wrap, bounds, hostile
    fuzz, the `enter_loop` exit-edge lost-wakeup soak). No GPU.
 2. **Per-isolate ring setup over the virtqueue** (memfd mint → GPA install +
-   SCM_RIGHTS to isolate; both map) + the grow handshake.
+   SCM_RIGHTS to isolate; both map) + the grow handshake. *(SETUP_RING + probe
+   DONE and **HW-VALIDATED** 2026-05-31 on vast.ai RTX 3060 / 580.159.04: the
+   handshake fires at every isolate spawn against the real hardened+seccomp'd
+   stub — "ring N ready ... bidirectional probe OK", 10/10 success; single +
+   4× concurrent matmul still PASS = no data-path regression. GPA install into
+   the guest deferred to Phase 4 where the guest mapping consumes it.)*
 3. **Isolate consumer loop** (driven by `enter_loop`): ring read → copy-out →
    validate → inline ioctl → response ring; the exit-edge re-check + idle
    timeout; one thread also polls the socket at the drain edge. *(Exit-edge
