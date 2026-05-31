@@ -104,6 +104,13 @@ struct nvkvm_isolate_table {
 	struct nvkvm_isolate isolates[NVKVM_ISOLATE_MAX];
 	uint32_t             next_id;
 	uint32_t             abi_profile;  /* #81: per-VM ABI id stamped into IOCTLs */
+	/*
+	 * Owning VirtIONvgpu (opaque here to avoid a header cycle).  Set on the
+	 * first isolate create; used by ring setup/teardown to place the ring
+	 * memfd in the sparse GPA window (nvkvm_sparse_gpa_alloc/free) so the
+	 * guest can map it.  QEMU only maps the ring — it never inspects contents.
+	 */
+	void                *nv;
 };
 
 void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t);
@@ -116,6 +123,7 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t);
  */
 int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 uint32_t session_id,
+			 void *nv,
 			 uint32_t *isolate_id_out);
 
 /*
@@ -137,7 +145,8 @@ pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
  * The ring is a pure optimisation: a non-zero return is logged and ignored by
  * the caller — the isolate keeps serving every ioctl over the existing path.
  */
-int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     void *nv);
 
 /*
  * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently

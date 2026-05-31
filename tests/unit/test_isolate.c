@@ -93,7 +93,7 @@ TEST(lifecycle)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	int ret = nvkvm_isolate_create(&g_it, /*session_id=*/1, &iso_id);
+	int ret = nvkvm_isolate_create(&g_it, /*session_id=*/1, NULL, &iso_id);
 	EXPECT_EQ(ret, 0);
 	EXPECT_GE(iso_id, 1);
 
@@ -114,7 +114,7 @@ TEST(sequential_ioctl)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	EXPECT_EQ(nvkvm_isolate_create(&g_it, 1, &iso_id), 0);
+	EXPECT_EQ(nvkvm_isolate_create(&g_it, 1, NULL, &iso_id), 0);
 
 	uint8_t params[16] = { 0 };
 	uint32_t nvstatus  = 0xdead;
@@ -163,7 +163,7 @@ TEST(concurrent_ioctl)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	EXPECT_EQ(nvkvm_isolate_create(&g_it, 2, &iso_id), 0);
+	EXPECT_EQ(nvkvm_isolate_create(&g_it, 2, NULL, &iso_id), 0);
 
 	pthread_t threads[CONCURRENT_THREADS];
 	struct ioctl_thread_arg args[CONCURRENT_THREADS];
@@ -216,7 +216,7 @@ TEST(out_of_order_ioctl)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	EXPECT_EQ(nvkvm_isolate_create(&g_it, 3, &iso_id), 0);
+	EXPECT_EQ(nvkvm_isolate_create(&g_it, 3, NULL, &iso_id), 0);
 
 	pthread_t threads[DELAY_THREADS];
 	struct ioctl_thread_arg args[DELAY_THREADS];
@@ -266,7 +266,7 @@ TEST(kill_during_inflight)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	EXPECT_EQ(nvkvm_isolate_create(&g_it, 4, &iso_id), 0);
+	EXPECT_EQ(nvkvm_isolate_create(&g_it, 4, NULL, &iso_id), 0);
 
 	struct kill_race_arg arg = { .iso_id = iso_id, .result = -999 };
 	pthread_t t;
@@ -301,7 +301,7 @@ TEST(sync_mmap_munmap)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	EXPECT_EQ(nvkvm_isolate_create(&g_it, 5, &iso_id), 0);
+	EXPECT_EQ(nvkvm_isolate_create(&g_it, 5, NULL, &iso_id), 0);
 
 	/* Open a memory handle to send */
 	uint32_t hid = 0;
@@ -339,7 +339,7 @@ TEST(poll_unpoll)
 	fixture_init();
 
 	uint32_t iso_id = 0;
-	EXPECT_EQ(nvkvm_isolate_create(&g_it, 6, &iso_id), 0);
+	EXPECT_EQ(nvkvm_isolate_create(&g_it, 6, NULL, &iso_id), 0);
 
 	uint32_t hid = 0;
 	EXPECT_EQ(nvkvm_handle_open_memory(&g_ht, 6, 4096, &hid), 0);

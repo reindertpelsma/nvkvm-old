@@ -676,11 +676,17 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 
 int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 uint32_t session_id,
+			 void *nv,
 			 uint32_t *isolate_id_out)
 {
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
 		return -errno;
+
+	/* Remember the owning device so ring setup/teardown can use the sparse
+	 * GPA window allocator (idempotent — same nv every call). */
+	if (nv)
+		t->nv = nv;
 
 	pthread_mutex_lock(&t->lock);
 	uint32_t id;
@@ -853,7 +859,7 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	 * skips it entirely (debugging / A-B perf comparison).
 	 */
 	if (getenv("NVKVM_RING_DISABLE") == NULL) {
-		int rret = nvkvm_isolate_ring_setup(t, id);
+		int rret = nvkvm_isolate_ring_setup(t, id, nv);
 		if (rret != 0)
 			NVKVM_DBG(
 				"nvkvm_isolate: ring setup for isolate %u failed: %d "
@@ -888,6 +894,9 @@ pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 }
 
 /* ── Kill isolate ───────────────────────────────────────────────────────── */
+
+static void ring_qva_unmap(void *nv, uint64_t ring_gpa, void *qva,
+			   uint64_t region);
 
 int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 {
@@ -971,10 +980,10 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	 * and, once Phase 4 installs it, the guest KVM memslot.
 	 */
 	pthread_mutex_lock(&iso->lock);
-	void *ring_qva   = iso->ring_qva;
-	uint64_t ring_sz = iso->ring_region_size;
-	int ring_mfd     = iso->ring_memfd;
-	int ring_slot    = iso->ring_kvm_slot;
+	void *ring_qva    = iso->ring_qva;
+	uint64_t ring_sz  = iso->ring_region_size;
+	int ring_mfd      = iso->ring_memfd;
+	uint64_t ring_gpa = iso->ring_gpa;
 	iso->ring_qva    = NULL;
 	iso->ring_memfd  = -1;
 	iso->ring_kvm_slot = -1;
@@ -984,10 +993,10 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	iso->in_use = false;
 	pthread_mutex_unlock(&iso->lock);
 
-	if (ring_slot >= 0)
-		nvkvm_kvm_slot_release(ring_slot);   /* Phase 4 installs the slot */
+	/* Window-aware: ring_gpa != 0 → restore anon backing + free the window
+	 * extent; private fallback → plain munmap. */
 	if (ring_qva && ring_qva != MAP_FAILED && ring_sz)
-		munmap(ring_qva, ring_sz);
+		ring_qva_unmap(t->nv, ring_gpa, ring_qva, ring_sz);
 	if (ring_mfd >= 0)
 		close(ring_mfd);
 
@@ -1137,7 +1146,29 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 
 /* ── Command-buffer ring setup ──────────────────────────────────────────── */
 
-int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id)
+/*
+ * Undo the ring's QEMU-side mapping, window-aware.  Inside the sparse window we
+ * must NOT munmap (that would punch a hole in the window's single VMA/memslot);
+ * instead restore the anonymous backing in place and return the GPA extent to
+ * the window allocator.  A private fallback mapping is plain-munmap'd.
+ */
+static void ring_qva_unmap(void *nv, uint64_t ring_gpa, void *qva,
+			   uint64_t region)
+{
+	if (qva == MAP_FAILED || !qva)
+		return;
+	if (nv && ring_gpa) {
+		mmap(qva, region, PROT_READ | PROT_WRITE,
+		     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE | MAP_FIXED,
+		     -1, 0);
+		nvkvm_sparse_gpa_free((VirtIONvgpu *)nv, ring_gpa, region);
+	} else {
+		munmap(qva, region);
+	}
+}
+
+int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     void *nv)
 {
 	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
 		return -ENOENT;
@@ -1161,10 +1192,47 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 		int e = -errno; close(mfd); return e;
 	}
 
-	void *qva = mmap(NULL, region, PROT_READ | PROT_WRITE,
-			 MAP_SHARED, mfd, 0);
+	/*
+	 * Place the ring memfd into the sparse GPA window so the guest can map
+	 * it, exactly like MMAP_ON_ISOLATE places a device fd: allocate a window
+	 * GPA, MAP_FIXED the memfd over the window's anonymous backing at that
+	 * VA.  The window's single pre-installed KVM memslot then maps
+	 * [gpa, gpa+region) → these memfd pages — no new memslot, no overlap.
+	 * If the window isn't available yet (BAR unprogrammed) we fall back to a
+	 * private mapping: the QEMU↔isolate ring still works, but it's not
+	 * guest-visible (ring_gpa stays 0 → the guest uses the virtqueue path).
+	 */
+	uint64_t ring_gpa = 0;
+	void    *qva      = MAP_FAILED;
+	if (nv) {
+		ring_gpa = nvkvm_sparse_gpa_alloc((VirtIONvgpu *)nv, region);
+		void *target = ring_gpa ?
+			nvkvm_gpa_to_vmm_va((VirtIONvgpu *)nv, ring_gpa, region) : NULL;
+		if (target) {
+			qva = mmap(target, region, PROT_READ | PROT_WRITE,
+				   MAP_SHARED | MAP_FIXED, mfd, 0);
+			if (qva == MAP_FAILED) {
+				/* Restore the anon backing we clobbered so the
+				 * window stays fully mapped for KVM. */
+				mmap(target, region, PROT_READ | PROT_WRITE,
+				     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
+				     MAP_FIXED, -1, 0);
+				nvkvm_sparse_gpa_free((VirtIONvgpu *)nv,
+						      ring_gpa, region);
+				ring_gpa = 0;
+			}
+		} else {
+			ring_gpa = 0;   /* window full / not ready */
+		}
+	}
 	if (qva == MAP_FAILED) {
-		int e = -errno; close(mfd); return e;
+		/* Fallback: private mapping (not guest-visible). */
+		ring_gpa = 0;
+		qva = mmap(NULL, region, PROT_READ | PROT_WRITE,
+			   MAP_SHARED, mfd, 0);
+		if (qva == MAP_FAILED) {
+			int e = -errno; close(mfd); return e;
+		}
 	}
 
 	/* Initialise both ring control blocks: head==tail==0 ⇒ empty. */
@@ -1203,7 +1271,7 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 
 	int ret = sync_sendmsg_recv(iso, &msg);   /* reader fills sync_ring_probe */
 	if (ret != 0) {
-		munmap(qva, region); close(mfd); return ret;
+		ring_qva_unmap(nv, ring_gpa, qva, region); close(mfd); return ret;
 	}
 
 	/* Verify QEMU→isolate (probe echoed) and isolate→QEMU (resp_data). */
@@ -1220,7 +1288,7 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 			(unsigned long long)echoed, (unsigned long long)back,
 			(unsigned long long)probe,
 			(unsigned long long)(probe ^ NVKVM_RING_PROBE_MASK));
-		munmap(qva, region); close(mfd); return -EPROTO;
+		ring_qva_unmap(nv, ring_gpa, qva, region); close(mfd); return -EPROTO;
 	}
 
 	/* Self-test passed — wipe the probe so the data regions start clean. */
@@ -1232,16 +1300,17 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	iso->ring_qva         = qva;
 	iso->ring_region_size = region;
 	iso->ring_bytes       = ring_bytes;
-	iso->ring_gpa         = 0;     /* Phase 4: install into guest GPA space */
-	iso->ring_kvm_slot    = -1;
+	iso->ring_gpa         = ring_gpa;  /* sparse-window GPA, or 0 if private */
+	iso->ring_kvm_slot    = -1;        /* in-window: no dedicated slot */
 	iso->ring_ready       = true;
 	pthread_mutex_unlock(&iso->lock);
 
 	NVKVM_DBG(
 		"nvkvm_isolate: ring %u ready (region=%llu B, ring_bytes=%u, "
-		"resp_off=%llu) — bidirectional probe OK\n",
+		"resp_off=%llu, gpa=0x%llx %s) — bidirectional probe OK\n",
 		isolate_id, (unsigned long long)region, ring_bytes,
-		(unsigned long long)resp_off);
+		(unsigned long long)resp_off, (unsigned long long)ring_gpa,
+		ring_gpa ? "guest-visible" : "private");
 	return 0;
 }
 

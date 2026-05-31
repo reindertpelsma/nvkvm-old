@@ -303,7 +303,7 @@ int nvkvm_req_create_isolate(VirtIONvgpu *nv,
 			      struct nvkvm_resp_create_isolate *resp)
 {
 	uint32_t isolate_id = 0;
-	int ret = nvkvm_isolate_create(&nv->isolates, req->session_id, &isolate_id);
+	int ret = nvkvm_isolate_create(&nv->isolates, req->session_id, nv, &isolate_id);
 	if (ret < 0) {
 		resp->isolate_id = 0;
 		resp->status     = (uint32_t)-ret;
