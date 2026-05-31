@@ -149,6 +149,16 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 			     void *nv);
 
 /*
+ * Report an isolate's command-buffer ring placement so the guest can map it:
+ * the guest-physical base + geometry.  Returns 0 and fills the out-params if
+ * the ring is ready and guest-visible (ring_gpa != 0); -ENODEV otherwise (the
+ * guest then stays on the virtqueue path).
+ */
+int nvkvm_isolate_ring_info(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			    uint64_t *gpa, uint32_t *region_size,
+			    uint32_t *resp_off, uint32_t *ring_bytes);
+
+/*
  * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently
  * running target_txn so its in-flight host ioctl returns -EINTR.  Returns 0 if
  * the command was written to a live isolate, -ENOENT for an unknown/dead one.

@@ -19,6 +19,7 @@
 
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_abi.h"
+#include "../../src/common/nvkvm_ring.h"
 #include "../../src/abi/nvgpu.h"
 
 /* virtio-nvgpu device ID.
@@ -68,6 +69,19 @@ struct nvkvm_session {
 	int     refcount;       /* protected by nvkvm_state.sessions_lock */
 	__u32   isolate_id;     /* QEMU isolate process ID (0 = not yet created) */
 	struct mutex isolate_lock; /* protects isolate_id creation       */
+
+	/*
+	 * Command-buffer ring (docs/design/command_buffer.md).  QEMU placed the
+	 * ring memfd in the sparse GPA window at isolate create; we memremap it
+	 * here so the kmd can run the SPSC fast path.  ring_base == NULL means no
+	 * ring (fall back to the virtqueue).  Set up once under isolate_lock.
+	 */
+	void   *ring_base;          /* memremap'd ring region (NULL = none)   */
+	u64     ring_gpa;           /* guest-physical base                    */
+	u32     ring_region_size;
+	u32     ring_bytes;         /* per-ring data bytes                    */
+	struct nvkvm_ring *req_ring;  /* guest→isolate (we produce)           */
+	struct nvkvm_ring *resp_ring; /* isolate→guest (we consume)           */
 };
 
 /* ── Per-FD context (one per open(/dev/nvidia*)) ──────────────────────────── */
@@ -298,6 +312,9 @@ int  nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_create_isolate(unsigned int session_id,
 				 __u32 *isolate_id_out);
+int  nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
+			     u32 *ring_bytes_out);
+bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
 int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle(__u32 handle_id);

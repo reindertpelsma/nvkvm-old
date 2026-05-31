@@ -158,6 +158,7 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_REALIZE_UVM_MAPPING    25  /* state-machine mmap-realize     */
 #define NVKVM_REQ_READ_HOST_FILE         26  /* read live host proc/sys file   */
 #define NVKVM_REQ_INTERRUPT              27  /* interrupt an in-flight ioctl   */
+#define NVKVM_REQ_SETUP_RING             28  /* fetch this session's command-buffer ring GPA */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -288,6 +289,29 @@ struct nvkvm_req_interrupt {
 
 struct nvkvm_resp_interrupt {
 	__le32 status;      /* 0 = routed; nonzero = unknown isolate/txn        */
+	__le32 reserved;
+};
+
+/* ── SETUP_RING ──────────────────────────────────────────────────────────────
+ * The guest asks for its session's command-buffer ring (docs/design/
+ * command_buffer.md).  QEMU returns the guest-physical address of the ring
+ * region (already placed in the sparse window at isolate create) plus its
+ * geometry, so the guest kmd can memremap it and run the SPSC fast path.
+ * status != 0 (or ring_gpa == 0) means no ring is available → the guest stays
+ * on the virtqueue path.  QEMU only maps the ring; it never inspects contents.
+ */
+struct nvkvm_req_setup_ring {
+	__le32 session_id;
+	__le32 reserved;
+};
+
+struct nvkvm_resp_setup_ring {
+	__le64 ring_gpa;      /* guest-physical base of the ring region (0 = none) */
+	__le32 region_size;   /* total bytes to memremap                           */
+	__le32 req_off;       /* offset of request-ring control block (=0)         */
+	__le32 resp_off;      /* offset of response-ring control block             */
+	__le32 ring_bytes;    /* per-ring data bytes                               */
+	__le32 status;        /* 0 = ok; errno otherwise                           */
 	__le32 reserved;
 };
 

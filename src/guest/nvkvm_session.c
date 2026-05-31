@@ -17,6 +17,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/io.h>
 #include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/sched/mm.h>
@@ -90,6 +91,7 @@ void nvkvm_session_put(struct nvkvm_session *session)
 	__u32 isolate_id = 0;
 	struct mm_struct *mm = NULL;
 	struct pid *tgid_pid = NULL;
+	void *ring_base = NULL;
 
 	mutex_lock(&nvkvm.sessions_lock);
 	last = --session->refcount == 0;
@@ -97,6 +99,9 @@ void nvkvm_session_put(struct nvkvm_session *session)
 		idr_remove(&nvkvm.sessions_idr, session->id);
 		isolate_id = session->isolate_id;
 		session->isolate_id = 0;
+		ring_base = session->ring_base;
+		session->ring_base = NULL;
+		session->req_ring = session->resp_ring = NULL;
 		mm = session->mm;
 		session->mm = NULL;
 		tgid_pid = session->tgid_pid;
@@ -105,6 +110,9 @@ void nvkvm_session_put(struct nvkvm_session *session)
 	mutex_unlock(&nvkvm.sessions_lock);
 
 	if (last) {
+		/* Drop our ring mapping; QEMU frees the GPA + memfd on isolate kill. */
+		if (ring_base)
+			memunmap(ring_base);
 		/* Kill the isolate process before freeing the session struct. */
 		if (isolate_id)
 			nvkvm_virtio_kill_isolate(isolate_id);

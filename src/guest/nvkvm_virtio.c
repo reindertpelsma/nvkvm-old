@@ -239,6 +239,13 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->status = le32_to_cpu(resp->status);
 			break;
 		}
+		case NVKVM_REQ_SETUP_RING: {
+			struct nvkvm_resp_setup_ring *resp = (void *)(hdr + 1);
+			inf->status   = le32_to_cpu(resp->status);
+			inf->retval   = le64_to_cpu(resp->ring_gpa);   /* GPA       */
+			inf->nvstatus = le32_to_cpu(resp->ring_bytes); /* ring_bytes */
+			break;
+		}
 		case NVKVM_REQ_COPY_HANDLE_TO_ISOLATE: {
 			struct nvkvm_resp_copy_handle_to_isolate *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -737,6 +744,57 @@ int nvkvm_virtio_create_isolate(unsigned int session_id, __u32 *isolate_id_out)
 	ret = simple_req(NVKVM_REQ_CREATE_ISOLATE, &msg, sizeof(msg), &retval);
 	if (ret == 0 && isolate_id_out)
 		*isolate_id_out = (__u32)retval;
+	return ret;
+}
+
+/*
+ * Fetch this session's command-buffer ring placement.  Returns 0 and fills
+ * *ring_gpa_out / *ring_bytes_out on success; -errno otherwise (incl. -ENODEV
+ * when no ring is available → caller stays on the virtqueue path).  Carries two
+ * result fields, so it can't use simple_req (which surfaces only retval).
+ */
+int nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
+			    u32 *ring_bytes_out)
+{
+	struct {
+		struct nvkvm_hdr           hdr;
+		struct nvkvm_req_setup_ring req;
+	} msg = {};
+	struct nvkvm_inflight *inf;
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	void *buf;
+	int ret;
+
+	if (txn_id == 0)
+		return -EBUSY;
+
+	buf = kmalloc(sizeof(msg), GFP_KERNEL);
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	msg.req.session_id = cpu_to_le32(session_id);
+	memcpy(buf, &msg, sizeof(msg));
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(NVKVM_REQ_SETUP_RING);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
+
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	ret = nvkvm_send_sync(&nvkvm, buf, sizeof(msg), inf);
+	if (ret == 0) {
+		if (inf->status) {
+			ret = -(int)inf->status;
+		} else {
+			if (ring_gpa_out)   *ring_gpa_out   = inf->retval;
+			if (ring_bytes_out) *ring_bytes_out = inf->nvstatus;
+		}
+	}
+	inflight_free(&nvkvm, inf);
+	kfree(buf);
 	return ret;
 }
 

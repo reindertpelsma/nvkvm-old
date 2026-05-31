@@ -407,6 +407,34 @@ int nvkvm_req_interrupt(VirtIONvgpu *nv,
 	return 0;
 }
 
+/* ── Command-buffer ring ─────────────────────────────────────────────────── */
+
+int nvkvm_req_setup_ring(VirtIONvgpu *nv,
+			 struct nvkvm_req_setup_ring *req,
+			 struct nvkvm_resp_setup_ring *resp)
+{
+	uint32_t iso_id = session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		resp->status = ENODEV;   /* no isolate yet → guest uses virtqueue */
+		return 0;
+	}
+	uint64_t gpa = 0;
+	uint32_t region = 0, resp_off = 0, ring_bytes = 0;
+	int ret = nvkvm_isolate_ring_info(&nv->isolates, iso_id,
+					  &gpa, &region, &resp_off, &ring_bytes);
+	if (ret < 0 || gpa == 0) {
+		resp->status = (ret < 0) ? (uint32_t)-ret : ENODEV;
+		return 0;
+	}
+	resp->ring_gpa     = gpa;
+	resp->region_size  = region;
+	resp->req_off      = 0;
+	resp->resp_off     = resp_off;
+	resp->ring_bytes   = ring_bytes;
+	resp->status       = 0;
+	return 0;
+}
+
 /* ── Handle distribution ────────────────────────────────────────────────── */
 
 int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,

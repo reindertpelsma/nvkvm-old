@@ -1314,6 +1314,28 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 	return 0;
 }
 
+int nvkvm_isolate_ring_info(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			    uint64_t *gpa, uint32_t *region_size,
+			    uint32_t *resp_off, uint32_t *ring_bytes)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	int rc = -ENODEV;
+	if (iso->in_use && iso->id == isolate_id && iso->alive &&
+	    iso->ring_ready && iso->ring_gpa) {
+		if (gpa)         *gpa         = iso->ring_gpa;
+		if (region_size) *region_size = (uint32_t)iso->ring_region_size;
+		if (resp_off)    *resp_off    = (uint32_t)nvkvm_ring_resp_off(iso->ring_bytes);
+		if (ring_bytes)  *ring_bytes  = iso->ring_bytes;
+		rc = 0;
+	}
+	pthread_mutex_unlock(&iso->lock);
+	return rc;
+}
+
 int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
 			    uint32_t isolate_id, uint32_t target_txn)
 {

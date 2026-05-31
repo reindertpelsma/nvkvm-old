@@ -38,6 +38,7 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/mm.h>
+#include <linux/io.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/scatterlist.h>
@@ -269,6 +270,78 @@ static void unregister_devices(void)
 
 /* ── Device open/release ──────────────────────────────────────────────────── */
 
+/*
+ * Map this session's command-buffer ring (docs/design/command_buffer.md).
+ * QEMU placed the ring memfd in the sparse GPA window at isolate create; we
+ * fetch its GPA and memremap it so the kmd can run the SPSC fast path.  Pure
+ * optimisation: any failure leaves ring_base NULL and the session keeps using
+ * the virtqueue path.  Called once, under isolate_lock.
+ */
+static void nvkvm_session_setup_ring(struct nvkvm_session *session)
+{
+	u64 gpa = 0;
+	u32 ring_bytes = 0, region;
+	void *base;
+	int ret;
+
+	if (session->ring_base)
+		return;   /* already mapped */
+
+	ret = nvkvm_virtio_setup_ring((unsigned int)session->id,
+				      &gpa, &ring_bytes);
+	if (ret || !gpa || !nvkvm_ring_size_ok(ring_bytes)) {
+		pr_info("nvkvm: session %d: no command-buffer ring (ret=%d) — virtqueue path\n",
+			session->id, ret);
+		return;
+	}
+
+	region = (u32)nvkvm_ring_region_size(ring_bytes);
+	if (!nvkvm_gpa_in_mmap_window((unsigned long)gpa, region)) {
+		pr_warn("nvkvm: session %d ring gpa 0x%llx outside mmap window\n",
+			session->id, gpa);
+		return;
+	}
+
+	/* WB-cached, directly dereferenceable; arch_memremap_wb handles the
+	 * non-RAM (reservation-BAR) range on x86. */
+	base = memremap((resource_size_t)gpa, region, MEMREMAP_WB);
+	if (!base) {
+		pr_warn("nvkvm: session %d memremap(0x%llx, %u) failed\n",
+			session->id, gpa, region);
+		return;
+	}
+
+	session->ring_base        = base;
+	session->ring_gpa         = gpa;
+	session->ring_region_size = region;
+	session->ring_bytes       = ring_bytes;
+	session->req_ring  = (struct nvkvm_ring *)base;
+	session->resp_ring = (struct nvkvm_ring *)
+		((u8 *)base + nvkvm_ring_resp_off(ring_bytes));
+
+	/*
+	 * 3-way probe: QEMU initialised both control blocks with size==ring_bytes
+	 * and head==tail==0.  Reading them back here proves the guest maps the
+	 * SAME physical pages as QEMU and the isolate (all three share one memfd).
+	 */
+	if (session->req_ring->size == ring_bytes &&
+	    session->resp_ring->size == ring_bytes &&
+	    session->req_ring->head == session->req_ring->tail) {
+		pr_info("nvkvm: session %d RING MAPPED gpa=0x%llx bytes=%u — 3-way OK (req.size=%llu resp.size=%llu)\n",
+			session->id, gpa, ring_bytes,
+			(unsigned long long)session->req_ring->size,
+			(unsigned long long)session->resp_ring->size);
+	} else {
+		pr_warn("nvkvm: session %d ring readback mismatch (req.size=%llu resp.size=%llu want=%u) — disabling ring\n",
+			session->id,
+			(unsigned long long)session->req_ring->size,
+			(unsigned long long)session->resp_ring->size, ring_bytes);
+		memunmap(base);
+		session->ring_base = NULL;
+		session->req_ring = session->resp_ring = NULL;
+	}
+}
+
 /* Ensure the session has an isolate; creates one if isolate_id == 0. */
 static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 {
@@ -281,8 +354,10 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 		return 0;
 	}
 	ret = nvkvm_virtio_create_isolate((unsigned int)session->id, &isolate_id);
-	if (ret == 0)
+	if (ret == 0) {
 		session->isolate_id = isolate_id;
+		nvkvm_session_setup_ring(session);   /* map the ring (best-effort) */
+	}
 	mutex_unlock(&session->isolate_lock);
 	return ret;
 }
