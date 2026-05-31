@@ -197,3 +197,22 @@ Goal: fix pageable cuMemcpyDtoH (100x slow). Findings:
   RM_CONTROL/field that reports pageable support and override it to 0, then
   re-test — OR fix the ~8MB pinned cap so apps using pinned go fast directly.
   Both are source-level digs (libcuda decision tracing / RM control byte-diff).
+
+## "Deep migration" probe (2026-06-01) — DtoH does NOT use cpu_page_migrate
+
+Hypothesis: pageable DtoH slowness is per-page cpu_page_migrate (the memfd
+page-migration path), so bulk-migrating the whole range to one memfd would fix it.
+Instrumented nvkvm_cpu_page_migrate with a call counter and ran a 32MB pageable
+DtoH (still 0.1 GB/s, byte-exact). Result: **cpu_page_migrate fired 0 times.**
+
+So the pageable DtoH does NOT go through our cpu_page_migrate/efault_resolve
+memfd path at all — it's entirely UVM-internal (the ~6118 forwarded
+UVM_VALIDATE_VA_RANGE ioctls + UVM's own page handling inside the stub). The
+"bulk migration" fix targets the wrong path and would not help DtoH. (Probing
+first avoided implementing a complex, correctness-sensitive mm change for a path
+DtoH doesn't use.)
+
+Confirmed levers for DtoH remain: (1) make libcuda avoid the pageable-UVM path
+via the PAGEABLE_MEMORY_ACCESS(88) attribute → copy-engine (instant); (2) speed
+up / cache the forwarded UVM ioctls. Both need source-level work (deferred to
+the user's deep-dive).
