@@ -331,3 +331,32 @@ launch path is not ioctls. NEXT (needs guest-side per-launch timing, do not
 guess): decompose the 28us — doorbell-observe latency (is QEMU/stub polling the
 doorbell region, and at what period?) vs fence-writeback propagation to the
 guest's poll. That decomposition is the prerequisite for any launch-path fix.
+
+## Decode launch latency localized to the COMPLETION-READ memory type (2026-06-01)
+
+launchstorm microbench (empty kernel, CU_CTX_SCHED_SPIN), host vs guest:
+  A pipelined submit:  host 2.99us  guest 4.82us   (1.6x — small, genuine virt cost)
+  B launch+sync RT:    host 6.53us  guest 12.51us  (1.9x)
+  C empty cuCtxSync:   host 0.36us  guest 3.19us   (8.9x  <-- the tax)
+strace -f -c: 270k launches/syncs => only ~396 ioctls / 74 poll / 78 futex. So
+submit AND sync make NO syscalls per op. The guest's 3.19us empty-sync is pure
+userspace memory access = an UNCACHED read of GPU completion state (native MMIO/
+cached read ~0.3us; ~3us = same read taxed uncached via WC mapping in the guest).
+
+ROOT CAUSE (same class as the DtoH bug): the guest blanket-maps the device-mmap
+path write-combining (nvkvm_mmap.c:105 pgprot_writecombine), regardless of whether
+the region is real BAR (must be WC/UC) or pinned SYSMEM (should be WB). The host
+backs all of these as WB RAM memslots but does NOT tell the guest the type; on x86
+the guest's WC pgprot combines with EPT-WB to effective WC, so sysmem completion
+semaphores are read uncached -> 8.9x slow sync -> serializes decode, GPU starves.
+
+WHY host/VFIO-passthrough/vGPU/gVisor-nvproxy do NOT have it: all run the real
+driver / pass the real mmap with the driver's CORRECT memory type — completion is
+a WB-cached sysmem semaphore (or MSI via APICv), never an uncached read. None
+re-type GPU memory. We do (blanket WC). => NOT an inherent KVM/EPT tax (VFIO+vGPU
+are also KVM/EPT and don't pay it); it's our memory-type handling. FIXABLE.
+
+FIX (must be per-region — cannot blanket-WB): a WB mapping of the real doorbell
+BAR would leave the ring store in cache and never reach the device => decode HANG.
+So plumb a memtype (WB sysmem / WC BAR) from the host mmap classification to the
+guest, and have remap_pfn_range honor it (WB for sysmem, WC for BAR). Tracked #95.
