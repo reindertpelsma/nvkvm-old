@@ -34,6 +34,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_device.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_gem_shmem_helper.h>   /* #102: dumb buffers for KMS scanout */
 
 #include "nvkvm.h"
 
@@ -337,6 +338,7 @@ const struct file_operations nvkvm_drm_fops = {   /* F-4: non-static for embedde
 	.compat_ioctl   = drm_compat_ioctl,
 	.poll           = drm_poll,
 	.read           = drm_read,
+	.mmap           = drm_gem_mmap,   /* #102: mmap dumb (shmem) scanout buffers */
 	.llseek         = noop_llseek,
 };
 
@@ -353,6 +355,9 @@ static const struct drm_driver nvkvm_drm_driver = {
 	.ioctls          = nvkvm_drm_ioctls,
 	.num_ioctls      = ARRAY_SIZE(nvkvm_drm_ioctls),
 	.fops            = &nvkvm_drm_fops,
+	/* #102: shmem-backed dumb buffers for the virtual KMS head's scanout
+	 * (compositor/modetest fbs). Distinct from the proxy GEM render objects. */
+	.dumb_create     = drm_gem_shmem_dumb_create,
 	/* VERSION values — driver-constant, verified against host nvidia-drm. */
 	.name            = "nvidia-drm",
 	.desc            = "NVIDIA DRM driver",
