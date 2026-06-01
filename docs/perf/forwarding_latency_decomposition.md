@@ -254,3 +254,32 @@ CONCLUSION: every DtoH symptom (OS_DESCRIPTOR migrate, validate storm, slow poll
 is the UVM pageable path. The single fix is forcing libcuda onto the copy engine
 via the PAGEABLE_MEMORY_ACCESS(88) attribute (source dig: find the RM_CONTROL/
 field). Stub slow-ioctl probe (>2ms) left in nvkvm_stub.c for the investigation.
+
+## DtoH RESOLVED (2026-06-01, commit 578662f) — it was an uncached mapping, not ioctls
+
+The "GPU copy via slow UVM pageable path" and "PAGEABLE_MEMORY_ACCESS(88) lever"
+conclusions above were WRONG. Method that found the truth (host baseline first,
+per the standing rule "always explain why the host does NOT have the issue"):
+
+- Built dtoh_probe, ran the SAME libcuda binary on host and guest under strace.
+- Host warm 16MB pageable DtoH = 9.66 GB/s; guest = 0.073 GB/s (130x).
+- ioctl streams are IDENTICAL: 399 (guest) vs 402 (host) total, UVM cmd tally
+  byte-identical, UVM_VALIDATE_VA_RANGE issued EXACTLY ONCE on both. So there is
+  NO validate storm and the attrs match (88=1, 89=1 on both). The gap is 100%
+  data path, zero ioctl involvement.
+- Asymmetry: HtoD at parity (12.8 GB/s) because the guest fills its buffer while
+  it is still cached anon RAM (before migration) and the stub then reads the
+  memfd as host RAM — the guest never reads through the window on HtoD. DtoH
+  forced the guest to READ the result through the migrated window.
+- The migrated-range VMA (nvkvm_mmap.c bulk migrate) was remapped
+  pgprot_noncached (UC). The window is memfd-backed host RAM in a KVM RAM
+  memslot, not device MMIO — UC was gratuitous and made every guest read an
+  uncached, unprefetched load.
+
+FIX: vm_get_page_prot(vm_flags) => write-back cached. x86 keeps guest-WB /
+stub-WB / GPU-DMA coherent (DMA snoops). Warm DtoH 0.073 -> 8.595 GB/s (118x,
+host parity), byte-exact; HtoD unchanged; matmul + vector_add pass.
+
+LESSON (reinforced): "guest slow because nvidia-internal / different path" was a
+non-answer that hid the real bug. Forcing the question "why is the HOST fast?"
+(same libcuda, identical ioctls) collapsed it to one wrong line of our own code.
