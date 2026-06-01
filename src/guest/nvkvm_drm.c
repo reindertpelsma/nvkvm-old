@@ -91,18 +91,28 @@ static const struct drm_gem_object_funcs nvkvm_gem_funcs = {
 	.free = nvkvm_gem_free,
 };
 
-/* Create a guest proxy GEM for a stub-side handle; returns the guest handle. */
+/* Create a guest proxy GEM for a stub-side handle; returns the guest handle.
+ * `size` is the proxy object's reported GEM size: for buffers that become
+ * scanout framebuffers (GEM_ALLOC_NVKMS_MEMORY) it MUST be >= the real buffer
+ * size, because drm_gem_fb_create validates pitch*height <= gem->size when a
+ * compositor calls AddFB2.  For non-framebuffer proxies (fence contexts) any
+ * page-sized stub is fine.  Always page-aligned (a GEM size below one page is
+ * rejected by the core). */
 static int nvkvm_gem_proxy_create(struct drm_file *file,
 				  struct nvkvm_fd_ctx *ctx,
-				  __u32 stub_handle, __u32 *guest_handle)
+				  __u32 stub_handle, size_t size,
+				  __u32 *guest_handle)
 {
 	struct nvkvm_gem_object *ng;
 	int ret;
 
+	size = PAGE_ALIGN(size);
+	if (!size)
+		size = PAGE_SIZE;
 	ng = kzalloc(sizeof(*ng), GFP_KERNEL);
 	if (!ng)
 		return -ENOMEM;
-	drm_gem_private_object_init(file->minor->dev, &ng->base, PAGE_SIZE);
+	drm_gem_private_object_init(file->minor->dev, &ng->base, size);
 	ng->base.funcs = &nvkvm_gem_funcs;
 	/*
 	 * Audit G-6 (latent): ng->ctx is cached WITHOUT a refcount.  Safe today
@@ -181,6 +191,25 @@ struct drm_nvidia_semsurf_fence_create_params {      /* 24 bytes */
 	__u32 __pad;
 };
 
+/* Scanout-buffer allocation path (#109 present path). The NVIDIA gbm backend
+ * allocates a display-capable bo on the render node via ALLOC_NVKMS_MEMORY, and
+ * keys its per-DRM-file allocator state on GET_DRM_FILE_UNIQUE_ID — both are
+ * DRM_RENDER_ALLOW (no DRM-master / no display privilege), so the unprivileged
+ * stub forwards them on its host renderD128.  Both are flat scalars (no embedded
+ * pointers).  Sizes/layout MUST match host nvidia-drm-ioctl.h byte-for-byte. */
+struct drm_nvidia_get_drm_file_unique_id_params {    /* 8 bytes */
+	__u64 id;                   /* OUT unique id of the host DRM file */
+};
+struct drm_nvidia_gem_alloc_nvkms_memory_params {    /* 24 bytes */
+	__u32 handle;               /* OUT GEM handle in the stub's DRM file */
+	__u8  block_linear;         /* IN  */
+	__u8  compressible;         /* IN/OUT */
+	__u16 __pad0;
+	__u64 memory_size;          /* IN  */
+	__u32 flags;                /* IN  */
+	__u32 __pad1;
+};
+
 /* Forward an already-kernel-copied DRM param blob to the host render node via
  * the process's isolate.  The DRM core handled the user<->kernel copy using
  * _IOC_SIZE(cmd); we just relay `data` and let the host write results back. */
@@ -207,6 +236,31 @@ NVKVM_DRM_FWD(get_dev_info,
 	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
 		       struct drm_nvidia_get_dev_info_params))
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
+/*
+ * GET_DRM_FILE_UNIQUE_ID (0x18): the gbm backend reads this before allocating
+ * and uses it ONLY as an opaque per-DRM-file key to dedup its userspace
+ * allocator state across gbm_devices wrapping the same fd; it is never sent back
+ * to the kernel.  We answer it ENTIRELY guest-side and do NOT forward it: the
+ * host impl returns (u64)filep->driver_priv — a host kernel pointer — which
+ * would leak a host heap address across the VM boundary (KASLR-defeat aid), the
+ * exact class of leak the render-node allowlist exists to block.  ctx->handle_id
+ * is already unique per open fd and opaque, so it is a correct, leak-free id.
+ */
+static int nvkvm_drm_fwd_get_drm_file_unique_id(struct drm_device *dev,
+						void *data,
+						struct drm_file *file)
+{
+	struct drm_nvidia_get_drm_file_unique_id_params *p = data;
+	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+
+	(void)dev;
+	if (!ctx)
+		return -EBADF;
+	/* Bias by a fixed nonzero constant so the id is never 0 (some callers
+	 * treat 0 as "unset"); handle_id is unique per fd within the VM. */
+	p->id = 0x6e766b766d000000ULL | (__u64)ctx->handle_id; /* "nvkvm" tag */
+	return 0;
+}
 
 /*
  * SEMSURF_FENCE_CREATE takes fence_context_handle (a GEM handle from
@@ -299,7 +353,49 @@ static int nvkvm_drm_fwd_semsurf_fence_ctx_create(struct drm_device *dev,
 	if (p->handle) {
 		__u32 guest_handle = 0;
 		int gret = nvkvm_gem_proxy_create(file, ctx, p->handle,
-						  &guest_handle);
+						  PAGE_SIZE, &guest_handle);
+		if (gret)
+			return gret;
+		p->handle = guest_handle;
+	}
+	return 0;
+}
+
+/*
+ * GEM_ALLOC_NVKMS_MEMORY (0x0b): the NVIDIA gbm backend's scanout-buffer
+ * allocation.  Flat scalar params (no embedded pointer) — forward as-is; the
+ * host allocates a real bo on the stub's render node and writes its GEM handle
+ * to p->handle.  That handle is valid only in the stub's DRM file, so mint a
+ * guest-core proxy GEM (sized to the real allocation so AddFB2's size check
+ * passes) and hand the guest handle back.  This is what makes gbm_bo_get_handle
+ * return a usable card0 handle on the guest → compositors can AddFB2 + flip the
+ * NVIDIA scanout bo on the virtual head (was the present-path keystone, #109).
+ */
+static int nvkvm_drm_fwd_gem_alloc_nvkms_memory(struct drm_device *dev,
+						void *data,
+						struct drm_file *file)
+{
+	struct drm_nvidia_gem_alloc_nvkms_memory_params *p = data;
+	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x0b,
+				    struct drm_nvidia_gem_alloc_nvkms_memory_params);
+	__u64 memory_size = p->memory_size;
+	__u64 fault = 0;
+	long r;
+
+	(void)dev;
+	if (!ctx)
+		return -EBADF;
+
+	r = nvkvm_virtio_ioctl_on_isolate(ctx, cmd, data, sizeof(*p),
+					  NULL, 0, 0, &fault);
+	if (r < 0)
+		return (int)r;
+
+	if (p->handle) {
+		__u32 guest_handle = 0;
+		int gret = nvkvm_gem_proxy_create(file, ctx, p->handle,
+						  memory_size, &guest_handle);
 		if (gret)
 			return gret;
 		p->handle = guest_handle;
@@ -314,9 +410,17 @@ static const struct drm_ioctl_desc nvkvm_drm_ioctls[] = {
 				   struct drm_nvidia_get_dev_info_params),
 		   .func = nvkvm_drm_fwd_get_dev_info,
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GET_DEV_INFO" },
+	[0x0b] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x0b,
+				   struct drm_nvidia_gem_alloc_nvkms_memory_params),
+		   .func = nvkvm_drm_fwd_gem_alloc_nvkms_memory,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GEM_ALLOC_NVKMS_MEMORY" },
 	[0x0f] = { .cmd = DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f),
 		   .func = nvkvm_drm_fwd_dmabuf_supported,
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_DMABUF_SUPPORTED" },
+	[0x18] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x18,
+				   struct drm_nvidia_get_drm_file_unique_id_params),
+		   .func = nvkvm_drm_fwd_get_drm_file_unique_id,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GET_DRM_FILE_UNIQUE_ID" },
 	[0x14] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x14,
 				   struct drm_nvidia_semsurf_fence_ctx_create_params),
 		   .func = nvkvm_drm_fwd_semsurf_fence_ctx_create,

@@ -33,6 +33,20 @@ static inline bool nvkvm_drm_nr_allowed(unsigned nr)
 	case NVKVM_DRM_COMMAND_BASE + 0x05: /* PRIME_FENCE_CONTEXT_CREATE */
 	case NVKVM_DRM_COMMAND_BASE + 0x06: /* GEM_PRIME_FENCE_ATTACH */
 	case NVKVM_DRM_COMMAND_BASE + 0x08: /* GET_CLIENT_CAPABILITY */
+	/*
+	 * GEM_ALLOC_NVKMS_MEMORY (0x0b): the NVIDIA gbm backend's scanout-buffer
+	 * allocation (#109 present path).  Despite the "NVKMS" name it is
+	 * DRM_RENDER_ALLOW and does NO display programming — the kernel impl
+	 * (nv_drm_gem_alloc_nvkms_memory_ioctl) only calls nvKms->allocateMemory
+	 * to allocate a GEM-backed buffer in the *stub's own* device context
+	 * (freed on GEM_CLOSE, accounted to the stub), same resource class as the
+	 * RM memory allocations already forwarded for compute.  Params are flat
+	 * scalars (handle/block_linear/compressible/memory_size/flags) with NO
+	 * embedded guest VA — so unlike the G-3-excluded IMPORT_USERSPACE_MEMORY /
+	 * MAP_OFFSET / EXPORT_DMABUF it discloses no stub-heap address.  SCANOUT is
+	 * only a memory-layout capability, not a CRTC attachment.
+	 */
+	case NVKVM_DRM_COMMAND_BASE + 0x0b: /* GEM_ALLOC_NVKMS_MEMORY */
 	case NVKVM_DRM_COMMAND_BASE + 0x0f: /* DMABUF_SUPPORTED */
 	/*
 	 * Audit G-3: GEM_IMPORT_USERSPACE_MEMORY (0x02), GEM_MAP_OFFSET (0x0a),
