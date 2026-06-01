@@ -381,3 +381,35 @@ pipelined submission throughput (A sustains ~240k/s). NEXT (#95): profile with a
 DECODE-SHAPED workload — a dependency chain of small kernels on one stream (no CPU
 sync between), guest vs host — and guest-side rdtsc around the submit of a kernel
 that depends on the prior, to expose where the inter-launch idle comes from.
+
+## CORRECTION: decode is at PARITY; "starved/14x" was measurement error (2026-06-01)
+
+Evidence-based reconciliation overturns the decode-gap premise:
+- Clean host decode (no profiler, same flags): 67.9 t/s. Guest: 64.4 t/s = ~95%.
+- CUDA-API interposer (LD_PRELOAD, runtime API, cycle-accurate, same TSC): the
+  big cost is cudaMemcpyAsync H2D >=1M — 155 calls x ~28MB = ~4.3GB = the WHOLE
+  4.5GB model. That is the one-time MODEL LOAD upload, not per-token. Decode's
+  per-token CUDA calls (small H2D <4K embeddings, launches) are minor.
+- GPU-util TIMELINE across a guest run (sampled every 1s): 0-13s = 0-4% (model
+  load, GPU idle), 14-22s = 95-97% util / 100% mem / 169W (decode, GPU SATURATED,
+  identical to host 98%/170W), then done. The earlier "guest decode 0-5% util"
+  was sampled at 4-8s = during model LOAD, not decode. With correct sampling,
+  guest decode is GPU-bandwidth-bound at full util, same as host.
+
+CONCLUSIONS:
+1. Decode/inference throughput is at PARITY (~95%, GPU-saturated). There is no
+   per-launch decode bottleneck. The "decode 14x slow" / "387 t/s host" was a
+   STALE pre-session number (different model/build); it does not hold here.
+2. The launchstorm micro-taxes are real but IRRELEVANT to decode: decode is
+   memory-bandwidth-bound on the GPU (100% mem util), so CPU-side submission/
+   sync/completion-read taxes are hidden behind GPU work. They only matter for
+   CPU-bound / launch-bound or sync-heavy workloads.
+3. The genuine remaining guest tax is MODEL LOAD: cudaMemcpyAsync H2D >=1M at
+   ~0.82 GB/s guest vs ~14 GB/s host (17x) — a one-time ~10-15s startup penalty
+   (llama.cpp uploads weights from the file-backed gguf mmap; that HtoD path is
+   not the anon-OS_DESCRIPTOR path and is slow). Optimization target IF startup
+   latency matters; not a throughput issue.
+
+LESSON (again): get the clean baseline + correct sampling before declaring a gap.
+The DtoH(#94) and WB-sysmem fixes remain correct wins on their own paths; they
+just don't move decode because decode was never CPU/copy-bound.
