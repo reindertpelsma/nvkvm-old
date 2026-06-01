@@ -24,6 +24,7 @@
 #include "nvkvm_fe_alloc_allowlist.h"
 #include "nvkvm_drm_allowlist.h"
 #include "nvkvm_nvkms_allowlist.h"
+#include "nvkvm_present_egl.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -866,6 +867,26 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	NVKVM_DBG("nvkvm present: dma-buf fd=%d %ux%u size=%lld gem=0x%x\n",
 		  dmabuf_fd, req->width, req->height, (long long)sz,
 		  req->stub_handle);
+
+	/*
+	 * #107: capture the composited frame on the host.  Gated by
+	 * NVKVM_PRESENT_CAPTURE=<path> (the readback is a synchronous glReadPixels
+	 * — too costly to do every frame) and throttled to ~1/30 frames.  This is
+	 * the interim "view it" mechanism on a headless host; the steady-state
+	 * present will be dpy_gl_scanout_dmabuf / NVENC (#107 follow-up, #101).
+	 */
+	const char *cap = getenv("NVKVM_PRESENT_CAPTURE");
+	if (cap) {
+		static unsigned frame;
+		if ((frame++ % 30) == 0) {
+			int cr = nvkvm_present_capture(dmabuf_fd, req->width,
+						       req->height, req->pitch,
+						       req->format, req->modifier,
+						       cap);
+			if (cr < 0)
+				NVKVM_DBG("nvkvm present: capture rc=%d\n", cr);
+		}
+	}
 	close(dmabuf_fd);
 	resp->status = 0;
 	return 0;

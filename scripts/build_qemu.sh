@@ -116,6 +116,11 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
   'nvkvm_frontend.c',
   'nvkvm_objects.c',
   'nvkvm_mmap_host.c',
+  'nvkvm_handle.c',
+  'nvkvm_isolate.c',
+  'nvkvm_isolate_handlers.c',
+  'nvkvm_tables.c',
+  'nvkvm_present_egl.c',
 ))
 """
 
