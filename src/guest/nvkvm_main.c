@@ -587,6 +587,48 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
  * RM device.  Returns ERR_PTR on failure.  Does NOT allocate UVM state; the
  * UVM caller adds it.
  */
+/* ── #101 async-event registry ──────────────────────────────────────────────
+ * VQ_EVT notifications from the host carry (isolate_id, handle_id). An OS-event
+ * fd's poll() blocks on ctx->poll_wq; this registry lets the VQ_EVT virtqueue
+ * callback (softirq) find the matching ctx and wake it immediately, instead of
+ * libnvidia-* falling back to a ~18 ms poll-timeout-then-recheck per completion
+ * (the NVENC throughput bottleneck). The shared lock also pins ctx lifetime:
+ * a concurrent close()'s unregister blocks until any in-flight deliver() ends. */
+static LIST_HEAD(nvkvm_evt_ctx_list);
+static DEFINE_SPINLOCK(nvkvm_evt_ctx_lock);
+
+void nvkvm_evt_ctx_register(struct nvkvm_fd_ctx *ctx)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&nvkvm_evt_ctx_lock, flags);
+	list_add(&ctx->evt_node, &nvkvm_evt_ctx_list);
+	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
+}
+
+void nvkvm_evt_ctx_unregister(struct nvkvm_fd_ctx *ctx)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&nvkvm_evt_ctx_lock, flags);
+	if (!list_empty(&ctx->evt_node))
+		list_del_init(&ctx->evt_node);
+	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
+}
+
+void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events)
+{
+	struct nvkvm_fd_ctx *ctx;
+	unsigned long flags;
+	spin_lock_irqsave(&nvkvm_evt_ctx_lock, flags);
+	list_for_each_entry(ctx, &nvkvm_evt_ctx_list, evt_node) {
+		if (ctx->handle_id == handle_id && ctx->session &&
+		    ctx->session->isolate_id == isolate_id) {
+			atomic_or((int)events, &ctx->poll_events);
+			wake_up_interruptible(&ctx->poll_wq);
+		}
+	}
+	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
+}
+
 struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 {
 	struct nvkvm_fd_ctx *ctx;
@@ -610,6 +652,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 	INIT_LIST_HEAD(&ctx->mmap_regions);
 	mutex_init(&ctx->cpu_pages_lock);
 	INIT_LIST_HEAD(&ctx->cpu_pages);
+	INIT_LIST_HEAD(&ctx->evt_node);   /* #101: not yet in the registry */
 
 	ret = nvkvm_ensure_isolate(ctx->session);
 	if (ret)
@@ -620,6 +663,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 	if (ret)
 		goto err;
 	ctx->handle_id = handle_id;
+	nvkvm_evt_ctx_register(ctx);   /* #101: now discoverable by VQ_EVT */
 	return ctx;
 err:
 	nvkvm_session_put(ctx->session);
@@ -631,6 +675,11 @@ err:
  * char-device release path). */
 void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
 {
+	/* #101: leave the async-event registry first so no VQ_EVT deliver() can
+	 * touch this ctx after we start tearing it down (unregister blocks until
+	 * any in-flight deliver() under the shared lock completes). */
+	nvkvm_evt_ctx_unregister(ctx);
+
 	if (ctx->handle_id && ctx->session->isolate_id)
 		nvkvm_virtio_close_handle_on_isolate(ctx->handle_id,
 						     ctx->session->isolate_id);

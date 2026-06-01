@@ -325,16 +325,58 @@ static void nvkvm_rx_callback(struct virtqueue *vq)
 	(void)vq;
 }
 
-/* ── VQ_EVT callback — async poll events from host ───────────────────────── */
+/* ── VQ_EVT — async poll events from host (#101) ─────────────────────────────
+ * QEMU fills a pre-posted nvkvm_evt_poll buffer with (isolate_id, handle_id,
+ * events) whenever a forwarded NVIDIA OS-event fires on the host, then returns
+ * it on VQ_EVT. We wake the matching guest fd's poll_wq and recycle the buffer.
+ * Without this the host completion never reaches the guest poll() promptly and
+ * libnvidia-* spins on a ~18 ms poll-timeout-then-recheck (NVENC throughput). */
+#define NVKVM_EVT_NBUFS 16
+
+static int nvkvm_evt_post_one(struct nvkvm_state *state,
+			      struct nvkvm_evt_poll *evt)
+{
+	struct scatterlist sg;
+	sg_init_one(&sg, evt, sizeof(*evt));
+	return virtqueue_add_inbuf(state->vq_evt, &sg, 1, evt, GFP_ATOMIC);
+}
+
+/* Pre-post the IN buffers QEMU writes events into. Called once at init. */
+static void nvkvm_evt_prime(struct nvkvm_state *state)
+{
+	int i;
+	for (i = 0; i < NVKVM_EVT_NBUFS; i++) {
+		struct nvkvm_evt_poll *evt = kzalloc(sizeof(*evt), GFP_KERNEL);
+		if (!evt)
+			break;
+		if (nvkvm_evt_post_one(state, evt) < 0) {
+			kfree(evt);
+			break;
+		}
+	}
+	virtqueue_kick(state->vq_evt);
+}
 
 static void nvkvm_evt_callback(struct virtqueue *vq)
 {
+	struct nvkvm_state *state = vq->vdev->priv;
 	struct nvkvm_evt_poll *evt;
 	unsigned int len;
+	bool posted = false;
 
-	/* TODO: look up fd_token in session table, wake poll queue */
-	while ((evt = virtqueue_get_buf(vq, &len)) != NULL)
-		kfree(evt);
+	while ((evt = virtqueue_get_buf(vq, &len)) != NULL) {
+		if (len >= sizeof(*evt))
+			nvkvm_evt_deliver(le32_to_cpu(evt->isolate_id),
+					  le32_to_cpu(evt->handle_id),
+					  le32_to_cpu(evt->events));
+		/* recycle the buffer back onto VQ_EVT */
+		if (nvkvm_evt_post_one(state, evt) < 0)
+			kfree(evt);
+		else
+			posted = true;
+	}
+	if (posted)
+		virtqueue_kick(vq);
 }
 
 /* ── Generic synchronous send ─────────────────────────────────────────────── */
@@ -651,6 +693,11 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 		NVKVM_CONFIG_F_GRAPHICS) != 0;
 
 	virtio_device_ready(vdev);
+
+	/* #101: pre-post the IN buffers QEMU fills with async OS-event
+	 * notifications (NVENC/completion wakeups). Safe even if QEMU never
+	 * sends any — they just sit on the queue. */
+	nvkvm_evt_prime(state);
 	return 0;
 }
 

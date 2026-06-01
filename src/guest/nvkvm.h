@@ -197,6 +197,9 @@ struct nvkvm_fd_ctx {
 	/* poll support */
 	wait_queue_head_t      poll_wq;
 	atomic_t               poll_events; /* cached POLL* bits from host         */
+	struct list_head       evt_node;    /* #101: node in the async-event registry,
+					     * keyed by (isolate_id, handle_id), so a
+					     * VQ_EVT notification can find + wake us  */
 
 	/* mmap regions owned by this FD */
 	spinlock_t             mmap_lock;
@@ -324,6 +327,13 @@ static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
 /* nvkvm_main.c — shared fd-context lifecycle (also used by the DRM driver) */
 struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags);
 void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx);
+
+/* #101 async event delivery: registry of poll-capable fd contexts keyed by
+ * (isolate_id, handle_id). register on open, unregister on close. deliver() is
+ * called from the VQ_EVT virtqueue callback (softirq) to wake the matching fd. */
+void nvkvm_evt_ctx_register(struct nvkvm_fd_ctx *ctx);
+void nvkvm_evt_ctx_unregister(struct nvkvm_fd_ctx *ctx);
+void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events);
 
 /* nvkvm_drm.c — nvidia-drm render-node emulation (graphics) */
 int  nvkvm_drm_init(struct device *parent);
