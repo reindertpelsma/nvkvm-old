@@ -149,6 +149,31 @@ static const uint32_t nvkvm_pipe_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
+/*
+ * Present path (#102/#109): the head must accept the buffers a real NVIDIA
+ * client renders. NVIDIA scanout surfaces are BLOCK-LINEAR (tiled in VRAM), not
+ * linear — advertising only LINEAR makes AddFB2 reject them (EINVAL), so a
+ * compositor composits but can never flip. Advertise the canonical NVIDIA
+ * 16Bx2 block-linear scanout family (GOB heights 0..5) plus LINEAR so gbm /
+ * compositors negotiate a modifier we accept.
+ *
+ * We do NOT read these pixels in the guest (they live in host VRAM, tiled); the
+ * head only holds the buffer + its modifier and forwards (stub_handle, modifier,
+ * geometry) to QEMU, where the host NVIDIA driver imports the exported dma-buf
+ * (detiling on the GPU) for the present path. So "accepting" the modifier is
+ * correct support, not a fake — the host honours the real layout.
+ */
+static const uint64_t nvkvm_pipe_modifiers[] = {
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(0),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(1),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(2),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(3),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(4),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(5),
+	DRM_FORMAT_MOD_INVALID
+};
+
 /* ── Mode config ─────────────────────────────────────────────────────────── */
 static const struct drm_mode_config_funcs nvkvm_kms_mode_funcs = {
 	.fb_create     = drm_gem_fb_create,
@@ -195,7 +220,7 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	ret = drm_simple_display_pipe_init(ddev, &kms->pipe, &nvkvm_pipe_funcs,
 					   nvkvm_pipe_formats,
 					   ARRAY_SIZE(nvkvm_pipe_formats),
-					   NULL, &kms->conn);
+					   nvkvm_pipe_modifiers, &kms->conn);
 	if (ret)
 		return ret;
 
