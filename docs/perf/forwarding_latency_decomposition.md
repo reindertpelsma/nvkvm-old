@@ -413,3 +413,25 @@ CONCLUSIONS:
 LESSON (again): get the clean baseline + correct sampling before declaring a gap.
 The DtoH(#94) and WB-sysmem fixes remain correct wins on their own paths; they
 just don't move decode because decode was never CPU/copy-bound.
+
+## Model-load HtoD 17x — ROOT CAUSE = guest RAM < model; FIXED by -m 16G (2026-06-01)
+
+The model-load HtoD tax (H2D >=1M, 0.82 GB/s guest vs 14 GB/s host) was NOT a
+forwarding / memory-type bug. Evidence:
+- htod_probe (fresh vs reused, anon vs file-backed): guest == host at every point
+  (anon-reuse 12/13 GB/s; anon-fresh 1.2/1.4; file-mmap-fresh 4.2/4.7). So the
+  HtoD path itself is at parity — the probe did NOT reproduce 0.82 GB/s because
+  its file was page-cache-warm.
+- Guest RAM was -m 4G (3915 MB) but the model is 4683 MB (4.4 GiB) — BIGGER than
+  guest RAM. So the gguf could never be page-cached (buff/cache capped ~3.3 GB);
+  every weight upload faulted from the virtio-blk disk during cudaMemcpyAsync.
+  Host has 49 GB, caches the whole model (warm dd 8.3 GB/s), uploads at 14 GB/s.
+- FIX: -m 16G in scripts/run_test_vm.sh (host has 49 GB). After warming the cache,
+  H2D >=1M: 87.9M -> 5.78M cyc/call = ~12.5 GB/s = HOST PARITY (15x). H2D <1M also
+  20x. Decode unchanged at 65 t/s (it was never the issue).
+
+LESSON: the probe that "fails to reproduce" is itself evidence — it pointed away
+from the GPU path and at page-cache/RAM. The whole guest-slowness saga reduces to
+two real fixes (DtoH cached map #94, WB-sysmem map) + correcting two MEASUREMENT
+errors (stale 387 t/s baseline; util sampled during model load) + one VM-sizing
+fix (RAM >= model). No remaining inherent forwarding tax on the compute/IO paths.
