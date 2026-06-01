@@ -339,6 +339,10 @@ void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events);
 int  nvkvm_drm_init(struct device *parent);
 void nvkvm_drm_fini(void);
 
+/* nvkvm_kms.c — guest-emulated virtual KMS head (#102). Called from
+ * nvkvm_drm_init on the nvkvm drm_device before drm_dev_register. */
+int  nvkvm_kms_init(struct drm_device *ddev);
+
 /* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
 void nvkvm_virtio_fini(struct nvkvm_state *state);

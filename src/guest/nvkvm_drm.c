@@ -344,7 +344,10 @@ static const struct drm_driver nvkvm_drm_driver = {
 	/* DRIVER_GEM: the DRM core only inits the per-file GEM object_idr (via
 	 * drm_gem_open) and wires the core GEM ioctls (GEM_CLOSE, etc.) when this
 	 * is set — required for our proxy GEM handles to resolve. */
-	.driver_features = DRIVER_RENDER | DRIVER_GEM,
+	/* DRIVER_MODESET|ATOMIC: the guest-emulated virtual KMS head (#102,
+	 * nvkvm_kms.c) lives on this same device so render + scanout share one DRM
+	 * device (no cross-device PRIME). */
+	.driver_features = DRIVER_RENDER | DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.open            = nvkvm_drm_open,
 	.postclose       = nvkvm_drm_postclose,
 	.ioctls          = nvkvm_drm_ioctls,
@@ -427,6 +430,13 @@ int nvkvm_drm_init(struct device *fallback_parent)
 		pci_dev_put(pdev);
 		return PTR_ERR(ddev);
 	}
+	/* #102: bring up the guest-emulated virtual KMS head before the device
+	 * goes live (mode objects must exist at register time). Non-fatal: on
+	 * failure we still register as a render-only node. */
+	ret = nvkvm_kms_init(ddev);
+	if (ret)
+		pr_warn("nvkvm: virtual KMS head init failed: %d (render-only)\n", ret);
+
 	ret = drm_dev_register(ddev, 0);
 	if (ret) {
 		pr_warn("nvkvm: drm_dev_register failed: %d (graphics disabled)\n",
