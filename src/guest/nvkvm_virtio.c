@@ -962,6 +962,22 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	 * this isolate to interrupt the in-flight host ioctl. */
 	inf->isolate_id = ctx->session->isolate_id;
 
+	/*
+	 * FF-2 backstop (security_audit_2026_06_01): the RM_CONTROL aux-extend
+	 * paths (info-list / FIFO_GET_CHANNELLIST / GET_CLASSLIST / BUILD_VERSION)
+	 * can grow aux_size well past a single SHM slot. Each slot is one tile of a
+	 * VM-WIDE shared region, so an over-large memcpy here would stomp adjacent
+	 * slots held by OTHER guest processes (class-1 LPE) or run off the region.
+	 * Refuse before any slot memcpy can overflow. slot_size is host-negotiated,
+	 * validated power-of-two >= NVKVM_SHM_SLOT_MIN_SIZE.
+	 */
+	if (param_size > nvkvm.slot_size || aux_size > nvkvm.slot_size) {
+		pr_err_ratelimited("nvkvm: param/aux size %zu/%zu exceeds slot_size %zu — refusing\n",
+				   param_size, aux_size, nvkvm.slot_size);
+		ret = -EINVAL;
+		goto out;
+	}
+
 	/* Param slot */
 	if (param_size > 0) {
 		void *slot_ptr;

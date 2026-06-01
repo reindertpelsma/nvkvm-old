@@ -349,7 +349,7 @@ static int nvkvm_ring_wait_resp(struct nvkvm_session *s, u32 txn,
 		u8 *pay;
 		u32 len;
 		u64 total;
-		int rc = nvkvm_ring_peek(s->resp_ring, &pay, &len, &total);
+		int rc = nvkvm_ring_peek(s->resp_ring, s->ring_bytes, &pay, &len, &total);
 
 		if (rc == NVKVM_RING_OK) {
 			struct nvkvm_ring_ioctl_resp rh;
@@ -452,7 +452,7 @@ int nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
 	}
 
 	payload = (u32)sizeof(rh) + (u32)param_size + (u32)aux_size;
-	p = nvkvm_ring_reserve(s->req_ring, payload, &total);
+	p = nvkvm_ring_reserve(s->req_ring, s->ring_bytes, payload, &total);
 	if (!p) {                       /* ring full → slow path this time */
 		mutex_unlock(&s->ring_lock);
 		return NVKVM_RING_TRY_PUNT;

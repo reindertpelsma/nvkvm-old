@@ -1947,7 +1947,7 @@ static void ring_write_resp(uint32_t txn_id, int32_t retval, uint32_t nvstatus,
 	uint8_t *p = NULL;
 
 	for (uint32_t spin = 0; ; spin++) {
-		p = nvkvm_ring_reserve(g_resp_ring, payload, &total);
+		p = nvkvm_ring_reserve(g_resp_ring, g_ring_bytes, payload, &total);
 		if (p)
 			break;
 		if (spin >= NVKVM_RING_RESP_FULL_SPIN)
@@ -2121,7 +2121,7 @@ static uint64_t ring_consumer_loop(uint32_t idle_us)
 		uint8_t *pay;
 		uint32_t len;
 		uint64_t total;
-		int rc = nvkvm_ring_peek(g_req_ring, &pay, &len, &total);
+		int rc = nvkvm_ring_peek(g_req_ring, g_ring_bytes, &pay, &len, &total);
 
 		if (rc == NVKVM_RING_OK) {
 			ring_exec_one(pay, len);

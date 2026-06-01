@@ -98,13 +98,21 @@ static inline int nvkvm_ring_size_ok(uint64_t n)
  * but does NOT publish; *out_total receives the bytes this reservation will
  * consume (including any wrap-skip), which the matching commit() publishes.
  */
-static inline void *nvkvm_ring_reserve(struct nvkvm_ring *r, uint32_t payload,
-				       uint64_t *out_total)
+static inline void *nvkvm_ring_reserve(struct nvkvm_ring *r, uint64_t cap,
+				       uint32_t payload, uint64_t *out_total)
 {
 	uint32_t rec = nvkvm_ring_roundup(
 		(uint32_t)sizeof(struct nvkvm_ring_rec) + payload);
-	uint64_t N    = r->size;
-	uint64_t tail = r->tail;   /* producer-owned: plain read */
+	/* FF-1 (security_audit_2026_06_01): `cap` is the caller's TRUSTED ring
+	 * capacity (snapshotted at setup), NOT r->size — that control word lives in
+	 * shared memory the peer can forge. Masking off with a trusted power-of-two
+	 * bounds every write into the real data region; a forged head/tail then only
+	 * mis-accounts free space (logic/teardown), never an OOB write. */
+	uint64_t N = cap;
+	uint64_t tail;
+	if (!nvkvm_ring_size_ok(N))
+		return NULL;
+	tail = r->tail;            /* producer-owned: plain read */
 	uint64_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
 	uint64_t used = tail - head;
 	uint64_t off  = tail & (N - 1);
@@ -157,11 +165,19 @@ static inline void nvkvm_ring_commit(struct nvkvm_ring *r, uint64_t total)
  * *out_total is what pop() must consume. The consumer must COPY the payload
  * into private memory before acting on it (it lives in producer-writable mem).
  */
-static inline int nvkvm_ring_peek(struct nvkvm_ring *r, uint8_t **out_pay,
-				  uint32_t *out_len, uint64_t *out_total)
+static inline int nvkvm_ring_peek(struct nvkvm_ring *r, uint64_t cap,
+				  uint8_t **out_pay, uint32_t *out_len,
+				  uint64_t *out_total)
 {
-	uint64_t N = r->size;
+	/* FF-1: use the caller's TRUSTED capacity, not the peer-writable r->size.
+	 * With a trusted power-of-two N, off=head&(N-1) and off+len<=N keep every
+	 * dereference inside the real data region even if head/tail are forged
+	 * (those then only yield NVKVM_RING_BAD → teardown, not an OOB read). */
+	uint64_t N = cap;
 	uint8_t *data = NVKVM_RING_DATA(r);
+
+	if (!nvkvm_ring_size_ok(N))
+		return NVKVM_RING_BAD;
 
 	for (;;) {
 		uint64_t head = r->head;                       /* consumer-owned */

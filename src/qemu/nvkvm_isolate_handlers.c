@@ -2241,6 +2241,9 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 					       &host_va, &out_len,
 					       &token, &rm_status);
 	if (ret < 0 || host_va == 0) {
+		/* FF-3 (security_audit_2026_06_01): free the window extent on the
+		 * error path — otherwise every failed realize leaks GPA space. */
+		nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 		resp->status    = (uint32_t)-ret;
 		resp->rm_status = rm_status;
 		return 0;
@@ -2248,6 +2251,7 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	if (rm_status != 0) {
 		/* Kernel rejected the intent — host_va may still be set if the
 		 * mmap succeeded but a later step failed.  Treat as failure. */
+		nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);   /* FF-3: no leak on error */
 		resp->rm_status = rm_status;
 		resp->status    = (uint32_t)-EIO;
 		return 0;
@@ -2257,6 +2261,16 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	 * invalid as a QEMU KVM userspace_addr.  See security-fixes commit.
 	 * Master masked this via slot=1100 > KVM cap (install failed). */
 	(void)host_va;
+
+	/* FF-3 (security_audit_2026_06_01): record the realize extent in
+	 * iso_mmap_tbl so the #80 kill-reaper reclaims its GPA-window space when
+	 * the isolate dies.  It rides the sparse window's pre-installed memslot
+	 * (IN_WINDOW_SLOT) and has no standalone QEMU qva, so the reaper's
+	 * in-window branch simply sparse_gpa_free()s it — no munmap/slot touch.
+	 * Previously this allocation was never tracked or freed → unprivileged
+	 * guest realize churn exhausted the 128 GiB window (VM-wide GPU DoS). */
+	(void)iso_mmap_alloc(req->isolate_id, gpa, /*qva=*/NULL, (size_t)len,
+			     NVKVM_IN_WINDOW_SLOT, gpa, /*stub_mirrored=*/false);
 
 	resp->gpa_base      = gpa;
 	resp->length        = len;
