@@ -26,16 +26,32 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>      /* drm_add_modes_noedid */
 #include <drm/drm_crtc.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
 
 #include "nvkvm.h"
 
-#define NVKVM_KMS_W 1920
-#define NVKVM_KMS_H 1080
+#define NVKVM_KMS_W   1920
+#define NVKVM_KMS_H   1080
+#define NVKVM_KMS_HZ  60
 
 struct nvkvm_kms {
 	struct drm_connector            conn;
 	struct drm_simple_display_pipe  pipe;
+	struct hrtimer                  vblank;   /* software vblank source       */
+	ktime_t                         period;   /* 1/refresh                    */
 };
+
+/* ── Software vblank (vkms-style): an hrtimer drives the CRTC vblank at a fixed
+ * refresh so page-flips pace + complete. Headless has no real scanout timing;
+ * later (host present) this slaves to the host window's actual vblank. ──────── */
+static enum hrtimer_restart nvkvm_vblank_fn(struct hrtimer *t)
+{
+	struct nvkvm_kms *kms = container_of(t, struct nvkvm_kms, vblank);
+	drm_crtc_handle_vblank(&kms->pipe.crtc);
+	hrtimer_forward_now(t, kms->period);
+	return HRTIMER_RESTART;
+}
 
 /* ── Connector: a single fixed mode, no EDID ─────────────────────────────── */
 static int nvkvm_conn_get_modes(struct drm_connector *conn)
@@ -67,6 +83,19 @@ static const struct drm_connector_funcs nvkvm_conn_funcs = {
 };
 
 /* ── Display pipe (CRTC + primary plane + encoder) ───────────────────────── */
+static int nvkvm_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
+{
+	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
+	hrtimer_start(&kms->vblank, kms->period, HRTIMER_MODE_REL);
+	return 0;
+}
+
+static void nvkvm_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
+{
+	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
+	hrtimer_cancel(&kms->vblank);
+}
+
 static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 			      struct drm_plane_state *old_state)
 {
@@ -74,18 +103,23 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct drm_pending_vblank_event *event = crtc->state->event;
 
 	(void)old_state;
-	/* Headless: no real scanout. Complete the flip event immediately so the
-	 * compositor's page-flip returns. (Host-paced vblank lands in Piece 1.) */
+	/* Headless: no real scanout. Pace the flip completion to the software
+	 * vblank so a compositor renders at the refresh rate, not unbounded. */
 	if (event) {
 		crtc->state->event = NULL;
 		spin_lock_irq(&crtc->dev->event_lock);
-		drm_crtc_send_vblank_event(crtc, event);
+		if (drm_crtc_vblank_get(crtc) == 0)
+			drm_crtc_arm_vblank_event(crtc, event);
+		else
+			drm_crtc_send_vblank_event(crtc, event);
 		spin_unlock_irq(&crtc->dev->event_lock);
 	}
 }
 
 static const struct drm_simple_display_pipe_funcs nvkvm_pipe_funcs = {
-	.update = nvkvm_pipe_update,
+	.update         = nvkvm_pipe_update,
+	.enable_vblank  = nvkvm_pipe_enable_vblank,
+	.disable_vblank = nvkvm_pipe_disable_vblank,
 };
 
 static const uint32_t nvkvm_pipe_formats[] = {
@@ -125,6 +159,10 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	kms = drmm_kzalloc(ddev, sizeof(*kms), GFP_KERNEL);
 	if (!kms)
 		return -ENOMEM;
+
+	hrtimer_init(&kms->vblank, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	kms->vblank.function = nvkvm_vblank_fn;
+	kms->period = ns_to_ktime(NSEC_PER_SEC / NVKVM_KMS_HZ);
 
 	drm_connector_helper_add(&kms->conn, &nvkvm_conn_helper_funcs);
 	ret = drm_connector_init(ddev, &kms->conn, &nvkvm_conn_funcs,
