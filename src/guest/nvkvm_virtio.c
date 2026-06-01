@@ -252,6 +252,11 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->retval = le64_to_cpu(resp->head);   /* last_processed */
 			break;
 		}
+		case NVKVM_REQ_PRESENT: {
+			struct nvkvm_resp_present *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			break;
+		}
 		case NVKVM_REQ_COPY_HANDLE_TO_ISOLATE: {
 			struct nvkvm_resp_copy_handle_to_isolate *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -892,6 +897,67 @@ int nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us, u64 *head_out)
 		else if (head_out)
 			*head_out = inf->retval;
 	}
+	inflight_free(&nvkvm, inf);
+	kfree(buf);
+	return ret;
+}
+
+/*
+ * nvkvm_virtio_present (#106 present path B) — tell QEMU the virtual head just
+ * flipped a scanout bo backed by the stub-side GEM `stub_handle` (geometry as
+ * given).  QEMU asks the owning isolate's stub to export the host dma-buf and
+ * route it to the host display/codec.  Called from the KMS pipe update (atomic
+ * commit tail, a sleepable kworker context), so a synchronous virtqueue wait is
+ * safe; the round-trip is bounded (export is a single host ioctl).  No guest VA
+ * crosses the boundary — only the opaque stub handle + scanout metadata.
+ */
+int nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
+			 __u32 width, __u32 height, __u32 pitch,
+			 __u32 format, __u64 modifier)
+{
+	struct {
+		struct nvkvm_hdr         hdr;
+		struct nvkvm_req_present req;
+	} msg = {};
+	struct nvkvm_inflight *inf;
+	__u32 txn_id;
+	void *buf;
+	int ret;
+
+	if (!ctx || !ctx->session)
+		return -EBADF;
+
+	txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0)
+		return -EBUSY;
+
+	buf = kmalloc(sizeof(msg), GFP_KERNEL);
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	msg.req.isolate_id  = cpu_to_le32(ctx->session->isolate_id);
+	msg.req.handle_id   = cpu_to_le32(ctx->handle_id);
+	msg.req.stub_handle = cpu_to_le32(stub_handle);
+	msg.req.width       = cpu_to_le32(width);
+	msg.req.height      = cpu_to_le32(height);
+	msg.req.pitch       = cpu_to_le32(pitch);
+	msg.req.format      = cpu_to_le32(format);
+	msg.req.session_id  = cpu_to_le32((__u32)ctx->session->id);
+	msg.req.modifier    = cpu_to_le64(modifier);
+	memcpy(buf, &msg, sizeof(msg));
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(NVKVM_REQ_PRESENT);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
+
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	ret = nvkvm_send_sync(&nvkvm, buf, sizeof(msg), inf);
+	if (ret == 0 && inf->status)
+		ret = -(int)inf->status;
 	inflight_free(&nvkvm, inf);
 	kfree(buf);
 	return ret;

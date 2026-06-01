@@ -387,6 +387,17 @@ static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
+/* PRESENT_EXPORT (#106): dedicated slot, carries the dma-buf SCM_RIGHTS fd. */
+static void reader_signal_present(struct nvkvm_isolate *iso, int err, int fd)
+{
+	pthread_mutex_lock(&iso->present_sync_lock);
+	iso->present_err  = err;
+	iso->present_fd   = fd;
+	iso->present_done = true;
+	pthread_cond_signal(&iso->present_cond);
+	pthread_mutex_unlock(&iso->present_sync_lock);
+}
+
 static void *isolate_reader_fn(void *arg)
 {
 	struct nvkvm_isolate *iso = arg;
@@ -402,6 +413,7 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_realize_uvm     realize;
 		struct isolate_resp_ring_ready      ring_ready;
 		struct isolate_resp_loop_exited     loop_exited;
+		struct isolate_resp_present_export  present_export;
 	} u;
 
 	for (;;) {
@@ -432,7 +444,8 @@ static void *isolate_reader_fn(void *arg)
 		 * any received fd on every non-OPEN_DEVICE response.  (cmsg_buf is
 		 * one-fd-sized, so the kernel already closed any truncated extras.)
 		 */
-		if (u.type != ISOLATE_RESP_OPEN_DEVICE) {
+		if (u.type != ISOLATE_RESP_OPEN_DEVICE &&
+		    u.type != ISOLATE_RESP_PRESENT_EXPORT) {
 			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
 			     cm = CMSG_NXTHDR(&msg, cm)) {
 				if (cm->cmsg_level == SOL_SOCKET &&
@@ -594,6 +607,25 @@ static void *isolate_reader_fn(void *arg)
 			break;
 		}
 
+		case ISOLATE_RESP_PRESENT_EXPORT: {
+			int got_fd = -1;
+			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+			     cm; cm = CMSG_NXTHDR(&msg, cm)) {
+				if (cm->cmsg_level == SOL_SOCKET &&
+				    cm->cmsg_type  == SCM_RIGHTS &&
+				    cm->cmsg_len   == CMSG_LEN(sizeof(int))) {
+					memcpy(&got_fd, CMSG_DATA(cm), sizeof(int));
+				}
+			}
+			int err = u.present_export.retval;
+			if (err && got_fd >= 0) {
+				close(got_fd);
+				got_fd = -1;
+			}
+			reader_signal_present(iso, err, got_fd);
+			break;
+		}
+
 		default:
 			NVKVM_DBG(
 				"nvkvm_isolate: unknown response type 0x%x\n",
@@ -616,6 +648,8 @@ reader_exit:
 
 	/* Wake any pending sync command too. */
 	reader_signal_sync(iso, -ECONNRESET, 0);
+	/* …and any pending present-export waiter (dedicated slot, #106). */
+	reader_signal_present(iso, -ECONNRESET, -1);
 
 	return NULL;
 }
@@ -634,6 +668,10 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 		pthread_mutex_init(&iso->write_lock, NULL);
 		pthread_mutex_init(&iso->sync_lock,  NULL);
 		pthread_cond_init(&iso->sync_cond,   NULL);
+		pthread_mutex_init(&iso->present_lock,      NULL);
+		pthread_mutex_init(&iso->present_sync_lock, NULL);
+		pthread_cond_init(&iso->present_cond,       NULL);
+		iso->present_fd = -1;
 	}
 }
 
@@ -647,6 +685,9 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 		pthread_mutex_destroy(&iso->write_lock);
 		pthread_mutex_destroy(&iso->sync_lock);
 		pthread_cond_destroy(&iso->sync_cond);
+		pthread_mutex_destroy(&iso->present_lock);
+		pthread_mutex_destroy(&iso->present_sync_lock);
+		pthread_cond_destroy(&iso->present_cond);
 	}
 	pthread_mutex_destroy(&t->lock);
 }
@@ -1528,6 +1569,71 @@ int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 	if (fd < 0)
 		return -EPROTO;   /* stub said success but sent no fd */
 
+	if (fd_out)
+		*fd_out = fd;
+	else
+		close(fd);
+	return 0;
+}
+
+int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
+				 uint32_t isolate_id, uint32_t handle_id,
+				 uint32_t gem_handle, int *fd_out)
+{
+	if (fd_out)
+		*fd_out = -1;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	uint32_t txn_id = iso->next_txn_id++;
+	if (iso->next_txn_id == 0)
+		iso->next_txn_id = 1;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_present_export cmd = {
+		.type       = ISOLATE_CMD_PRESENT_EXPORT,
+		.handle_id  = handle_id,
+		.gem_handle = gem_handle,
+		.txn_id     = txn_id,
+	};
+
+	/* present_lock serializes present-export callers (held across the whole
+	 * round-trip); present_sync_lock + present_cond are the reader handoff. */
+	pthread_mutex_lock(&iso->present_lock);
+	pthread_mutex_lock(&iso->present_sync_lock);
+	iso->present_done = false;
+	iso->present_err  = 0;
+	iso->present_fd   = -1;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->present_sync_lock);
+		pthread_mutex_unlock(&iso->present_lock);
+		return (int)sr;
+	}
+
+	while (!iso->present_done)
+		pthread_cond_wait(&iso->present_cond, &iso->present_sync_lock);
+	int err = iso->present_err;
+	int fd  = iso->present_fd;
+	iso->present_fd = -1;
+	pthread_mutex_unlock(&iso->present_sync_lock);
+	pthread_mutex_unlock(&iso->present_lock);
+
+	if (err) {
+		if (fd >= 0)
+			close(fd);
+		return err;
+	}
+	if (fd < 0)
+		return -EPROTO;   /* stub said success but sent no fd */
 	if (fd_out)
 		*fd_out = fd;
 	else

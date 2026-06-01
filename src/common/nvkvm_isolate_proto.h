@@ -53,6 +53,7 @@
 #define ISOLATE_CMD_INTERRUPT    11   /* post SIGUSR1 to the worker on txn_id  */
 #define ISOLATE_CMD_SETUP_RING   12   /* mint per-isolate SPSC ring pair; memfd via SCM_RIGHTS */
 #define ISOLATE_CMD_ENTER_LOOP   13   /* drive the SPSC consumer loop until idle */
+#define ISOLATE_CMD_PRESENT_EXPORT 14 /* PRIME_HANDLE_TO_FD a GEM; reply w/ dma-buf via SCM */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -65,6 +66,7 @@
 #define ISOLATE_RESP_REALIZE_UVM 0x16  /* realize result: host VA + rmStatus */
 #define ISOLATE_RESP_RING_READY  0x17  /* SPSC ring mapped + self-test echo  */
 #define ISOLATE_RESP_LOOP_EXITED 0x18  /* consumer loop drained + idled out  */
+#define ISOLATE_RESP_PRESENT_EXPORT 0x19 /* present export result + dma-buf via SCM */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -325,6 +327,27 @@ struct isolate_resp_loop_exited {
 	uint32_t type;        /* ISOLATE_RESP_LOOP_EXITED */
 	int32_t  error;       /* 0, or -errno if no ring is set up */
 	uint64_t head;        /* request-ring head at exit (last_processed) */
+};
+
+/* ── PRESENT_EXPORT (#106) ─────────────────────────────────────────────────
+ * QEMU asks the stub to export a render-node GEM object as a dma-buf so the
+ * host display/codec can import it.  The stub looks up the render-node fd under
+ * handle_id, runs DRM_IOCTL_PRIME_HANDLE_TO_FD on gem_handle, and replies with
+ * the dma-buf fd attached via SCM_RIGHTS (same pattern as OPEN_DEVICE).  The
+ * fd is a host buffer reference only — the stub never maps or reads it. */
+struct isolate_cmd_present_export {
+	uint32_t type;        /* ISOLATE_CMD_PRESENT_EXPORT */
+	uint32_t handle_id;   /* render-node handle whose fd holds the GEM */
+	uint32_t gem_handle;  /* GEM handle in the stub's render-node DRM file */
+	uint32_t txn_id;      /* echoed in response */
+};
+
+struct isolate_resp_present_export {
+	uint32_t type;        /* ISOLATE_RESP_PRESENT_EXPORT */
+	uint32_t txn_id;      /* echoed from command */
+	int32_t  retval;      /* 0 on success; -errno on failure (no SCM)   */
+	uint32_t reserved;
+	/* On success: one dma-buf fd attached via SCM_RIGHTS in the same sendmsg. */
 };
 
 /*

@@ -757,6 +757,14 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_open_nvidia_handle,
 			    nvkvm_resp_open_nvidia_handle,
 			    nvkvm_req_open_nvidia_handle)
+		/* #106 present: does a bounded stub round-trip (PRIME export)
+		 * inline on the TX thread. TODO(perf): offload to the thread
+		 * pool like NVKVM_REQ_IOCTL_ON_ISOLATE if per-frame TX stall
+		 * matters for a high-fps desktop. */
+		ISOLATE_REQ(NVKVM_REQ_PRESENT,
+			    nvkvm_req_present,
+			    nvkvm_resp_present,
+			    nvkvm_req_present)
 		ISOLATE_REQ(NVKVM_REQ_OPEN_MEMORY_HANDLE,
 			    nvkvm_req_open_memory_handle,
 			    nvkvm_resp_open_memory_handle,

@@ -160,6 +160,8 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_INTERRUPT              27  /* interrupt an in-flight ioctl   */
 #define NVKVM_REQ_SETUP_RING             28  /* fetch this session's command-buffer ring GPA */
 #define NVKVM_REQ_ENTER_LOOP             29  /* drive the isolate's SPSC consumer loop */
+#define NVKVM_REQ_PRESENT                30  /* #106 present path: virtual head flipped a
+                                              * scanout bo; QEMU exports its host dma-buf  */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -200,6 +202,31 @@ struct nvkvm_req_open_nvidia_handle {
 struct nvkvm_resp_open_nvidia_handle {
 	__le32 handle_id;    /* globally unique handle               */
 	__le32 status;       /* 0 = success, errno otherwise         */
+};
+
+/* ── PRESENT (#106 present path B) ───────────────────────────────────────────
+ * The guest's virtual KMS head just flipped a framebuffer backed by one of our
+ * proxy GEMs (an NVIDIA scanout bo allocated through the render node).  The
+ * guest sends this so QEMU can ask the owning isolate's stub to export the real
+ * host buffer behind it as a dma-buf (PRIME_HANDLE_TO_FD on the stub-side GEM
+ * handle) and route it to the host display/codec.  Geometry is carried so QEMU
+ * can import the dma-buf as an EGLImage without re-deriving it.  No guest VA is
+ * involved — only the opaque stub GEM handle + scanout metadata. */
+struct nvkvm_req_present {
+	__le32 isolate_id;   /* which isolate owns the render-node fd        */
+	__le32 handle_id;    /* render-node handle whose stub fd holds the bo */
+	__le32 stub_handle;  /* GEM handle in the stub's render-node DRM file */
+	__le32 width;
+	__le32 height;
+	__le32 pitch;        /* bytes per row (plane 0)                      */
+	__le32 format;       /* DRM fourcc                                   */
+	__le32 session_id;
+	__le64 modifier;     /* DRM format modifier (block-linear / linear)  */
+};
+
+struct nvkvm_resp_present {
+	__le32 status;       /* 0 = QEMU exported/accepted the frame, errno else */
+	__le32 reserved;
 };
 
 /* Kept for compat with existing open path */

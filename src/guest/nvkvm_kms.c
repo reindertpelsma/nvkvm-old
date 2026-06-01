@@ -106,24 +106,35 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 
 	(void)old_state;
 
-	/* Present path (#102) — identify the host buffer behind this scanout
-	 * frame. A real compositor (weston) flips an NVIDIA bo, which surfaces
-	 * here as one of our proxy GEMs carrying the stub handle; that is the
-	 * buffer QEMU will export + scan out to the host. (Logging step first:
-	 * proves the head can name the composited buffer per flip.) */
+	/* Present path (#106) — the host buffer behind this scanout frame. A real
+	 * compositor (weston) flips an NVIDIA bo, which surfaces here as one of our
+	 * proxy GEMs carrying the stub handle + owning isolate. Notify QEMU so it
+	 * exports that buffer's host dma-buf and routes it to the host display /
+	 * codec. Best-effort: a failed present must not stall the flip completion
+	 * (we still arm the vblank event below). A plain shmem dumb fb (modetest)
+	 * is not a proxy → nothing to present. */
 	if (fb) {
 		__u32 stub_handle = 0;
+		struct nvkvm_fd_ctx *fctx = NULL;
 
-		if (nvkvm_fb_stub_handle(fb, &stub_handle, NULL))
-			pr_info_ratelimited(
-				"nvkvm present: flip %ux%u pitch=%u fmt=0x%08x mod=0x%llx stub_handle=0x%x\n",
-				fb->width, fb->height, fb->pitches[0],
+		if (nvkvm_fb_stub_handle(fb, &stub_handle, &fctx)) {
+			int pret = nvkvm_virtio_present(
+				fctx, stub_handle, fb->width, fb->height,
+				fb->pitches[0],
 				fb->format ? fb->format->format : 0,
-				(unsigned long long)fb->modifier, stub_handle);
-		else
-			pr_info_ratelimited(
-				"nvkvm present: flip %ux%u (non-proxy fb — dumb/shmem)\n",
-				fb->width, fb->height);
+				fb->modifier);
+			if (pret)
+				pr_info_ratelimited(
+					"nvkvm present: export failed %d (flip %ux%u stub_handle=0x%x)\n",
+					pret, fb->width, fb->height, stub_handle);
+			else
+				pr_info_ratelimited(
+					"nvkvm present: flip %ux%u pitch=%u fmt=0x%08x mod=0x%llx stub_handle=0x%x → exported\n",
+					fb->width, fb->height, fb->pitches[0],
+					fb->format ? fb->format->format : 0,
+					(unsigned long long)fb->modifier,
+					stub_handle);
+		}
 	}
 	/* Headless: no real scanout. Pace the flip completion to the software
 	 * vblank so a compositor renders at the refresh rate, not unbounded. */

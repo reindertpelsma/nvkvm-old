@@ -366,6 +366,9 @@ int  nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
 			     u32 *ring_bytes_out);
 int  nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us,
 			     u64 *head_out);
+int  nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
+			  __u32 width, __u32 height, __u32 pitch,
+			  __u32 format, __u64 modifier);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
 int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);

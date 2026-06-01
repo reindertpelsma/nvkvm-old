@@ -1551,6 +1551,75 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 	}
 }
 
+/* DRM PRIME export (#106 present path). Mirrors <drm/drm.h>:
+ *   DRM_IOCTL_PRIME_HANDLE_TO_FD = _IOWR('d', 0x2d, struct drm_prime_handle)
+ *   = (3<<30)|(12<<16)|('d'<<8)|0x2d = 0xC00C642D.
+ * Flags = DRM_CLOEXEC|DRM_RDWR so the host display/codec can import + map it. */
+struct stub_drm_prime_handle { uint32_t handle; uint32_t flags; int32_t fd; };
+#define STUB_DRM_IOCTL_PRIME_HANDLE_TO_FD 0xC00C642DUL
+#define STUB_DRM_CLOEXEC 0x80000u   /* O_CLOEXEC */
+#define STUB_DRM_RDWR    0x2u       /* O_RDWR    */
+
+static int send_present_export_resp(uint32_t txn_id, int retval, int fd)
+{
+	struct isolate_resp_present_export resp = {
+		.type   = ISOLATE_RESP_PRESENT_EXPORT,
+		.txn_id = txn_id,
+		.retval = retval,
+	};
+	struct iovec iov = { &resp, sizeof(resp) };
+	char cmsg_buf[CMSG_SPACE(sizeof(int))];
+	struct msghdr msg_hdr = {
+		.msg_iov     = &iov,
+		.msg_iovlen  = 1,
+	};
+	if (retval == 0 && fd >= 0) {
+		msg_hdr.msg_control    = cmsg_buf;
+		msg_hdr.msg_controllen = sizeof(cmsg_buf);
+		struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type  = SCM_RIGHTS;
+		cm->cmsg_len   = CMSG_LEN(sizeof(int));
+		__builtin_memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+		msg_hdr.msg_controllen = cm->cmsg_len;
+	}
+	fs_mutex_lock(&write_mutex);
+	long r = stub_sendmsg(SOCK_FD, &msg_hdr, 0);
+	fs_mutex_unlock(&write_mutex);
+	return r < 0 ? -1 : 0;
+}
+
+/* Export a render-node GEM object as a host dma-buf and hand it to QEMU via
+ * SCM_RIGHTS (#106).  The dma-buf is a host buffer reference; the stub never
+ * maps or reads it.  Transient: we close our copy right after sending — the
+ * SCM_RIGHTS transfer gives QEMU its own reference (kept alive by the kernel
+ * across our close). */
+static void handle_present_export(struct isolate_cmd_present_export *cmd)
+{
+	int rfd;
+
+	fs_mutex_lock(&fd_mutex);
+	rfd = handle_lookup(cmd->handle_id);
+	fs_mutex_unlock(&fd_mutex);
+	if (rfd < 0) {
+		send_present_export_resp(cmd->txn_id, -EBADF, -1);
+		return;
+	}
+
+	struct stub_drm_prime_handle p = {
+		.handle = cmd->gem_handle,
+		.flags  = STUB_DRM_CLOEXEC | STUB_DRM_RDWR,
+		.fd     = -1,
+	};
+	long r = stub_ioctl(rfd, STUB_DRM_IOCTL_PRIME_HANDLE_TO_FD, &p);
+	if (r < 0 || p.fd < 0) {
+		send_present_export_resp(cmd->txn_id, (r < 0) ? (int)r : -EINVAL, -1);
+		return;
+	}
+	send_present_export_resp(cmd->txn_id, 0, p.fd);
+	stub_close(p.fd);
+}
+
 static void handle_close_fd(uint32_t handle_id)
 {
 	fs_mutex_lock(&fd_mutex);
@@ -1897,6 +1966,7 @@ union stub_cmd {
 	struct isolate_cmd_interrupt        interrupt_cmd;
 	struct isolate_cmd_setup_ring       setup_ring;
 	struct isolate_cmd_enter_loop       enter_loop;
+	struct isolate_cmd_present_export   present_export;
 };
 
 /* ── Command-buffer consumer loop (docs/design/command_buffer.md, Phase 3) ───
@@ -2216,6 +2286,9 @@ static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
 		return 0;
 	case ISOLATE_CMD_OPEN_DEVICE:
 		handle_open_device(&c->open_dev);
+		return 0;
+	case ISOLATE_CMD_PRESENT_EXPORT:
+		handle_present_export(&c->present_export);
 		return 0;
 	case ISOLATE_CMD_REALIZE_UVM_FD:
 		handle_realize_uvm_fd(&c->realize);

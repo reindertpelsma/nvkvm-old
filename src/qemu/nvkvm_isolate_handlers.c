@@ -792,6 +792,85 @@ static uint64_t nvkvm_admin_get_pid_mem(VirtIONvgpu *nv, pid_t tgid,
 	return sum;
 }
 
+/*
+ * PRESENT (#106 present path B) — the guest's virtual KMS head flipped a
+ * scanout bo backed by a render-node GEM.  Ask the owning isolate's stub to
+ * export it as a host dma-buf (PRIME_HANDLE_TO_FD) and route it to the host
+ * display/codec.  This is the host/cross-VM boundary, so we validate hard:
+ *   - graphics must be enabled (compute-only VMs never present);
+ *   - the handle must be a render-node handle OWNED by this session, so a
+ *     guest cannot coerce QEMU into PRIME-exporting an arbitrary fd (e.g. a
+ *     /dev/nvidia0 control handle) — only its own DRM render GEMs.
+ * The stub_handle is opaque to QEMU; the stub validates it against its own GEM
+ * table when it runs the ioctl.
+ */
+int nvkvm_req_present(VirtIONvgpu *nv,
+		      struct nvkvm_req_present *req,
+		      struct nvkvm_resp_present *resp)
+{
+	resp->reserved = 0;
+
+	if (!nv->graphics) {
+		resp->status = EPERM;
+		return 0;
+	}
+
+	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
+	if (!h || h->session_id != req->session_id ||
+	    h->dev_id < NVKVM_DEV_DRM_RD(0) ||
+	    h->dev_id >= NVKVM_DEV_DRM_RD(16)) {
+		NVKVM_DBG("nvkvm present: bad handle %u (sess=%u dev=%d)\n",
+			  req->handle_id, req->session_id, h ? h->dev_id : -1);
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	uint32_t iso_id = req->isolate_id ? req->isolate_id
+					  : session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		NVKVM_DBG("nvkvm present: no isolate (req_iso=%u sess=%u)\n",
+			  req->isolate_id, req->session_id);
+		resp->status = ENOENT;
+		return 0;
+	}
+
+	int dmabuf_fd = -1;
+	int r = nvkvm_isolate_present_export(&nv->isolates, iso_id,
+					     req->handle_id, req->stub_handle,
+					     &dmabuf_fd);
+	if (r < 0 || dmabuf_fd < 0) {
+		NVKVM_DBG("nvkvm present: export rc=%d iso=%u handle=%u gem=0x%x\n",
+			  r, iso_id, req->handle_id, req->stub_handle);
+		resp->status = (r < 0) ? (uint32_t)(-r) : EIO;
+		return 0;
+	}
+
+	/*
+	 * #106 verification: prove the host buffer crossed the boundary.  The
+	 * dma-buf size is the real host allocation (block-linear scanout VRAM).
+	 * (107 imports this as an EGLImage for capture/scanout; for now we close
+	 * it per frame so no fd accumulates.)  One-shot fprintf so the proof is
+	 * visible without NVKVM_DEBUG; per-frame detail under NVKVM_DBG.
+	 */
+	off_t sz = lseek(dmabuf_fd, 0, SEEK_END);
+	static bool logged_once;
+	if (!logged_once) {
+		logged_once = true;
+		fprintf(stderr,
+			"nvkvm present #106: host dma-buf fd=%d %ux%u pitch=%u "
+			"fmt=0x%08x mod=0x%llx size=%lld (gem=0x%x)\n",
+			dmabuf_fd, req->width, req->height, req->pitch,
+			req->format, (unsigned long long)req->modifier,
+			(long long)sz, req->stub_handle);
+	}
+	NVKVM_DBG("nvkvm present: dma-buf fd=%d %ux%u size=%lld gem=0x%x\n",
+		  dmabuf_fd, req->width, req->height, (long long)sz,
+		  req->stub_handle);
+	close(dmabuf_fd);
+	resp->status = 0;
+	return 0;
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,

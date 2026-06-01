@@ -83,6 +83,21 @@ struct nvkvm_isolate {
 	uint64_t    sync_loop_head;
 
 	/*
+	 * Present-export slot (#106) — DEDICATED, independent of the sync_* slot
+	 * above, because present fires per frame and would otherwise race a
+	 * concurrent setup-time OPEN_DEVICE/MMAP/REALIZE on the same isolate.
+	 * present_lock serializes present-export callers (held across the whole
+	 * round-trip, NOT released during the wait); present_sync_lock + present_cond
+	 * are the reader handoff (released during cond_wait).
+	 */
+	pthread_mutex_t present_lock;
+	pthread_mutex_t present_sync_lock;
+	pthread_cond_t  present_cond;
+	bool        present_done;
+	int         present_err;
+	int         present_fd;     /* dma-buf fd via SCM_RIGHTS; -1 if none */
+
+	/*
 	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
 	 * QEMU mints one memfd holding both rings, keeps its own MAP_SHARED
 	 * mapping (for init / the grow handshake / a future QEMU-side ring), and
@@ -136,6 +151,16 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 
 /* Host pid of a live isolate by id (0 if none) — for GET_PID_INFO pid mapping. */
 pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+
+/*
+ * Present export (#106): ask the isolate's stub to PRIME_HANDLE_TO_FD the
+ * render-node GEM `gem_handle` (held under `handle_id`) and return the dma-buf
+ * fd (received via SCM_RIGHTS) in *fd_out.  Caller owns *fd_out and must close
+ * it.  Serialized per isolate.  Returns 0 on success, -errno otherwise.
+ */
+int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
+				 uint32_t isolate_id, uint32_t handle_id,
+				 uint32_t gem_handle, int *fd_out);
 
 /*
  * Set up the per-isolate SPSC command-buffer ring (docs/design/command_buffer.md).
