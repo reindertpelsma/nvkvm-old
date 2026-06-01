@@ -1045,8 +1045,23 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 		memcpy(slot_ptr, aux_buf, aux_size);
 	}
 
-	/* VMA whitelist slot — all VMAs in current mm */
-	vma_buf = kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES, GFP_KERNEL);
+	/*
+	 * VMA whitelist slot — all VMAs in current mm.
+	 *
+	 * current->mm can be NULL here: a forwarded ioctl may run from a context
+	 * with no user mm — most notably GEM_CLOSE forwarded out of
+	 * nvkvm_gem_free() during drm_release() at PROCESS EXIT, where the kernel
+	 * has already run exit_mm() (current->mm = NULL) before exit_files()
+	 * closes the DRM fd. mmap_read_lock(NULL) then faults at &NULL->mmap_lock
+	 * (offset 0xb0) — a hard oops that, for a compositor holding DRM master,
+	 * leaves the master stuck and wedges all later modeset (SET_MASTER EBUSY).
+	 *
+	 * No mm means no guest VAs to whitelist, and the commands that reach this
+	 * path without an mm (GEM_CLOSE) carry no embedded user pointers anyway, so
+	 * skipping the whitelist (vma_count stays 0) is correct, not a workaround.
+	 */
+	vma_buf = current->mm ? kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES,
+					GFP_KERNEL) : NULL;
 	if (vma_buf) {
 		struct mm_struct *mm = current->mm;
 		struct vm_area_struct *vma;
