@@ -43,6 +43,19 @@ for vlib in libnvidia-encode libnvcuvid; do
     fi
 done
 
+# -- EGL GBM external platform (#102 modeset): libnvidia-egl-gbm lets the NVIDIA
+# EGL stack render via GBM on a DRM card (the virtual KMS head). Its config
+# (15_nvidia_gbm.json) ships with the guest userspace but the .so did not.
+# Necessary-but-not-yet-sufficient: NVIDIA EGL still fails to init on the
+# emulated head's GBM device (deep integration — see docs/PRE_PUBLIC + #102).
+# egl-gbm carries its OWN version (not driver $V); copy whatever the bundle has. --
+for f in "$GFXBUNDLE"/libnvidia-egl-gbm.so.*; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f")
+    sudo cp -f "$f" "$SYS/"
+    sudo ln -sf "$b" "$SYS/libnvidia-egl-gbm.so.1"
+done
+
 # -- canonical CUDA dir: libcuda + allocator + ptxjit (what apps actually load) --
 sudo cp -f "$GFXBUNDLE/libcuda.so.$V"                  "$CUDADIR/" 2>/dev/null
 sudo cp -f "$GFXBUNDLE/libnvidia-allocator.so.$V"      "$CUDADIR/" 2>/dev/null
