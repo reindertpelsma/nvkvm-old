@@ -360,3 +360,24 @@ FIX (must be per-region — cannot blanket-WB): a WB mapping of the real doorbel
 BAR would leave the ring store in cache and never reach the device => decode HANG.
 So plumb a memtype (WB sysmem / WC BAR) from the host mmap classification to the
 guest, and have remap_pfn_range honor it (WB for sysmem, WC for BAR). Tracked #95.
+
+## WB-sysmem fix landed — sync tax gone, but decode NOT bound by it (2026-06-01)
+
+Mapped nvidiactl/nvidia-uvm (sysmem) mmaps WB-cached (kept GPU/DRM/modeset BAR at
+WC). Results:
+  - empty cuCtxSynchronize: 3.19us -> 0.37us (HOST PARITY, was 8.9x). Confirms the
+    tax WAS our uncached mapping of a sysmem completion semaphore — i.e. our
+    memory-type bug, NOT an inherent KVM/EPT tax (answer to "is it a hw VM tax":
+    NO; VFIO/vGPU/gVisor keep this on WB sysmem and we now do too).
+  - launch+sync RT: 12.5 -> 8.0us. matmul passes (doorbell BAR stayed WC -> no hang).
+  - DECODE: 63.4 -> 64.4 t/s (UNCHANGED). GPU still 0% util / 38W (starved).
+
+So decode's per-launch starvation is a SEPARATE bottleneck the empty-kernel
+launchstorm did not reproduce (it OVER-predicted decode impact, mirror of how the
+DtoH microbench under-predicted it). Decode is a CHAIN of DEPENDENT small kernels;
+the GPU finishes one and idles waiting for the next to be submitted, so the cost
+is per-dependent-launch latency, not the completion-semaphore read and not
+pipelined submission throughput (A sustains ~240k/s). NEXT (#95): profile with a
+DECODE-SHAPED workload — a dependency chain of small kernels on one stream (no CPU
+sync between), guest vs host — and guest-side rdtsc around the submit of a kernel
+that depends on the prior, to expose where the inter-launch idle comes from.
