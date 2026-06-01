@@ -283,3 +283,21 @@ host parity), byte-exact; HtoD unchanged; matmul + vector_add pass.
 LESSON (reinforced): "guest slow because nvidia-internal / different path" was a
 non-answer that hid the real bug. Forcing the question "why is the HOST fast?"
 (same libcuda, identical ioctls) collapsed it to one wrong line of our own code.
+
+## DtoH cached fix → 2.76x LLM DECODE (A/B on identical VM, 2026-06-01)
+
+The cached-mapping fix is not just a DtoH-microbench win — it nearly TRIPLES 7B
+decode throughput. Clean A/B (Qwen2.5-7B Q4_K_M, -ngl 99, -n 120, same VM/prompt,
+only the one pgprot line changed + rebuild + restart between runs):
+  - uncached (pgprot_noncached) baseline: 23.0 t/s generation
+  - cached (vm_get_page_prot, WB):        63.4 t/s generation  (2.76x)
+  (prompt eval ~287 -> ~326 t/s.)
+
+This REFRAMES the decode-14x analysis: a large share of the decode gap was NOT
+per-launch latency — it was the per-token host readback (logits + sampling
+buffers) passing through the uncached migrated-range window. llama.cpp reads back
+far more per token than logits alone (the effect is ~2.8x, not the ~15% logits
+estimate). Host generation reference still higher; remaining gap is the next
+target, but this single line closed most of the decode deficit. LESSON repeated:
+microbench impact (118x on a 16MB copy) under-predicted real-workload impact
+because real decode does many small pageable readbacks/token, each uncached.
