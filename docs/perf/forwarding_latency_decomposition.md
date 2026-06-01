@@ -301,3 +301,33 @@ estimate). Host generation reference still higher; remaining gap is the next
 target, but this single line closed most of the decode deficit. LESSON repeated:
 microbench impact (118x on a 16MB copy) under-predicted real-workload impact
 because real decode does many small pageable readbacks/token, each uncached.
+
+## New decode bottleneck PROVEN (2026-06-01): GPU starved by per-launch latency
+
+After the cached-mapping fix (decode 63 t/s vs host 387, ~6x), the residual gap
+was localized by measurement, every alternative ruled out:
+
+- NOT ioctls: strace -c, 8-token vs 128-token decode -> IDENTICAL ioctl count
+  (958). 120 extra tokens add ZERO ioctls. Per-token path is ioctl-free.
+- NOT VM exits: /sys/kernel/debug/kvm deltas, (N=128)-(N=8) -> mmio_exits delta
+  EXACTLY 0 (1396 vs 1396); io/halt/irq/total all flat to noise. 120 extra
+  tokens add ~0 exits of any kind. The vCPU neither traps nor halts during
+  decode — it spins on a polled shared-memory handshake (doorbell/fence in the
+  now-cached window).
+- NOT compute, NOT readback: GPU utilization sampled on the host (same physical
+  GPU) during steady decode:
+    host-native decode: 98% GPU util, 100% mem util, ~170 W  (saturated)
+    guest decode:       0-5% GPU util, 0% mem util, ~38 W    (starved/idle)
+  The GPU does this exact work at 98% on the host; in the guest it sits idle
+  waiting between tiny kernel launches.
+
+CONCLUSION: decode is per-kernel-LAUNCH-LATENCY bound. The GPU is starved (0-5%)
+because each launch is a long round-trip (doorbell ring -> host observes -> GPU
+executes -> fence -> guest observes) with no trap/ioctl to accelerate or even
+measure via exits. Rough: guest 16.7ms/token @ ~3% util => ~16ms/token idle;
+at ~570 launches/token that's ~28us idle gap per launch (host ~us). This is why
+the SPSC ring (#93) gave no decode win — it offloaded control ioctls, but the
+launch path is not ioctls. NEXT (needs guest-side per-launch timing, do not
+guess): decompose the 28us — doorbell-observe latency (is QEMU/stub polling the
+doorbell region, and at what period?) vs fence-writeback propagation to the
+guest's poll. That decomposition is the prerequisite for any launch-path fix.
