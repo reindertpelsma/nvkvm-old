@@ -97,6 +97,19 @@ struct nvkvm_session {
 	u32               ring_txn_next;  /* producer-private txn id counter   */
 	struct task_struct *pump_task;    /* per-session ENTER_LOOP pump       */
 	wait_queue_head_t pump_wq;        /* woken when a producer publishes   */
+
+	/*
+	 * UVM_VALIDATE_VA_RANGE cache (#94).  libcuda re-validates the SAME
+	 * (base,len) range thousands of times per pageable cuMemcpy (~191µs
+	 * forwarded each → the DtoH bottleneck).  VALIDATE is an idempotent
+	 * registration check, so we cache its rm_status and serve repeats
+	 * locally.  Conservatively cleared on ANY UVM free/unmap/unregister so a
+	 * stale "valid" can never outlive a teardown.
+	 */
+#define NVKVM_VCACHE_N 16
+	struct { u64 base, len; u32 status; bool valid; } vcache[NVKVM_VCACHE_N];
+	u32               vcache_next;
+	spinlock_t        vcache_lock;
 };
 
 /* ── Per-FD context (one per open(/dev/nvidia*)) ──────────────────────────── */
@@ -403,6 +416,10 @@ int  nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
 			    void *params_buf, size_t param_size,
 			    void *aux_buf, size_t aux_size, u32 *nvstatus_out);
 void nvkvm_session_stop_pump(struct nvkvm_session *session);
+/* Invalidate the UVM_VALIDATE_VA_RANGE cache (#94): called on any UVM teardown
+ * (unmap/unregister/free) and on a new OS_DESCRIPTOR migration, so a cached
+ * "valid" can never outlive the range's registration. */
+void nvkvm_session_vcache_clear(struct nvkvm_session *session);
 
 /* nvkvm_session.c */
 struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,

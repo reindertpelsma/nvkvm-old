@@ -720,6 +720,10 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		if (cpdup->gva == start) { mutex_unlock(&ctx->cpu_pages_lock); return 0; }
 	mutex_unlock(&ctx->cpu_pages_lock);
 
+	/* A new registration changes the set of valid ranges — drop any cached
+	 * VALIDATE results so a stale "valid" can't survive a free+remap. */
+	nvkvm_session_vcache_clear(ctx->session);
+
 	range_len = end - start;
 	npages    = range_len >> PAGE_SHIFT;
 

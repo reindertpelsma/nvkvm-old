@@ -73,6 +73,7 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 	mutex_init(&session->isolate_lock);
 	mutex_init(&session->ring_lock);
 	init_waitqueue_head(&session->pump_wq);
+	spin_lock_init(&session->vcache_lock);
 
 	id = idr_alloc(&nvkvm.sessions_idr, session, 1, 0, GFP_KERNEL);
 	if (id < 0) {
@@ -85,6 +86,16 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 
 	mutex_unlock(&nvkvm.sessions_lock);
 	return session;
+}
+
+void nvkvm_session_vcache_clear(struct nvkvm_session *session)
+{
+	unsigned long fl;
+	int k;
+	spin_lock_irqsave(&session->vcache_lock, fl);
+	for (k = 0; k < NVKVM_VCACHE_N; k++)
+		session->vcache[k].valid = false;
+	spin_unlock_irqrestore(&session->vcache_lock, fl);
 }
 
 void nvkvm_session_put(struct nvkvm_session *session)

@@ -1831,6 +1831,47 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		__u64 fault_addr  = 0;
 		int retries;
 		int ring_rc = NVKVM_RING_TRY_PUNT;
+		int vcache_miss = 0;
+
+		/* Any UVM range teardown invalidates the VALIDATE cache (#94). */
+		if (cmd == UVM_UNMAP_EXTERNAL || cmd == UVM_FREE ||
+		    cmd == UVM_UNREGISTER_GPU_VASPACE || cmd == UVM_UNREGISTER_GPU ||
+		    cmd == UVM_DESTROY_RANGE_GROUP)
+			nvkvm_session_vcache_clear(ctx->session);
+
+		/*
+		 * UVM_VALIDATE_VA_RANGE cache (#94): libcuda re-validates the SAME
+		 * (base,len) range ~1000x per pageable cuMemcpy, each a ~191us
+		 * forwarded round-trip (the DtoH bottleneck).  It's an idempotent
+		 * registration check, so serve a cached rm_status locally.  The
+		 * cache is cleared on any UVM teardown / new migration so a stale
+		 * "valid" can never outlive the range's registration.
+		 */
+		if (cmd == UVM_VALIDATE_VA_RANGE && params_buf && param_size >= 20) {
+			struct nvkvm_session *s = ctx->session;
+			u64 vbase = *(u64 *)params_buf;
+			u64 vlen  = *(u64 *)((char *)params_buf + 8);
+			unsigned long vfl;
+			int hit = 0, k;
+			u32 st = 0;
+
+			spin_lock_irqsave(&s->vcache_lock, vfl);
+			for (k = 0; k < NVKVM_VCACHE_N; k++)
+				if (s->vcache[k].valid &&
+				    s->vcache[k].base == vbase &&
+				    s->vcache[k].len  == vlen) {
+					st = s->vcache[k].status;
+					hit = 1;
+					break;
+				}
+			spin_unlock_irqrestore(&s->vcache_lock, vfl);
+			if (hit) {
+				*(u32 *)((char *)params_buf + 16) = st;
+				ret = 0;
+				goto forwarded;   /* skip the forward entirely */
+			}
+			vcache_miss = 1;   /* forward, then cache the result */
+		}
 
 		/*
 		 * Command-buffer fast path: flat RM_CONTROLs that need no guest-
@@ -1868,6 +1909,23 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 		}
 forwarded:;
+
+		/* Cache a freshly-forwarded VALIDATE result (miss path). */
+		if (vcache_miss && ret == 0 && params_buf && param_size >= 20) {
+			struct nvkvm_session *s = ctx->session;
+			u64 vbase = *(u64 *)params_buf;
+			u64 vlen  = *(u64 *)((char *)params_buf + 8);
+			u32 st    = *(u32 *)((char *)params_buf + 16);
+			unsigned long vfl;
+			int slot;
+			spin_lock_irqsave(&s->vcache_lock, vfl);
+			slot = s->vcache_next++ % NVKVM_VCACHE_N;
+			s->vcache[slot].base   = vbase;
+			s->vcache[slot].len    = vlen;
+			s->vcache[slot].status = st;
+			s->vcache[slot].valid  = true;
+			spin_unlock_irqrestore(&s->vcache_lock, vfl);
+		}
 
 		/*
 		 * Write back any CPU pages migrated during this ioctl.
