@@ -216,3 +216,21 @@ Confirmed levers for DtoH remain: (1) make libcuda avoid the pageable-UVM path
 via the PAGEABLE_MEMORY_ACCESS(88) attribute → copy-engine (instant); (2) speed
 up / cache the forwarded UVM ioctls. Both need source-level work (deferred to
 the user's deep-dive).
+
+## Bulk-migration idea tested → MOOT (2026-06-01)
+
+Hypothesis: pageable DtoH slow because of per-page CPU-page migration (cpu_page_-
+migrate via EFAULT-resolve); fix = migrate the whole range to one memfd at once.
+
+TESTED (counter on the migrate path, measure-before-implement): **zero
+cpu_page_migrate calls during a pageable DtoH** (count=0). So the page-migration
+path is NOT triggered at all — there is nothing to bulk-migrate. The cost is
+purely libcuda's forwarded UVM_VALIDATE_VA_RANGE storm:
+  16MB DtoH x8 = 2022 uvm 0x48 ioctls (381ms);  64MB x8 = 6118 (scales w/ size).
+DtoH byte-exact correct, no migration, no writeback involved.
+
+So the ONLY levers for pageable DtoH are: (1) make libcuda not use the pageable
+UVM path (the PAGEABLE_MEMORY_ACCESS(88) device-attr / RM_CONTROL lever — source
+dig), or (2) cache/short-circuit UVM_VALIDATE_VA_RANGE in the guest (idempotent
+range query; correctness-risky), or (3) general transport speedup. Bulk page
+migration does NOT apply.
