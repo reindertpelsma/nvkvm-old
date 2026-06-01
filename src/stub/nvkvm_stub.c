@@ -446,6 +446,7 @@ static uint32_t nvkvm_ctrl_list_entry_size(uint32_t cmd)
 	case 0x20801802U: /* NV2080_CTRL_CMD_BUS_GET_INFO */
 		return 8;
 	case 0x20800123U: /* NV2080_CTRL_CMD_GPU_GET_ENGINES (engineList NvU32[]) */
+	case 0x00800201U: /* NV0080_CTRL_CMD_GPU_GET_CLASSLIST (classList NvU32[]; NVENC) */
 		return 4;
 	case 0x00801102U: /* NV0080_CTRL_CMD_GR_GET_CAPS */
 	case 0x00801301U: /* NV0080_CTRL_CMD_FB_GET_CAPS */

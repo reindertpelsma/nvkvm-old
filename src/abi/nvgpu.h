@@ -724,6 +724,17 @@ struct nv0000_ctrl_system_get_build_version_params {
 #define NV2080_CTRL_CMD_GPU_GET_ENGINES   0x20800123U
 
 /*
+ * NV0080_CTRL_CMD_GPU_GET_CLASSLIST (non-V2) embeds { NvU32 numClasses@0; NvP64
+ * classList@8 } where classList points at a NvU32[numClasses] array of object
+ * class IDs the driver writes through (numClasses is IN=capacity / OUT=actual).
+ * Same {size@0, pad, ptr@8} preamble as GET_ENGINES, entries are 4-byte class
+ * IDs → list entry size 4. libcuda uses the inline V2 (0x800292); the NVIDIA
+ * video stack (libnvidia-encode/NVENC) uses THIS pointer form to discover the
+ * encoder engine class — without it NVENC reports "unsupported device". ctrl0080gpu.h.
+ */
+#define NV0080_CTRL_CMD_GPU_GET_CLASSLIST 0x00800201U
+
+/*
  * Device-level (NV0080) GET_CAPS family. These embed an
  * NvxxxCtrlXxxGetCapsParams preamble { NvU32 capsTblSize@0; NvP64 capsTbl@8 }
  * — STRUCTURALLY identical to the GetInfo preamble (u32@0, ptr@8) but the

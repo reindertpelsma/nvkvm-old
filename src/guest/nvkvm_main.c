@@ -928,6 +928,8 @@ static unsigned int nvkvm_ctrl_list_entry_size(__u32 cmd)
 		return NVXXX_CTRL_XXX_INFO_ENTRY_SIZE; /* 8 */
 	case NV2080_CTRL_CMD_GPU_GET_ENGINES:
 		return 4; /* engineList is NvU32[engineCount] */
+	case NV0080_CTRL_CMD_GPU_GET_CLASSLIST:
+		return 4; /* classList is NvU32[numClasses] (NVENC engine discovery) */
 	case NV0080_CTRL_CMD_GR_GET_CAPS:
 	case NV0080_CTRL_CMD_FB_GET_CAPS:
 	case NV0080_CTRL_CMD_HOST_GET_CAPS:

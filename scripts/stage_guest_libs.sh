@@ -31,6 +31,18 @@ sudo cp -f "$GFXBUNDLE/libcuda.so.$V"      "$SYS/" 2>/dev/null
 sudo ln -sf "libcuda.so.$V"                "$SYS/libcuda.so.1"
 sudo rm -f "$SYS/libcuda.so.575.51.03" "$SYS/libnvidia-ml.so.575.51.03"
 
+# -- video engines: NVENC encode + NVDEC/cuvid.  libnvidia-encode.so depends on
+# libnvcuvid.so, so BOTH must be present + version-matched or ffmpeg/NVENC says
+# "Cannot load libnvidia-encode.so.1".  (NVENC session InitializeEncoder beyond
+# this is a separate deeper forwarder gap — tracked as its own task.) --
+for vlib in libnvidia-encode libnvcuvid; do
+    if [ -f "$GFXBUNDLE/$vlib.so.$V" ]; then
+        sudo cp -f "$GFXBUNDLE/$vlib.so.$V" "$SYS/"
+        sudo ln -sf "$vlib.so.$V" "$SYS/$vlib.so.1"
+        sudo ln -sf "$vlib.so.1"  "$SYS/$vlib.so"
+    fi
+done
+
 # -- canonical CUDA dir: libcuda + allocator + ptxjit (what apps actually load) --
 sudo cp -f "$GFXBUNDLE/libcuda.so.$V"                  "$CUDADIR/" 2>/dev/null
 sudo cp -f "$GFXBUNDLE/libnvidia-allocator.so.$V"      "$CUDADIR/" 2>/dev/null
