@@ -821,7 +821,19 @@ chunk_fail:
 	}
 	zap_page_range_single(vma, start, range_len, NULL);
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	/*
+	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
+	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
+	 * On x86 the guest's WB view, the stub's WB view of the same memfd, and
+	 * the GPU's DMA are all cache-coherent (DMA snoops), so WB is correct.
+	 * Mapping it UC made the guest's post-DtoH read of the result a stream of
+	 * uncached, unprefetched loads — measured 0.07 GB/s vs 9.6 GB/s on the
+	 * host (130x).  HtoD was unaffected because the guest fills the buffer
+	 * while it is still cached anon memory (before this swap) and the stub
+	 * then reads the memfd as host RAM — the guest never reads through the
+	 * window on HtoD.  Leaving vm_page_prot at its default keeps it WB.
+	 */
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 	for (i = 0; i < nck; i++) {
 		ret = remap_pfn_range(vma, ck[i].base,
 				      (unsigned long)(ck[i].gpa >> PAGE_SHIFT),
