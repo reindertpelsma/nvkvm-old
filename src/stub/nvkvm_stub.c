@@ -1169,8 +1169,18 @@ static void worker_thread(void *arg)
 		 * returns so a late interrupt lands on a no-op handler, not on
 		 * the post-processing/send path. */
 		worker_inflight_txn[slot] = job.txn_id;
+		uint64_t _tsc0 = __builtin_ia32_rdtsc();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
+		uint64_t _dcyc = __builtin_ia32_rdtsc() - _tsc0;
 		worker_inflight_txn[slot] = 0;
+		/* DIAG: log slow forwarded ioctls (>2ms @ 2595MHz) — find the slow
+		 * cuMemcpyDtoH op in the stub. */
+		if (_dcyc > 5000000ULL)
+			fs_dprintf(STDERR_FD,
+				"PROF slow stub ioctl nr=0x%x type=0x%x %u us\n",
+				(unsigned)(job.cmd & 0xff),
+				(unsigned)((job.cmd >> 8) & 0xff),
+				(unsigned)(_dcyc / 2595));
 		/* sc*: negative return is -errno, matching kernel convention. */
 		int  err  = (ret < 0) ? (int)(-ret) : 0;
 		if (ret < 0) ret = -1;  /* normalise to (-1, errno) for callers */

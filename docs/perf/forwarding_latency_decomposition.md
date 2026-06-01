@@ -234,3 +234,23 @@ UVM path (the PAGEABLE_MEMORY_ACCESS(88) device-attr / RM_CONTROL lever — sour
 dig), or (2) cache/short-circuit UVM_VALIDATE_VA_RANGE in the guest (idempotent
 range query; correctness-risky), or (3) general transport speedup. Bulk page
 migration does NOT apply.
+
+## DtoH poll root cause (2026-06-01) — it's the GPU copy, via the UVM pageable path
+
+Stub-side rdtsc (around the real nvidia ioctl) + the poll breakdown localize it:
+- poll=4.5s vs all-ioctls=1.5s during a 16MB-x8 DtoH → the guest is overwhelmingly
+  blocked in poll() waiting for the GPU copy to COMPLETE (not forwarding/ioctls).
+- Decisive: an EMPTY completion (cuEventSynchronize / poll_sync) = 131us; a
+  DtoH-copy completion = ~45ms. That 45ms IS the GPU doing the copy.
+- So pageable cuMemcpyDtoH runs the copy via the slow UVM per-page migration path
+  (~45ms/16MB) instead of the copy engine (~1.6ms, what pinned uses). The relay
+  works (131us); the forwarding works; the GPU copy itself is ~28x slow because
+  libcuda took the UVM pageable path (PAGEABLE_MEMORY_ACCESS=1).
+- Secondary: some forwarded allocs are slow IN THE STUB — RM_ALLOC(0x2b) up to
+  31ms, RM_ALLOC_MEMORY(0x27) 13ms, RM_CONTROL(0x2a) 11ms (~73ms total, ~6%).
+  Separate stub-side question (why are these host-driver calls 11-31ms?).
+
+CONCLUSION: every DtoH symptom (OS_DESCRIPTOR migrate, validate storm, slow poll)
+is the UVM pageable path. The single fix is forcing libcuda onto the copy engine
+via the PAGEABLE_MEMORY_ACCESS(88) attribute (source dig: find the RM_CONTROL/
+field). Stub slow-ioctl probe (>2ms) left in nvkvm_stub.c for the investigation.
