@@ -102,8 +102,24 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 		return -EIO;
 	}
 
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	/*
+	 * Cacheability by device class.  nvidiactl/nvidia-uvm mmaps are pinned
+	 * SYSTEM memory (the host backs them as WB RAM memslots; smaps shows no
+	 * VM_IO) — they must be WB-cached, or the CPU reads them uncached.  The
+	 * channel completion semaphore lives here; mapping it write-combining
+	 * made cuCtxSynchronize's poll an uncached read (~3us vs ~0.36us host,
+	 * 8.9x), serializing decode and starving the GPU (0-5% util).  On x86 the
+	 * guest-WB / host-WB / GPU-DMA views of the same memfd are cache-coherent
+	 * (DMA snoops), so WB is correct.  nvidia0/DRM/modeset mmaps are real
+	 * BAR/MMIO (VM_IO) and MUST stay write-combining — a WB mapping of the
+	 * doorbell BAR would leave the ring store in cache and never reach the
+	 * device (decode would hang).
+	 */
+	if (ctx->dev_id == NVKVM_DEV_CTL || ctx->dev_id == NVKVM_DEV_UVM)
+		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	else
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
 	ret = remap_pfn_range(vma, vma->vm_start,
 			      (unsigned long)(gpa_base >> PAGE_SHIFT),
