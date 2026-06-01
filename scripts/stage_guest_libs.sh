@@ -43,12 +43,29 @@ for vlib in libnvidia-encode libnvcuvid; do
     fi
 done
 
-# -- EGL GBM external platform (#102 modeset): libnvidia-egl-gbm lets the NVIDIA
-# EGL stack render via GBM on a DRM card (the virtual KMS head). Its config
-# (15_nvidia_gbm.json) ships with the guest userspace but the .so did not.
-# Necessary-but-not-yet-sufficient: NVIDIA EGL still fails to init on the
-# emulated head's GBM device (deep integration — see docs/PRE_PUBLIC + #102).
-# egl-gbm carries its OWN version (not driver $V); copy whatever the bundle has. --
+# -- EGL GBM stack (#102 modeset): GPU-accelerated GL/EGL on the virtual KMS
+# head needs THREE pieces, all of which must be present or the NVIDIA path is
+# silently skipped and Mesa falls back to llvmpipe (software):
+#
+#   1. The GBM *backend* — Mesa's libgbm dlopens "<drmdriver>_gbm.so" from the
+#      gbm backends dir by the card's DRM driver name ("nvidia-drm"). The NVIDIA
+#      backend IS libnvidia-allocator (the host ships nvidia-drm_gbm.so as a
+#      symlink to it). Without this, gbm_create_device() on card0 returns a Mesa
+#      "dri" device and the NVIDIA EGL platform never even gets a chance. THIS
+#      was the whole "EGL fails to init on the head" wall (#102 chunk 5).
+#   2. libnvidia-egl-gbm.so.1 — the EGL external platform that handles
+#      EGL_PLATFORM_GBM on an NVIDIA gbm device (config 15_nvidia_gbm.json).
+#   3. libnvidia-allocator in the SYSTEM lib dir so the backend symlink resolves
+#      for non-CUDA GL apps (compositors don't add /usr/local/nvidia-guest/lib).
+GBMDIR="$SYS/gbm"
+sudo mkdir -p "$GBMDIR"
+# (1)+(3): allocator in the system dir + the GBM backend symlink to it.
+if [ -f "$GFXBUNDLE/libnvidia-allocator.so.$V" ]; then
+    sudo cp -f "$GFXBUNDLE/libnvidia-allocator.so.$V" "$SYS/"
+    sudo ln -sf "libnvidia-allocator.so.$V"    "$SYS/libnvidia-allocator.so.1"
+    sudo ln -sf "../libnvidia-allocator.so.$V" "$GBMDIR/nvidia-drm_gbm.so"
+fi
+# (2): the EGL external platform (its own version, not driver $V).
 for f in "$GFXBUNDLE"/libnvidia-egl-gbm.so.*; do
     [ -e "$f" ] || continue
     b=$(basename "$f")
