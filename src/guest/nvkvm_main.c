@@ -1580,6 +1580,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * libnvidia-eglcore later NULL-derefs the missing object. */
 				ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
 				break;
+			case NV01_CONTEXT_DMA:
+				/* 0x0002: 32B; NVENC binds a context-DMA with size=0. Without
+				 * this the kernel sees empty params -> INVALID_ARGUMENT and
+				 * InitializeEncoder fails (#99). */
+				ap_size = sizeof(struct nv_context_dma_allocation_params);
+				break;
+			case NVENC_SW_SESSION:
+				/* 0xa0bc: 20B; NVENC session-tracking object, size=0.
+				 * Same pattern as NV01_CONTEXT_DMA (#99). */
+				ap_size = sizeof(struct nva0bc_alloc_parameters);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -1687,6 +1698,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					 * libnvidia-eglcore NULL-derefs later (#84). */
 					ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
 					break;
+					case NV01_CONTEXT_DMA:
+						/* 0x0002: 32B; NVENC binds a context-DMA with size=0 ->
+						 * without this the kernel sees empty params -> INVALID_
+						 * ARGUMENT and InitializeEncoder fails (#99). */
+						ap_size = sizeof(struct nv_context_dma_allocation_params);
+						break;
+					case NVENC_SW_SESSION:
+						/* 0xa0bc: 20B; NVENC session-tracking object, size=0.
+						 * Same pattern as NV01_CONTEXT_DMA (#99). */
+						ap_size = sizeof(struct nva0bc_alloc_parameters);
+						break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
 				case NV01_MEMORY_SYSTEM:
