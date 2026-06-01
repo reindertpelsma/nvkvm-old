@@ -329,7 +329,7 @@ static void nvkvm_drm_postclose(struct drm_device *dev, struct drm_file *file)
 	}
 }
 
-static const struct file_operations nvkvm_drm_fops = {
+const struct file_operations nvkvm_drm_fops = {   /* F-4: non-static for embedded-fd type-check */
 	.owner          = THIS_MODULE,
 	.open           = drm_open,
 	.release        = drm_release,

@@ -370,7 +370,9 @@ static void reader_signal_sync(struct nvkvm_isolate *iso, int err,
 	iso->sync_error       = err;
 	iso->sync_mmap_retval = mmap_retval;
 	iso->sync_done        = true;
-	pthread_cond_signal(&iso->sync_cond);
+	/* F-5: broadcast (not signal) so a stale ENTER_LOOP waiter on a reused
+	 * slot and a fresh waiter both re-evaluate their identity predicate. */
+	pthread_cond_broadcast(&iso->sync_cond);
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
@@ -666,7 +668,10 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->sock_fd      = -1;
 			iso->pending_head = NULL;
 			iso->next_txn_id  = 1;
-			iso->sync_done    = false;
+			/* F-5 (security_audit_2026_06_01): do NOT reset sync_done here.
+			 * Every sync op resets it under sync_lock before its own wait;
+			 * resetting it here under iso->lock is a cross-lock data race that
+			 * can re-park a stale ENTER_LOOP waiter from a just-killed slot. */
 			iso->sync_open_fd = -1;
 			iso->reader_started = false;
 			iso->ring_memfd   = -1;
@@ -761,6 +766,22 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				close(mfd);
 				mfd = 3;
 			}
+			/* F-6 (security_audit_2026_06_01): don't let the stub inherit
+			 * QEMU's stdout/stderr — a compromised stub could write attacker
+			 * bytes into the host terminal / log / supervisor pipe. Redirect
+			 * 1,2 to /dev/null (opened here, before the mount-ns pivot, while
+			 * /dev/null still resolves). Keep stdio only under NVKVM_STUB_DEBUG=1. */
+			{
+				const char *dbg = getenv("NVKVM_STUB_DEBUG");
+				if (!(dbg && *dbg == '1')) {
+					int dn = open("/dev/null", O_RDWR);
+					if (dn >= 0) {
+						dup2(dn, STDOUT_FILENO);
+						dup2(dn, STDERR_FILENO);
+						if (dn > 3) close(dn);
+					}
+				}
+			}
 			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
 			if (harden && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -804,6 +825,17 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				dup2(binfd, 3);
 				close(binfd);
 				binfd = 3;
+			}
+			/* F-6: redirect the stub's stdout/stderr to /dev/null so a
+			 * compromised stub can't spoof into QEMU's inherited host
+			 * terminal/log. keep_env (NVKVM_STUB_DEBUG=1) keeps stdio too. */
+			if (!keep_env) {
+				int dn = open("/dev/null", O_RDWR);
+				if (dn >= 0) {
+					dup2(dn, STDOUT_FILENO);
+					dup2(dn, STDERR_FILENO);
+					if (dn > 3) close(dn);
+				}
 			}
 			if (harden && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -1420,11 +1452,20 @@ int nvkvm_isolate_enter_loop(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 		return (int)sr;
 	}
 
-	while (!iso->sync_done)
+	/* F-5: ENTER_LOOP runs on the thread pool (not the serialized TX thread),
+	 * so guard against the slot being killed+reused under us: bail if our
+	 * identity no longer holds. The kill path also sets sync_done via
+	 * reader_signal_sync (broadcast), so this is belt-and-suspenders. */
+	while (!iso->sync_done && iso->id == isolate_id && iso->alive)
 		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
-	int err = iso->sync_error;
-	if (head_out)
-		*head_out = iso->sync_loop_head;
+	int err;
+	if (!iso->sync_done) {
+		err = -ENODEV;                 /* torn down / reused while parked */
+	} else {
+		err = iso->sync_error;
+		if (head_out)
+			*head_out = iso->sync_loop_head;
+	}
 	pthread_mutex_unlock(&iso->sync_lock);
 	return err;
 }

@@ -393,6 +393,21 @@ int    nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				   void *params_buf, size_t param_size);
 __s32  guest_fd_to_handle_id(int guest_fd);
 
+/*
+ * F-4 (security_audit_2026_06_01): a guest fd embedded in an ioctl field
+ * (uvm_fd, rm_ctrl_fd, OS_EVENT.fd, NV0005.data, …) must be one of OUR device
+ * files before we read `struct nvkvm_fd_ctx` out of its ->private_data — else a
+ * caller pointing the field at any other fd (pipe/socket/eventfd/drm) causes a
+ * type-confused read of a foreign subsystem's private_data. Mirrors the real
+ * driver's `f->f_op == nv_frontend_fops` check in osUserHandleToKernelPtr.
+ */
+extern const struct file_operations nvkvm_fops;
+extern const struct file_operations nvkvm_drm_fops;
+static inline bool nvkvm_file_is_ours(struct file *f)
+{
+	return f && (f->f_op == &nvkvm_fops || f->f_op == &nvkvm_drm_fops);
+}
+
 /* nvkvm_mmap.c */
 extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);

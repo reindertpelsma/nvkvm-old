@@ -76,7 +76,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 static int  nvkvm_mmap(struct file *filp, struct vm_area_struct *vma);
 static __poll_t nvkvm_poll(struct file *filp, poll_table *wait);
 
-static const struct file_operations nvkvm_fops = {
+const struct file_operations nvkvm_fops = {   /* F-4: non-static so embedded-fd translation can type-check against it */
 	.owner          = THIS_MODULE,
 	.open           = nvkvm_open,
 	.release        = nvkvm_release,
@@ -1773,33 +1773,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				    ap_size >= sizeof(struct nv0005_alloc_parameters)) {
 					struct nv0005_alloc_parameters *ep = aux_buf;
 					int user_fd = (int)(int32_t)ep->data;
-					/* Pre-translate dump: exactly what libcuda wrote */
-					print_hex_dump(KERN_INFO,
-						"nvkvm guest pre 0x79 nvos64: ",
-						DUMP_PREFIX_NONE, 48, 1,
-						params_buf, param_size, false);
-					print_hex_dump(KERN_INFO,
-						"nvkvm guest pre 0x79 aux:    ",
-						DUMP_PREFIX_NONE, 24, 1,
-						aux_buf, aux_size, false);
 					if (user_fd >= 0) {
 						struct file *f = fget(user_fd);
 						__u32 hid = 0;
 						if (f) {
-							struct nvkvm_fd_ctx *other =
-								f->private_data;
-							if (other && other->handle_id)
-								hid = other->handle_id;
+							/* F-4: only read private_data if it's our fd */
+							if (nvkvm_file_is_ours(f)) {
+								struct nvkvm_fd_ctx *other =
+									f->private_data;
+								if (other && other->handle_id)
+									hid = other->handle_id;
+							}
 							fput(f);
 						}
 						if (hid > 0)
 							ep->data = hid;
 					}
-					/* Post-translate dump */
-					print_hex_dump(KERN_INFO,
-						"nvkvm guest post 0x79 aux:   ",
-						DUMP_PREFIX_NONE, 24, 1,
-						aux_buf, aux_size, false);
 				}
 			}
 		}
