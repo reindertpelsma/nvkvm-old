@@ -26,6 +26,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>      /* drm_add_modes_noedid */
 #include <drm/drm_crtc.h>
+#include <drm/drm_framebuffer.h>  /* #102 present path: fb geometry/format */
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 
@@ -101,8 +102,29 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 {
 	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_pending_vblank_event *event = crtc->state->event;
+	struct drm_framebuffer *fb = pipe->plane.state ? pipe->plane.state->fb : NULL;
 
 	(void)old_state;
+
+	/* Present path (#102) — identify the host buffer behind this scanout
+	 * frame. A real compositor (weston) flips an NVIDIA bo, which surfaces
+	 * here as one of our proxy GEMs carrying the stub handle; that is the
+	 * buffer QEMU will export + scan out to the host. (Logging step first:
+	 * proves the head can name the composited buffer per flip.) */
+	if (fb) {
+		__u32 stub_handle = 0;
+
+		if (nvkvm_fb_stub_handle(fb, &stub_handle, NULL))
+			pr_info_ratelimited(
+				"nvkvm present: flip %ux%u pitch=%u fmt=0x%08x mod=0x%llx stub_handle=0x%x\n",
+				fb->width, fb->height, fb->pitches[0],
+				fb->format ? fb->format->format : 0,
+				(unsigned long long)fb->modifier, stub_handle);
+		else
+			pr_info_ratelimited(
+				"nvkvm present: flip %ux%u (non-proxy fb — dumb/shmem)\n",
+				fb->width, fb->height);
+	}
 	/* Headless: no real scanout. Pace the flip completion to the software
 	 * vblank so a compositor renders at the refresh rate, not unbounded. */
 	if (event) {

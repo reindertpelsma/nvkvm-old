@@ -35,6 +35,7 @@
 #include <drm/drm_device.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>   /* #102: dumb buffers for KMS scanout */
+#include <drm/drm_framebuffer.h>        /* #102: fb->obj[] for the present path */
 
 #include "nvkvm.h"
 
@@ -132,6 +133,27 @@ static __u32 nvkvm_gem_to_stub(struct drm_file *file, __u32 guest_handle)
 		drm_gem_object_put(obj);
 	}
 	return sh;
+}
+
+/* Present path (#102): map a scanout framebuffer back to the host/stub buffer
+ * behind it. A compositor's scanout buffer is an NVIDIA bo allocated via the
+ * render node, so its guest GEM is one of our proxy objects carrying the stub
+ * handle + owning isolate. (A plain shmem dumb fb is NOT a proxy → false.) */
+bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
+			  struct nvkvm_fd_ctx **ctx)
+{
+	struct drm_gem_object *obj;
+
+	if (!fb)
+		return false;
+	obj = fb->obj[0];
+	if (!obj || obj->funcs != &nvkvm_gem_funcs)
+		return false;
+	if (stub_handle)
+		*stub_handle = to_nvkvm_gem(obj)->stub_handle;
+	if (ctx)
+		*ctx = to_nvkvm_gem(obj)->ctx;
+	return true;
 }
 
 /* Param structs — sizes must match the host nvidia-drm-ioctl.h exactly so the

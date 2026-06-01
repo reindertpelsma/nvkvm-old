@@ -339,6 +339,14 @@ void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events);
 int  nvkvm_drm_init(struct device *parent);
 void nvkvm_drm_fini(void);
 
+/* Present path (#102): if `fb` is backed by one of our proxy GEM objects (a
+ * host/stub buffer forwarded via the render node — e.g. a compositor's scanout
+ * buffer), report the stub-side handle and owning isolate ctx so the flip can be
+ * presented to the host. Returns false for non-proxy fbs (e.g. shmem dumb). */
+struct drm_framebuffer;
+bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
+			  struct nvkvm_fd_ctx **ctx);
+
 /* nvkvm_kms.c — guest-emulated virtual KMS head (#102). Called from
  * nvkvm_drm_init on the nvkvm drm_device before drm_dev_register. */
 int  nvkvm_kms_init(struct drm_device *ddev);
