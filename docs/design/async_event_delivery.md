@@ -81,3 +81,81 @@ page walk) on per-frame multi-MB CPU writes; not NVENC-specific.
 3. Document the GPU-resident-input guidance for downstream encode pipelines.
 
 Validate any fix with the table above (CPU-raw 1080p is the sensitive case).
+
+---
+
+## UPDATE 2026-06-02 — root cause CONFIRMED: GPA window is UC in the EPT
+
+A clean microbench (`tests/integration/pinned_write_bench.c`: CPU memcpy in/out of
+`cuMemAllocHost` vs `malloc`) pins it, isolated from NVENC:
+
+```
+            guest WRITE   guest READ      (host: no penalty, ~14 GB/s both)
+malloc      13–15 GB/s    13 GB/s
+pinned       0.22 GB/s     0.12 GB/s     (60–112× slower)
+```
+
+So **guest CPU access to any forwarded buffer through the GPA window is uncached.**
+Mechanism: the window is exposed as a prefetchable **MMIO** PCI BAR
+(`memory_region_init_io`, `virtio_nvgpu_pci.c:108`, GPA `0x380000000000`), so KVM
+maps that guest-physical range **UC in the EPT**.
+
+Proven the guest cannot fix it (all no-ops, identical 0.12/0.22):
+- guest PTE WB (`pgprot=0x…0027`, PWT=0 PCD=0)
+- guest PTE WC (`pgprot=0x…002f`, PWT=1)
+- a WB `/proc/mtrr` entry over the window range
+
+→ the UC is forced **below** the guest PTE/MTRR, in the host EPT. The GPU's own DMA
+does not use the CPU EPT memory-type, so compute/decode and `cuMemcpy` HtoD/DtoH
+stay at parity; only **CPU-direct** access suffers (NVENC `av_image_copy` into the
+input surface, `cuMemAllocHost` CPU fills, any CPU memcpy into pinned/mapped GPU
+buffers). This silently regressed #94's WB win once #55 moved the window into BAR
+space. (The earlier huge-page / TLB hypothesis is **wrong** — reads are UC too.)
+
+### Fix (QEMU-side; guest cacheability flags are irrelevant)
+Make KVM map the window memslot WB: expose the window as a RAM region
+(`memory_region_init_ram_ptr` over `sparse_vmm_va`) instead of an MMIO BAR, drop the
+raw `KVM_SET_USER_MEMORY_REGION`, and resolve the #55 memslot collision
+(ivshmem-style RAM BARs are WB). Core memory-path change → regression risk.
+Validate: `pinned_write_bench` pinned≈malloc (~10 GB/s) + matmul/parity no-regress
++ NVENC 1080p. Tracked as task #111. (Replacing the guest `dev_id` WB/WC heuristic
+does **not** help here — the guest PTE is proven irrelevant.)
+
+### Why VFIO passthrough, vGPU and gVisor nvproxy do NOT have this
+The UC penalty is specific to nvkvm's "forward ioctls into a VM + expose
+host-resident buffers through a guest PCI-BAR window" design. The others avoid the
+cross-address-space window entirely:
+
+- **VFIO GPU passthrough:** the *real* nvidia driver runs **in the guest**, so
+  DMA-target/staging buffers (`cudaHostAlloc` etc.) are **native guest RAM** —
+  ordinary WB pages — and the GPU reaches them via the **IOMMU** translating to
+  guest physical addresses. The CPU touches them at full WB speed; only the GPU's
+  own BAR aperture is WC/UC (exactly as on bare metal). No host-memory window
+  exists, so there is nothing for KVM to mark UC.
+- **vGPU (GRID / SR-IOV):** same shape — the guest owns its system memory (WB),
+  the mediated/virtual function DMAs into guest RAM via the host IOMMU. Pinned
+  buffers are guest WB RAM, not a view onto host memory.
+- **gVisor nvproxy:** the closest cousin — it *also* forwards the ioctl ABI, and
+  on its **KVM platform it runs a real VM with a GPA→HPA (EPT) map**, exactly like
+  us (the ptrace platform has no VM, but KVM mode does). Yet it has no UC penalty.
+  The difference is purely *how the forwarded host memory is installed in the
+  guest*: gVisor maps it as **ordinary RAM memslots** (its sentry doesn't emulate a
+  PCI bus to the sandboxed app — it maps device/file memory straight into the
+  guest physical space as RAM), so KVM stamps the EPT **WB**. nvkvm routes the same
+  host memory through an emulated **MMIO PCI-BAR window**, so KVM stamps it **UC**.
+  Same VM, same EPT, same forwarding model — opposite EPT memory type, entirely
+  because of RAM-memslot vs MMIO-BAR.
+
+**So this is the existence proof that it is fixable:** nvproxy-KVM is a
+forward-into-a-VM design with a GPA map and full WB on forwarded GPU sysmem.
+nvkvm is different only in that the nvidia driver runs on the **host** (in the
+stub), so DMA-able memory is **host** memory exposed to the guest via a window —
+and we currently expose that window as a **PCI MMIO BAR**, which is the single
+reason KVM marks it UC. The fix is to install the window as a **RAM** memslot
+(`memory_region_init_ram_ptr` over `sparse_vmm_va`, ivshmem-style WB RAM BAR, drop
+the raw `KVM_SET_USER_MEMORY_REGION`) → KVM stamps WB, matching gVisor. (On x86 the
+guest-WB / host-WB / GPU-DMA views of that shared memory stay cache-coherent via
+snooping, so WB is correct.) Constraint to respect: keep it to **one** big memslot
+(the #55 reason for the single window — cuCtxCreate issues ~1500 device mmaps, one
+memslot each blows the KVM slot count); a single RAM-region window satisfies both
+WB and the slot budget.
