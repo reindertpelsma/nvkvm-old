@@ -334,3 +334,33 @@ Implementation sketch:
 3. Stub: already MAP_FIXED-installs migrated memfds (OS_DESCRIPTOR path) — verify
    it covers the import RM class.
 4. Present: read/forward the memfd pages (already host-accessible).
+
+### ROOT CAUSE of the import BAD_ALLOC (2026-06-02, rmdump byte-compare)
+
+`tests/perf/apps/rmdump.c` (LD_PRELOAD ioctl shim dumping RM_CONTROL structs)
+ran on host (import OK) vs guest (BAD_ALLOC). The import ioctl sequence is
+byte-identical and every guest ioctl returns 0 — the divergence is a single
+missing RM control:
+
+  HOST RM_CONTROL histogram includes `cmd=0x00003d06` ×1; GUEST has ×0.
+  Both do `cmd=0x00003d05` ×3.
+
+- `0x3d05` = `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` (works on guest — our
+  forwarding already bridges it, stub nvkvm_stub.c:862/2071).
+- `0x3d06` = `NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD` — THE primitive that
+  imports the dma-buf's RM memory object into EGL's RM client. Host issues it;
+  guest never does → EGL has no RM backing for the image → BAD_ALLOC.
+
+WHY the guest skips it: our proxy GEM exports via the DRM-core DEFAULT dma-buf
+ops (`drm_gem_prime_dmabuf_ops`). On re-import (`PRIME_FD_TO_HANDLE`),
+`drm_gem_prime_import_dev` sees a same-device DRM dma-buf and SHORT-CIRCUITS to
+the original GEM object — so EGL believes it already holds the object and skips
+`IMPORT_OBJECT_FROM_FD`. But that original proxy GEM has no RM memory backing in
+EGL's (separate) RM client → BAD_ALLOC. NVIDIA's real dma-buf uses CUSTOM ops, so
+the same-dev short-circuit doesn't fire and EGL does the full import.
+
+FIX PATH: make the proxy GEM's dma-buf NOT short-circuit (custom export so
+`IMPORT_OBJECT_FROM_FD` runs), then forward `0x3d06` with guest-fd↔stub-object
+bridging — the import multi-hop: guest dma-buf fd → (our map) → stub bo →
+EXPORT_OBJECT_TO_FD on stub → IMPORT_OBJECT_FROM_FD into EGL's stub RM client.
+The export half (0x3d05) bridging already exists; mirror it for import (0x3d06).
