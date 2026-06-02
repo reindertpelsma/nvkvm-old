@@ -364,3 +364,61 @@ FIX PATH: make the proxy GEM's dma-buf NOT short-circuit (custom export so
 bridging — the import multi-hop: guest dma-buf fd → (our map) → stub bo →
 EXPORT_OBJECT_TO_FD on stub → IMPORT_OBJECT_FROM_FD into EGL's stub RM client.
 The export half (0x3d05) bridging already exists; mirror it for import (0x3d06).
+
+---
+
+## #110 UPDATE (2026-06-02, commit 6f591b8): single-process import FIXED; cross-isolate is the real wall
+
+The fix path above was *partially* right. Byte-diffing the host-vs-guest
+`eglCreateImageKHR(LINUX_DMA_BUF)` ioctl stream showed the import sequence is:
+
+    PRIME_FD_TO_HANDLE → (RM queries) → GEM_IDENTIFY_OBJECT(0x0e)
+      → GEM_EXPORT_NVKMS_MEMORY(DRM 0x09, onto a caller-provided nv-export fd)
+      → IMPORT_OBJECT_FROM_FD(0x3d06, that fd) into EGL's RM client
+
+The LONE host-vs-guest divergence was **DRM 0x09 GEM_EXPORT_NVKMS_MEMORY**:
+EINVAL on the guest (unimplemented → DRM core rejects), 0 on host. So EGL aborted
+with BAD_ALLOC *before* ever issuing 0x3d06 — the 0x3d06 bridge was necessary but
+not the trigger. (strace mis-labels 0x09 as `DRM_IOCTL_VIRTGPU_GET_CAPS`, nr 0x49.)
+
+Implemented (guest + stub + QEMU allowlists):
+- DRM `GEM_EXPORT_NVKMS_MEMORY` (0x09): translate proxy handle→stub handle;
+  marshal the 4-byte `{int memFd}` blob via the aux slot (guest fd→handle_id,
+  zero the params ptr; stub substitutes a host VA at offset 8 and resolves the
+  memFd to its local fd). **Forward on the PROXY's ctx, not the calling
+  drm_file's** — NVIDIA EGL opens renderD128 several times; a cross-file PRIME
+  re-import hands a *different* drm_file a handle pointing back to the original
+  proxy, and the stub GEM handle is only valid in the host fd that ran
+  GEM_ALLOC. Forwarding on the wrong fd → `nvkms_memory_lookup` returns UNKNOWN →
+  EINVAL. (`nvkvm_gem_to_stub_ctx`.)
+- `IMPORT_OBJECT_FROM_FD` (0x3d06): fd at inner offset 0 swapped guest-fd→
+  handle_id (mirror of 0x3d05's fd@16), restored on response, excluded from the
+  SPSC ring.
+- G-6 fixed: `nvkvm_fd_ctx` is now refcounted; a proxy GEM that outlives its
+  drm_file (cross-file PRIME) keeps the ctx — and the stub-side bo — alive until
+  the last proxy ref drops.
+
+VERIFIED: `dmabuf_import_probe` RESULT=OK (LINEAR + block-linear); cuInit PASS.
+This also unblocks the **host-side #107** present import (same-process re-import).
+
+### Still stuck: cross-isolate (cross-process) buffer sharing
+`wcapflip dmabuf` (weston_output_capture into a client-allocated GPU bo) STILL
+fails: weston (isolate B) imports a dma-buf the wcapflip client (isolate A)
+allocated. The bo's host RM object lives in stub A's RM client; 0x09 now forwards
+on the proxy's ctx = stub A (correct for the export), but the `memFd` weston
+supplies belongs to stub B, and `handle_lookup` is per-stub → unresolvable.
+Cross-process GPU buffer sharing is a separate, larger mechanism.
+
+Two candidate paths (decision pending):
+1. **Cross-isolate dma-buf brokering** — QEMU brokers a host export/dma-buf fd
+   between the two stub processes (stub A `EXPORT_OBJECT_TO_FD` → QEMU passes the
+   host fd to stub B → `IMPORT_OBJECT_FROM_FD`). General, but adds host-boundary
+   attack surface (host fds passed between unprivileged stubs) — design with care.
+2. **Single-isolate capture** — make the headless compositor produce the
+   composited bo in ITS OWN isolate and export it via the existing present path
+   (#106), avoiding cross-process entirely. Candidate: a **WRITEBACK connector**
+   on the virtual KMS head (#102 card0) — the GL renderer writes the composite
+   into a weston-owned bo (no NVIDIA scanout-present hang, no cross-process).
+   Likely the cleaner path.
+
+SHM capture (~28 fps, CPU glReadPixels-bound) remains the working interim.
