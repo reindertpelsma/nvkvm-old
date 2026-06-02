@@ -6,42 +6,34 @@ it can be picked up as a focused effort.
 
 ---
 
-## NVENC encode throughput (~7×) — task #101
+## NVENC encode throughput — task #101 (RE-BASELINED 2026-06-02: NOT a blocker)
 
-**Status:** root-caused, parked. NVENC video **encode is correct and usable**
-(H.264 + HEVC, valid bitstreams, host-identical RM statuses — task #99), at
-**~55 fps / 1080p** vs host ~373 fps (raw input). Fine for real-time 1080p30
-streaming today; **not** for high-fps / multi-stream / 4K.
+**Status:** re-measured cleanly; the "~7×" was a measurement artifact. NVENC
+encode is correct and usable (#99). Apples-to-apples (RTX 3060, drv 580,
+h264_nvenc p4, pre-generated raw input, identical cmd both sides):
 
-**Why it matters before public:** remote GPU-VM workstations are viewed over the
-wire via codecs, so NVENC throughput is the pixel-delivery rate. 55 fps caps the
-remote-desktop experience at ~1080p30.
+| input path             | host | guest | ratio |
+|------------------------|-----:|------:|------:|
+| 720p,  CPU raw         |  932 |   895 | 0.96× (PARITY) |
+| 1080p, CPU raw         |  428 |    63 | 6.8×  |
+| 1080p, CUDA `hwupload` |  302 |   121 | 2.5×  |
 
-**Root cause (proven, not guessed):** NVENC waits on a per-frame **userspace
-kernel eventfd** (`anon_inode:[eventfd]`, one per in-flight frame) with a 100 ms
-timeout. In the guest that completion event is **never signaled**, so every frame
-eats the full 100 ms timeout then re-checks and finds the frame done. On the host
-the same eventfd *is* signaled promptly (→ 373 fps), so the driver uses eventfd
-completion; the guest simply never receives the host-side signal. Not ioctl-bound
-(~1.85 ioctls/frame) and not GPU-bound (encoder saturates with raw input).
+The old "55 vs 373 / 7×" were short-clip cumulative-average artifacts + CPU-bound
+`testsrc` input. NOT eventfd, NOT fence coherence, NOT WC cacheability — all three
+theories disproven (see `docs/design/async_event_delivery.md`).
 
-**Two attempts that MISSED (so the next person doesn't repeat them):**
-1. Guest VQ_EVT registry waking an `nvkvm_fd_ctx` `poll_wq` — **wrong target**;
-   the OS-event fd is a real userspace eventfd, needs `eventfd_signal`, not poll_wq.
-   (Harmless no-op scaffolding landed in commit `c55bd71`; reusable.)
-2. QEMU eventfd watch hooked at the `dev_id 0xFF` open path
-   (`nvkvm_isolate_handlers.c` open handler) — **never registers** for NVENC's
-   event (proven: watch-add count 0). NVENC's eventfd does not flow through that
-   path. Reverted.
+**Real cause:** at 1080p with CPU raw input the guest main ffmpeg thread is
+memcpy-bound (8/8 gdb samples in `av_image_copy` into NVENC's CPU input surface,
+which nvkvm has migrated onto the GPA window) — per-frame multi-MB CPU writes
+*through the window* are slower in-guest than native (likely EPT TLB pressure).
+Steady-state ioctls ≈ 0; mapping the buffer WB gave zero change (already WB via #94).
 
-**Remaining work (do the trace FIRST):** there are ≥2 eventfd-creation paths —
-stub-side (handle-resolved at the stub, `fe_embedded_fd_off=8` for `NV_ESC_ALLOC_OS_EVENT`)
-and QEMU-direct (`nvkvm_handle.c:107` makes an eventfd itself). Trace end-to-end
-*which* host-side eventfd the driver actually signals for the event, then: watch
-THAT fd on the QEMU main loop → relay via `VQ_EVT` → in the guest `eventfd_signal`
-the userspace eventfd captured at `NV_ESC_ALLOC_OS_EVENT` (keyed by handle). The
-`VQ_EVT` plumbing + guest registry from `c55bd71` are reusable once the wake
-target is corrected to `eventfd_signal`. Same problem-class as the broader
-control-path latency; a correct fix here speeds **every** event-driven NVIDIA wait.
+**Why not a blocker:** 720p at parity; 1080p still 63–121 fps = real-time for
+1080p30/1080p60 streaming. The real use case (GPU-resident framebuffer → NVENC)
+never touches the slow CPU input surface — the 6.8× is a CPU-raw-input artifact.
 
-Details: task #101; memory `nvenc_encode_working.md`.
+**Deferred perf fix (same family as #94):** huge-page-back the GPA window memslot
+(THP / `MADV_HUGEPAGE` in QEMU) — a 3 MB per-frame write hits 768 4 KB EPT entries
+vs ~2 with 2 MB pages; benefits ALL large guest window accesses (HtoD/DtoH/NVENC).
+
+Details: task #101; memory `nvenc_101_root_cause_wc_input.md`.
