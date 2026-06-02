@@ -24,6 +24,7 @@
 #include "nvkvm_fe_alloc_allowlist.h"
 #include "nvkvm_drm_allowlist.h"
 #include "nvkvm_nvkms_allowlist.h"
+#include "nvkvm_present_egl.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -303,7 +304,7 @@ int nvkvm_req_create_isolate(VirtIONvgpu *nv,
 			      struct nvkvm_resp_create_isolate *resp)
 {
 	uint32_t isolate_id = 0;
-	int ret = nvkvm_isolate_create(&nv->isolates, req->session_id, &isolate_id);
+	int ret = nvkvm_isolate_create(&nv->isolates, req->session_id, nv, &isolate_id);
 	if (ret < 0) {
 		resp->isolate_id = 0;
 		resp->status     = (uint32_t)-ret;
@@ -403,6 +404,51 @@ int nvkvm_req_interrupt(VirtIONvgpu *nv,
 {
 	int ret = nvkvm_isolate_interrupt(&nv->isolates,
 					  req->isolate_id, req->target_txn);
+	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
+	return 0;
+}
+
+/* ── Command-buffer ring ─────────────────────────────────────────────────── */
+
+int nvkvm_req_setup_ring(VirtIONvgpu *nv,
+			 struct nvkvm_req_setup_ring *req,
+			 struct nvkvm_resp_setup_ring *resp)
+{
+	uint32_t iso_id = session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		resp->status = ENODEV;   /* no isolate yet → guest uses virtqueue */
+		return 0;
+	}
+	uint64_t gpa = 0;
+	uint32_t region = 0, resp_off = 0, ring_bytes = 0;
+	int ret = nvkvm_isolate_ring_info(&nv->isolates, iso_id,
+					  &gpa, &region, &resp_off, &ring_bytes);
+	if (ret < 0 || gpa == 0) {
+		resp->status = (ret < 0) ? (uint32_t)-ret : ENODEV;
+		return 0;
+	}
+	resp->ring_gpa     = gpa;
+	resp->region_size  = region;
+	resp->req_off      = 0;
+	resp->resp_off     = resp_off;
+	resp->ring_bytes   = ring_bytes;
+	resp->status       = 0;
+	return 0;
+}
+
+int nvkvm_req_enter_loop(VirtIONvgpu *nv,
+			 struct nvkvm_req_enter_loop *req,
+			 struct nvkvm_resp_enter_loop *resp)
+{
+	uint32_t iso_id = session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		resp->status = ENODEV;
+		return 0;
+	}
+	uint64_t head = 0;
+	int ret = nvkvm_isolate_enter_loop(&nv->isolates, iso_id,
+					   req->idle_us, &head);
+	resp->head   = head;
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
 	return 0;
 }
@@ -745,6 +791,190 @@ static uint64_t nvkvm_admin_get_pid_mem(VirtIONvgpu *nv, pid_t tgid,
 	if (any_out)
 		*any_out = any;
 	return sum;
+}
+
+/*
+ * PRESENT (#106 present path B) — the guest's virtual KMS head flipped a
+ * scanout bo backed by a render-node GEM.  Ask the owning isolate's stub to
+ * export it as a host dma-buf (PRIME_HANDLE_TO_FD) and route it to the host
+ * display/codec.  This is the host/cross-VM boundary, so we validate hard:
+ *   - graphics must be enabled (compute-only VMs never present);
+ *   - the handle must be a render-node handle OWNED by this session, so a
+ *     guest cannot coerce QEMU into PRIME-exporting an arbitrary fd (e.g. a
+ *     /dev/nvidia0 control handle) — only its own DRM render GEMs.
+ * The stub_handle is opaque to QEMU; the stub validates it against its own GEM
+ * table when it runs the ioctl.
+ */
+int nvkvm_req_present(VirtIONvgpu *nv,
+		      struct nvkvm_req_present *req,
+		      struct nvkvm_resp_present *resp)
+{
+	resp->reserved = 0;
+
+	if (!nv->graphics) {
+		resp->status = EPERM;
+		return 0;
+	}
+
+	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
+	if (!h || h->session_id != req->session_id ||
+	    h->dev_id < NVKVM_DEV_DRM_RD(0) ||
+	    h->dev_id >= NVKVM_DEV_DRM_RD(16)) {
+		NVKVM_DBG("nvkvm present: bad handle %u (sess=%u dev=%d)\n",
+			  req->handle_id, req->session_id, h ? h->dev_id : -1);
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	uint32_t iso_id = req->isolate_id ? req->isolate_id
+					  : session_first_isolate(nv, req->session_id);
+	if (iso_id == 0) {
+		NVKVM_DBG("nvkvm present: no isolate (req_iso=%u sess=%u)\n",
+			  req->isolate_id, req->session_id);
+		resp->status = ENOENT;
+		return 0;
+	}
+
+	int dmabuf_fd = -1;
+	int r = nvkvm_isolate_present_export(&nv->isolates, iso_id,
+					     req->handle_id, req->stub_handle,
+					     &dmabuf_fd);
+	if (r < 0 || dmabuf_fd < 0) {
+		NVKVM_DBG("nvkvm present: export rc=%d iso=%u handle=%u gem=0x%x\n",
+			  r, iso_id, req->handle_id, req->stub_handle);
+		resp->status = (r < 0) ? (uint32_t)(-r) : EIO;
+		return 0;
+	}
+
+	/*
+	 * #106 verification: prove the host buffer crossed the boundary.  The
+	 * dma-buf size is the real host allocation (block-linear scanout VRAM).
+	 * (107 imports this as an EGLImage for capture/scanout; for now we close
+	 * it per frame so no fd accumulates.)  One-shot fprintf so the proof is
+	 * visible without NVKVM_DEBUG; per-frame detail under NVKVM_DBG.
+	 */
+	off_t sz = lseek(dmabuf_fd, 0, SEEK_END);
+	static bool logged_once;
+	if (!logged_once) {
+		logged_once = true;
+		fprintf(stderr,
+			"nvkvm present #106: host dma-buf fd=%d %ux%u pitch=%u "
+			"fmt=0x%08x mod=0x%llx size=%lld (gem=0x%x)\n",
+			dmabuf_fd, req->width, req->height, req->pitch,
+			req->format, (unsigned long long)req->modifier,
+			(long long)sz, req->stub_handle);
+	}
+	NVKVM_DBG("nvkvm present: dma-buf fd=%d %ux%u size=%lld gem=0x%x\n",
+		  dmabuf_fd, req->width, req->height, (long long)sz,
+		  req->stub_handle);
+
+	/*
+	 * #102: hand the frame to the live QEMU display window.  The console
+	 * takes ownership of the dma-buf fd (retires it once presented), so on
+	 * acceptance we must NOT close it here.  If no console is active
+	 * (compute-only build, graphics=off, or no display backend), submit
+	 * returns false and we fall through to close it ourselves.
+	 */
+	if (nvkvm_present_submit(nv, dmabuf_fd, req->width, req->height,
+				 req->pitch, req->format, req->modifier)) {
+		resp->status = 0;
+		return 0;
+	}
+
+	/*
+	 * #107: capture the composited frame on the host.  Gated by
+	 * NVKVM_PRESENT_CAPTURE=<path> (the readback is a synchronous glReadPixels
+	 * — too costly to do every frame) and throttled to ~1/30 frames.  This is
+	 * the interim "view it" mechanism on a headless host with no window.
+	 */
+	const char *cap = getenv("NVKVM_PRESENT_CAPTURE");
+	if (cap) {
+		static unsigned frame;
+		if ((frame++ % 30) == 0) {
+			int cr = nvkvm_present_capture(dmabuf_fd, req->width,
+						       req->height, req->pitch,
+						       req->format, req->modifier,
+						       cap);
+			if (cr < 0)
+				NVKVM_DBG("nvkvm present: capture rc=%d\n", cr);
+		}
+	}
+	close(dmabuf_fd);
+	resp->status = 0;
+	return 0;
+}
+
+/*
+ * XISO_IMPORT (#110 cross-isolate dma-buf) — broker a GPU buffer owned by one
+ * isolate into another (compositor importing a client bo).  Host/cross-VM
+ * boundary, so validate hard, exactly like PRESENT:
+ *   - graphics must be enabled;
+ *   - BOTH the owner and importer handles must be render-node handles, so a
+ *     guest cannot coerce QEMU into PRIME-exporting/importing an arbitrary fd.
+ * Same-VM scoping is inherent: nv->handles / nv->isolates are this VM's only.
+ * WHO may import (cross-UID / cross-container on the guest) is enforced
+ * guest-side — the guest kernel gates which process holds the guest dma-buf fd
+ * that drives this request (the access-model split: intra-VM rights = guest's).
+ * Mechanism: owner stub PRIME_HANDLE_TO_FD → host dma-buf → importer stub
+ * PRIME_FD_TO_HANDLE → local GEM, returned to the guest.  The dma-buf fd never
+ * leaves QEMU's hands; only the same-VM stubs ever touch it.
+ */
+int nvkvm_req_xiso_import(VirtIONvgpu *nv,
+			  struct nvkvm_req_xiso_import *req,
+			  struct nvkvm_resp_xiso_import *resp)
+{
+	resp->gem_handle = 0;
+
+	if (!nv->graphics) {
+		resp->status = EPERM;
+		return 0;
+	}
+	if (req->owner_isolate_id == 0 || req->importer_isolate_id == 0) {
+		resp->status = ENOENT;
+		return 0;
+	}
+
+	struct nvkvm_handle *oh = nvkvm_handle_get(&nv->handles, req->owner_handle_id);
+	struct nvkvm_handle *ih = nvkvm_handle_get(&nv->handles, req->importer_handle_id);
+	if (!oh || oh->dev_id < NVKVM_DEV_DRM_RD(0) ||
+	    oh->dev_id >= NVKVM_DEV_DRM_RD(16) ||
+	    !ih || ih->dev_id < NVKVM_DEV_DRM_RD(0) ||
+	    ih->dev_id >= NVKVM_DEV_DRM_RD(16)) {
+		NVKVM_DBG("nvkvm xiso: non-render handle (owner=%u imp=%u)\n",
+			  req->owner_handle_id, req->importer_handle_id);
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	/* 1. Owner stub exports the bo as a host dma-buf (PRIME_HANDLE_TO_FD). */
+	int dmabuf_fd = -1;
+	int r = nvkvm_isolate_present_export(&nv->isolates, req->owner_isolate_id,
+					     req->owner_handle_id,
+					     req->owner_stub_handle, &dmabuf_fd);
+	if (r < 0 || dmabuf_fd < 0) {
+		NVKVM_DBG("nvkvm xiso: owner export rc=%d iso=%u gem=0x%x\n",
+			  r, req->owner_isolate_id, req->owner_stub_handle);
+		resp->status = (r < 0) ? (uint32_t)(-r) : EIO;
+		return 0;
+	}
+
+	/* 2. Importer stub PRIME_FD_TO_HANDLEs it into a local GEM. */
+	uint32_t gem = 0;
+	r = nvkvm_isolate_xiso_import(&nv->isolates, req->importer_isolate_id,
+				      req->importer_handle_id, dmabuf_fd, &gem);
+	close(dmabuf_fd);
+	if (r < 0) {
+		NVKVM_DBG("nvkvm xiso: importer import rc=%d iso=%u\n",
+			  r, req->importer_isolate_id);
+		resp->status = (uint32_t)(-r);
+		return 0;
+	}
+	NVKVM_DBG("nvkvm xiso: owner(iso=%u gem=0x%x) -> importer(iso=%u) gem=0x%x\n",
+		  req->owner_isolate_id, req->owner_stub_handle,
+		  req->importer_isolate_id, gem);
+	resp->gem_handle = gem;
+	resp->status = 0;
+	return 0;
 }
 
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
@@ -2196,6 +2426,9 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 					       &host_va, &out_len,
 					       &token, &rm_status);
 	if (ret < 0 || host_va == 0) {
+		/* FF-3 (security_audit_2026_06_01): free the window extent on the
+		 * error path — otherwise every failed realize leaks GPA space. */
+		nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 		resp->status    = (uint32_t)-ret;
 		resp->rm_status = rm_status;
 		return 0;
@@ -2203,6 +2436,7 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	if (rm_status != 0) {
 		/* Kernel rejected the intent — host_va may still be set if the
 		 * mmap succeeded but a later step failed.  Treat as failure. */
+		nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);   /* FF-3: no leak on error */
 		resp->rm_status = rm_status;
 		resp->status    = (uint32_t)-EIO;
 		return 0;
@@ -2212,6 +2446,16 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	 * invalid as a QEMU KVM userspace_addr.  See security-fixes commit.
 	 * Master masked this via slot=1100 > KVM cap (install failed). */
 	(void)host_va;
+
+	/* FF-3 (security_audit_2026_06_01): record the realize extent in
+	 * iso_mmap_tbl so the #80 kill-reaper reclaims its GPA-window space when
+	 * the isolate dies.  It rides the sparse window's pre-installed memslot
+	 * (IN_WINDOW_SLOT) and has no standalone QEMU qva, so the reaper's
+	 * in-window branch simply sparse_gpa_free()s it — no munmap/slot touch.
+	 * Previously this allocation was never tracked or freed → unprivileged
+	 * guest realize churn exhausted the 128 GiB window (VM-wide GPU DoS). */
+	(void)iso_mmap_alloc(req->isolate_id, gpa, /*qva=*/NULL, (size_t)len,
+			     NVKVM_IN_WINDOW_SLOT, gpa, /*stub_mirrored=*/false);
 
 	resp->gpa_base      = gpa;
 	resp->length        = len;

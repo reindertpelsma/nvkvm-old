@@ -51,6 +51,11 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x00000d01u,
 	0x00000d04u,
 	0x00410110u,
+	0x00800201u,	/* NV0080_CTRL_CMD_GPU_GET_CLASSLIST — read-only class
+			 * enumeration (NvU32List, marshalled by the info-list path).
+			 * Enables NVENC engine discovery (libnvidia-encode); nvproxy
+			 * maps it ctrlGetNvU32List/compUtil. Benign OUT-only list, no
+			 * host/cross-VM escape. */
 	0x00800280u,
 	0x00800288u,
 	0x00800289u,
@@ -58,9 +63,13 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x0080028eu,
 	0x00800292u,
 	0x00800294u,
+	0x00801109u,	/* NV0080_CTRL_CMD_GR_GET_CAPS_V2 — inline caps (rmControlSimple);
+			 * NVENC engine-caps query. CapGraphics|CapVideo in nvproxy. */
 	0x00801307u,
 	0x00801402u,
 	0x0080170du,
+	0x00801713u,	/* NV0080_CTRL_CMD_FIFO_GET_CAPS_V2 — inline caps (rmControlSimple);
+			 * NVENC engine-caps query. CapVideo in nvproxy. */
 	0x00801806u,
 	0x0080180du,
 	0x00801909u,
@@ -85,6 +94,8 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x2080014bu,
 	0x20800156u,
 	0x20800157u,
+	0x2080016cu,	/* NV2080_CTRL_CMD_GPU_GET_ENCODER_CAPACITY — inline (rmControlSimple);
+			 * NVENC InitializeEncoder query. CapVideo in nvproxy. */
 	0x20800170u,
 	0x2080018bu,
 	0x2080018du,
@@ -164,6 +175,18 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	 * no reg-ops/HWPM/debug/fabric. */
 	0x00000301u,
 	0x00003d05u,
+	/*
+	 * #110 dma-buf import: NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD —
+	 * the counterpart of EXPORT_OBJECT_TO_FD (0x3d05, already allowed).
+	 * NVIDIA's EGL re-imports a render/scanout bo's exported memory object
+	 * into its own RM client (via an nv-export fd) when a compositor capture
+	 * or PRIME re-import happens.  The embedded fd is guest→handle_id
+	 * translated (guest) and handle_id→stub-local-fd (stub); no guest VA or
+	 * host fd ever crosses the boundary.  Same resource class as the export
+	 * it pairs with — RmImportObject dups an existing memory object the stub
+	 * already owns into the caller's client (intra-stub, accounted to the
+	 * stub).  No reg-ops/HWPM/display. */
+	0x00003d06u,
 	0x00730101u,
 	0x00801102u, /* NV0080 device controls */
 	0x00801104u,

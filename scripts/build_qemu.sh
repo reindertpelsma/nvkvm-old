@@ -36,7 +36,12 @@ apt-get install -y \
     git \
     libslirp-dev \
     pkg-config \
-    libattr1-dev
+    libattr1-dev \
+    `# modeset present path (#102): OpenGL + headless EGL scanout` \
+    libepoxy-dev \
+    libgbm-dev \
+    libegl-dev \
+    libdrm-dev
 
 # ── 2. Clone QEMU 9.2 stable ──────────────────────────────────────────────
 if [ ! -d "$QEMU_SRC" ]; then
@@ -111,6 +116,11 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
   'nvkvm_frontend.c',
   'nvkvm_objects.c',
   'nvkvm_mmap_host.c',
+  'nvkvm_handle.c',
+  'nvkvm_isolate.c',
+  'nvkvm_isolate_handlers.c',
+  'nvkvm_tables.c',
+  'nvkvm_present_egl.c',
 ))
 """
 
@@ -174,7 +184,11 @@ cd "$QEMU_SRC"
     --disable-werror \
     --disable-sdl \
     --disable-gtk \
-    --disable-opengl \
+    --enable-opengl \
+    `# opengl pulls in the egl-headless display + dpy_gl_scanout_dmabuf, the` \
+    `# host-aligned present path (#102). virglrenderer stays off — the nvkvm` \
+    `# present path scans out the guest render target's own dma-buf directly,` \
+    `# it does not use virtio-gpu GL virgl.` \
     --disable-virglrenderer \
     --disable-vnc \
     --prefix="$QEMU_PREFIX"

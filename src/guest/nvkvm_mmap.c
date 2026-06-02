@@ -20,6 +20,7 @@
  * could abuse this, but we are not defending against the hypervisor.
  */
 
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/sizes.h>
@@ -30,6 +31,8 @@
 #include <linux/highmem.h>
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
+#include <linux/pgtable.h>
+#include <asm/pgtable_types.h>
 
 #include "nvkvm.h"
 
@@ -37,6 +40,73 @@
 static void nvkvm_vma_open(struct vm_area_struct *vma);
 static void nvkvm_vma_close(struct vm_area_struct *vma);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
+
+/*
+ * nvkvm_force_range_wb — rewrite the leaf PTEs covering [start,end) to
+ * write-back caching.
+ *
+ * Our GPA window is exposed to the guest as a prefetchable PCI BAR — a
+ * non-System-RAM region.  remap_pfn_range() therefore routes through x86
+ * track_pfn_remap()/reserve_pfn_range(), which SILENTLY downgrades the WB
+ * pgprot we request to UC- (PAT index 2) because the range isn't RAM and the
+ * MTRR over it isn't uniformly write-back.  On an Intel host this was masked:
+ * KVM's EPT sets the IPAT bit and forces WB for any struct-page memslot
+ * regardless of the guest PTE.  On an AMD host (NPT honors the guest PTE
+ * memtype) the UC- sticks, and CPU access to these cache-coherent,
+ * memfd-backed window pages runs ~100x slow (measured 0.12 GB/s vs 14 GB/s on
+ * an EPYC 7K62 / RTX 3060).  The pages are genuine write-back RAM (a host
+ * memfd; the GPU's DMA snoops the CPU cache), so WB is correct and coherent —
+ * see the cacheability discussion in nvkvm_mmap_request_isolate() and the
+ * migrate path.  Rewrite the PAT bits directly: PAT index 0 == WB on Linux's
+ * PAT MSR, i.e. clear PCD/PWT (and the PAT bit) on the leaf entry.
+ *
+ * No TLB flush is needed: callers invoke this on PTEs that remap_pfn_range()
+ * has just created for a VMA being set up inside the mmap/ioctl syscall (the
+ * range was freshly mapped, after a zap in the migrate path), before userspace
+ * can have touched — and thus TLB-cached — them.  Callers must hold mmap lock.
+ */
+static void nvkvm_force_range_wb(struct mm_struct *mm,
+				 unsigned long start, unsigned long end)
+{
+	unsigned long a;
+
+	for (a = start; a < end; a += PAGE_SIZE) {
+		pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
+		unsigned long v;
+
+		pgd = pgd_offset(mm, a);
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			continue;
+		p4d = p4d_offset(pgd, a);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			continue;
+		pud = pud_offset(p4d, a);
+		if (pud_none(*pud))
+			continue;
+		if (pud_large(*pud)) {
+			v = pud_val(*pud);
+			set_pud(pud, __pud(v & ~(_PAGE_PCD | _PAGE_PWT |
+						 _PAGE_PAT_LARGE)));
+			a = ALIGN_DOWN(a, PUD_SIZE) + PUD_SIZE - PAGE_SIZE;
+			continue;
+		}
+		pmd = pmd_offset(pud, a);
+		if (pmd_none(*pmd))
+			continue;
+		if (pmd_large(*pmd)) {
+			v = pmd_val(*pmd);
+			set_pmd(pmd, __pmd(v & ~(_PAGE_PCD | _PAGE_PWT |
+						 _PAGE_PAT_LARGE)));
+			a = ALIGN_DOWN(a, PMD_SIZE) + PMD_SIZE - PAGE_SIZE;
+			continue;
+		}
+		pte = pte_offset_kernel(pmd, a);
+		v = pte_val(*pte);
+		if (!(v & _PAGE_PRESENT))
+			continue;
+		set_pte(pte, __pte(v & ~(_PAGE_PCD | _PAGE_PWT | _PAGE_PAT)));
+	}
+}
 
 
 const struct vm_operations_struct nvkvm_vm_ops = {
@@ -101,8 +171,24 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 		return -EIO;
 	}
 
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	/*
+	 * Cacheability by device class.  nvidiactl/nvidia-uvm mmaps are pinned
+	 * SYSTEM memory (the host backs them as WB RAM memslots; smaps shows no
+	 * VM_IO) — they must be WB-cached, or the CPU reads them uncached.  The
+	 * channel completion semaphore lives here; mapping it write-combining
+	 * made cuCtxSynchronize's poll an uncached read (~3us vs ~0.36us host,
+	 * 8.9x), serializing decode and starving the GPU (0-5% util).  On x86 the
+	 * guest-WB / host-WB / GPU-DMA views of the same memfd are cache-coherent
+	 * (DMA snoops), so WB is correct.  nvidia0/DRM/modeset mmaps are real
+	 * BAR/MMIO (VM_IO) and MUST stay write-combining — a WB mapping of the
+	 * doorbell BAR would leave the ring store in cache and never reach the
+	 * device (decode would hang).
+	 */
+	if (ctx->dev_id == NVKVM_DEV_CTL || ctx->dev_id == NVKVM_DEV_UVM)
+		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	else
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
 	ret = remap_pfn_range(vma, vma->vm_start,
 			      (unsigned long)(gpa_base >> PAGE_SHIFT),
@@ -129,6 +215,17 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 		}
 		return ret;
 	}
+
+	/*
+	 * WB-intended mappings (nvidiactl/nvidia-uvm SYSTEM memory) are silently
+	 * downgraded to UC- by x86's PCI-BAR pfn tracking inside remap_pfn_range
+	 * (see nvkvm_force_range_wb).  Force the freshly mapped PTEs back to WB so
+	 * CPU access to the cache-coherent window pages runs at RAM speed.  The
+	 * write-combining branch is left as-is — WC is honored as-requested and is
+	 * required for the doorbell/ring BAR pages.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_CTL || ctx->dev_id == NVKVM_DEV_UVM)
+		nvkvm_force_range_wb(vma->vm_mm, vma->vm_start, vma->vm_end);
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);
 	if (!region)
@@ -533,7 +630,10 @@ void nvkvm_cpu_pages_writeback(struct nvkvm_fd_ctx *ctx)
 
 	mutex_lock(&ctx->cpu_pages_lock);
 	list_for_each_entry(cp, &ctx->cpu_pages, list) {
-		if (!(cp->prot & PROT_WRITE) || n >= NVKVM_WB_BATCH)
+		/* Range entries (bulk migrate) have page==NULL: the guest VMA is
+		 * remapped to the memfd GPA, so it reads the GPU's writes directly
+		 * — no per-page writeback, and no page to deref. */
+		if (!cp->page || !(cp->prot & PROT_WRITE) || n >= NVKVM_WB_BATCH)
 			continue;
 		get_page(cp->page);
 		batch[n].handle_id = cp->handle_id;
@@ -586,7 +686,8 @@ void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx)
 							     isolate_id);
 		}
 		nvkvm_virtio_close_handle(cp->handle_id);
-		put_page(cp->page);
+		if (cp->page)            /* range entries are page==NULL */
+			put_page(cp->page);
 		list_del(&cp->list);
 		kfree(cp);
 	}
@@ -666,91 +767,219 @@ bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len)
  * so the kernel pin_user_pages call on the stub's task finds the same
  * physical pages libcuda is writing to in the guest.
  */
+/*
+ * Bulk migration chunk size.  Each chunk = ONE memfd + ONE mmap_on_isolate +
+ * ONE remap_pfn_range (vs the old per-4KB-page path: ~5 forwarded round-trips
+ * EACH — measured 2.44s for a 16MB OS_DESCRIPTOR).  Chunking (rather than one
+ * memfd for the whole range) bounds the transient memory: during migration the
+ * data lives in BOTH the pinned guest pages AND the memfd, so a multi-GB single
+ * memfd would need ~2x the RAM.  2MB amortizes the ~4 fixed per-chunk forwards
+ * over 512 pages (negligible) while keeping the in-flight memfd small.
+ */
+#define NVKVM_MIG_CHUNK   (2UL << 20)
+#define NVKVM_MIG_MAXCHK  8          /* 16MB cap / 2MB = 8 chunks max */
+
 int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 				  __u64 gva, __u64 len, unsigned long prot)
 {
 	unsigned long start = (unsigned long)gva & PAGE_MASK;
 	unsigned long end   = ((unsigned long)gva + len + PAGE_SIZE - 1) &
 			      PAGE_MASK;
-	unsigned long off;
+	unsigned long range_len, npages, coff;
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
-	int ret;
+	struct page **pages = NULL;
+	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
+	size_t slot_bytes = nvkvm.slot_size;
+	struct nvkvm_cpu_page *cpdup;
+	long got = 0;
+	int ret = 0, nck = 0, i;
+	struct { unsigned long base, clen; __u64 gpa; __u32 handle, token; }
+		ck[NVKVM_MIG_MAXCHK];
+	ktime_t _t0 = ktime_get();   /* DIAG */
 
 	if (!len)
 		return 0;
-	if (end < start)   /* overflow */
+	if (end < start)                  /* overflow */
 		return -EINVAL;
-	if (end - start > (16ULL << 20))   /* sanity: 16 MB max per call */
+	if (end - start > (16ULL << 20))  /* sanity: 16 MB max per call */
 		return -E2BIG;
+	if (!isolate_id)
+		return -ENOENT;
+	if (slot_bytes < PAGE_SIZE)
+		return -ENOMEM;
 
-	/*
-	 * Step 1: per-page migrate.  Pin each guest anon page, ship its
-	 * content into a memfd in QEMU, MAP_FIXED the memfd at the same
-	 * VA in the stub's mm, and record the (gva, gpa) in ctx->cpu_pages.
-	 * Pages already migrated are no-ops.  No VMA mutation in the guest
-	 * yet — that has to wait until every page has been gup'd, otherwise
-	 * the first VM_PFNMAP toggle would block gup_fast on the remainder.
-	 */
-	for (off = start; off < end; off += PAGE_SIZE) {
-		ret = nvkvm_cpu_page_migrate(ctx, off, prot);
-		if (ret) {
-			pr_warn("nvkvm: migrate_range pin gva=0x%lx ret=%d\n",
-				off, ret);
-			return ret;
-		}
+	/* Dedup: if the start page is already migrated (range re-registered),
+	 * the VMA is already VM_PFNMAP and gup would fail — treat as done. */
+	mutex_lock(&ctx->cpu_pages_lock);
+	list_for_each_entry(cpdup, &ctx->cpu_pages, list)
+		if (cpdup->gva == start) { mutex_unlock(&ctx->cpu_pages_lock); return 0; }
+	mutex_unlock(&ctx->cpu_pages_lock);
+
+	/* A new registration changes the set of valid ranges — drop any cached
+	 * VALIDATE results so a stale "valid" can't survive a free+remap. */
+	nvkvm_session_vcache_clear(ctx->session);
+
+	range_len = end - start;
+	npages    = range_len >> PAGE_SHIFT;
+
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		return -ENOMEM;
+
+	/* Pin every page up front — BEFORE any VMA mutation, so a later
+	 * VM_PFNMAP toggle can't break gup_fast on the remainder. */
+	while (got < npages) {
+		long n = get_user_pages_fast(start + (got << PAGE_SHIFT),
+					     npages - got, FOLL_WRITE, pages + got);
+		if (n <= 0) { ret = (n < 0) ? (int)n : -EFAULT; goto err_unpin; }
+		got += n;
 	}
 
-	/*
-	 * Step 2: single VMA swap.  Drop the anonymous PTEs in [start, end),
-	 * mark the VMA VM_PFNMAP|VM_IO, and remap each page onto its memfd-
-	 * backed GPA in our mmap window.  After this libcuda writes hit the
-	 * memfd, which the stub already has mapped at the same VA via the
-	 * step-1 MAP_FIXED — single physical backing across both processes
-	 * and across the host kernel's pin_user_pages on the stub's mm.
-	 */
+	/* Phase 1: one memfd + batched upload + copy + mmap per chunk.  No VMA
+	 * mutation yet. */
+	for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
+		unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
+					 range_len - coff);
+		__u32 handle = 0, token = 0;
+		__u64 gpa = 0;
+		unsigned long uoff;
+
+		if (nck >= NVKVM_MIG_MAXCHK) { ret = -E2BIG; goto err_handles; }
+
+		ret = nvkvm_virtio_open_memory_handle(
+			(unsigned int)ctx->session->id, clen, &handle);
+		if (ret)
+			goto err_handles;
+
+		/* Upload clen bytes in slot-sized batches (one forward per slot,
+		 * vs one per 4KB page in the old path). */
+		for (uoff = 0; uoff < clen; uoff += slot_bytes) {
+			unsigned long this = min((unsigned long)slot_bytes,
+						 clen - uoff);
+			unsigned long p;
+			int slot = nvkvm_slot_alloc(&nvkvm);
+			void *sp;
+
+			if (slot < 0) { ret = -ENOSPC; goto chunk_fail; }
+			sp = nvkvm_slot_addr(&nvkvm, slot);
+			if (!sp) { nvkvm_slot_free(&nvkvm, slot); ret = -ENOMEM; goto chunk_fail; }
+			for (p = 0; p < this; p += PAGE_SIZE) {
+				unsigned long pidx = (coff + uoff + p) >> PAGE_SHIFT;
+				void *ka = kmap_local_page(pages[pidx]);
+				memcpy((char *)sp + p, ka, PAGE_SIZE);
+				kunmap_local(ka);
+			}
+			wmb();
+			ret = nvkvm_virtio_write_memory_handle(handle, uoff, slot,
+							       (__u32)this);
+			nvkvm_slot_free(&nvkvm, slot);
+			if (ret) goto chunk_fail;
+			continue;
+chunk_fail:
+			nvkvm_virtio_close_handle(handle);
+			goto err_handles;
+		}
+
+		ret = nvkvm_virtio_copy_handle_to_isolate(handle, isolate_id);
+		if (ret) { nvkvm_virtio_close_handle(handle); goto err_handles; }
+
+		ret = nvkvm_virtio_mmap_on_isolate(isolate_id, handle,
+						   start + coff, 0, clen,
+						   (__u32)prot, MAP_SHARED,
+						   (unsigned int)ctx->session->id,
+						   &gpa, &token);
+		if (ret) {
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			nvkvm_virtio_close_handle(handle);
+			goto err_handles;
+		}
+		if (!nvkvm_gpa_in_mmap_window(gpa, clen)) {
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			nvkvm_virtio_close_handle(handle);
+			ret = -EIO; goto err_handles;
+		}
+		ck[nck].base = start + coff; ck[nck].clen = clen;
+		ck[nck].gpa = gpa; ck[nck].handle = handle; ck[nck].token = token;
+		nck++;
+	}
+
+	/* Phase 2: ONE VMA swap — zap the whole range, mark PFNMAP, remap each
+	 * chunk's contiguous GPA.  After this libcuda reads/writes the memfd via
+	 * the GPA window directly (the stub maps the same memfd) — no per-page
+	 * writeback needed. */
 	mmap_write_lock(mm);
 	vma = find_vma(mm, start);
 	if (!vma || vma->vm_start > start || vma->vm_end < end) {
 		mmap_write_unlock(mm);
-		pr_warn("nvkvm: migrate_range no VMA covering [%lx, %lx)\n",
-			start, end);
-		return -EFAULT;
+		ret = -EFAULT; goto err_handles;
 	}
-
-	zap_page_range_single(vma, start, end - start, NULL);
+	zap_page_range_single(vma, start, range_len, NULL);
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-
-	for (off = start; off < end; off += PAGE_SIZE) {
-		struct nvkvm_cpu_page *cp;
-		__u64 page_gpa = 0;
-
-		mutex_lock(&ctx->cpu_pages_lock);
-		list_for_each_entry(cp, &ctx->cpu_pages, list) {
-			if (cp->gva == off) {
-				page_gpa = cp->gpa;
-				break;
-			}
-		}
-		mutex_unlock(&ctx->cpu_pages_lock);
-		if (!page_gpa) {
-			mmap_write_unlock(mm);
-			pr_warn("nvkvm: migrate_range no GPA for gva=0x%lx\n",
-				off);
-			return -EFAULT;
-		}
-
-		ret = remap_pfn_range(vma, off,
-				      (unsigned long)(page_gpa >> PAGE_SHIFT),
-				      PAGE_SIZE, vma->vm_page_prot);
-		if (ret) {
-			mmap_write_unlock(mm);
-			pr_warn("nvkvm: migrate_range remap_pfn_range gva=0x%lx gpa=0x%llx ret=%d\n",
-				off, page_gpa, ret);
-			return ret;
-		}
+	/*
+	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
+	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
+	 * On x86 the guest's WB view, the stub's WB view of the same memfd, and
+	 * the GPU's DMA are all cache-coherent (DMA snoops), so WB is correct.
+	 * Mapping it UC made the guest's post-DtoH read of the result a stream of
+	 * uncached, unprefetched loads — measured 0.07 GB/s vs 9.6 GB/s on the
+	 * host (130x).  HtoD was unaffected because the guest fills the buffer
+	 * while it is still cached anon memory (before this swap) and the stub
+	 * then reads the memfd as host RAM — the guest never reads through the
+	 * window on HtoD.  Leaving vm_page_prot at its default keeps it WB.
+	 *
+	 * NB: requesting WB here is necessary but NOT sufficient — because the GPA
+	 * window is a PCI-BAR (non-RAM) region, remap_pfn_range silently downgrades
+	 * the PTEs to UC-.  On Intel the EPT IPAT bit hid this; on AMD it does not,
+	 * so we rewrite the PTEs to WB with nvkvm_force_range_wb() after the remap.
+	 */
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	for (i = 0; i < nck; i++) {
+		ret = remap_pfn_range(vma, ck[i].base,
+				      (unsigned long)(ck[i].gpa >> PAGE_SHIFT),
+				      ck[i].clen, vma->vm_page_prot);
+		if (ret) { mmap_write_unlock(mm); goto err_handles; }
 	}
+	nvkvm_force_range_wb(mm, start, end);
 	mmap_write_unlock(mm);
+
+	/* The VMA now points at the GPAs (memfds); release the original anon
+	 * page pins. */
+	for (i = 0; i < got; i++)
+		put_page(pages[i]);
+	kvfree(pages);
+
+	/* Track one range entry per chunk (page==NULL → no writeback, no
+	 * put_page at cleanup; munmap_on_isolate(token)+close_handle suffice). */
+	for (i = 0; i < nck; i++) {
+		struct nvkvm_cpu_page *cp = kzalloc(sizeof(*cp), GFP_KERNEL);
+		if (!cp)
+			continue;   /* mapping live; accept tracking leak */
+		cp->page       = NULL;
+		cp->gva        = ck[i].base;
+		cp->gpa        = ck[i].gpa;
+		cp->handle_id  = ck[i].handle;
+		cp->mmap_token = ck[i].token;
+		cp->prot       = (__u32)prot;
+		mutex_lock(&ctx->cpu_pages_lock);
+		list_add_tail(&cp->list, &ctx->cpu_pages);
+		mutex_unlock(&ctx->cpu_pages_lock);
+	}
+	pr_info("nvkvm DIAG: migrate_range(bulk) %lu pages, %d chunks in %lld us\n",
+		npages, nck, ktime_to_us(ktime_sub(ktime_get(), _t0)));
 	return 0;
+
+err_handles:
+	for (i = 0; i < nck; i++) {
+		nvkvm_virtio_munmap_on_isolate(isolate_id, ck[i].token);
+		nvkvm_virtio_close_handle_on_isolate(ck[i].handle, isolate_id);
+		nvkvm_virtio_close_handle(ck[i].handle);
+	}
+err_unpin:
+	for (i = 0; i < got; i++)
+		put_page(pages[i]);
+	kvfree(pages);
+	pr_warn("nvkvm: migrate_range(bulk) failed ret=%d at chunk %d\n", ret, nck);
+	return ret;
 }

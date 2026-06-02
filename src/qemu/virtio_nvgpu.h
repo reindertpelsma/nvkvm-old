@@ -30,6 +30,25 @@
 #ifndef VIRTIO_NVGPU_H
 #define VIRTIO_NVGPU_H
 
+/*
+ * NVKVM_QEMU_GRAPHICS — compile-time graphics/display gate (default 1).
+ *
+ *   1 (default): full backend — DRM render node forwarding, NVKMS, and the
+ *                host present/EGL path are built in; per-VM availability is
+ *                still chosen at runtime via the `graphics=on|off` device prop.
+ *   0          : compute-only build, like gVisor's nvproxy. The graphics= prop
+ *                is forced off (all runtime graphics gates fire) AND the host
+ *                EGL present code (nvkvm_present_egl.c) is compiled out, so the
+ *                binary carries no display attack surface. This is the QEMU twin
+ *                of the guest module's `make NVKVM_GRAPHICS=0` build; deploy the
+ *                two consistently.
+ *
+ * Override at build time with -DNVKVM_QEMU_GRAPHICS=0.
+ */
+#ifndef NVKVM_QEMU_GRAPHICS
+#define NVKVM_QEMU_GRAPHICS 1
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
@@ -298,6 +317,15 @@ typedef struct VirtIONvgpu {
 	uint32_t            admin_hclient;
 	uint32_t            admin_hsubdev;
 	int                 admin_state;    /* 0 untried, 1 ready, -1 failed   */
+
+	/*
+	 * #102 present-to-window: opaque NvkvmPresent context (QemuConsole +
+	 * pending-frame slot + dual GL/readback path).  Allocated at realize
+	 * when graphics is on; owned by nvkvm_present_egl.c.  NULL in the
+	 * compute-only build or when graphics=off.  void* so this header stays
+	 * free of ui/console.h.
+	 */
+	void               *present_ctx;
 } VirtIONvgpu;
 
 #define TYPE_VIRTIO_NVGPU  "virtio-nvgpu-device"
@@ -351,6 +379,12 @@ int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
 int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
 				  struct nvkvm_req_open_nvidia_handle *req,
 				  struct nvkvm_resp_open_nvidia_handle *resp);
+int nvkvm_req_present(VirtIONvgpu *nv,
+		      struct nvkvm_req_present *req,
+		      struct nvkvm_resp_present *resp);
+int nvkvm_req_xiso_import(VirtIONvgpu *nv,
+			  struct nvkvm_req_xiso_import *req,
+			  struct nvkvm_resp_xiso_import *resp);
 int nvkvm_req_open_memory_handle(VirtIONvgpu *nv,
 				  struct nvkvm_req_open_memory_handle *req,
 				  struct nvkvm_resp_open_memory_handle *resp);
@@ -366,6 +400,12 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 int nvkvm_req_interrupt(VirtIONvgpu *nv,
 			struct nvkvm_req_interrupt *req,
 			struct nvkvm_resp_interrupt *resp);
+int nvkvm_req_setup_ring(VirtIONvgpu *nv,
+			 struct nvkvm_req_setup_ring *req,
+			 struct nvkvm_resp_setup_ring *resp);
+int nvkvm_req_enter_loop(VirtIONvgpu *nv,
+			 struct nvkvm_req_enter_loop *req,
+			 struct nvkvm_resp_enter_loop *resp);
 int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,
 				      struct nvkvm_req_copy_handle_to_isolate *req,
 				      struct nvkvm_resp_copy_handle_to_isolate *resp);

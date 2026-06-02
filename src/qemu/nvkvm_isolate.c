@@ -243,6 +243,7 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 #include "virtio_nvgpu.h"
 
 #include "../../src/common/nvkvm_isolate_proto.h"
+#include "../../src/common/nvkvm_ring.h"
 
 #ifdef NVKVM_STUB_EMBEDDED
 #include "nvkvm_stub_bin.h"
@@ -369,7 +370,9 @@ static void reader_signal_sync(struct nvkvm_isolate *iso, int err,
 	iso->sync_error       = err;
 	iso->sync_mmap_retval = mmap_retval;
 	iso->sync_done        = true;
-	pthread_cond_signal(&iso->sync_cond);
+	/* F-5: broadcast (not signal) so a stale ENTER_LOOP waiter on a reused
+	 * slot and a fresh waiter both re-evaluate their identity predicate. */
+	pthread_cond_broadcast(&iso->sync_cond);
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
@@ -382,6 +385,17 @@ static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
 	iso->sync_done     = true;
 	pthread_cond_signal(&iso->sync_cond);
 	pthread_mutex_unlock(&iso->sync_lock);
+}
+
+/* PRESENT_EXPORT (#106): dedicated slot, carries the dma-buf SCM_RIGHTS fd. */
+static void reader_signal_present(struct nvkvm_isolate *iso, int err, int fd)
+{
+	pthread_mutex_lock(&iso->present_sync_lock);
+	iso->present_err  = err;
+	iso->present_fd   = fd;
+	iso->present_done = true;
+	pthread_cond_signal(&iso->present_cond);
+	pthread_mutex_unlock(&iso->present_sync_lock);
 }
 
 static void *isolate_reader_fn(void *arg)
@@ -397,6 +411,10 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_poll_event      poll_event;
 		struct isolate_resp_open_device     open_dev;
 		struct isolate_resp_realize_uvm     realize;
+		struct isolate_resp_ring_ready      ring_ready;
+		struct isolate_resp_loop_exited     loop_exited;
+		struct isolate_resp_present_export  present_export;
+		struct isolate_resp_xiso_import     xiso_import;
 	} u;
 
 	for (;;) {
@@ -427,7 +445,8 @@ static void *isolate_reader_fn(void *arg)
 		 * any received fd on every non-OPEN_DEVICE response.  (cmsg_buf is
 		 * one-fd-sized, so the kernel already closed any truncated extras.)
 		 */
-		if (u.type != ISOLATE_RESP_OPEN_DEVICE) {
+		if (u.type != ISOLATE_RESP_OPEN_DEVICE &&
+		    u.type != ISOLATE_RESP_PRESENT_EXPORT) {
 			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
 			     cm = CMSG_NXTHDR(&msg, cm)) {
 				if (cm->cmsg_level == SOL_SOCKET &&
@@ -548,6 +567,26 @@ static void *isolate_reader_fn(void *arg)
 			break;
 		}
 
+		case ISOLATE_RESP_RING_READY: {
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_ring_probe = u.ring_ready.probe_seen;
+			iso->sync_error      = u.ring_ready.error;
+			iso->sync_done       = true;
+			pthread_cond_signal(&iso->sync_cond);
+			pthread_mutex_unlock(&iso->sync_lock);
+			break;
+		}
+
+		case ISOLATE_RESP_LOOP_EXITED: {
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_loop_head = u.loop_exited.head;
+			iso->sync_error     = u.loop_exited.error;
+			iso->sync_done      = true;
+			pthread_cond_signal(&iso->sync_cond);
+			pthread_mutex_unlock(&iso->sync_lock);
+			break;
+		}
+
 		case ISOLATE_RESP_OPEN_DEVICE: {
 			int got_fd = -1;
 			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
@@ -566,6 +605,35 @@ static void *isolate_reader_fn(void *arg)
 				got_fd = -1;
 			}
 			reader_signal_sync_open(iso, err, got_fd);
+			break;
+		}
+
+		case ISOLATE_RESP_PRESENT_EXPORT: {
+			int got_fd = -1;
+			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+			     cm; cm = CMSG_NXTHDR(&msg, cm)) {
+				if (cm->cmsg_level == SOL_SOCKET &&
+				    cm->cmsg_type  == SCM_RIGHTS &&
+				    cm->cmsg_len   == CMSG_LEN(sizeof(int))) {
+					memcpy(&got_fd, CMSG_DATA(cm), sizeof(int));
+				}
+			}
+			int err = u.present_export.retval;
+			if (err && got_fd >= 0) {
+				close(got_fd);
+				got_fd = -1;
+			}
+			reader_signal_present(iso, err, got_fd);
+			break;
+		}
+
+		case ISOLATE_RESP_XISO_IMPORT: {
+			pthread_mutex_lock(&iso->xiso_sync_lock);
+			iso->xiso_err  = u.xiso_import.retval;
+			iso->xiso_gem  = u.xiso_import.gem_handle;
+			iso->xiso_done = true;
+			pthread_cond_signal(&iso->xiso_cond);
+			pthread_mutex_unlock(&iso->xiso_sync_lock);
 			break;
 		}
 
@@ -591,6 +659,8 @@ reader_exit:
 
 	/* Wake any pending sync command too. */
 	reader_signal_sync(iso, -ECONNRESET, 0);
+	/* …and any pending present-export waiter (dedicated slot, #106). */
+	reader_signal_present(iso, -ECONNRESET, -1);
 
 	return NULL;
 }
@@ -609,6 +679,13 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 		pthread_mutex_init(&iso->write_lock, NULL);
 		pthread_mutex_init(&iso->sync_lock,  NULL);
 		pthread_cond_init(&iso->sync_cond,   NULL);
+		pthread_mutex_init(&iso->present_lock,      NULL);
+		pthread_mutex_init(&iso->present_sync_lock, NULL);
+		pthread_cond_init(&iso->present_cond,       NULL);
+		pthread_mutex_init(&iso->xiso_lock,         NULL);
+		pthread_mutex_init(&iso->xiso_sync_lock,    NULL);
+		pthread_cond_init(&iso->xiso_cond,          NULL);
+		iso->present_fd = -1;
 	}
 }
 
@@ -622,6 +699,12 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 		pthread_mutex_destroy(&iso->write_lock);
 		pthread_mutex_destroy(&iso->sync_lock);
 		pthread_cond_destroy(&iso->sync_cond);
+		pthread_mutex_destroy(&iso->present_lock);
+		pthread_mutex_destroy(&iso->present_sync_lock);
+		pthread_cond_destroy(&iso->present_cond);
+		pthread_mutex_destroy(&iso->xiso_lock);
+		pthread_mutex_destroy(&iso->xiso_sync_lock);
+		pthread_cond_destroy(&iso->xiso_cond);
 	}
 	pthread_mutex_destroy(&t->lock);
 }
@@ -643,9 +726,19 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->sock_fd      = -1;
 			iso->pending_head = NULL;
 			iso->next_txn_id  = 1;
-			iso->sync_done    = false;
+			/* F-5 (security_audit_2026_06_01): do NOT reset sync_done here.
+			 * Every sync op resets it under sync_lock before its own wait;
+			 * resetting it here under iso->lock is a cross-lock data race that
+			 * can re-park a stale ENTER_LOOP waiter from a just-killed slot. */
 			iso->sync_open_fd = -1;
 			iso->reader_started = false;
+			iso->ring_memfd   = -1;
+			iso->ring_qva     = NULL;
+			iso->ring_region_size = 0;
+			iso->ring_bytes   = 0;
+			iso->ring_gpa     = 0;
+			iso->ring_kvm_slot = -1;
+			iso->ring_ready   = false;
 			*id_out = id;
 			return iso;
 		}
@@ -657,11 +750,17 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 
 int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 uint32_t session_id,
+			 void *nv,
 			 uint32_t *isolate_id_out)
 {
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
 		return -errno;
+
+	/* Remember the owning device so ring setup/teardown can use the sparse
+	 * GPA window allocator (idempotent — same nv every call). */
+	if (nv)
+		t->nv = nv;
 
 	pthread_mutex_lock(&t->lock);
 	uint32_t id;
@@ -725,6 +824,22 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				close(mfd);
 				mfd = 3;
 			}
+			/* F-6 (security_audit_2026_06_01): don't let the stub inherit
+			 * QEMU's stdout/stderr — a compromised stub could write attacker
+			 * bytes into the host terminal / log / supervisor pipe. Redirect
+			 * 1,2 to /dev/null (opened here, before the mount-ns pivot, while
+			 * /dev/null still resolves). Keep stdio only under NVKVM_STUB_DEBUG=1. */
+			{
+				const char *dbg = getenv("NVKVM_STUB_DEBUG");
+				if (!(dbg && *dbg == '1')) {
+					int dn = open("/dev/null", O_RDWR);
+					if (dn >= 0) {
+						dup2(dn, STDOUT_FILENO);
+						dup2(dn, STDERR_FILENO);
+						if (dn > 3) close(dn);
+					}
+				}
+			}
 			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
 			if (harden && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -768,6 +883,17 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				dup2(binfd, 3);
 				close(binfd);
 				binfd = 3;
+			}
+			/* F-6: redirect the stub's stdout/stderr to /dev/null so a
+			 * compromised stub can't spoof into QEMU's inherited host
+			 * terminal/log. keep_env (NVKVM_STUB_DEBUG=1) keeps stdio too. */
+			if (!keep_env) {
+				int dn = open("/dev/null", O_RDWR);
+				if (dn >= 0) {
+					dup2(dn, STDOUT_FILENO);
+					dup2(dn, STDERR_FILENO);
+					if (dn > 3) close(dn);
+				}
 			}
 			if (harden && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -827,6 +953,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	}
 	iso->reader_started = true;
 
+	/*
+	 * Set up the command-buffer ring (docs/design/command_buffer.md).
+	 * Pure optimisation: failure is logged and ignored — the isolate keeps
+	 * serving every ioctl over the existing IOCTL/MMAP path.  NVKVM_RING_DISABLE
+	 * skips it entirely (debugging / A-B perf comparison).
+	 */
+	if (getenv("NVKVM_RING_DISABLE") == NULL) {
+		int rret = nvkvm_isolate_ring_setup(t, id, nv);
+		if (rret != 0)
+			NVKVM_DBG(
+				"nvkvm_isolate: ring setup for isolate %u failed: %d "
+				"(falling back to socket path)\n", id, rret);
+	}
+
 	*isolate_id_out = id;
 
 	NVKVM_DBG(
@@ -855,6 +995,9 @@ pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 }
 
 /* ── Kill isolate ───────────────────────────────────────────────────────── */
+
+static void ring_qva_unmap(void *nv, uint64_t ring_gpa, void *qva,
+			   uint64_t region);
 
 int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 {
@@ -932,10 +1075,31 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 		}
 	}
 
+	/*
+	 * Tear down the command-buffer ring.  The stub is already dead (its
+	 * mapping went with it), so we only release QEMU's own mapping + memfd
+	 * and, once Phase 4 installs it, the guest KVM memslot.
+	 */
 	pthread_mutex_lock(&iso->lock);
+	void *ring_qva    = iso->ring_qva;
+	uint64_t ring_sz  = iso->ring_region_size;
+	int ring_mfd      = iso->ring_memfd;
+	uint64_t ring_gpa = iso->ring_gpa;
+	iso->ring_qva    = NULL;
+	iso->ring_memfd  = -1;
+	iso->ring_kvm_slot = -1;
+	iso->ring_ready  = false;
+	iso->ring_gpa    = 0;
 	iso->pid    = 0;
 	iso->in_use = false;
 	pthread_mutex_unlock(&iso->lock);
+
+	/* Window-aware: ring_gpa != 0 → restore anon backing + free the window
+	 * extent; private fallback → plain munmap. */
+	if (ring_qva && ring_qva != MAP_FAILED && ring_sz)
+		ring_qva_unmap(t->nv, ring_gpa, ring_qva, ring_sz);
+	if (ring_mfd >= 0)
+		close(ring_mfd);
 
 	NVKVM_DBG( "nvkvm_isolate: killed isolate %u\n", isolate_id);
 	return 0;
@@ -1081,6 +1245,198 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	return ret;
 }
 
+/* ── Command-buffer ring setup ──────────────────────────────────────────── */
+
+/*
+ * Undo the ring's QEMU-side mapping, window-aware.  Inside the sparse window we
+ * must NOT munmap (that would punch a hole in the window's single VMA/memslot);
+ * instead restore the anonymous backing in place and return the GPA extent to
+ * the window allocator.  A private fallback mapping is plain-munmap'd.
+ */
+static void ring_qva_unmap(void *nv, uint64_t ring_gpa, void *qva,
+			   uint64_t region)
+{
+	if (qva == MAP_FAILED || !qva)
+		return;
+	if (nv && ring_gpa) {
+		mmap(qva, region, PROT_READ | PROT_WRITE,
+		     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE | MAP_FIXED,
+		     -1, 0);
+		nvkvm_sparse_gpa_free((VirtIONvgpu *)nv, ring_gpa, region);
+	} else {
+		munmap(qva, region);
+	}
+}
+
+int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     void *nv)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool ok = iso->in_use && iso->id == isolate_id && iso->alive &&
+		  iso->ring_memfd < 0;   /* not already set up */
+	pthread_mutex_unlock(&iso->lock);
+	if (!ok)
+		return -EINVAL;
+
+	uint32_t ring_bytes = NVKVM_RING_DEFAULT_BYTES;
+	uint64_t region = nvkvm_ring_region_size(ring_bytes);
+	region = (region + 4095) & ~4095ULL;   /* page-round for mmap/ftruncate */
+
+	int mfd = nvkvm_memfd_create("nvkvm-ring", MFD_CLOEXEC);
+	if (mfd < 0)
+		return -errno;
+	if (ftruncate(mfd, (off_t)region) < 0) {
+		int e = -errno; close(mfd); return e;
+	}
+
+	/*
+	 * Place the ring memfd into the sparse GPA window so the guest can map
+	 * it, exactly like MMAP_ON_ISOLATE places a device fd: allocate a window
+	 * GPA, MAP_FIXED the memfd over the window's anonymous backing at that
+	 * VA.  The window's single pre-installed KVM memslot then maps
+	 * [gpa, gpa+region) → these memfd pages — no new memslot, no overlap.
+	 * If the window isn't available yet (BAR unprogrammed) we fall back to a
+	 * private mapping: the QEMU↔isolate ring still works, but it's not
+	 * guest-visible (ring_gpa stays 0 → the guest uses the virtqueue path).
+	 */
+	uint64_t ring_gpa = 0;
+	void    *qva      = MAP_FAILED;
+	if (nv) {
+		ring_gpa = nvkvm_sparse_gpa_alloc((VirtIONvgpu *)nv, region);
+		void *target = ring_gpa ?
+			nvkvm_gpa_to_vmm_va((VirtIONvgpu *)nv, ring_gpa, region) : NULL;
+		if (target) {
+			qva = mmap(target, region, PROT_READ | PROT_WRITE,
+				   MAP_SHARED | MAP_FIXED, mfd, 0);
+			if (qva == MAP_FAILED) {
+				/* Restore the anon backing we clobbered so the
+				 * window stays fully mapped for KVM. */
+				mmap(target, region, PROT_READ | PROT_WRITE,
+				     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
+				     MAP_FIXED, -1, 0);
+				nvkvm_sparse_gpa_free((VirtIONvgpu *)nv,
+						      ring_gpa, region);
+				ring_gpa = 0;
+			}
+		} else {
+			ring_gpa = 0;   /* window full / not ready */
+		}
+	}
+	if (qva == MAP_FAILED) {
+		/* Fallback: private mapping (not guest-visible). */
+		ring_gpa = 0;
+		qva = mmap(NULL, region, PROT_READ | PROT_WRITE,
+			   MAP_SHARED, mfd, 0);
+		if (qva == MAP_FAILED) {
+			int e = -errno; close(mfd); return e;
+		}
+	}
+
+	/* Initialise both ring control blocks: head==tail==0 ⇒ empty. */
+	uint64_t resp_off = nvkvm_ring_resp_off(ring_bytes);
+	struct nvkvm_ring *req  = (struct nvkvm_ring *)qva;
+	struct nvkvm_ring *resp = (struct nvkvm_ring *)((uint8_t *)qva + resp_off);
+	memset(req, 0, sizeof(*req));   req->size  = ring_bytes;
+	memset(resp, 0, sizeof(*resp)); resp->size = ring_bytes;
+
+	/* Bidirectional shared-memory self-test probe (see proto header). */
+	uint64_t probe = 0x6e766b766d000000ULL | isolate_id;   /* "nvkvm\0\0\0" | id */
+	uint8_t *req_data  = (uint8_t *)req  + sizeof(struct nvkvm_ring);
+	uint8_t *resp_data = (uint8_t *)resp + sizeof(struct nvkvm_ring);
+	memcpy(req_data, &probe, sizeof(probe));
+	memset(resp_data, 0, sizeof(uint64_t));
+
+	struct isolate_cmd_setup_ring hdr = {
+		.type        = ISOLATE_CMD_SETUP_RING,
+		.region_size = (uint32_t)region,
+		.req_off     = 0,
+		.resp_off    = (uint32_t)resp_off,
+		.ring_bytes  = ring_bytes,
+	};
+	struct msghdr msg = { 0 };
+	struct iovec  iov = { .iov_base = &hdr, .iov_len = sizeof(hdr) };
+	char          cbuf[CMSG_SPACE(sizeof(int))];
+	msg.msg_iov        = &iov;
+	msg.msg_iovlen     = 1;
+	msg.msg_control    = cbuf;
+	msg.msg_controllen = sizeof(cbuf);
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type  = SCM_RIGHTS;
+	cm->cmsg_len   = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &mfd, sizeof(int));
+
+	int ret = sync_sendmsg_recv(iso, &msg);   /* reader fills sync_ring_probe */
+	if (ret != 0) {
+		ring_qva_unmap(nv, ring_gpa, qva, region); close(mfd); return ret;
+	}
+
+	/* Verify QEMU→isolate (probe echoed) and isolate→QEMU (resp_data). */
+	pthread_mutex_lock(&iso->sync_lock);
+	uint64_t echoed = iso->sync_ring_probe;
+	pthread_mutex_unlock(&iso->sync_lock);
+	uint64_t back = 0;
+	memcpy(&back, resp_data, sizeof(back));
+	if (echoed != probe || back != (probe ^ NVKVM_RING_PROBE_MASK)) {
+		NVKVM_DBG(
+			"nvkvm_isolate: ring %u self-test FAILED "
+			"(echo=0x%llx back=0x%llx want_echo=0x%llx want_back=0x%llx)\n",
+			isolate_id,
+			(unsigned long long)echoed, (unsigned long long)back,
+			(unsigned long long)probe,
+			(unsigned long long)(probe ^ NVKVM_RING_PROBE_MASK));
+		ring_qva_unmap(nv, ring_gpa, qva, region); close(mfd); return -EPROTO;
+	}
+
+	/* Self-test passed — wipe the probe so the data regions start clean. */
+	memset(req_data, 0, sizeof(uint64_t));
+	memset(resp_data, 0, sizeof(uint64_t));
+
+	pthread_mutex_lock(&iso->lock);
+	iso->ring_memfd       = mfd;
+	iso->ring_qva         = qva;
+	iso->ring_region_size = region;
+	iso->ring_bytes       = ring_bytes;
+	iso->ring_gpa         = ring_gpa;  /* sparse-window GPA, or 0 if private */
+	iso->ring_kvm_slot    = -1;        /* in-window: no dedicated slot */
+	iso->ring_ready       = true;
+	pthread_mutex_unlock(&iso->lock);
+
+	NVKVM_DBG(
+		"nvkvm_isolate: ring %u ready (region=%llu B, ring_bytes=%u, "
+		"resp_off=%llu, gpa=0x%llx %s) — bidirectional probe OK\n",
+		isolate_id, (unsigned long long)region, ring_bytes,
+		(unsigned long long)resp_off, (unsigned long long)ring_gpa,
+		ring_gpa ? "guest-visible" : "private");
+	return 0;
+}
+
+int nvkvm_isolate_ring_info(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			    uint64_t *gpa, uint32_t *region_size,
+			    uint32_t *resp_off, uint32_t *ring_bytes)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	int rc = -ENODEV;
+	if (iso->in_use && iso->id == isolate_id && iso->alive &&
+	    iso->ring_ready && iso->ring_gpa) {
+		if (gpa)         *gpa         = iso->ring_gpa;
+		if (region_size) *region_size = (uint32_t)iso->ring_region_size;
+		if (resp_off)    *resp_off    = (uint32_t)nvkvm_ring_resp_off(iso->ring_bytes);
+		if (ring_bytes)  *ring_bytes  = iso->ring_bytes;
+		rc = 0;
+	}
+	pthread_mutex_unlock(&iso->lock);
+	return rc;
+}
+
 int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
 			    uint32_t isolate_id, uint32_t target_txn)
 {
@@ -1111,6 +1467,65 @@ int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
 	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
 	pthread_mutex_unlock(&iso->write_lock);
 	return sr < 0 ? (int)sr : 0;
+}
+
+int nvkvm_isolate_enter_loop(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     uint32_t idle_us, uint64_t *head_out)
+{
+	if (head_out)
+		*head_out = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive &&
+		     iso->ring_ready && iso->sock_fd >= 0;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENODEV;
+
+	struct isolate_cmd_enter_loop cmd = {
+		.type    = ISOLATE_CMD_ENTER_LOOP,
+		.idle_us = idle_us,
+	};
+
+	/*
+	 * Sync send: this BLOCKS until the stub's consumer loop idles out and
+	 * replies LOOP_EXITED (which the reader thread delivers via sync_cond).
+	 * The caller runs on QEMU's thread pool, so a long loop does not stall
+	 * the main loop.  Slow-path IOCTLs that arrive while the stub loops use
+	 * the independent per-txn pending mechanism, not sync_lock.
+	 */
+	pthread_mutex_lock(&iso->sync_lock);
+	iso->sync_done      = false;
+	iso->sync_error     = 0;
+	iso->sync_loop_head = 0;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->sync_lock);
+		return (int)sr;
+	}
+
+	/* F-5: ENTER_LOOP runs on the thread pool (not the serialized TX thread),
+	 * so guard against the slot being killed+reused under us: bail if our
+	 * identity no longer holds. The kill path also sets sync_done via
+	 * reader_signal_sync (broadcast), so this is belt-and-suspenders. */
+	while (!iso->sync_done && iso->id == isolate_id && iso->alive)
+		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
+	int err;
+	if (!iso->sync_done) {
+		err = -ENODEV;                 /* torn down / reused while parked */
+	} else {
+		err = iso->sync_error;
+		if (head_out)
+			*head_out = iso->sync_loop_head;
+	}
+	pthread_mutex_unlock(&iso->sync_lock);
+	return err;
 }
 
 int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
@@ -1175,6 +1590,147 @@ int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 		*fd_out = fd;
 	else
 		close(fd);
+	return 0;
+}
+
+int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
+				 uint32_t isolate_id, uint32_t handle_id,
+				 uint32_t gem_handle, int *fd_out)
+{
+	if (fd_out)
+		*fd_out = -1;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	uint32_t txn_id = iso->next_txn_id++;
+	if (iso->next_txn_id == 0)
+		iso->next_txn_id = 1;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_present_export cmd = {
+		.type       = ISOLATE_CMD_PRESENT_EXPORT,
+		.handle_id  = handle_id,
+		.gem_handle = gem_handle,
+		.txn_id     = txn_id,
+	};
+
+	/* present_lock serializes present-export callers (held across the whole
+	 * round-trip); present_sync_lock + present_cond are the reader handoff. */
+	pthread_mutex_lock(&iso->present_lock);
+	pthread_mutex_lock(&iso->present_sync_lock);
+	iso->present_done = false;
+	iso->present_err  = 0;
+	iso->present_fd   = -1;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->present_sync_lock);
+		pthread_mutex_unlock(&iso->present_lock);
+		return (int)sr;
+	}
+
+	while (!iso->present_done)
+		pthread_cond_wait(&iso->present_cond, &iso->present_sync_lock);
+	int err = iso->present_err;
+	int fd  = iso->present_fd;
+	iso->present_fd = -1;
+	pthread_mutex_unlock(&iso->present_sync_lock);
+	pthread_mutex_unlock(&iso->present_lock);
+
+	if (err) {
+		if (fd >= 0)
+			close(fd);
+		return err;
+	}
+	if (fd < 0)
+		return -EPROTO;   /* stub said success but sent no fd */
+	if (fd_out)
+		*fd_out = fd;
+	else
+		close(fd);
+	return 0;
+}
+
+/*
+ * Cross-isolate import (#110): hand `dmabuf_fd` (a host dma-buf the OWNER stub
+ * exported) to the IMPORTER isolate's stub, which PRIME_FD_TO_HANDLEs it into a
+ * local GEM and returns the handle.  The caller still owns dmabuf_fd afterwards
+ * (the stub takes its own reference via the SCM dup + PRIME import).
+ */
+int nvkvm_isolate_xiso_import(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id, uint32_t handle_id,
+			      int dmabuf_fd, uint32_t *gem_out)
+{
+	if (gem_out)
+		*gem_out = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	if (dmabuf_fd < 0)
+		return -EINVAL;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	uint32_t txn_id = iso->next_txn_id++;
+	if (iso->next_txn_id == 0)
+		iso->next_txn_id = 1;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_xiso_import cmd = {
+		.type      = ISOLATE_CMD_XISO_IMPORT,
+		.handle_id = handle_id,
+		.txn_id    = txn_id,
+	};
+	struct msghdr msg = { 0 };
+	struct iovec  iov = { .iov_base = &cmd, .iov_len = sizeof(cmd) };
+	char          cbuf[CMSG_SPACE(sizeof(int))];
+	msg.msg_iov        = &iov;
+	msg.msg_iovlen     = 1;
+	msg.msg_control    = cbuf;
+	msg.msg_controllen = sizeof(cbuf);
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type  = SCM_RIGHTS;
+	cm->cmsg_len   = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &dmabuf_fd, sizeof(int));
+
+	pthread_mutex_lock(&iso->xiso_lock);
+	pthread_mutex_lock(&iso->xiso_sync_lock);
+	iso->xiso_done = false;
+	iso->xiso_err  = 0;
+	iso->xiso_gem  = 0;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_sendmsg_fd(iso->sock_fd, &msg);
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->xiso_sync_lock);
+		pthread_mutex_unlock(&iso->xiso_lock);
+		return (int)sr;
+	}
+
+	while (!iso->xiso_done)
+		pthread_cond_wait(&iso->xiso_cond, &iso->xiso_sync_lock);
+	int err = iso->xiso_err;
+	uint32_t gem = iso->xiso_gem;
+	pthread_mutex_unlock(&iso->xiso_sync_lock);
+	pthread_mutex_unlock(&iso->xiso_lock);
+
+	if (err)
+		return err;
+	if (gem == 0)
+		return -EPROTO;
+	if (gem_out)
+		*gem_out = gem;
 	return 0;
 }
 

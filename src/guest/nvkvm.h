@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/refcount.h>
 #include <linux/virtio.h>
 #include <linux/virtio_ids.h>
 #include <linux/spinlock.h>
@@ -19,6 +20,8 @@
 
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_abi.h"
+#include "../../src/common/nvkvm_ring.h"
+#include "../../src/common/nvkvm_ring_ioctl.h"
 #include "../../src/abi/nvgpu.h"
 
 /* virtio-nvgpu device ID.
@@ -68,6 +71,46 @@ struct nvkvm_session {
 	int     refcount;       /* protected by nvkvm_state.sessions_lock */
 	__u32   isolate_id;     /* QEMU isolate process ID (0 = not yet created) */
 	struct mutex isolate_lock; /* protects isolate_id creation       */
+
+	/*
+	 * Command-buffer ring (docs/design/command_buffer.md).  QEMU placed the
+	 * ring memfd in the sparse GPA window at isolate create; we memremap it
+	 * here so the kmd can run the SPSC fast path.  ring_base == NULL means no
+	 * ring (fall back to the virtqueue).  Set up once under isolate_lock.
+	 */
+	void   *ring_base;          /* memremap'd ring region (NULL = none)   */
+	u64     ring_gpa;           /* guest-physical base                    */
+	u32     ring_region_size;
+	u32     ring_bytes;         /* per-ring data bytes                    */
+	struct nvkvm_ring *req_ring;  /* guest→isolate (we produce)           */
+	struct nvkvm_ring *resp_ring; /* isolate→guest (we consume)           */
+
+	/*
+	 * Fast-path producer/consumer state (docs/design/command_buffer.md).
+	 * ring_lock serialises guest producers so the request ring has a single
+	 * producer AND the response ring a single consumer (the lock holder
+	 * reads back its own response) — preserving the SPSC contract regardless
+	 * of how many guest threads issue fast controls.  The pump kthread keeps
+	 * the isolate spinning via ENTER_LOOP while there is queued work; it is a
+	 * pure observer of the rings (reads tail via has_work, never their data).
+	 */
+	struct mutex      ring_lock;
+	u32               ring_txn_next;  /* producer-private txn id counter   */
+	struct task_struct *pump_task;    /* per-session ENTER_LOOP pump       */
+	wait_queue_head_t pump_wq;        /* woken when a producer publishes   */
+
+	/*
+	 * UVM_VALIDATE_VA_RANGE cache (#94).  libcuda re-validates the SAME
+	 * (base,len) range thousands of times per pageable cuMemcpy (~191µs
+	 * forwarded each → the DtoH bottleneck).  VALIDATE is an idempotent
+	 * registration check, so we cache its rm_status and serve repeats
+	 * locally.  Conservatively cleared on ANY UVM free/unmap/unregister so a
+	 * stale "valid" can never outlive a teardown.
+	 */
+#define NVKVM_VCACHE_N 16
+	struct { u64 base, len; u32 status; bool valid; } vcache[NVKVM_VCACHE_N];
+	u32               vcache_next;
+	spinlock_t        vcache_lock;
 };
 
 /* ── Per-FD context (one per open(/dev/nvidia*)) ──────────────────────────── */
@@ -152,9 +195,23 @@ struct nvkvm_fd_ctx {
 	int                    dev_id;      /* NVKVM_DEV_*                */
 	struct nvkvm_session  *session;
 
+	/*
+	 * Lifetime refcount (G-6).  One reference for the open file; each proxy
+	 * GEM minted on this ctx (nvkvm_drm.c) takes another, because a proxy
+	 * can outlive its drm_file via a cross-file PRIME re-import yet still
+	 * forwards GEM ops (GEM_CLOSE / GEM_EXPORT_NVKMS_MEMORY) on this exact
+	 * ctx — the stub handle is only valid in the host fd this ctx owns.
+	 * Teardown (handle close, session put, free) is deferred until the last
+	 * ref drops, which also keeps the stub-side bo alive for the importer.
+	 */
+	refcount_t             refs;
+
 	/* poll support */
 	wait_queue_head_t      poll_wq;
 	atomic_t               poll_events; /* cached POLL* bits from host         */
+	struct list_head       evt_node;    /* #101: node in the async-event registry,
+					     * keyed by (isolate_id, handle_id), so a
+					     * VQ_EVT notification can find + wake us  */
 
 	/* mmap regions owned by this FD */
 	spinlock_t             mmap_lock;
@@ -282,10 +339,32 @@ static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
 /* nvkvm_main.c — shared fd-context lifecycle (also used by the DRM driver) */
 struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags);
 void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx);
+/* G-6: take/drop a lifetime ref (proxy GEMs that outlive their drm_file). */
+void nvkvm_fd_ctx_get(struct nvkvm_fd_ctx *ctx);
+void nvkvm_fd_ctx_put(struct nvkvm_fd_ctx *ctx);
+
+/* #101 async event delivery: registry of poll-capable fd contexts keyed by
+ * (isolate_id, handle_id). register on open, unregister on close. deliver() is
+ * called from the VQ_EVT virtqueue callback (softirq) to wake the matching fd. */
+void nvkvm_evt_ctx_register(struct nvkvm_fd_ctx *ctx);
+void nvkvm_evt_ctx_unregister(struct nvkvm_fd_ctx *ctx);
+void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events);
 
 /* nvkvm_drm.c — nvidia-drm render-node emulation (graphics) */
 int  nvkvm_drm_init(struct device *parent);
 void nvkvm_drm_fini(void);
+
+/* Present path (#102): if `fb` is backed by one of our proxy GEM objects (a
+ * host/stub buffer forwarded via the render node — e.g. a compositor's scanout
+ * buffer), report the stub-side handle and owning isolate ctx so the flip can be
+ * presented to the host. Returns false for non-proxy fbs (e.g. shmem dumb). */
+struct drm_framebuffer;
+bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
+			  struct nvkvm_fd_ctx **ctx);
+
+/* nvkvm_kms.c — guest-emulated virtual KMS head (#102). Called from
+ * nvkvm_drm_init on the nvkvm drm_device before drm_dev_register. */
+int  nvkvm_kms_init(struct drm_device *ddev);
 
 /* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
@@ -298,6 +377,17 @@ int  nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_create_isolate(unsigned int session_id,
 				 __u32 *isolate_id_out);
+int  nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
+			     u32 *ring_bytes_out);
+int  nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us,
+			     u64 *head_out);
+int  nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
+			  __u32 width, __u32 height, __u32 pitch,
+			  __u32 format, __u64 modifier);
+int  nvkvm_virtio_xiso_import(struct nvkvm_fd_ctx *ctx,
+			      __u32 owner_isolate_id, __u32 owner_handle_id,
+			      __u32 owner_stub_handle, __u32 *gem_out);
+bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
 int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle(__u32 handle_id);
@@ -346,6 +436,31 @@ int    nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				   void *params_buf, size_t param_size);
 __s32  guest_fd_to_handle_id(int guest_fd);
 
+/*
+ * F-4 (security_audit_2026_06_01): a guest fd embedded in an ioctl field
+ * (uvm_fd, rm_ctrl_fd, OS_EVENT.fd, NV0005.data, …) must be one of OUR device
+ * files before we read `struct nvkvm_fd_ctx` out of its ->private_data — else a
+ * caller pointing the field at any other fd (pipe/socket/eventfd/drm) causes a
+ * type-confused read of a foreign subsystem's private_data. Mirrors the real
+ * driver's `f->f_op == nv_frontend_fops` check in osUserHandleToKernelPtr.
+ */
+extern const struct file_operations nvkvm_fops;
+#ifdef NVKVM_GRAPHICS
+extern const struct file_operations nvkvm_drm_fops;
+#endif
+static inline bool nvkvm_file_is_ours(struct file *f)
+{
+	if (!f)
+		return false;
+	if (f->f_op == &nvkvm_fops)
+		return true;
+#ifdef NVKVM_GRAPHICS
+	if (f->f_op == &nvkvm_drm_fops)
+		return true;
+#endif
+	return false;
+}
+
 /* nvkvm_mmap.c */
 extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
@@ -359,6 +474,20 @@ void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
  * pages that alias libcuda's guest userspace pages. */
 int  nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 				   __u64 gva, __u64 len, unsigned long prot);
+
+/* Command-buffer fast path (nvkvm_main.c).  ring_try forwards a flat
+ * RM_CONTROL over the SPSC ring; returns 0/-errno on success/failure, or
+ * NVKVM_RING_TRY_PUNT if the control is not ring-eligible or the stub punted
+ * (the caller then forwards on the virtqueue — the control was NOT executed). */
+#define NVKVM_RING_TRY_PUNT 1
+int  nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
+			    void *params_buf, size_t param_size,
+			    void *aux_buf, size_t aux_size, u32 *nvstatus_out);
+void nvkvm_session_stop_pump(struct nvkvm_session *session);
+/* Invalidate the UVM_VALIDATE_VA_RANGE cache (#94): called on any UVM teardown
+ * (unmap/unregister/free) and on a new OS_DESCRIPTOR migration, so a cached
+ * "valid" can never outlive the range's registration. */
+void nvkvm_session_vcache_clear(struct nvkvm_session *session);
 
 /* nvkvm_session.c */
 struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,

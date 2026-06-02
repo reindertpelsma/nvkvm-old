@@ -77,6 +77,56 @@ struct nvkvm_isolate {
 	uint64_t    sync_realize_length;
 	uint64_t    sync_realize_token;
 	uint32_t    sync_realize_rm_status;
+	/* SETUP_RING probe echo — reader fills before signaling. */
+	uint64_t    sync_ring_probe;
+	/* ENTER_LOOP result — reader fills before signaling. */
+	uint64_t    sync_loop_head;
+
+	/*
+	 * Present-export slot (#106) — DEDICATED, independent of the sync_* slot
+	 * above, because present fires per frame and would otherwise race a
+	 * concurrent setup-time OPEN_DEVICE/MMAP/REALIZE on the same isolate.
+	 * present_lock serializes present-export callers (held across the whole
+	 * round-trip, NOT released during the wait); present_sync_lock + present_cond
+	 * are the reader handoff (released during cond_wait).
+	 */
+	pthread_mutex_t present_lock;
+	pthread_mutex_t present_sync_lock;
+	pthread_cond_t  present_cond;
+	bool        present_done;
+	int         present_err;
+	int         present_fd;     /* dma-buf fd via SCM_RIGHTS; -1 if none */
+
+	/*
+	 * Cross-isolate import slot (#110) — DEDICATED like present, because a
+	 * compositor isolate may import (this) concurrently with presenting its
+	 * own scanout (present_*).  Targets THIS (importer) isolate; QEMU sends a
+	 * dma-buf fd in and gets a GEM handle out.
+	 */
+	pthread_mutex_t xiso_lock;
+	pthread_mutex_t xiso_sync_lock;
+	pthread_cond_t  xiso_cond;
+	bool        xiso_done;
+	int         xiso_err;
+	uint32_t    xiso_gem;       /* importer-local GEM handle on success */
+
+	/*
+	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
+	 * QEMU mints one memfd holding both rings, keeps its own MAP_SHARED
+	 * mapping (for init / the grow handshake / a future QEMU-side ring), and
+	 * hands a copy to the isolate which maps the same memfd.  ring_ready is
+	 * set once the bidirectional probe self-test passes.  ring_gpa /
+	 * ring_kvm_slot are filled in Phase 4 when the region is installed into
+	 * the guest's physical address space.  ring_memfd < 0 ⇒ no ring (the
+	 * isolate keeps serving ioctls over the existing path).
+	 */
+	int         ring_memfd;
+	void       *ring_qva;
+	uint64_t    ring_region_size;
+	uint32_t    ring_bytes;
+	uint64_t    ring_gpa;
+	int         ring_kvm_slot;
+	bool        ring_ready;
 };
 
 struct nvkvm_isolate_table {
@@ -84,6 +134,13 @@ struct nvkvm_isolate_table {
 	struct nvkvm_isolate isolates[NVKVM_ISOLATE_MAX];
 	uint32_t             next_id;
 	uint32_t             abi_profile;  /* #81: per-VM ABI id stamped into IOCTLs */
+	/*
+	 * Owning VirtIONvgpu (opaque here to avoid a header cycle).  Set on the
+	 * first isolate create; used by ring setup/teardown to place the ring
+	 * memfd in the sparse GPA window (nvkvm_sparse_gpa_alloc/free) so the
+	 * guest can map it.  QEMU only maps the ring — it never inspects contents.
+	 */
+	void                *nv;
 };
 
 void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t);
@@ -96,6 +153,7 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t);
  */
 int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 uint32_t session_id,
+			 void *nv,
 			 uint32_t *isolate_id_out);
 
 /*
@@ -106,6 +164,61 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id);
 
 /* Host pid of a live isolate by id (0 if none) — for GET_PID_INFO pid mapping. */
 pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id);
+
+/*
+ * Present export (#106): ask the isolate's stub to PRIME_HANDLE_TO_FD the
+ * render-node GEM `gem_handle` (held under `handle_id`) and return the dma-buf
+ * fd (received via SCM_RIGHTS) in *fd_out.  Caller owns *fd_out and must close
+ * it.  Serialized per isolate.  Returns 0 on success, -errno otherwise.
+ */
+int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
+				 uint32_t isolate_id, uint32_t handle_id,
+				 uint32_t gem_handle, int *fd_out);
+
+/*
+ * #110 cross-isolate import: hand `dmabuf_fd` to the importer isolate's stub,
+ * which PRIME_FD_TO_HANDLEs it into a local GEM, returned in *gem_out.  Caller
+ * retains ownership of dmabuf_fd.  Serialized per isolate.  0 / -errno.
+ */
+int nvkvm_isolate_xiso_import(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id, uint32_t handle_id,
+			      int dmabuf_fd, uint32_t *gem_out);
+
+/*
+ * Set up the per-isolate SPSC command-buffer ring (docs/design/command_buffer.md).
+ * Mints a memfd holding the request+response rings, maps it in QEMU,
+ * initialises both control blocks, hands a copy to the isolate via SCM_RIGHTS,
+ * and runs a bidirectional shared-memory probe self-test.  On success the
+ * isolate has the ring mapped and ready (Phase 3 spins a consumer on it).
+ *
+ * The ring is a pure optimisation: a non-zero return is logged and ignored by
+ * the caller — the isolate keeps serving every ioctl over the existing path.
+ */
+int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     void *nv);
+
+/*
+ * Report an isolate's command-buffer ring placement so the guest can map it:
+ * the guest-physical base + geometry.  Returns 0 and fills the out-params if
+ * the ring is ready and guest-visible (ring_gpa != 0); -ENODEV otherwise (the
+ * guest then stays on the virtqueue path).
+ */
+int nvkvm_isolate_ring_info(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			    uint64_t *gpa, uint32_t *region_size,
+			    uint32_t *resp_off, uint32_t *ring_bytes);
+
+/*
+ * Drive the isolate's SPSC consumer loop (docs/design/command_buffer.md).
+ * Sends ISOLATE_CMD_ENTER_LOOP and BLOCKS until the loop idles out, then
+ * returns 0 and fills *head_out with the request-ring head at exit
+ * (last_processed).  The guest pump compares it to the published tail to decide
+ * whether to re-enter.  Returns -errno on a dead isolate / missing ring.
+ *
+ * MUST be called off QEMU's main loop (it blocks for the whole loop lifetime) —
+ * the virtio dispatch offloads it to the thread pool.
+ */
+int nvkvm_isolate_enter_loop(struct nvkvm_isolate_table *t, uint32_t isolate_id,
+			     uint32_t idle_us, uint64_t *head_out);
 
 /*
  * Fire-and-forget: ask the isolate to post SIGUSR1 to the worker currently

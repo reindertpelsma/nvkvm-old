@@ -81,6 +81,23 @@ static void virtio_nvgpu_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 	DeviceState    *vdev = DEVICE(&dev->vdev);
 
 	vpci_dev->class_code = PCI_CLASS_OTHERS;
+
+	/*
+	 * Enable MSI-X (one vector per VQ + 1 config) instead of falling back to
+	 * legacy IO-APIC INTx.  Shared-INTx demux reads each sharing device's ISR
+	 * status register over MMIO on EVERY completion interrupt — measured
+	 * ~4170 IRQs/token + ~2150 ISR-read MMIO exits/token during LLM decode,
+	 * the dominant decode tax (the block devices already use MSI-X; only this
+	 * device was left on INTx because nvectors was unspecified).  3 VQs (tx,
+	 * rx, evt) + 1 config vector.
+	 */
+	/* Force MSI-X: the struct default is 0 (not DEV_NVECTORS_UNSPECIFIED), so
+	 * the usual "if unspecified" idiom never fires and we'd stay on INTx.  Set
+	 * it unconditionally BEFORE qdev_realize — msix_init runs during the child
+	 * device_plugged, so a later set is ignored. 3 VQs + 1 config. */
+	if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED || vpci_dev->nvectors == 0)
+		vpci_dev->nvectors = 4;
+
 	qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
 	if (errp && *errp)
 		return;

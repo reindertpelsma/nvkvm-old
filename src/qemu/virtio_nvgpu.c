@@ -42,6 +42,7 @@
 #include <stdio.h>
 
 #include "virtio_nvgpu.h"
+#include "nvkvm_present_egl.h"   /* #102 present-to-window console */
 #include <dirent.h>
 
 /*
@@ -676,6 +677,43 @@ static void nvkvm_ioctl_work_done(void *opaque, int ret)
 	g_free(w);
 }
 
+/*
+ * ENTER_LOOP offload.  nvkvm_isolate_enter_loop blocks for the whole consumer-
+ * loop lifetime (until the stub idles out), so it must NOT run on the main loop.
+ * Mirror the IOCTL offload: a thread-pool worker blocks, the completion pushes
+ * the response.  Holding one pool thread per active isolate's pump is fine at
+ * our scale (the pool grows to 64) and the short idle window cycles it.
+ */
+struct nvkvm_enter_loop_work {
+	VirtIONvgpu                  *nv;
+	VirtQueue                    *vq;
+	VirtQueueElement             *elem;
+	struct nvkvm_hdr              hdr;
+	struct nvkvm_req_enter_loop   req;
+	struct nvkvm_resp_enter_loop  resp;
+};
+
+static int nvkvm_enter_loop_work_fn(void *opaque)
+{
+	struct nvkvm_enter_loop_work *w = opaque;
+	nvkvm_req_enter_loop(w->nv, &w->req, &w->resp);
+	return 0;
+}
+
+static void nvkvm_enter_loop_work_done(void *opaque, int ret)
+{
+	struct nvkvm_enter_loop_work *w = opaque;
+	struct { struct nvkvm_hdr h;
+		 struct nvkvm_resp_enter_loop r; } out;
+	out.h = w->hdr;
+	out.r = w->resp;
+	iov_from_buf(w->elem->in_sg, w->elem->in_num, 0, &out, sizeof(out));
+	virtqueue_push(w->vq, w->elem, sizeof(out));
+	virtio_notify(VIRTIO_DEVICE(w->nv), w->vq);
+	g_free(w->elem);
+	g_free(w);
+}
+
 static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
@@ -720,6 +758,21 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_open_nvidia_handle,
 			    nvkvm_resp_open_nvidia_handle,
 			    nvkvm_req_open_nvidia_handle)
+		/* #106 present: does a bounded stub round-trip (PRIME export)
+		 * inline on the TX thread. TODO(perf): offload to the thread
+		 * pool like NVKVM_REQ_IOCTL_ON_ISOLATE if per-frame TX stall
+		 * matters for a high-fps desktop. */
+		ISOLATE_REQ(NVKVM_REQ_PRESENT,
+			    nvkvm_req_present,
+			    nvkvm_resp_present,
+			    nvkvm_req_present)
+		/* #110 cross-isolate dma-buf import: two bounded stub round-trips
+		 * (owner PRIME export + importer PRIME import) inline on the TX
+		 * thread, like PRESENT. */
+		ISOLATE_REQ(NVKVM_REQ_XISO_IMPORT,
+			    nvkvm_req_xiso_import,
+			    nvkvm_resp_xiso_import,
+			    nvkvm_req_xiso_import)
 		ISOLATE_REQ(NVKVM_REQ_OPEN_MEMORY_HANDLE,
 			    nvkvm_req_open_memory_handle,
 			    nvkvm_resp_open_memory_handle,
@@ -740,6 +793,27 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_interrupt,
 			    nvkvm_resp_interrupt,
 			    nvkvm_req_interrupt)
+		ISOLATE_REQ(NVKVM_REQ_SETUP_RING,
+			    nvkvm_req_setup_ring,
+			    nvkvm_resp_setup_ring,
+			    nvkvm_req_setup_ring)
+
+		case NVKVM_REQ_ENTER_LOOP: {
+			/* Blocks for the whole consumer-loop lifetime → offload to
+			 * the thread pool; completion pushes the response. Ownership
+			 * of `elem` transfers to the work item (we `continue`). */
+			struct nvkvm_enter_loop_work *w =
+				g_new0(struct nvkvm_enter_loop_work, 1);
+			w->nv   = nv;
+			w->vq   = vq;
+			w->elem = elem;
+			w->hdr  = hdr;
+			iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr),
+				   &w->req, sizeof(w->req));
+			thread_pool_submit_aio(nvkvm_enter_loop_work_fn, w,
+					       nvkvm_enter_loop_work_done, w);
+			continue;
+		}
 		ISOLATE_REQ(NVKVM_REQ_COPY_HANDLE_TO_ISOLATE,
 			    nvkvm_req_copy_handle_to_isolate,
 			    nvkvm_resp_copy_handle_to_isolate,
@@ -977,6 +1051,14 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 
 	g_nvkvm_device = nv;
 
+#if !NVKVM_QEMU_GRAPHICS
+	/* Compute-only QEMU build (NVKVM_QEMU_GRAPHICS=0): the graphics/display
+	 * code (DRM render node, NVKMS modeset, present/EGL path) is compiled out,
+	 * so force the runtime gate off regardless of the graphics= property. This
+	 * is the QEMU-side twin of the guest module's NVKVM_GRAPHICS=0 build. */
+	nv->graphics = false;
+#endif
+
 	/*
 	 * Find QEMU's KVM VM fd by scanning our own /proc/self/fd for the
 	 * "anon_inode:kvm-vm" entry, so the nvidia/UVM mmap path in
@@ -1147,11 +1229,23 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	if (!nv->graphics)
 		info_report("nvkvm: graphics disabled (compute-only): DRM render "
 			    "node + NVKMS modeset device + ioctls refused");
+
+	/*
+	 * #102: register a QemuConsole so the guest's GPU-composited scanout can
+	 * be shown in a live QEMU display window.  Graphics-gated; no-op in the
+	 * compute-only build.  The console is host-private and strictly a sink —
+	 * frames flow guest→host only.
+	 */
+	if (nv->graphics)
+		nvkvm_present_console_init(dev, nv);
 }
 
 static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(dev);
+
+	/* #102: close the present console before tearing down the device. */
+	nvkvm_present_console_fini(nv);
 
 	/* Tear down isolates and handles before shared memory */
 	nvkvm_isolate_table_fini(&nv->isolates);

@@ -51,6 +51,11 @@
 #define ISOLATE_CMD_OPEN_DEVICE  9   /* stub opens /dev/nvidia*, replies w/ SCM_RIGHTS fd */
 #define ISOLATE_CMD_REALIZE_UVM_FD 10 /* full UVM realize: init+register+intent+mmap */
 #define ISOLATE_CMD_INTERRUPT    11   /* post SIGUSR1 to the worker on txn_id  */
+#define ISOLATE_CMD_SETUP_RING   12   /* mint per-isolate SPSC ring pair; memfd via SCM_RIGHTS */
+#define ISOLATE_CMD_ENTER_LOOP   13   /* drive the SPSC consumer loop until idle */
+#define ISOLATE_CMD_PRESENT_EXPORT 14 /* PRIME_HANDLE_TO_FD a GEM; reply w/ dma-buf via SCM */
+#define ISOLATE_CMD_XISO_IMPORT  15   /* #110 cross-isolate: PRIME_FD_TO_HANDLE a dma-buf
+				       * (arrives via SCM_RIGHTS) → reply w/ GEM handle */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -61,6 +66,10 @@
 #define ISOLATE_RESP_POLL_EVENT  0x14  /* async: fd became ready             */
 #define ISOLATE_RESP_OPEN_DEVICE 0x15  /* open result + fd via SCM_RIGHTS    */
 #define ISOLATE_RESP_REALIZE_UVM 0x16  /* realize result: host VA + rmStatus */
+#define ISOLATE_RESP_RING_READY  0x17  /* SPSC ring mapped + self-test echo  */
+#define ISOLATE_RESP_LOOP_EXITED 0x18  /* consumer loop drained + idled out  */
+#define ISOLATE_RESP_PRESENT_EXPORT 0x19 /* present export result + dma-buf via SCM */
+#define ISOLATE_RESP_XISO_IMPORT 0x1a    /* #110 cross-isolate import result + GEM handle */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -257,6 +266,117 @@ struct isolate_resp_realize_uvm {
 	uint64_t host_va;     /* mmap result address                        */
 	uint64_t length;      /* echo                                       */
 	uint64_t realize_token;/* opaque (currently == host_va for now)     */
+};
+
+/* ── SETUP_RING ───────────────────────────────────────────────────────────
+ * QEMU mints ONE memfd holding the request + response SPSC rings
+ * (docs/design/command_buffer.md): it maps the memfd, initialises both ring
+ * control blocks, then hands a copy of the memfd to the isolate via SCM_RIGHTS
+ * in the same sendmsg.  The isolate maps it MAP_SHARED so QEMU, the isolate
+ * (and, from Phase 4, the guest via a KVM memslot) all share the same pages.
+ *
+ * Before the ring is trusted a probe word round-trips through the shared data
+ * region to prove BIDIRECTIONAL visibility: QEMU writes `probe` at the start
+ * of the request data region; the isolate echoes it back in the response
+ * (proves QEMU→isolate) and writes `probe ^ NVKVM_RING_PROBE_MASK` at the
+ * start of the response data region (QEMU re-reads it → proves isolate→QEMU).
+ *
+ * The ring is a PURE OPTIMISATION: if setup fails the isolate keeps serving
+ * every ioctl over the existing IOCTL/MMAP path, so SETUP_RING failure is
+ * non-fatal to the isolate.
+ *
+ * Layout (see nvkvm_ring.h helpers): req ring control block at req_off (=0),
+ * its data immediately after; resp ring control block at resp_off, its data
+ * immediately after.  region_size is the whole memfd the isolate must mmap.
+ */
+struct isolate_cmd_setup_ring {
+	uint32_t type;         /* ISOLATE_CMD_SETUP_RING */
+	uint32_t region_size;  /* total memfd bytes the isolate must mmap */
+	uint32_t req_off;      /* offset of request-ring control block (=0) */
+	uint32_t resp_off;     /* offset of response-ring control block */
+	uint32_t ring_bytes;   /* per-ring data bytes (power of two, >= 64) */
+	uint32_t reserved;
+	/* memfd attached via SCM_RIGHTS in the same sendmsg. */
+};
+
+struct isolate_resp_ring_ready {
+	uint32_t type;         /* ISOLATE_RESP_RING_READY */
+	int32_t  error;        /* 0 on success; -errno on failure */
+	uint64_t probe_seen;   /* value the isolate read from the request data
+	                        * region — QEMU checks it equals what it wrote */
+};
+
+/* Self-test mask (see SETUP_RING comment above). */
+#define NVKVM_RING_PROBE_MASK 0x5a5a5a5a5a5a5a5aULL
+
+/* ── ENTER_LOOP ───────────────────────────────────────────────────────────
+ * QEMU forwards this (offloaded to its thread pool — it blocks for the whole
+ * loop) to drive the isolate's reader thread into the SPSC consumer loop.  The
+ * loop drains the request ring, executes flat RM_CONTROLs inline, writes
+ * responses to the response ring, and — while looping — still polls the socket
+ * at each drain edge so slow-path commands (IOCTL/INTERRUPT/EXIT) are serviced.
+ * It exits after `idle_us` of no ring work AND no socket traffic, re-checking
+ * nvkvm_ring_has_work() once more before committing to exit (the lost-wakeup-
+ * free exit edge).  LOOP_EXITED carries the consumer's `head` (last_processed
+ * free-running byte count) so the guest can compare it against last_published
+ * and re-enter if the loop exited with work still queued.
+ */
+struct isolate_cmd_enter_loop {
+	uint32_t type;        /* ISOLATE_CMD_ENTER_LOOP */
+	uint32_t idle_us;     /* idle window before exit (0 → stub default) */
+};
+
+struct isolate_resp_loop_exited {
+	uint32_t type;        /* ISOLATE_RESP_LOOP_EXITED */
+	int32_t  error;       /* 0, or -errno if no ring is set up */
+	uint64_t head;        /* request-ring head at exit (last_processed) */
+};
+
+/* ── PRESENT_EXPORT (#106) ─────────────────────────────────────────────────
+ * QEMU asks the stub to export a render-node GEM object as a dma-buf so the
+ * host display/codec can import it.  The stub looks up the render-node fd under
+ * handle_id, runs DRM_IOCTL_PRIME_HANDLE_TO_FD on gem_handle, and replies with
+ * the dma-buf fd attached via SCM_RIGHTS (same pattern as OPEN_DEVICE).  The
+ * fd is a host buffer reference only — the stub never maps or reads it. */
+struct isolate_cmd_present_export {
+	uint32_t type;        /* ISOLATE_CMD_PRESENT_EXPORT */
+	uint32_t handle_id;   /* render-node handle whose fd holds the GEM */
+	uint32_t gem_handle;  /* GEM handle in the stub's render-node DRM file */
+	uint32_t txn_id;      /* echoed in response */
+};
+
+struct isolate_resp_present_export {
+	uint32_t type;        /* ISOLATE_RESP_PRESENT_EXPORT */
+	uint32_t txn_id;      /* echoed from command */
+	int32_t  retval;      /* 0 on success; -errno on failure (no SCM)   */
+	uint32_t reserved;
+	/* On success: one dma-buf fd attached via SCM_RIGHTS in the same sendmsg. */
+};
+
+/* ── XISO_IMPORT (#110 cross-isolate dma-buf) ──────────────────────────────
+ * QEMU brokers a GPU buffer from one isolate (the owner, which allocated it)
+ * into another (the importer, e.g. a compositor).  QEMU first PRESENT_EXPORTs
+ * the bo from the owner stub (host dma-buf fd), then sends THIS command to the
+ * importer stub with that dma-buf fd attached via SCM_RIGHTS.  The importer
+ * runs DRM_IOCTL_PRIME_FD_TO_HANDLE on its own render-node fd, producing a real
+ * local nvidia-drm GEM backed by the same physical memory — exactly what a
+ * bare-metal cross-process import does.  Subsequent RM export/import (0x09 /
+ * 0x3d06) then run entirely within the importer.  QEMU guarantees both isolates
+ * belong to the same VM; entitlement (which process may import) is enforced
+ * guest-side by the guest kernel gating who holds the guest dma-buf fd. */
+struct isolate_cmd_xiso_import {
+	uint32_t type;        /* ISOLATE_CMD_XISO_IMPORT */
+	uint32_t handle_id;   /* importer render-node handle whose fd does the import */
+	uint32_t txn_id;      /* echoed in response */
+	uint32_t reserved;
+	/* The host dma-buf fd to import arrives via SCM_RIGHTS in the same msg. */
+};
+
+struct isolate_resp_xiso_import {
+	uint32_t type;        /* ISOLATE_RESP_XISO_IMPORT */
+	uint32_t txn_id;      /* echoed from command */
+	int32_t  retval;      /* 0 on success; -errno on failure */
+	uint32_t gem_handle;  /* OUT: the importer-local GEM handle (valid if retval==0) */
 };
 
 /*

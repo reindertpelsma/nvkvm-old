@@ -645,6 +645,39 @@ struct nv_semaphore_surface_alloc_parameters {
 	__u64 flags;               /* [IN] */
 };
 
+/* ── NV_CONTEXT_DMA_ALLOCATION_PARAMS — for NV01_CONTEXT_DMA (0x0002) ──────── */
+/*    32 bytes; from src/common/sdk/nvidia/inc/nvos.h. The NVIDIA video stack
+ *    (NVENC) binds a context-DMA over a memory object and allocs it with
+ *    nvos.alloc_parms_size=0, relying on class sizing — so like NV01_MEMORY_VIRTUAL
+ *    and NV_SEMAPHORE_SURFACE the forwarder MUST size it by hClass, else the inner
+ *    params never reach the kernel and the alloc fails NV_ERR_INVALID_ARGUMENT
+ *    (0x1f), and NVENC's InitializeEncoder bails ("EncodeAPI Internal Error", #99).
+ *    h_subdevice / h_memory are RM object handles in the client namespace
+ *    (forwarded verbatim, not fd handle_ids). */
+struct nv_context_dma_allocation_params {
+	__u32 h_subdevice;  /* [IN] @0  */
+	__u32 flags;        /* [IN] @4  */
+	__u32 h_memory;     /* [IN] @8  */
+	__u32 pad;          /*      @12 */
+	__u64 offset;       /* [IN] @16 */
+	__u64 limit;        /* [IN] @24 */
+};
+
+/* ── NVA0BC_ALLOC_PARAMETERS — for NVENC_SW_SESSION (0xa0bc) ──────────────── */
+/*    20 bytes; from class/cla0bc.h. NVENC allocs this session-tracking object
+ *    (what nvidia-smi reads for encoder-session stats) with alloc_parms_size=0;
+ *    same class-sizing path as NV01_CONTEXT_DMA. Non-fatal to encode if missing,
+ *    but the alloc fails INVALID_ARGUMENT and the session never registers (#99).
+ *    h_mem is an RM object handle (client namespace, forwarded verbatim). */
+#define NVENC_SW_SESSION 0x0000a0bcU
+struct nva0bc_alloc_parameters {
+	__u32 codec_type;    /* [IN] @0  */
+	__u32 h_resolution;  /* [IN] @4  */
+	__u32 v_resolution;  /* [IN] @8  */
+	__u32 version;       /* [IN] @12 */
+	__u32 h_mem;         /* [IN] @16 */
+};
+
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */
 /*    several other generic memory classes. V545 layout (driver >= 545.23.06,
  *    matches our 575.51.03): adds numa_node + pad. */
@@ -722,6 +755,17 @@ struct nv0000_ctrl_system_get_build_version_params {
  * and needs no handling. cl2080.h / ctrl2080gpu.h.
  */
 #define NV2080_CTRL_CMD_GPU_GET_ENGINES   0x20800123U
+
+/*
+ * NV0080_CTRL_CMD_GPU_GET_CLASSLIST (non-V2) embeds { NvU32 numClasses@0; NvP64
+ * classList@8 } where classList points at a NvU32[numClasses] array of object
+ * class IDs the driver writes through (numClasses is IN=capacity / OUT=actual).
+ * Same {size@0, pad, ptr@8} preamble as GET_ENGINES, entries are 4-byte class
+ * IDs → list entry size 4. libcuda uses the inline V2 (0x800292); the NVIDIA
+ * video stack (libnvidia-encode/NVENC) uses THIS pointer form to discover the
+ * encoder engine class — without it NVENC reports "unsupported device". ctrl0080gpu.h.
+ */
+#define NV0080_CTRL_CMD_GPU_GET_CLASSLIST 0x00800201U
 
 /*
  * Device-level (NV0080) GET_CAPS family. These embed an

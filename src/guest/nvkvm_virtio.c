@@ -223,6 +223,12 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->retval = le32_to_cpu(resp->handle_id);
 			break;
 		}
+		case NVKVM_REQ_XISO_IMPORT: {
+			struct nvkvm_resp_xiso_import *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			inf->retval = le32_to_cpu(resp->gem_handle);
+			break;
+		}
 		case NVKVM_REQ_CLOSE_HANDLE: {
 			struct nvkvm_resp_close_handle *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -236,6 +242,24 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 		}
 		case NVKVM_REQ_KILL_ISOLATE: {
 			struct nvkvm_resp_kill_isolate *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			break;
+		}
+		case NVKVM_REQ_SETUP_RING: {
+			struct nvkvm_resp_setup_ring *resp = (void *)(hdr + 1);
+			inf->status   = le32_to_cpu(resp->status);
+			inf->retval   = le64_to_cpu(resp->ring_gpa);   /* GPA       */
+			inf->nvstatus = le32_to_cpu(resp->ring_bytes); /* ring_bytes */
+			break;
+		}
+		case NVKVM_REQ_ENTER_LOOP: {
+			struct nvkvm_resp_enter_loop *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			inf->retval = le64_to_cpu(resp->head);   /* last_processed */
+			break;
+		}
+		case NVKVM_REQ_PRESENT: {
+			struct nvkvm_resp_present *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
 			break;
 		}
@@ -312,16 +336,58 @@ static void nvkvm_rx_callback(struct virtqueue *vq)
 	(void)vq;
 }
 
-/* ── VQ_EVT callback — async poll events from host ───────────────────────── */
+/* ── VQ_EVT — async poll events from host (#101) ─────────────────────────────
+ * QEMU fills a pre-posted nvkvm_evt_poll buffer with (isolate_id, handle_id,
+ * events) whenever a forwarded NVIDIA OS-event fires on the host, then returns
+ * it on VQ_EVT. We wake the matching guest fd's poll_wq and recycle the buffer.
+ * Without this the host completion never reaches the guest poll() promptly and
+ * libnvidia-* spins on a ~18 ms poll-timeout-then-recheck (NVENC throughput). */
+#define NVKVM_EVT_NBUFS 16
+
+static int nvkvm_evt_post_one(struct nvkvm_state *state,
+			      struct nvkvm_evt_poll *evt)
+{
+	struct scatterlist sg;
+	sg_init_one(&sg, evt, sizeof(*evt));
+	return virtqueue_add_inbuf(state->vq_evt, &sg, 1, evt, GFP_ATOMIC);
+}
+
+/* Pre-post the IN buffers QEMU writes events into. Called once at init. */
+static void nvkvm_evt_prime(struct nvkvm_state *state)
+{
+	int i;
+	for (i = 0; i < NVKVM_EVT_NBUFS; i++) {
+		struct nvkvm_evt_poll *evt = kzalloc(sizeof(*evt), GFP_KERNEL);
+		if (!evt)
+			break;
+		if (nvkvm_evt_post_one(state, evt) < 0) {
+			kfree(evt);
+			break;
+		}
+	}
+	virtqueue_kick(state->vq_evt);
+}
 
 static void nvkvm_evt_callback(struct virtqueue *vq)
 {
+	struct nvkvm_state *state = vq->vdev->priv;
 	struct nvkvm_evt_poll *evt;
 	unsigned int len;
+	bool posted = false;
 
-	/* TODO: look up fd_token in session table, wake poll queue */
-	while ((evt = virtqueue_get_buf(vq, &len)) != NULL)
-		kfree(evt);
+	while ((evt = virtqueue_get_buf(vq, &len)) != NULL) {
+		if (len >= sizeof(*evt))
+			nvkvm_evt_deliver(le32_to_cpu(evt->isolate_id),
+					  le32_to_cpu(evt->handle_id),
+					  le32_to_cpu(evt->events));
+		/* recycle the buffer back onto VQ_EVT */
+		if (nvkvm_evt_post_one(state, evt) < 0)
+			kfree(evt);
+		else
+			posted = true;
+	}
+	if (posted)
+		virtqueue_kick(vq);
 }
 
 /* ── Generic synchronous send ─────────────────────────────────────────────── */
@@ -638,6 +704,11 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 		NVKVM_CONFIG_F_GRAPHICS) != 0;
 
 	virtio_device_ready(vdev);
+
+	/* #101: pre-post the IN buffers QEMU fills with async OS-event
+	 * notifications (NVENC/completion wakeups). Safe even if QEMU never
+	 * sends any — they just sit on the queue. */
+	nvkvm_evt_prime(state);
 	return 0;
 }
 
@@ -737,6 +808,199 @@ int nvkvm_virtio_create_isolate(unsigned int session_id, __u32 *isolate_id_out)
 	ret = simple_req(NVKVM_REQ_CREATE_ISOLATE, &msg, sizeof(msg), &retval);
 	if (ret == 0 && isolate_id_out)
 		*isolate_id_out = (__u32)retval;
+	return ret;
+}
+
+/*
+ * Fetch this session's command-buffer ring placement.  Returns 0 and fills
+ * *ring_gpa_out / *ring_bytes_out on success; -errno otherwise (incl. -ENODEV
+ * when no ring is available → caller stays on the virtqueue path).  Carries two
+ * result fields, so it can't use simple_req (which surfaces only retval).
+ */
+int nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
+			    u32 *ring_bytes_out)
+{
+	struct {
+		struct nvkvm_hdr           hdr;
+		struct nvkvm_req_setup_ring req;
+	} msg = {};
+	struct nvkvm_inflight *inf;
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	void *buf;
+	int ret;
+
+	if (txn_id == 0)
+		return -EBUSY;
+
+	buf = kmalloc(sizeof(msg), GFP_KERNEL);
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	msg.req.session_id = cpu_to_le32(session_id);
+	memcpy(buf, &msg, sizeof(msg));
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(NVKVM_REQ_SETUP_RING);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
+
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	ret = nvkvm_send_sync(&nvkvm, buf, sizeof(msg), inf);
+	if (ret == 0) {
+		if (inf->status) {
+			ret = -(int)inf->status;
+		} else {
+			if (ring_gpa_out)   *ring_gpa_out   = inf->retval;
+			if (ring_bytes_out) *ring_bytes_out = inf->nvstatus;
+		}
+	}
+	inflight_free(&nvkvm, inf);
+	kfree(buf);
+	return ret;
+}
+
+int nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us, u64 *head_out)
+{
+	struct {
+		struct nvkvm_hdr            hdr;
+		struct nvkvm_req_enter_loop req;
+	} msg = {};
+	struct nvkvm_inflight *inf;
+	__u32 txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	void *buf;
+	int ret;
+
+	if (txn_id == 0)
+		return -EBUSY;
+
+	buf = kmalloc(sizeof(msg), GFP_KERNEL);
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	msg.req.session_id = cpu_to_le32(session_id);
+	msg.req.idle_us    = cpu_to_le32(idle_us);
+	memcpy(buf, &msg, sizeof(msg));
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(NVKVM_REQ_ENTER_LOOP);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
+
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	/* Blocks until the isolate's consumer loop idles out (QEMU offloads the
+	 * forward so this is just a normal virtqueue wait, uninterruptible — the
+	 * pump kthread owns it and exits via kthread_stop). */
+	ret = nvkvm_send_sync(&nvkvm, buf, sizeof(msg), inf);
+	if (ret == 0) {
+		if (inf->status)
+			ret = -(int)inf->status;
+		else if (head_out)
+			*head_out = inf->retval;
+	}
+	inflight_free(&nvkvm, inf);
+	kfree(buf);
+	return ret;
+}
+
+/*
+ * nvkvm_virtio_present (#106 present path B) — tell QEMU the virtual head just
+ * flipped a scanout bo backed by the stub-side GEM `stub_handle` (geometry as
+ * given).  QEMU asks the owning isolate's stub to export the host dma-buf and
+ * route it to the host display/codec.  Called from the KMS pipe update (atomic
+ * commit tail, a sleepable kworker context), so a synchronous virtqueue wait is
+ * safe; the round-trip is bounded (export is a single host ioctl).  No guest VA
+ * crosses the boundary — only the opaque stub handle + scanout metadata.
+ */
+int nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
+			 __u32 width, __u32 height, __u32 pitch,
+			 __u32 format, __u64 modifier)
+{
+	struct {
+		struct nvkvm_hdr         hdr;
+		struct nvkvm_req_present req;
+	} msg = {};
+	struct nvkvm_inflight *inf;
+	__u32 txn_id;
+	void *buf;
+	int ret;
+
+	if (!ctx || !ctx->session)
+		return -EBADF;
+
+	txn_id = nvkvm_txn_id_alloc(&nvkvm);
+	if (txn_id == 0)
+		return -EBUSY;
+
+	buf = kmalloc(sizeof(msg), GFP_KERNEL);
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
+		return -ENOMEM;
+	}
+	msg.req.isolate_id  = cpu_to_le32(ctx->session->isolate_id);
+	msg.req.handle_id   = cpu_to_le32(ctx->handle_id);
+	msg.req.stub_handle = cpu_to_le32(stub_handle);
+	msg.req.width       = cpu_to_le32(width);
+	msg.req.height      = cpu_to_le32(height);
+	msg.req.pitch       = cpu_to_le32(pitch);
+	msg.req.format      = cpu_to_le32(format);
+	msg.req.session_id  = cpu_to_le32((__u32)ctx->session->id);
+	msg.req.modifier    = cpu_to_le64(modifier);
+	memcpy(buf, &msg, sizeof(msg));
+	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(NVKVM_REQ_PRESENT);
+	((struct nvkvm_hdr *)buf)->txn_id = cpu_to_le32(txn_id);
+
+	inf = inflight_alloc_legacy(txn_id);
+	if (!inf) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	ret = nvkvm_send_sync(&nvkvm, buf, sizeof(msg), inf);
+	if (ret == 0 && inf->status)
+		ret = -(int)inf->status;
+	inflight_free(&nvkvm, inf);
+	kfree(buf);
+	return ret;
+}
+
+/*
+ * #110 cross-isolate dma-buf import.  `ctx` is the importer (the drm_file the
+ * GEM op arrived on); the bo is owned by a different isolate.  QEMU brokers it
+ * (owner PRIME export → importer PRIME import) and returns a stub GEM handle
+ * valid in the importer's render-node fd, which the caller then uses to forward
+ * the RM export/import (0x09 / 0x3d06) entirely within the importer.
+ */
+int nvkvm_virtio_xiso_import(struct nvkvm_fd_ctx *ctx,
+			     __u32 owner_isolate_id, __u32 owner_handle_id,
+			     __u32 owner_stub_handle, __u32 *gem_out)
+{
+	struct {
+		struct nvkvm_hdr             hdr;
+		struct nvkvm_req_xiso_import req;
+	} msg = {};
+	__u64 retval = 0;
+	int ret;
+
+	if (!ctx || !ctx->session)
+		return -EBADF;
+	if (!owner_isolate_id || !owner_handle_id)
+		return -EINVAL;
+
+	msg.req.owner_isolate_id    = cpu_to_le32(owner_isolate_id);
+	msg.req.owner_handle_id     = cpu_to_le32(owner_handle_id);
+	msg.req.owner_stub_handle   = cpu_to_le32(owner_stub_handle);
+	msg.req.importer_isolate_id = cpu_to_le32(ctx->session->isolate_id);
+	msg.req.importer_handle_id  = cpu_to_le32(ctx->handle_id);
+
+	ret = simple_req(NVKVM_REQ_XISO_IMPORT, &msg, sizeof(msg), &retval);
+	if (ret == 0 && gem_out)
+		*gem_out = (__u32)retval;
 	return ret;
 }
 
@@ -852,6 +1116,22 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	 * this isolate to interrupt the in-flight host ioctl. */
 	inf->isolate_id = ctx->session->isolate_id;
 
+	/*
+	 * FF-2 backstop (security_audit_2026_06_01): the RM_CONTROL aux-extend
+	 * paths (info-list / FIFO_GET_CHANNELLIST / GET_CLASSLIST / BUILD_VERSION)
+	 * can grow aux_size well past a single SHM slot. Each slot is one tile of a
+	 * VM-WIDE shared region, so an over-large memcpy here would stomp adjacent
+	 * slots held by OTHER guest processes (class-1 LPE) or run off the region.
+	 * Refuse before any slot memcpy can overflow. slot_size is host-negotiated,
+	 * validated power-of-two >= NVKVM_SHM_SLOT_MIN_SIZE.
+	 */
+	if (param_size > nvkvm.slot_size || aux_size > nvkvm.slot_size) {
+		pr_err_ratelimited("nvkvm: param/aux size %zu/%zu exceeds slot_size %zu — refusing\n",
+				   param_size, aux_size, nvkvm.slot_size);
+		ret = -EINVAL;
+		goto out;
+	}
+
 	/* Param slot */
 	if (param_size > 0) {
 		void *slot_ptr;
@@ -872,8 +1152,23 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 		memcpy(slot_ptr, aux_buf, aux_size);
 	}
 
-	/* VMA whitelist slot — all VMAs in current mm */
-	vma_buf = kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES, GFP_KERNEL);
+	/*
+	 * VMA whitelist slot — all VMAs in current mm.
+	 *
+	 * current->mm can be NULL here: a forwarded ioctl may run from a context
+	 * with no user mm — most notably GEM_CLOSE forwarded out of
+	 * nvkvm_gem_free() during drm_release() at PROCESS EXIT, where the kernel
+	 * has already run exit_mm() (current->mm = NULL) before exit_files()
+	 * closes the DRM fd. mmap_read_lock(NULL) then faults at &NULL->mmap_lock
+	 * (offset 0xb0) — a hard oops that, for a compositor holding DRM master,
+	 * leaves the master stuck and wedges all later modeset (SET_MASTER EBUSY).
+	 *
+	 * No mm means no guest VAs to whitelist, and the commands that reach this
+	 * path without an mm (GEM_CLOSE) carry no embedded user pointers anyway, so
+	 * skipping the whitelist (vma_count stays 0) is correct, not a workaround.
+	 */
+	vma_buf = current->mm ? kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES,
+					GFP_KERNEL) : NULL;
 	if (vma_buf) {
 		struct mm_struct *mm = current->mm;
 		struct vm_area_struct *vma;

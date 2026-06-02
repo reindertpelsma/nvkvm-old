@@ -38,6 +38,9 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/mm.h>
+#include <linux/io.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/scatterlist.h>
@@ -73,7 +76,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 static int  nvkvm_mmap(struct file *filp, struct vm_area_struct *vma);
 static __poll_t nvkvm_poll(struct file *filp, poll_table *wait);
 
-static const struct file_operations nvkvm_fops = {
+const struct file_operations nvkvm_fops = {   /* F-4: non-static so embedded-fd translation can type-check against it */
 	.owner          = THIS_MODULE,
 	.open           = nvkvm_open,
 	.release        = nvkvm_release,
@@ -179,6 +182,7 @@ static int __init register_devices(void)
 	 * so graphics_enabled already reflects the host's NVKVM_CONFIG_F_GRAPHICS
 	 * by now; compute-only VMs never create the modeset device.
 	 */
+#ifdef NVKVM_GRAPHICS
 	if (nvkvm.graphics_enabled) {
 		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
 				   NV_MINOR_DEVICE_NUMBER_MODESET);
@@ -197,6 +201,7 @@ static int __init register_devices(void)
 			pr_warn("nvkvm: could not reserve nvidia-modeset (195:254)\n");
 		}
 	}
+#endif /* NVKVM_GRAPHICS */
 
 	pr_info("nvkvm: registered nvidiactl (major %u), nvidia0-%d (major %u), nvidia-uvm/uvm-tools (major %u)\n",
 		nvkvm.ctl_major, nvkvm.num_gpus - 1, nvkvm.gpu_major,
@@ -269,6 +274,292 @@ static void unregister_devices(void)
 
 /* ── Device open/release ──────────────────────────────────────────────────── */
 
+/*
+ * Map this session's command-buffer ring (docs/design/command_buffer.md).
+ * QEMU placed the ring memfd in the sparse GPA window at isolate create; we
+ * fetch its GPA and memremap it so the kmd can run the SPSC fast path.  Pure
+ * optimisation: any failure leaves ring_base NULL and the session keeps using
+ * the virtqueue path.  Called once, under isolate_lock.
+ */
+/* ── Command-buffer fast path (docs/design/command_buffer.md, Phase 4c) ──────
+ *
+ * Producers (any guest thread issuing a flat RM_CONTROL) serialise on
+ * ring_lock, so the request ring has ONE producer and the response ring ONE
+ * consumer (the lock holder reads back its own response) — SPSC preserved.
+ * A per-session pump kthread keeps the isolate spinning via ENTER_LOOP while
+ * work is queued; producers wake it after publishing.  Level-triggered
+ * re-evaluation (the pump re-checks has_work after every enter_loop) is the
+ * lost-wakeup-free keystone — see the design doc.
+ */
+#define NVKVM_RING_WAIT_SPIN_TIGHT   200000u  /* tight cpu_relax spins        */
+#define NVKVM_RING_WAIT_MAX_RESCHED  5000u    /* resched rounds before giving up */
+
+/* Tunable idle window passed to the stub (spin iterations before the consumer
+ * loop exits).  0 → stub default (2000).  Crank it up to keep the isolate
+ * spinning across inter-control gaps so one enter_loop batches many controls —
+ * the lever to test whether virtqueue-txn count actually drops. */
+static unsigned int nvkvm_ring_idle_us;
+module_param_named(ring_idle_us, nvkvm_ring_idle_us, uint, 0644);
+MODULE_PARM_DESC(ring_idle_us, "stub consumer-loop idle window in spin iters (0=default; capped in stub)");
+
+static int nvkvm_pump_fn(void *data)
+{
+	struct nvkvm_session *s = data;
+
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(s->pump_wq,
+			kthread_should_stop() ||
+			(s->req_ring && nvkvm_ring_has_work(s->req_ring)));
+		while (!kthread_should_stop() &&
+		       s->req_ring && nvkvm_ring_has_work(s->req_ring)) {
+			u64 head = 0;
+			int ret = nvkvm_virtio_enter_loop((unsigned int)s->id,
+							  nvkvm_ring_idle_us,
+							  &head);
+			if (ret) {
+				/* dead isolate / missing ring → stop driving */
+				if (!kthread_should_stop())
+					msleep(2);
+				break;
+			}
+		}
+	}
+	return 0;
+}
+
+void nvkvm_session_stop_pump(struct nvkvm_session *session)
+{
+	if (session->pump_task) {
+		kthread_stop(session->pump_task);   /* wakes + waits for exit */
+		session->pump_task = NULL;
+	}
+}
+
+/*
+ * Spin on the response ring for txn's reply; copy param/aux back in place.
+ * Caller holds ring_lock (sole consumer).  Returns 0/-errno, or
+ * NVKVM_RING_TRY_PUNT if the stub declined to execute (use the slow path).
+ */
+static int nvkvm_ring_wait_resp(struct nvkvm_session *s, u32 txn,
+				void *params_buf, size_t param_size,
+				void *aux_buf, size_t aux_size,
+				u32 *nvstatus_out)
+{
+	u32 tight = 0, resched = 0;
+
+	for (;;) {
+		u8 *pay;
+		u32 len;
+		u64 total;
+		int rc = nvkvm_ring_peek(s->resp_ring, s->ring_bytes, &pay, &len, &total);
+
+		if (rc == NVKVM_RING_OK) {
+			struct nvkvm_ring_ioctl_resp rh;
+			int out = NVKVM_RING_TRY_PUNT;
+
+			if (len >= sizeof(rh)) {
+				memcpy(&rh, pay, sizeof(rh));
+				if (rh.txn_id == txn) {
+					if (rh.flags & NVKVM_RING_RESP_PUNT) {
+						out = NVKVM_RING_TRY_PUNT;
+					} else {
+						if (rh.param_size &&
+						    rh.param_size <= param_size &&
+						    sizeof(rh) + rh.param_size <= len)
+							memcpy(params_buf,
+							       pay + sizeof(rh),
+							       rh.param_size);
+						if (rh.aux_size &&
+						    rh.aux_size <= aux_size &&
+						    sizeof(rh) + rh.param_size +
+							    rh.aux_size <= len)
+							memcpy(aux_buf,
+							       pay + sizeof(rh) +
+								     rh.param_size,
+							       rh.aux_size);
+						if (nvstatus_out)
+							*nvstatus_out = rh.nvstatus;
+						out = (rh.retval < 0) ?
+							rh.retval : 0;
+					}
+					nvkvm_ring_pop(s->resp_ring, total);
+					return out;
+				}
+			}
+			/* malformed / stale record → drop and keep looking */
+			nvkvm_ring_pop(s->resp_ring, total);
+			continue;
+		}
+		if (rc == NVKVM_RING_BAD)
+			return -EIO;
+
+		if (++tight < NVKVM_RING_WAIT_SPIN_TIGHT) {
+			cpu_relax();
+			continue;
+		}
+		tight = 0;
+		if (++resched > NVKVM_RING_WAIT_MAX_RESCHED)
+			return -EIO;   /* stub wedged */
+		cond_resched();
+	}
+}
+
+/*
+ * Try to forward a flat RM_CONTROL over the SPSC ring.  Eligibility mirrors the
+ * stub's accept set; the stub PUNTs anything needing per-control marshalling
+ * (InfoList/GET_BUILD_VERSION/EXPORT) and the caller falls back to the
+ * virtqueue.  Controls needing guest- or QEMU-side handling (GET_PID_INFO,
+ * EXPORT) are excluded by the caller before reaching here.
+ */
+/*
+ * Runtime toggle for the SPSC command-buffer fast path.  Default OFF: the ring
+ * is correct + validated (HW: 1446 flat RM_CONTROLs/decode offloaded, byte-exact
+ * matmul, 4x multi-proc, zero regression) but measurement showed it does NOT
+ * improve LLM decode throughput — control-RTT is only ~1-2% of per-token time
+ * (the bottleneck is GPU compute + the mapped doorbell/fence launch path), and
+ * keeping the isolate spinning costs host CPU.  Enable it for workloads that ARE
+ * control-latency-bound:  echo 1 > /sys/module/nvkvm_guest/parameters/ring_enable
+ * See docs/design/command_buffer.md "Measured results".
+ */
+static bool nvkvm_ring_enable;   /* default false */
+module_param_named(ring_enable, nvkvm_ring_enable, bool, 0644);
+MODULE_PARM_DESC(ring_enable, "route flat RM_CONTROLs over the SPSC fast ring (default off)");
+
+int nvkvm_session_ring_try(struct nvkvm_fd_ctx *ctx, unsigned int cmd,
+			   void *params_buf, size_t param_size,
+			   void *aux_buf, size_t aux_size, u32 *nvstatus_out)
+{
+	struct nvkvm_session *s = ctx->session;
+
+	if (!nvkvm_ring_enable)
+		return NVKVM_RING_TRY_PUNT;
+	struct nvkvm_ring_ioctl_req rh;
+	u32 payload, txn;
+	u64 total;
+	u8 *p;
+	int rc;
+
+	if (!s->req_ring || !s->pump_task)
+		return NVKVM_RING_TRY_PUNT;
+	if (_IOC_NR(cmd) != NV_ESC_RM_CONTROL ||
+	    param_size != sizeof(struct nvos54_parameters) ||
+	    param_size > NVKVM_RING_MAX_PARAM ||
+	    aux_size > NVKVM_RING_MAX_AUX)
+		return NVKVM_RING_TRY_PUNT;
+
+	mutex_lock(&s->ring_lock);
+	if (!s->req_ring) {
+		mutex_unlock(&s->ring_lock);
+		return NVKVM_RING_TRY_PUNT;
+	}
+
+	payload = (u32)sizeof(rh) + (u32)param_size + (u32)aux_size;
+	p = nvkvm_ring_reserve(s->req_ring, s->ring_bytes, payload, &total);
+	if (!p) {                       /* ring full → slow path this time */
+		mutex_unlock(&s->ring_lock);
+		return NVKVM_RING_TRY_PUNT;
+	}
+
+	txn = ++s->ring_txn_next;
+	if (!txn)
+		txn = ++s->ring_txn_next;
+	rh.txn_id      = txn;
+	rh.handle_id   = ctx->handle_id;
+	rh.cmd         = cmd;
+	rh.param_size  = (u32)param_size;
+	rh.aux_size    = (u32)aux_size;
+	rh.abi_profile = 0;   /* RM_CONTROL nvstatus offset is fixed (nvos54@28) */
+	memcpy(p, &rh, sizeof(rh));
+	if (param_size)
+		memcpy(p + sizeof(rh), params_buf, param_size);
+	if (aux_size)
+		memcpy(p + sizeof(rh) + param_size, aux_buf, aux_size);
+	nvkvm_ring_commit(s->req_ring, total);
+
+	wake_up(&s->pump_wq);   /* drive the stub */
+
+	rc = nvkvm_ring_wait_resp(s, txn, params_buf, param_size,
+				  aux_buf, aux_size, nvstatus_out);
+	mutex_unlock(&s->ring_lock);
+	return rc;
+}
+
+static void nvkvm_session_setup_ring(struct nvkvm_session *session)
+{
+	u64 gpa = 0;
+	u32 ring_bytes = 0, region;
+	void *base;
+	int ret;
+
+	if (session->ring_base)
+		return;   /* already mapped */
+
+	ret = nvkvm_virtio_setup_ring((unsigned int)session->id,
+				      &gpa, &ring_bytes);
+	if (ret || !gpa || !nvkvm_ring_size_ok(ring_bytes)) {
+		pr_info("nvkvm: session %d: no command-buffer ring (ret=%d) — virtqueue path\n",
+			session->id, ret);
+		return;
+	}
+
+	region = (u32)nvkvm_ring_region_size(ring_bytes);
+	if (!nvkvm_gpa_in_mmap_window((unsigned long)gpa, region)) {
+		pr_warn("nvkvm: session %d ring gpa 0x%llx outside mmap window\n",
+			session->id, gpa);
+		return;
+	}
+
+	/* WB-cached, directly dereferenceable; arch_memremap_wb handles the
+	 * non-RAM (reservation-BAR) range on x86. */
+	base = memremap((resource_size_t)gpa, region, MEMREMAP_WB);
+	if (!base) {
+		pr_warn("nvkvm: session %d memremap(0x%llx, %u) failed\n",
+			session->id, gpa, region);
+		return;
+	}
+
+	session->ring_base        = base;
+	session->ring_gpa         = gpa;
+	session->ring_region_size = region;
+	session->ring_bytes       = ring_bytes;
+	session->req_ring  = (struct nvkvm_ring *)base;
+	session->resp_ring = (struct nvkvm_ring *)
+		((u8 *)base + nvkvm_ring_resp_off(ring_bytes));
+
+	/*
+	 * 3-way probe: QEMU initialised both control blocks with size==ring_bytes
+	 * and head==tail==0.  Reading them back here proves the guest maps the
+	 * SAME physical pages as QEMU and the isolate (all three share one memfd).
+	 */
+	if (session->req_ring->size == ring_bytes &&
+	    session->resp_ring->size == ring_bytes &&
+	    session->req_ring->head == session->req_ring->tail) {
+		pr_info("nvkvm: session %d RING MAPPED gpa=0x%llx bytes=%u — 3-way OK (req.size=%llu resp.size=%llu)\n",
+			session->id, gpa, ring_bytes,
+			(unsigned long long)session->req_ring->size,
+			(unsigned long long)session->resp_ring->size);
+		/* Start the pump that keeps the isolate spinning on the ring. */
+		session->pump_task = kthread_run(nvkvm_pump_fn, session,
+						 "nvkvm-pump-%d", session->id);
+		if (IS_ERR(session->pump_task)) {
+			pr_warn("nvkvm: session %d pump start failed — disabling ring\n",
+				session->id);
+			session->pump_task = NULL;
+			memunmap(base);
+			session->ring_base = NULL;
+			session->req_ring = session->resp_ring = NULL;
+		}
+	} else {
+		pr_warn("nvkvm: session %d ring readback mismatch (req.size=%llu resp.size=%llu want=%u) — disabling ring\n",
+			session->id,
+			(unsigned long long)session->req_ring->size,
+			(unsigned long long)session->resp_ring->size, ring_bytes);
+		memunmap(base);
+		session->ring_base = NULL;
+		session->req_ring = session->resp_ring = NULL;
+	}
+}
+
 /* Ensure the session has an isolate; creates one if isolate_id == 0. */
 static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 {
@@ -281,8 +572,10 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
 		return 0;
 	}
 	ret = nvkvm_virtio_create_isolate((unsigned int)session->id, &isolate_id);
-	if (ret == 0)
+	if (ret == 0) {
 		session->isolate_id = isolate_id;
+		nvkvm_session_setup_ring(session);   /* map the ring (best-effort) */
+	}
 	mutex_unlock(&session->isolate_lock);
 	return ret;
 }
@@ -296,6 +589,48 @@ static int nvkvm_ensure_isolate(struct nvkvm_session *session)
  * RM device.  Returns ERR_PTR on failure.  Does NOT allocate UVM state; the
  * UVM caller adds it.
  */
+/* ── #101 async-event registry ──────────────────────────────────────────────
+ * VQ_EVT notifications from the host carry (isolate_id, handle_id). An OS-event
+ * fd's poll() blocks on ctx->poll_wq; this registry lets the VQ_EVT virtqueue
+ * callback (softirq) find the matching ctx and wake it immediately, instead of
+ * libnvidia-* falling back to a ~18 ms poll-timeout-then-recheck per completion
+ * (the NVENC throughput bottleneck). The shared lock also pins ctx lifetime:
+ * a concurrent close()'s unregister blocks until any in-flight deliver() ends. */
+static LIST_HEAD(nvkvm_evt_ctx_list);
+static DEFINE_SPINLOCK(nvkvm_evt_ctx_lock);
+
+void nvkvm_evt_ctx_register(struct nvkvm_fd_ctx *ctx)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&nvkvm_evt_ctx_lock, flags);
+	list_add(&ctx->evt_node, &nvkvm_evt_ctx_list);
+	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
+}
+
+void nvkvm_evt_ctx_unregister(struct nvkvm_fd_ctx *ctx)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&nvkvm_evt_ctx_lock, flags);
+	if (!list_empty(&ctx->evt_node))
+		list_del_init(&ctx->evt_node);
+	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
+}
+
+void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events)
+{
+	struct nvkvm_fd_ctx *ctx;
+	unsigned long flags;
+	spin_lock_irqsave(&nvkvm_evt_ctx_lock, flags);
+	list_for_each_entry(ctx, &nvkvm_evt_ctx_list, evt_node) {
+		if (ctx->handle_id == handle_id && ctx->session &&
+		    ctx->session->isolate_id == isolate_id) {
+			atomic_or((int)events, &ctx->poll_events);
+			wake_up_interruptible(&ctx->poll_wq);
+		}
+	}
+	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
+}
+
 struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 {
 	struct nvkvm_fd_ctx *ctx;
@@ -307,6 +642,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 		return ERR_PTR(-ENOMEM);
 
 	ctx->dev_id  = dev_id;
+	refcount_set(&ctx->refs, 1);   /* G-6: the open file's reference */
 	ctx->session = nvkvm_session_get_or_create(current->mm, current->tgid);
 	if (IS_ERR(ctx->session)) {
 		ret = PTR_ERR(ctx->session);
@@ -319,6 +655,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 	INIT_LIST_HEAD(&ctx->mmap_regions);
 	mutex_init(&ctx->cpu_pages_lock);
 	INIT_LIST_HEAD(&ctx->cpu_pages);
+	INIT_LIST_HEAD(&ctx->evt_node);   /* #101: not yet in the registry */
 
 	ret = nvkvm_ensure_isolate(ctx->session);
 	if (ret)
@@ -329,6 +666,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 	if (ret)
 		goto err;
 	ctx->handle_id = handle_id;
+	nvkvm_evt_ctx_register(ctx);   /* #101: now discoverable by VQ_EVT */
 	return ctx;
 err:
 	nvkvm_session_put(ctx->session);
@@ -336,10 +674,15 @@ err:
 	return ERR_PTR(ret);
 }
 
-/* Tear down a context built by nvkvm_fd_ctx_open_dev (also the body of the
- * char-device release path). */
-void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
+/* Actual teardown — runs only when the last reference (open file + any proxy
+ * GEMs) drops.  See the refs comment in struct nvkvm_fd_ctx. */
+static void nvkvm_fd_ctx_destroy(struct nvkvm_fd_ctx *ctx)
 {
+	/* #101: leave the async-event registry first so no VQ_EVT deliver() can
+	 * touch this ctx after we start tearing it down (unregister blocks until
+	 * any in-flight deliver() under the shared lock completes). */
+	nvkvm_evt_ctx_unregister(ctx);
+
 	if (ctx->handle_id && ctx->session->isolate_id)
 		nvkvm_virtio_close_handle_on_isolate(ctx->handle_id,
 						     ctx->session->isolate_id);
@@ -385,6 +728,24 @@ void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
 
 	nvkvm_session_put(ctx->session);
 	kfree(ctx);
+}
+
+/* Drop the open file's reference (char-device release / DRM postclose). The
+ * ctx survives until any proxy GEMs that referenced it are freed too. */
+void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
+{
+	nvkvm_fd_ctx_put(ctx);
+}
+
+void nvkvm_fd_ctx_get(struct nvkvm_fd_ctx *ctx)
+{
+	refcount_inc(&ctx->refs);
+}
+
+void nvkvm_fd_ctx_put(struct nvkvm_fd_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->refs))
+		nvkvm_fd_ctx_destroy(ctx);
 }
 
 static int nvkvm_open(struct inode *inode, struct file *filp)
@@ -637,6 +998,8 @@ static unsigned int nvkvm_ctrl_list_entry_size(__u32 cmd)
 		return NVXXX_CTRL_XXX_INFO_ENTRY_SIZE; /* 8 */
 	case NV2080_CTRL_CMD_GPU_GET_ENGINES:
 		return 4; /* engineList is NvU32[engineCount] */
+	case NV0080_CTRL_CMD_GPU_GET_CLASSLIST:
+		return 4; /* classList is NvU32[numClasses] (NVENC engine discovery) */
 	case NV0080_CTRL_CMD_GR_GET_CAPS:
 	case NV0080_CTRL_CMD_FB_GET_CAPS:
 	case NV0080_CTRL_CMD_HOST_GET_CAPS:
@@ -863,6 +1226,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * the caller's fd to restore on the response (fd is IN/OUT, value kept). */
 	__s32 orig_export_fd = 0;
 	bool have_export_fd  = false;
+	__s32 orig_import_fd = 0;          /* IMPORT_OBJECT_FROM_FD (0x3d06) fd@0 */
+	bool have_import_fd  = false;
 	/* Embedded-fd fields in frontend ioctls: sanitizer overwrites these
 	 * with handle_ids; capture the caller's original guest-fd so the
 	 * response round-trips libcuda's value unchanged. */
@@ -1093,6 +1458,27 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				}
 			}
 
+			/* NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD (0x3d06,
+			 * #110): the dma-buf import counterpart of 0x3d05.  The
+			 * inner params carry the source nv-export fd at offset 0
+			 * (NvS32 fd; then the NV0000_CTRL_OS_UNIX_EXPORT_OBJECT).
+			 * Swap our handle_id in so the stub resolves its own local
+			 * fd and imports the object into the caller's RM client;
+			 * the fd is IN (unchanged), so save it to restore on the
+			 * response. */
+			if (ctrl->cmd == 0x3d06 && aux_size >= 4) {
+				__s32 gfd;
+				memcpy(&gfd, aux_buf, sizeof(gfd));
+				orig_import_fd = gfd;
+				have_import_fd = true;
+				if (gfd >= 0) {
+					__s32 hid = guest_fd_to_handle_id(gfd);
+					if (hid >= 0)
+						memcpy(aux_buf, &hid,
+						       sizeof(hid));
+				}
+			}
+
 			/*
 			 * Commands that embed an `NvxxxCtrlXxxGetInfoParams` preamble
 			 * (info_list_size, pad, info_list pointer) at the start of the
@@ -1287,6 +1673,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * libnvidia-eglcore later NULL-derefs the missing object. */
 				ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
 				break;
+			case NV01_CONTEXT_DMA:
+				/* 0x0002: 32B; NVENC binds a context-DMA with size=0. Without
+				 * this the kernel sees empty params -> INVALID_ARGUMENT and
+				 * InitializeEncoder fails (#99). */
+				ap_size = sizeof(struct nv_context_dma_allocation_params);
+				break;
+			case NVENC_SW_SESSION:
+				/* 0xa0bc: 20B; NVENC session-tracking object, size=0.
+				 * Same pattern as NV01_CONTEXT_DMA (#99). */
+				ap_size = sizeof(struct nva0bc_alloc_parameters);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -1394,6 +1791,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					 * libnvidia-eglcore NULL-derefs later (#84). */
 					ap_size = sizeof(struct nv_semaphore_surface_alloc_parameters);
 					break;
+					case NV01_CONTEXT_DMA:
+						/* 0x0002: 32B; NVENC binds a context-DMA with size=0 ->
+						 * without this the kernel sees empty params -> INVALID_
+						 * ARGUMENT and InitializeEncoder fails (#99). */
+						ap_size = sizeof(struct nv_context_dma_allocation_params);
+						break;
+					case NVENC_SW_SESSION:
+						/* 0xa0bc: 20B; NVENC session-tracking object, size=0.
+						 * Same pattern as NV01_CONTEXT_DMA (#99). */
+						ap_size = sizeof(struct nva0bc_alloc_parameters);
+						break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
 				case NV01_MEMORY_SYSTEM:
@@ -1480,33 +1888,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				    ap_size >= sizeof(struct nv0005_alloc_parameters)) {
 					struct nv0005_alloc_parameters *ep = aux_buf;
 					int user_fd = (int)(int32_t)ep->data;
-					/* Pre-translate dump: exactly what libcuda wrote */
-					print_hex_dump(KERN_INFO,
-						"nvkvm guest pre 0x79 nvos64: ",
-						DUMP_PREFIX_NONE, 48, 1,
-						params_buf, param_size, false);
-					print_hex_dump(KERN_INFO,
-						"nvkvm guest pre 0x79 aux:    ",
-						DUMP_PREFIX_NONE, 24, 1,
-						aux_buf, aux_size, false);
 					if (user_fd >= 0) {
 						struct file *f = fget(user_fd);
 						__u32 hid = 0;
 						if (f) {
-							struct nvkvm_fd_ctx *other =
-								f->private_data;
-							if (other && other->handle_id)
-								hid = other->handle_id;
+							/* F-4: only read private_data if it's our fd */
+							if (nvkvm_file_is_ours(f)) {
+								struct nvkvm_fd_ctx *other =
+									f->private_data;
+								if (other && other->handle_id)
+									hid = other->handle_id;
+							}
 							fput(f);
 						}
 						if (hid > 0)
 							ep->data = hid;
 					}
-					/* Post-translate dump */
-					print_hex_dump(KERN_INFO,
-						"nvkvm guest post 0x79 aux:   ",
-						DUMP_PREFIX_NONE, 24, 1,
-						aux_buf, aux_size, false);
 				}
 			}
 		}
@@ -1539,6 +1936,65 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		__u32 ioctl_flags = 0;
 		__u64 fault_addr  = 0;
 		int retries;
+		int ring_rc = NVKVM_RING_TRY_PUNT;
+		int vcache_miss = 0;
+
+		/* Any UVM range teardown invalidates the VALIDATE cache (#94). */
+		if (cmd == UVM_UNMAP_EXTERNAL || cmd == UVM_FREE ||
+		    cmd == UVM_UNREGISTER_GPU_VASPACE || cmd == UVM_UNREGISTER_GPU ||
+		    cmd == UVM_DESTROY_RANGE_GROUP)
+			nvkvm_session_vcache_clear(ctx->session);
+
+		/*
+		 * UVM_VALIDATE_VA_RANGE cache (#94): libcuda re-validates the SAME
+		 * (base,len) range ~1000x per pageable cuMemcpy, each a ~191us
+		 * forwarded round-trip (the DtoH bottleneck).  It's an idempotent
+		 * registration check, so serve a cached rm_status locally.  The
+		 * cache is cleared on any UVM teardown / new migration so a stale
+		 * "valid" can never outlive the range's registration.
+		 */
+		if (cmd == UVM_VALIDATE_VA_RANGE && params_buf && param_size >= 20) {
+			struct nvkvm_session *s = ctx->session;
+			u64 vbase = *(u64 *)params_buf;
+			u64 vlen  = *(u64 *)((char *)params_buf + 8);
+			unsigned long vfl;
+			int hit = 0, k;
+			u32 st = 0;
+
+			spin_lock_irqsave(&s->vcache_lock, vfl);
+			for (k = 0; k < NVKVM_VCACHE_N; k++)
+				if (s->vcache[k].valid &&
+				    s->vcache[k].base == vbase &&
+				    s->vcache[k].len  == vlen) {
+					st = s->vcache[k].status;
+					hit = 1;
+					break;
+				}
+			spin_unlock_irqrestore(&s->vcache_lock, vfl);
+			if (hit) {
+				*(u32 *)((char *)params_buf + 16) = st;
+				ret = 0;
+				goto forwarded;   /* skip the forward entirely */
+			}
+			vcache_miss = 1;   /* forward, then cache the result */
+		}
+
+		/*
+		 * Command-buffer fast path: flat RM_CONTROLs that need no guest-
+		 * or QEMU-side special handling ride the SPSC ring (the hot
+		 * decode-poll controls).  GET_PID_INFO (gpi_save) and
+		 * EXPORT_OBJECT_TO_FD (have_export_fd) are excluded — they need
+		 * host-VMM handling; everything else the stub PUNTs if it requires
+		 * per-control marshalling, and we drop to the virtqueue below.
+		 */
+		if (!gpi_save && !have_export_fd && !have_import_fd)
+			ring_rc = nvkvm_session_ring_try(ctx, cmd,
+							 params_buf, param_size,
+							 aux_buf, aux_size, NULL);
+		if (ring_rc != NVKVM_RING_TRY_PUNT) {
+			ret = ring_rc;
+			goto forwarded;
+		}
 
 #define NVKVM_MAX_EFAULT_RETRIES 128
 		for (retries = 0; retries < NVKVM_MAX_EFAULT_RETRIES; retries++) {
@@ -1557,6 +2013,24 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ret = -EFAULT;
 				break;
 			}
+		}
+forwarded:;
+
+		/* Cache a freshly-forwarded VALIDATE result (miss path). */
+		if (vcache_miss && ret == 0 && params_buf && param_size >= 20) {
+			struct nvkvm_session *s = ctx->session;
+			u64 vbase = *(u64 *)params_buf;
+			u64 vlen  = *(u64 *)((char *)params_buf + 8);
+			u32 st    = *(u32 *)((char *)params_buf + 16);
+			unsigned long vfl;
+			int slot;
+			spin_lock_irqsave(&s->vcache_lock, vfl);
+			slot = s->vcache_next++ % NVKVM_VCACHE_N;
+			s->vcache[slot].base   = vbase;
+			s->vcache[slot].len    = vlen;
+			s->vcache[slot].status = st;
+			s->vcache[slot].valid  = true;
+			spin_unlock_irqrestore(&s->vcache_lock, vfl);
 		}
 
 		/*
@@ -1579,6 +2053,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (have_export_fd && aux_buf && aux_size >= 20)
 			memcpy((char *)aux_buf + 16, &orig_export_fd,
 			       sizeof(orig_export_fd));
+
+		/* IMPORT_OBJECT_FROM_FD: restore the caller's own fd at offset 0
+		 * (we swapped it for a handle_id; the import keeps the fd). */
+		if (have_import_fd && aux_buf && aux_size >= 4)
+			memcpy(aux_buf, &orig_import_fd, sizeof(orig_import_fd));
 	} else {
 		/* Open establishes ctx->handle_id and ctx->session->isolate_id;
 		 * an ioctl on a ctx missing either is a logic bug. The legacy
@@ -1919,19 +2398,28 @@ static int nvkvm_virtio_probe(struct virtio_device *vdev)
 	 * compute works without it.  Parent = the virtio device so the DRM core
 	 * builds /sys/.../<virtio-dev>/drm/renderD128 that the NVIDIA ICD needs.
 	 */
+#ifdef NVKVM_GRAPHICS
 	if (nvkvm.graphics_enabled)
 		nvkvm_drm_init(&vdev->dev);
 	else {
 		nvkvm_modeset_unregister();
 		pr_info("nvkvm: graphics disabled by host — compute-only\n");
 	}
+#else
+	/* Compute-only build (NVKVM_GRAPHICS=0): no DRM/KMS code is linked in, so
+	 * never expose a graphics surface regardless of what the host advertises. */
+	nvkvm_modeset_unregister();
+	pr_info("nvkvm: compute-only build (no DRM/KMS/modeset)\n");
+#endif
 
 	return 0;
 }
 
 static void nvkvm_virtio_remove(struct virtio_device *vdev)
 {
+#ifdef NVKVM_GRAPHICS
 	nvkvm_drm_fini();
+#endif
 	nvkvm_virtio_fini(&nvkvm);
 }
 

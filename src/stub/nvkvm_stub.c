@@ -35,6 +35,8 @@
 
 #include "stub_freestanding.h"
 #include "../common/nvkvm_isolate_proto.h"
+#include "../common/nvkvm_ring.h"
+#include "../common/nvkvm_ring_ioctl.h"
 #include "../common/nvkvm_abi.h"
 
 /* ── Constants we'd otherwise pull from libc headers ─────────────────────── */
@@ -45,9 +47,12 @@
 #define EINTR     4
 #define EIO       5
 #define EBADF     9
+#define EAGAIN   11
+#define EWOULDBLOCK EAGAIN
 #define ENOMEM   12
 #define EFAULT   14
 #define EINVAL   22
+#define ENODEV   19
 #define ENOSYS   38
 #endif
 #ifndef ENOTSUP
@@ -72,10 +77,14 @@
 #define PROT_EXEC      0x4
 #endif
 #ifndef MAP_PRIVATE
+#define MAP_SHARED     0x01
 #define MAP_PRIVATE    0x02
 #define MAP_FIXED      0x10
 #define MAP_ANONYMOUS  0x20
 #define MAP_GROWSDOWN  0x0100
+#endif
+#ifndef MAP_SHARED
+#define MAP_SHARED     0x01
 #endif
 #define MAP_FAILED ((void *)-1L)
 
@@ -256,6 +265,19 @@ static __attribute__((noreturn)) void stub_exit(int code)
 	__builtin_unreachable();
 }
 
+/* Freestanding memcpy — the compiler lowers variable-length __builtin_memcpy
+ * to a memcpy() call.  no-tree-loop-distribute-patterns stops GCC from
+ * recognising this byte loop as memcpy and emitting a self-call. */
+__attribute__((used, optimize("no-tree-loop-distribute-patterns")))
+void *memcpy(void *dst, const void *src, size_t n)
+{
+	unsigned char *d = dst;
+	const unsigned char *s = src;
+	while (n--)
+		*d++ = *s++;
+	return dst;
+}
+
 static long stub_read(int fd, void *buf, size_t n)
 {
 	return sc3(__NR_read, fd, (long)buf, (long)n);
@@ -424,6 +446,7 @@ static uint32_t nvkvm_ctrl_list_entry_size(uint32_t cmd)
 	case 0x20801802U: /* NV2080_CTRL_CMD_BUS_GET_INFO */
 		return 8;
 	case 0x20800123U: /* NV2080_CTRL_CMD_GPU_GET_ENGINES (engineList NvU32[]) */
+	case 0x00800201U: /* NV0080_CTRL_CMD_GPU_GET_CLASSLIST (classList NvU32[]; NVENC) */
 		return 4;
 	case 0x00801102U: /* NV0080_CTRL_CMD_GR_GET_CAPS */
 	case 0x00801301U: /* NV0080_CTRL_CMD_FB_GET_CAPS */
@@ -435,6 +458,18 @@ static uint32_t nvkvm_ctrl_list_entry_size(uint32_t cmd)
 	}
 	return 0;
 }
+
+/* ── Command-buffer ring (docs/design/command_buffer.md) ─────────────────────
+ * QEMU mints a memfd holding the request + response SPSC rings and sends it
+ * via SCM_RIGHTS (ISOLATE_CMD_SETUP_RING).  We mmap the same memfd MAP_SHARED;
+ * the guest sees the same pages through a KVM memslot (Phase 4).  Phase 2 only
+ * maps + self-tests it; Phase 3 spins a consumer thread on g_req_ring.
+ */
+static void              *g_ring_base;       /* base of the mmapped region    */
+static uint64_t           g_ring_region_size;
+static struct nvkvm_ring *g_req_ring;        /* guest→isolate (we consume)    */
+static struct nvkvm_ring *g_resp_ring;       /* isolate→guest (we produce)    */
+static uint32_t           g_ring_bytes;
 
 /* ── Handle fd table ─────────────────────────────────────────────────────── */
 
@@ -511,6 +546,16 @@ static int send_error(int err)
 {
 	struct isolate_resp_error r = {
 		.type = ISOLATE_RESP_ERROR, .err = err < 0 ? -err : err };
+	return locked_send(&r, sizeof(r));
+}
+
+static int send_ring_ready(int error, uint64_t probe_seen)
+{
+	struct isolate_resp_ring_ready r = {
+		.type       = ISOLATE_RESP_RING_READY,
+		.error      = error,
+		.probe_seen = probe_seen,
+	};
 	return locked_send(&r, sizeof(r));
 }
 
@@ -743,13 +788,15 @@ static void worker_thread(void *arg)
 		 */
 		unsigned job_type = (job.cmd >> 8) & 0xff;
 		unsigned job_nr   = job.cmd & 0xff;
-		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper and the
-		 * DRM SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) both carry
-		 * their single user ptr there. */
+		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper, the DRM
+		 * SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) and DRM
+		 * GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110) all carry
+		 * their single user ptr (nvkms_params_ptr) there. */
 		if (job.aux_size > 0 &&
 		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
 		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
-		     (job_type == 'd' && job_nr == 0x54 && job.param_size >= 16))) {
+		     (job_type == 'd' && (job_nr == 0x54 || job_nr == 0x49) &&
+		      job.param_size >= 16))) {
 			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
 			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
 					 &aux_ptr, sizeof(uint64_t));
@@ -794,6 +841,31 @@ static void worker_thread(void *arg)
 						regsurf_hid[regsurf_n] = hid;
 						regsurf_n++;
 					}
+				}
+			}
+		}
+
+		/*
+		 * DRM GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110): the aux
+		 * blob is { int memFd } at offset 0, carrying our handle_id; map
+		 * it to the stub's local fd so the kernel exports the bo's RM
+		 * memory onto a real fd in this process (exactly the
+		 * EXPORT_OBJECT_TO_FD path).  Restore the handle_id after.
+		 */
+		int     drm_export_fd_off = -1;
+		int32_t drm_export_fd_hid = 0;
+		if (job_type == 'd' && job_nr == 0x49 &&
+		    job.aux_size >= sizeof(int32_t)) {
+			int32_t hid;
+			__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
+			if (hid > 0) {
+				int lfd = handle_lookup((uint32_t)hid);
+				if (lfd >= 0) {
+					int32_t lfd32 = lfd;
+					__builtin_memcpy(job.aux_buf, &lfd32,
+							 sizeof(lfd32));
+					drm_export_fd_off = 0;
+					drm_export_fd_hid = hid;
 				}
 			}
 		}
@@ -871,6 +943,25 @@ static void worker_thread(void *arg)
 					__builtin_memcpy((char *)job.aux_buf + 16,
 							 &lfd32, sizeof(lfd32));
 					export_fd_off = 16;
+				}
+			}
+			if (inner_cmd == 0x00003d06U &&
+			    job.aux_size >= 4) {
+				/* NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD
+				 * (#110): the source nv-export fd is at aux offset
+				 * 0 and carries a handle_id; map it to our local fd
+				 * so the kernel imports the object into the caller's
+				 * RM client.  Reuse export_fd_off/saved (restore
+				 * writes the handle_id back at that offset). */
+				int32_t hid;
+				__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
+				export_fd_saved = hid;
+				int lfd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
+				if (lfd >= 0) {
+					int32_t lfd32 = lfd;
+					__builtin_memcpy(job.aux_buf, &lfd32,
+							 sizeof(lfd32));
+					export_fd_off = 0;
 				}
 			}
 			if (inner_cmd == 0x0080170dU) {
@@ -1125,8 +1216,18 @@ static void worker_thread(void *arg)
 		 * returns so a late interrupt lands on a no-op handler, not on
 		 * the post-processing/send path. */
 		worker_inflight_txn[slot] = job.txn_id;
+		uint64_t _tsc0 = __builtin_ia32_rdtsc();
 		long ret  = stub_ioctl(fd, job.cmd, job.param_buf);
+		uint64_t _dcyc = __builtin_ia32_rdtsc() - _tsc0;
 		worker_inflight_txn[slot] = 0;
+		/* DIAG: log slow forwarded ioctls (>2ms @ 2595MHz) — find the slow
+		 * cuMemcpyDtoH op in the stub. */
+		if (_dcyc > 5000000ULL)
+			fs_dprintf(STDERR_FD,
+				"PROF slow stub ioctl nr=0x%x type=0x%x %u us\n",
+				(unsigned)(job.cmd & 0xff),
+				(unsigned)((job.cmd >> 8) & 0xff),
+				(unsigned)(_dcyc / 2595));
 		/* sc*: negative return is -errno, matching kernel convention. */
 		int  err  = (ret < 0) ? (int)(-ret) : 0;
 		if (ret < 0) ret = -1;  /* normalise to (-1, errno) for callers */
@@ -1189,6 +1290,13 @@ static void worker_thread(void *arg)
 		if (export_fd_off >= 0)
 			__builtin_memcpy((char *)job.aux_buf + export_fd_off,
 					 &export_fd_saved, sizeof(export_fd_saved));
+
+		/* DRM GEM_EXPORT_NVKMS_MEMORY: put the handle_id back at aux+0
+		 * over the stub fd we substituted (the guest restores its own
+		 * fd); never leak the stub's local fd. */
+		if (drm_export_fd_off >= 0)
+			__builtin_memcpy(job.aux_buf, &drm_export_fd_hid,
+					 sizeof(drm_export_fd_hid));
 
 		/* NVKMS REGISTER_SURFACE: restore handle_ids over the stub fds we
 		 * substituted into the plane slots (don't leak stub fds). */
@@ -1288,6 +1396,78 @@ static void *blob_alloc(size_t size)
 	void *p = stub_mmap(NULL, aligned, PROT_READ | PROT_WRITE,
 			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	return (p == MAP_FAILED) ? NULL : p;
+}
+
+/*
+ * ISOLATE_CMD_SETUP_RING: map the QEMU-minted ring memfd (delivered via
+ * SCM_RIGHTS) and run the bidirectional probe self-test.  QEMU is trusted, but
+ * the geometry is validated defensively before mmap so a bad size can never
+ * blow up the stub.  Phase 2 maps + self-tests only; Phase 3 spins a consumer
+ * thread on g_req_ring.  Failure replies RING_READY{error<0} and the isolate
+ * keeps serving every ioctl over the existing socket path.
+ */
+static void handle_setup_ring(const struct isolate_cmd_setup_ring *cmd,
+			      struct msghdr *msg_hdr, long msg_len)
+{
+	struct cmsghdr *cm = CMSG_FIRSTHDR(msg_hdr);
+	if (!cm || cm->cmsg_level != SOL_SOCKET ||
+	    cm->cmsg_type != SCM_RIGHTS ||
+	    cm->cmsg_len != CMSG_LEN(sizeof(int))) {
+		send_ring_ready(-EINVAL, 0);
+		return;
+	}
+	int fd;
+	__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+
+	if (msg_len < (long)sizeof(*cmd) || g_ring_base) {   /* malformed / dup */
+		stub_close(fd);
+		send_ring_ready(-EINVAL, 0);
+		return;
+	}
+
+	uint32_t ring_bytes = cmd->ring_bytes;
+	uint32_t region     = cmd->region_size;
+	uint32_t resp_off   = cmd->resp_off;
+
+	/* Geometry: power-of-two ring, layout matches the shared helpers, the
+	 * region holds both [control + data] halves, bounded total size. */
+	if (!nvkvm_ring_size_ok(ring_bytes) ||
+	    cmd->req_off != 0 ||
+	    resp_off != (uint32_t)nvkvm_ring_resp_off(ring_bytes) ||
+	    region < (uint32_t)nvkvm_ring_region_size(ring_bytes) ||
+	    region > (16u << 20)) {                          /* 16 MiB cap */
+		stub_close(fd);
+		send_ring_ready(-EINVAL, 0);
+		return;
+	}
+
+	void *base = stub_mmap(NULL, region, PROT_READ | PROT_WRITE,
+			       MAP_SHARED, fd, 0);
+	stub_close(fd);                  /* the mapping keeps the memfd alive */
+	if (base == MAP_FAILED) {
+		send_ring_ready(-ENOMEM, 0);
+		return;
+	}
+
+	struct nvkvm_ring *req  = (struct nvkvm_ring *)base;
+	struct nvkvm_ring *resp = (struct nvkvm_ring *)((uint8_t *)base + resp_off);
+	uint8_t *req_data  = (uint8_t *)req  + sizeof(struct nvkvm_ring);
+	uint8_t *resp_data = (uint8_t *)resp + sizeof(struct nvkvm_ring);
+
+	/* Probe: read QEMU's word (proves QEMU→isolate when echoed), write the
+	 * masked reply (proves isolate→QEMU when QEMU re-reads it). */
+	uint64_t v;
+	__builtin_memcpy(&v, req_data, sizeof(v));
+	uint64_t reply = v ^ NVKVM_RING_PROBE_MASK;
+	__builtin_memcpy(resp_data, &reply, sizeof(reply));
+
+	g_ring_base        = base;
+	g_ring_region_size = region;
+	g_req_ring         = req;
+	g_resp_ring        = resp;
+	g_ring_bytes       = ring_bytes;
+
+	send_ring_ready(0, v);
 }
 
 /* ── Command handlers (reader thread) ───────────────────────────────────── */
@@ -1422,6 +1602,128 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 		handle_remove(cmd->handle_id);
 		fs_mutex_unlock(&fd_mutex);
 	}
+}
+
+/* DRM PRIME export (#106 present path). Mirrors <drm/drm.h>:
+ *   DRM_IOCTL_PRIME_HANDLE_TO_FD = _IOWR('d', 0x2d, struct drm_prime_handle)
+ *   = (3<<30)|(12<<16)|('d'<<8)|0x2d = 0xC00C642D.
+ * Flags = DRM_CLOEXEC|DRM_RDWR so the host display/codec can import + map it. */
+struct stub_drm_prime_handle { uint32_t handle; uint32_t flags; int32_t fd; };
+#define STUB_DRM_IOCTL_PRIME_HANDLE_TO_FD 0xC00C642DUL
+#define STUB_DRM_CLOEXEC 0x80000u   /* O_CLOEXEC */
+#define STUB_DRM_RDWR    0x2u       /* O_RDWR    */
+
+static int send_present_export_resp(uint32_t txn_id, int retval, int fd)
+{
+	struct isolate_resp_present_export resp = {
+		.type   = ISOLATE_RESP_PRESENT_EXPORT,
+		.txn_id = txn_id,
+		.retval = retval,
+	};
+	struct iovec iov = { &resp, sizeof(resp) };
+	char cmsg_buf[CMSG_SPACE(sizeof(int))];
+	struct msghdr msg_hdr = {
+		.msg_iov     = &iov,
+		.msg_iovlen  = 1,
+	};
+	if (retval == 0 && fd >= 0) {
+		msg_hdr.msg_control    = cmsg_buf;
+		msg_hdr.msg_controllen = sizeof(cmsg_buf);
+		struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type  = SCM_RIGHTS;
+		cm->cmsg_len   = CMSG_LEN(sizeof(int));
+		__builtin_memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+		msg_hdr.msg_controllen = cm->cmsg_len;
+	}
+	fs_mutex_lock(&write_mutex);
+	long r = stub_sendmsg(SOCK_FD, &msg_hdr, 0);
+	fs_mutex_unlock(&write_mutex);
+	return r < 0 ? -1 : 0;
+}
+
+/* Export a render-node GEM object as a host dma-buf and hand it to QEMU via
+ * SCM_RIGHTS (#106).  The dma-buf is a host buffer reference; the stub never
+ * maps or reads it.  Transient: we close our copy right after sending — the
+ * SCM_RIGHTS transfer gives QEMU its own reference (kept alive by the kernel
+ * across our close). */
+static void handle_present_export(struct isolate_cmd_present_export *cmd)
+{
+	int rfd;
+
+	fs_mutex_lock(&fd_mutex);
+	rfd = handle_lookup(cmd->handle_id);
+	fs_mutex_unlock(&fd_mutex);
+	if (rfd < 0) {
+		send_present_export_resp(cmd->txn_id, -EBADF, -1);
+		return;
+	}
+
+	struct stub_drm_prime_handle p = {
+		.handle = cmd->gem_handle,
+		.flags  = STUB_DRM_CLOEXEC | STUB_DRM_RDWR,
+		.fd     = -1,
+	};
+	long r = stub_ioctl(rfd, STUB_DRM_IOCTL_PRIME_HANDLE_TO_FD, &p);
+	if (r < 0 || p.fd < 0) {
+		send_present_export_resp(cmd->txn_id, (r < 0) ? (int)r : -EINVAL, -1);
+		return;
+	}
+	send_present_export_resp(cmd->txn_id, 0, p.fd);
+	stub_close(p.fd);
+}
+
+/* DRM PRIME import (#110 cross-isolate). Mirrors <drm/drm.h>:
+ *   DRM_IOCTL_PRIME_FD_TO_HANDLE = _IOWR('d', 0x2e, struct drm_prime_handle)
+ *   = (3<<30)|(12<<16)|('d'<<8)|0x2e = 0xC00C642E.
+ * The dma-buf fd was exported by the OWNER stub (PRIME_HANDLE_TO_FD) and relayed
+ * here by QEMU via SCM_RIGHTS.  PRIME_FD_TO_HANDLE on our render node creates a
+ * real local nvidia-drm GEM backed by the same physical memory, so the caller's
+ * subsequent RM export/import (0x09 / 0x3d06) run entirely within this stub. */
+#define STUB_DRM_IOCTL_PRIME_FD_TO_HANDLE 0xC00C642EUL
+
+static void handle_xiso_import(struct isolate_cmd_xiso_import *cmd,
+			       struct msghdr *msg_hdr)
+{
+	struct isolate_resp_xiso_import resp = {
+		.type   = ISOLATE_RESP_XISO_IMPORT,
+		.txn_id = cmd->txn_id,
+		.retval = -EINVAL,
+		.gem_handle = 0,
+	};
+	int dbuf = -1;
+	int rfd;
+
+	/* The dma-buf fd arrives via SCM_RIGHTS (QEMU is trusted). */
+	struct cmsghdr *cm = CMSG_FIRSTHDR(msg_hdr);
+	if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+	    cm->cmsg_len == CMSG_LEN(sizeof(int)))
+		__builtin_memcpy(&dbuf, CMSG_DATA(cm), sizeof(int));
+	if (dbuf < 0) {
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	fs_mutex_lock(&fd_mutex);
+	rfd = handle_lookup(cmd->handle_id);
+	fs_mutex_unlock(&fd_mutex);
+	if (rfd < 0) {
+		resp.retval = -EBADF;
+		stub_close(dbuf);
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	struct stub_drm_prime_handle p = { .handle = 0, .flags = 0, .fd = dbuf };
+	long r = stub_ioctl(rfd, STUB_DRM_IOCTL_PRIME_FD_TO_HANDLE, &p);
+	stub_close(dbuf);   /* PRIME_FD_TO_HANDLE took its own reference */
+	if (r < 0) {
+		resp.retval = (int)r;
+	} else {
+		resp.retval = 0;
+		resp.gem_handle = p.handle;
+	}
+	locked_send(&resp, sizeof(resp));
 }
 
 static void handle_close_fd(uint32_t handle_id)
@@ -1754,6 +2056,385 @@ cleanup:
 	locked_send(&resp, sizeof(resp));
 }
 
+/* One SEQPACKET command message — large enough for any command struct.  Shared
+ * by the main reader loop and the consumer loop's drain-edge socket poll. */
+union stub_cmd {
+	uint32_t                            type;
+	struct isolate_cmd_receive_fd       recv_fd;
+	struct isolate_cmd_close_fd         close_fd;
+	struct isolate_cmd_ioctl            ioctl_cmd;
+	struct isolate_cmd_mmap             mmap_cmd;
+	struct isolate_cmd_munmap           munmap_cmd;
+	struct isolate_cmd_poll             poll_cmd;
+	struct isolate_cmd_unpoll           unpoll_cmd;
+	struct isolate_cmd_open_device      open_dev;
+	struct isolate_cmd_realize_uvm_fd   realize;
+	struct isolate_cmd_interrupt        interrupt_cmd;
+	struct isolate_cmd_setup_ring       setup_ring;
+	struct isolate_cmd_enter_loop       enter_loop;
+	struct isolate_cmd_present_export   present_export;
+	struct isolate_cmd_xiso_import      xiso_import;
+};
+
+/* ── Command-buffer consumer loop (docs/design/command_buffer.md, Phase 3) ───
+ *
+ * Driven by ISOLATE_CMD_ENTER_LOOP: the reader thread spins on g_req_ring,
+ * executes flat RM_CONTROLs inline (no worker hand-off — that latency is the
+ * whole point), writes responses to g_resp_ring, and — at every drain edge —
+ * polls the socket so slow-path commands are still serviced.  It exits after an
+ * idle window with no ring work and no socket traffic, re-checking has_work()
+ * once more (the lost-wakeup-free exit edge) before returning the request-ring
+ * head (last_processed) to the caller, which ships it back in LOOP_EXITED.
+ *
+ * TRUST: the request ring is producer-writable by the (untrusted) guest.  Every
+ * record is copied into private stack scratch and size-validated before use; a
+ * malformed ring is fatal to THIS isolate only (DoS, never OOB).
+ */
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0x40
+#endif
+#define NVKVM_RING_IDLE_DEFAULT   2000u   /* idle spin iterations before exit  */
+#define NVKVM_RING_IDLE_MAX       1000000u /* hard cap so a huge idle_us can't
+                                           * wedge guest teardown (kthread_stop
+                                           * blocks on the in-flight enter_loop) */
+#define NVKVM_RING_RESP_FULL_SPIN 100000u /* bound resp-ring backpressure spins */
+
+static inline void ring_cpu_relax(void)
+{
+	__builtin_ia32_pause();
+}
+
+/* Reader-loop reentrancy guard (the guest pump keeps one enter_loop in flight,
+ * but a stray duplicate must not recurse into a nested loop). */
+static volatile int g_ring_looping;
+
+/*
+ * Write one response record to g_resp_ring.  The stub is the sole producer of
+ * the response ring, so reserve/commit are race-free against the guest
+ * consumer.  Spins (bounded) if the guest has not drained the ring; persistent
+ * fullness is guest misbehaviour and tears down this isolate.
+ */
+static void ring_write_resp(uint32_t txn_id, int32_t retval, uint32_t nvstatus,
+			    uint32_t flags, const void *param, uint32_t param_size,
+			    const void *aux, uint32_t aux_size)
+{
+	uint32_t payload = (uint32_t)sizeof(struct nvkvm_ring_ioctl_resp) +
+			   param_size + aux_size;
+	uint64_t total;
+	uint8_t *p = NULL;
+
+	for (uint32_t spin = 0; ; spin++) {
+		p = nvkvm_ring_reserve(g_resp_ring, g_ring_bytes, payload, &total);
+		if (p)
+			break;
+		if (spin >= NVKVM_RING_RESP_FULL_SPIN)
+			stub_exit(141);   /* guest not draining responses → DoS-self */
+		ring_cpu_relax();
+	}
+
+	struct nvkvm_ring_ioctl_resp hdr = {
+		.txn_id     = txn_id,
+		.retval     = retval,
+		.nvstatus   = nvstatus,
+		.param_size = param_size,
+		.aux_size   = aux_size,
+		.flags      = flags,
+	};
+	__builtin_memcpy(p, &hdr, sizeof(hdr));
+	if (param_size)
+		__builtin_memcpy(p + sizeof(hdr), param, param_size);
+	if (aux_size)
+		__builtin_memcpy(p + sizeof(hdr) + param_size, aux, aux_size);
+	nvkvm_ring_commit(g_resp_ring, total);
+}
+
+/*
+ * Decide whether a ring-routed RM_CONTROL needs the per-control marshalling the
+ * slow worker path does (embedded inner pointers/fds).  If so we PUNT — the
+ * guest re-issues on the virtqueue.  PUNT means "not executed", so a
+ * side-effecting control is never run twice.
+ */
+static int ring_ctrl_must_punt(uint32_t cmd, const void *param,
+			       uint32_t param_size, uint32_t aux_size)
+{
+	unsigned type = (cmd >> 8) & 0xff;
+	unsigned nr   = cmd & 0xff;
+
+	/* Only flat NV_ESC_RM_CONTROL (nvos54, 32B) rides the ring. */
+	if (type != 'F' || nr != 0x2a || param_size < 32)
+		return 1;
+	if (aux_size == 0)
+		return 0;                 /* no inner params → trivially flat   */
+	if (aux_size > NVKVM_RING_MAX_AUX || param_size > NVKVM_RING_MAX_PARAM)
+		return 1;
+
+	/* Inner control cmd lives at param offset 8 (nvos54.cmd). */
+	uint32_t inner;
+	__builtin_memcpy(&inner, (const uint8_t *)param + 8, sizeof(inner));
+	if (nvkvm_ctrl_list_entry_size(inner))   /* InfoList/Caps family        */
+		return 1;
+	if (inner == 0x00000101U)                /* GET_BUILD_VERSION (str ptrs)*/
+		return 1;
+	if (inner == 0x00003d05U)                /* EXPORT_OBJECT_TO_FD (fd)    */
+		return 1;
+	if (inner == 0x0080170dU)                /* FIFO_GET_CHANNELLIST (ptr)  */
+		return 1;
+	return 0;
+}
+
+/*
+ * Execute one request record from the request ring.  The payload was already
+ * peeked (pointer into the hostile ring); we copy it into private scratch,
+ * validate, run the flat RM_CONTROL inline, and write the response.
+ */
+static void ring_exec_one(const uint8_t *pay, uint32_t len)
+{
+	struct nvkvm_ring_ioctl_req rq;
+	uint8_t param[NVKVM_RING_MAX_PARAM];
+	uint8_t aux[NVKVM_RING_MAX_AUX];
+
+	if (len < sizeof(rq))
+		return;                            /* runt record → drop silently */
+	__builtin_memcpy(&rq, pay, sizeof(rq));
+
+	if (rq.param_size > NVKVM_RING_MAX_PARAM ||
+	    rq.aux_size > NVKVM_RING_MAX_AUX ||
+	    (uint64_t)sizeof(rq) + rq.param_size + rq.aux_size > len) {
+		ring_write_resp(rq.txn_id, -EINVAL, 0, NVKVM_RING_RESP_PUNT,
+				NULL, 0, NULL, 0);
+		return;
+	}
+	if (rq.param_size)
+		__builtin_memcpy(param, pay + sizeof(rq), rq.param_size);
+	if (rq.aux_size)
+		__builtin_memcpy(aux, pay + sizeof(rq) + rq.param_size, rq.aux_size);
+
+	if (ring_ctrl_must_punt(rq.cmd, param, rq.param_size, rq.aux_size)) {
+		ring_write_resp(rq.txn_id, 0, 0, NVKVM_RING_RESP_PUNT,
+				NULL, 0, NULL, 0);
+		return;
+	}
+
+	fs_mutex_lock(&fd_mutex);
+	int fd = handle_lookup(rq.handle_id);
+	fs_mutex_unlock(&fd_mutex);
+	if (fd < 0) {
+		ring_write_resp(rq.txn_id, -EBADF, 0, 0, NULL, 0, NULL, 0);
+		return;
+	}
+
+	/* Wire the inner-params pointer (nvos54.params at offset 16) to our local
+	 * aux copy so the driver dereferences valid stub memory; zero it on the
+	 * way back so we never leak a host VA to the guest. */
+	if (rq.aux_size) {
+		uint64_t aux_ptr = (uint64_t)(uintptr_t)aux;
+		__builtin_memcpy(param + 16, &aux_ptr, sizeof(aux_ptr));
+	}
+
+	clear_fault_addr();
+	long ret = stub_ioctl(fd, rq.cmd, param);
+	int  err = (ret < 0) ? (int)(-ret) : 0;
+
+	if (rq.aux_size) {
+		uint64_t zero = 0;
+		__builtin_memcpy(param + 16, &zero, sizeof(zero));
+	}
+
+	uint32_t nvstatus = 0;
+	__builtin_memcpy(&nvstatus, param + 28, sizeof(nvstatus)); /* nvos54@28 */
+
+	ring_write_resp(rq.txn_id, err ? -err : (int32_t)ret, nvstatus, 0,
+			param, rq.param_size, aux, rq.aux_size);
+}
+
+/* Forward decl: drain-edge socket dispatch reuses the main command handler. */
+static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n);
+
+/*
+ * Drain-edge socket poll: service at most one pending slow-path command without
+ * blocking.  Returns 1 if the caller must terminate the process (EXIT/error), 0
+ * otherwise (nothing pending, or a command was dispatched).
+ */
+static int ring_loop_poll_socket(void)
+{
+	union stub_cmd cmd;
+	char cmsg_buf[CMSG_SPACE(sizeof(int))];
+	struct iovec iov = { &cmd, sizeof(cmd) };
+	struct msghdr msg_hdr = {
+		.msg_iov        = &iov,
+		.msg_iovlen     = 1,
+		.msg_control    = cmsg_buf,
+		.msg_controllen = sizeof(cmsg_buf),
+	};
+
+	long n = stub_recvmsg(SOCK_FD, &msg_hdr, MSG_DONTWAIT);
+	if (n == -EAGAIN || n == -EWOULDBLOCK || n == -EINTR)
+		return 0;
+	if (n <= 0)
+		return 1;                          /* EOF / error → terminate */
+	if (n < (long)sizeof(uint32_t))
+		return 1;
+	return stub_dispatch_cmd(&cmd, &msg_hdr, n);
+}
+
+/*
+ * The consumer loop itself.  Returns the request-ring head at exit.
+ */
+static uint64_t ring_consumer_loop(uint32_t idle_us)
+{
+	if (!g_req_ring || !g_resp_ring)
+		return 0;
+
+	uint32_t idle_budget = idle_us ? idle_us : NVKVM_RING_IDLE_DEFAULT;
+	uint32_t idle = 0;
+
+	/* Cap the idle window: enter_loop stays in flight for the whole budget,
+	 * and the guest pump's kthread_stop blocks on it during teardown — an
+	 * unbounded value would wedge teardown.  ~1e6 iters ≈ <1s worst case. */
+	if (idle_budget > NVKVM_RING_IDLE_MAX)
+		idle_budget = NVKVM_RING_IDLE_MAX;
+
+	for (;;) {
+		uint8_t *pay;
+		uint32_t len;
+		uint64_t total;
+		int rc = nvkvm_ring_peek(g_req_ring, g_ring_bytes, &pay, &len, &total);
+
+		if (rc == NVKVM_RING_OK) {
+			ring_exec_one(pay, len);
+			nvkvm_ring_pop(g_req_ring, total);
+			idle = 0;
+			continue;
+		}
+		if (rc == NVKVM_RING_BAD)
+			stub_exit(140);            /* corrupt ring → tear down */
+
+		/* Ring empty → service the socket, then consider exiting. */
+		if (ring_loop_poll_socket())
+			stub_exit(0);              /* EXIT during loop */
+		/* A dispatched command may have produced new ring work; re-check
+		 * immediately rather than counting it as idle. */
+		if (nvkvm_ring_has_work(g_req_ring)) {
+			idle = 0;
+			continue;
+		}
+		if (++idle >= idle_budget) {
+			/* Exit edge: one last has_work() before committing. */
+			if (nvkvm_ring_has_work(g_req_ring)) {
+				idle = 0;
+				continue;
+			}
+			return g_req_ring->head;
+		}
+		ring_cpu_relax();
+	}
+}
+
+/*
+ * Handle one received command.  Returns 1 if the reader loop should terminate
+ * the process (clean EXIT or fatal framing error), 0 to continue.  Called both
+ * from the main reader loop and from the consumer loop's drain-edge poll.
+ */
+static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
+{
+	switch (c->type) {
+	case ISOLATE_CMD_RECEIVE_FD: {
+		struct cmsghdr *cm = CMSG_FIRSTHDR(msg_hdr);
+		if (!cm || cm->cmsg_level != SOL_SOCKET ||
+		    cm->cmsg_type != SCM_RIGHTS) {
+			send_error(EINVAL);
+			return 0;
+		}
+		int fd;
+		__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+
+		/* For UVM, drop the QEMU-owned fd and use one of our pre-opened
+		 * local fds whose owning mm is the stub. */
+		if (n >= (long)sizeof(struct isolate_cmd_receive_fd) &&
+		    c->recv_fd.dev_id == 1 /* NVKVM_DEV_UVM */) {
+			fs_mutex_lock(&uvm_local_lock);
+			int local = -1;
+			if (uvm_local_next_idx < NVKVM_STUB_UVM_LOCAL_POOL_SIZE)
+				local = uvm_local_fds[uvm_local_next_idx++];
+			fs_mutex_unlock(&uvm_local_lock);
+			if (local >= 0) {
+				stub_close(fd);
+				fd = local;
+			}
+		}
+		fs_mutex_lock(&fd_mutex);
+		if (c->recv_fd.handle_id < MAX_HANDLES &&
+		    handle_fds[c->recv_fd.handle_id] >= 0)
+			stub_close(handle_fds[c->recv_fd.handle_id]);
+		handle_store(c->recv_fd.handle_id, fd);
+		fs_mutex_unlock(&fd_mutex);
+		send_ok();
+		return 0;
+	}
+	case ISOLATE_CMD_CLOSE_FD:
+		handle_close_fd(c->close_fd.handle_id);
+		return 0;
+	case ISOLATE_CMD_IOCTL:
+		handle_ioctl_cmd(&c->ioctl_cmd);
+		return 0;
+	case ISOLATE_CMD_MMAP:
+		handle_mmap(&c->mmap_cmd);
+		return 0;
+	case ISOLATE_CMD_MUNMAP:
+		handle_munmap_cmd(&c->munmap_cmd);
+		return 0;
+	case ISOLATE_CMD_POLL:
+		(void)c->poll_cmd;
+		send_ok();   /* TODO: background poll */
+		return 0;
+	case ISOLATE_CMD_UNPOLL:
+		(void)c->unpoll_cmd;
+		send_ok();
+		return 0;
+	case ISOLATE_CMD_OPEN_DEVICE:
+		handle_open_device(&c->open_dev);
+		return 0;
+	case ISOLATE_CMD_PRESENT_EXPORT:
+		handle_present_export(&c->present_export);
+		return 0;
+	case ISOLATE_CMD_XISO_IMPORT:
+		handle_xiso_import(&c->xiso_import, msg_hdr);
+		return 0;
+	case ISOLATE_CMD_REALIZE_UVM_FD:
+		handle_realize_uvm_fd(&c->realize);
+		return 0;
+	case ISOLATE_CMD_INTERRUPT:
+		interrupt_txn(c->interrupt_cmd.target_txn);
+		return 0;
+	case ISOLATE_CMD_SETUP_RING:
+		handle_setup_ring(&c->setup_ring, msg_hdr, n);
+		return 0;
+	case ISOLATE_CMD_ENTER_LOOP: {
+		uint64_t head;
+		if (g_ring_looping || !g_req_ring) {
+			/* Duplicate enter_loop (or no ring) — reply immediately so
+			 * the caller's blocking virtqueue request completes. */
+			head = g_req_ring ? g_req_ring->head : 0;
+		} else {
+			g_ring_looping = 1;
+			head = ring_consumer_loop(c->enter_loop.idle_us);
+			g_ring_looping = 0;
+		}
+		struct isolate_resp_loop_exited r = {
+			.type  = ISOLATE_RESP_LOOP_EXITED,
+			.error = g_req_ring ? 0 : -ENODEV,
+			.head  = head,
+		};
+		locked_send(&r, sizeof(r));
+		return 0;
+	}
+	case ISOLATE_CMD_EXIT:
+		return 1;
+	default:
+		return 1;
+	}
+}
+
 /* ── Seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -2023,19 +2704,7 @@ int main(void)
 	 * SEQPACKET messages by QEMU and are still read individually below.
 	 */
 	for (;;) {
-		union {
-			uint32_t                            type;
-			struct isolate_cmd_receive_fd       recv_fd;
-			struct isolate_cmd_close_fd         close_fd;
-			struct isolate_cmd_ioctl            ioctl_cmd;
-			struct isolate_cmd_mmap             mmap_cmd;
-			struct isolate_cmd_munmap           munmap_cmd;
-			struct isolate_cmd_poll             poll_cmd;
-			struct isolate_cmd_unpoll           unpoll_cmd;
-			struct isolate_cmd_open_device      open_dev;
-			struct isolate_cmd_realize_uvm_fd   realize;
-			struct isolate_cmd_interrupt        interrupt_cmd;
-		} cmd;
+		union stub_cmd cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
 		struct iovec iov = { &cmd, sizeof(cmd) };
@@ -2053,80 +2722,10 @@ int main(void)
 			break;
 		if (n < (long)sizeof(uint32_t))
 			goto done;
-		switch (cmd.type) {
-		case ISOLATE_CMD_RECEIVE_FD: {
-			struct cmsghdr *cm = CMSG_FIRSTHDR(&msg_hdr);
-			if (!cm || cm->cmsg_level != SOL_SOCKET ||
-			    cm->cmsg_type != SCM_RIGHTS) {
-				send_error(EINVAL);
-				break;
-			}
-			int fd;
-			__builtin_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
-
-			/* For UVM, drop the QEMU-owned fd and use one of our
-			 * pre-opened local fds whose owning mm is the stub. */
-			if (n >= (long)sizeof(struct isolate_cmd_receive_fd) &&
-			    cmd.recv_fd.dev_id == 1 /* NVKVM_DEV_UVM */) {
-				fs_mutex_lock(&uvm_local_lock);
-				int local = -1;
-				if (uvm_local_next_idx <
-				    NVKVM_STUB_UVM_LOCAL_POOL_SIZE)
-					local = uvm_local_fds[uvm_local_next_idx++];
-				fs_mutex_unlock(&uvm_local_lock);
-				if (local >= 0) {
-					stub_close(fd);
-					fd = local;
-				}
-			}
-			fs_mutex_lock(&fd_mutex);
-			if (cmd.recv_fd.handle_id < MAX_HANDLES &&
-			    handle_fds[cmd.recv_fd.handle_id] >= 0)
-				stub_close(handle_fds[cmd.recv_fd.handle_id]);
-			handle_store(cmd.recv_fd.handle_id, fd);
-			fs_mutex_unlock(&fd_mutex);
-			send_ok();
-			break;
-		}
-		case ISOLATE_CMD_CLOSE_FD:
-			handle_close_fd(cmd.close_fd.handle_id);
-			break;
-		case ISOLATE_CMD_IOCTL:
-			handle_ioctl_cmd(&cmd.ioctl_cmd);
-			break;
-		case ISOLATE_CMD_MMAP:
-			handle_mmap(&cmd.mmap_cmd);
-			break;
-		case ISOLATE_CMD_MUNMAP:
-			handle_munmap_cmd(&cmd.munmap_cmd);
-			break;
-		case ISOLATE_CMD_POLL:
-			(void)cmd.poll_cmd;
-			send_ok();  /* TODO: background poll */
-			break;
-		case ISOLATE_CMD_UNPOLL:
-			(void)cmd.unpoll_cmd;
-			send_ok();
-			break;
-		case ISOLATE_CMD_OPEN_DEVICE:
-			handle_open_device(&cmd.open_dev);
-			break;
-		case ISOLATE_CMD_REALIZE_UVM_FD: {
-			struct isolate_cmd_realize_uvm_fd *r = (void *)&cmd;
-			handle_realize_uvm_fd(r);
-			break;
-		}
-		case ISOLATE_CMD_INTERRUPT:
-			/* Fire-and-forget: signal the worker on this txn so its
-			 * in-flight ioctl returns -EINTR.  No response. (#73) */
-			interrupt_txn(cmd.interrupt_cmd.target_txn);
-			break;
-		case ISOLATE_CMD_EXIT:
+		if (stub_dispatch_cmd(&cmd, &msg_hdr, n))
 			goto done;
-		default:
-			goto done;
-		}
 	}
+
 
 done:
 	stub_exiting = 1;

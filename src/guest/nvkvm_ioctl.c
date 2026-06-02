@@ -228,6 +228,10 @@ __s32 guest_fd_to_handle_id(int guest_fd)
 
 	if (!f)
 		return -EBADF;
+	if (!nvkvm_file_is_ours(f)) {   /* F-4: must be one of our device fds */
+		fput(f);
+		return -EBADF;
+	}
 	{
 		struct nvkvm_fd_ctx *other = f->private_data;
 		if (!other || !other->handle_id) {
@@ -477,13 +481,14 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		 * Use handle_id, with the stub mapping to its local fd at
 		 * ioctl time. */
 		struct nv_ioctl_alloc_os_event *p = buf;
-		print_hex_dump(KERN_INFO,
-			"nvkvm guest pre  ALLOC_OS_EVENT: ",
-			DUMP_PREFIX_NONE, 16, 1, buf, size, false);
 		if (p->fd != (unsigned)-1) {
 			struct file *f = fget(p->fd);
 			if (!f)
 				return -EBADF;
+			if (!nvkvm_file_is_ours(f)) {   /* F-4 */
+				fput(f);
+				return -EBADF;
+			}
 			{
 				struct nvkvm_fd_ctx *other =
 					f->private_data;
@@ -492,9 +497,6 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 			}
 			fput(f);
 		}
-		print_hex_dump(KERN_INFO,
-			"nvkvm guest post ALLOC_OS_EVENT: ",
-			DUMP_PREFIX_NONE, 16, 1, buf, size, false);
 		break;
 	}
 
@@ -504,6 +506,10 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 			struct file *f = fget(p->fd);
 			if (!f)
 				return -EBADF;
+			if (!nvkvm_file_is_ours(f)) {   /* F-4 */
+				fput(f);
+				return -EBADF;
+			}
 			{
 				struct nvkvm_fd_ctx *other =
 					f->private_data;

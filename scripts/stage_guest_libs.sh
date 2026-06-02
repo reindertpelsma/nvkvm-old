@@ -31,6 +31,48 @@ sudo cp -f "$GFXBUNDLE/libcuda.so.$V"      "$SYS/" 2>/dev/null
 sudo ln -sf "libcuda.so.$V"                "$SYS/libcuda.so.1"
 sudo rm -f "$SYS/libcuda.so.575.51.03" "$SYS/libnvidia-ml.so.575.51.03"
 
+# -- video engines: NVENC encode + NVDEC/cuvid.  libnvidia-encode.so depends on
+# libnvcuvid.so, so BOTH must be present + version-matched or ffmpeg/NVENC says
+# "Cannot load libnvidia-encode.so.1".  (NVENC session InitializeEncoder beyond
+# this is a separate deeper forwarder gap — tracked as its own task.) --
+for vlib in libnvidia-encode libnvcuvid; do
+    if [ -f "$GFXBUNDLE/$vlib.so.$V" ]; then
+        sudo cp -f "$GFXBUNDLE/$vlib.so.$V" "$SYS/"
+        sudo ln -sf "$vlib.so.$V" "$SYS/$vlib.so.1"
+        sudo ln -sf "$vlib.so.1"  "$SYS/$vlib.so"
+    fi
+done
+
+# -- EGL GBM stack (#102 modeset): GPU-accelerated GL/EGL on the virtual KMS
+# head needs THREE pieces, all of which must be present or the NVIDIA path is
+# silently skipped and Mesa falls back to llvmpipe (software):
+#
+#   1. The GBM *backend* — Mesa's libgbm dlopens "<drmdriver>_gbm.so" from the
+#      gbm backends dir by the card's DRM driver name ("nvidia-drm"). The NVIDIA
+#      backend IS libnvidia-allocator (the host ships nvidia-drm_gbm.so as a
+#      symlink to it). Without this, gbm_create_device() on card0 returns a Mesa
+#      "dri" device and the NVIDIA EGL platform never even gets a chance. THIS
+#      was the whole "EGL fails to init on the head" wall (#102 chunk 5).
+#   2. libnvidia-egl-gbm.so.1 — the EGL external platform that handles
+#      EGL_PLATFORM_GBM on an NVIDIA gbm device (config 15_nvidia_gbm.json).
+#   3. libnvidia-allocator in the SYSTEM lib dir so the backend symlink resolves
+#      for non-CUDA GL apps (compositors don't add /usr/local/nvidia-guest/lib).
+GBMDIR="$SYS/gbm"
+sudo mkdir -p "$GBMDIR"
+# (1)+(3): allocator in the system dir + the GBM backend symlink to it.
+if [ -f "$GFXBUNDLE/libnvidia-allocator.so.$V" ]; then
+    sudo cp -f "$GFXBUNDLE/libnvidia-allocator.so.$V" "$SYS/"
+    sudo ln -sf "libnvidia-allocator.so.$V"    "$SYS/libnvidia-allocator.so.1"
+    sudo ln -sf "../libnvidia-allocator.so.$V" "$GBMDIR/nvidia-drm_gbm.so"
+fi
+# (2): the EGL external platform (its own version, not driver $V).
+for f in "$GFXBUNDLE"/libnvidia-egl-gbm.so.*; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f")
+    sudo cp -f "$f" "$SYS/"
+    sudo ln -sf "$b" "$SYS/libnvidia-egl-gbm.so.1"
+done
+
 # -- canonical CUDA dir: libcuda + allocator + ptxjit (what apps actually load) --
 sudo cp -f "$GFXBUNDLE/libcuda.so.$V"                  "$CUDADIR/" 2>/dev/null
 sudo cp -f "$GFXBUNDLE/libnvidia-allocator.so.$V"      "$CUDADIR/" 2>/dev/null

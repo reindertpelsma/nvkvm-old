@@ -200,3 +200,225 @@ FENCE_CONTEXT_CREATE / GEM_FENCE_ATTACH, GET_CLIENT_CAPABILITY, GEM_IDENTIFY_OBJ
 - The graphics delta (new RM alloc classes, DRM/GEM ioctls, guest+stub fd
   translations) added default-ALLOW surface and should get a targeted audit
   before the present path builds on top of it.
+
+---
+
+## UPDATE 2026-06-02 (#110): DRM-scanout compositors hang — headless is the path
+
+Hard-diagnosed why a real Wayland compositor "composites but never flips" on the
+virtual KMS head, via gdb backtraces on the live guest.
+
+### DRM-backend compositor HANGS in NVIDIA EGL
+
+`weston --backend=drm-backend --renderer=gl` on our virtual head:
+
+- Comes up GPU-accelerated (NVIDIA GL renderer, RTX 3060), detects the head
+  (`Virtual-1`, connector 31), enables the output, launches `desktop-shell`.
+- Then issues **zero** `ADDFB`/`ATOMIC`/`PAGEFLIP`/`SETCRTC` ioctls and its main
+  thread blocks **forever**:
+
+  ```
+  poll(timeout=-1)
+   ← libnvidia-eglcore.so
+   ← libEGL_nvidia.so  (x3)
+   ← libnvidia-egl-gbm.so       # NVIDIA GBM EGL platform
+   ← drm-backend.so  (x3)       # weston output scanout-buffer management
+   ← wl_event_loop_dispatch ← wl_display_run
+  ```
+
+- Because it is stuck inside that event-loop callback, the main loop never
+  services clients: a connecting client's `wl_display.get_registry` gets no reply.
+- `qemu.log` shows **no** `DENY nvkms` — the NVKMS commands it issues are all in
+  our allowlist `{0,1,17,18,61,62}` and are forwarded; it is blocked on a
+  *presentation/flip-completion event* that never arrives, not on a denial.
+
+**Root cause:** NVIDIA's userspace EGL GBM *scanout-present* path is coupled to
+`nvidia-modeset` doing a real flip and signaling completion. Our virtual head
+provides KMS ioctls but not NVKMS presentation semantics — by design (we never
+forward NVKMS; that is the rejected Piece 3 above and a host-boundary violation).
+This is intrinsic to NVIDIA's closed userspace: every DRM-backend compositor
+(weston/mutter/sway) uses the same `gbm_surface`→scanout path on NVIDIA.
+
+`gbmflip` (direct `gbm_bo_create` + `drmModePageFlip`, **no** `gbm_surface`, no
+EGL present) flips fine through the present path — confirming the hang is
+specifically NVIDIA EGL's `gbm_surface`→scanout path, not our KMS head.
+
+`weston --renderer=pixman` (software) has a healthy event loop but (a) still
+drives no proxy-GEM flip and (b) a `CREATE_DUMB` buffer lives in guest RAM, not a
+forwarded GPU bo — so it cannot reuse the dma-buf present path regardless.
+(`DRM_IOCTL_MODE_CREATE_DUMB` does succeed on our head, leaving a software
+fallback option open, but it is not GPU-accelerated.)
+
+### Headless-GL compositor WORKS
+
+`weston --backend=headless-backend --renderer=gl`:
+
+- Main thread is a healthy `epoll_wait` (no `nvidia-egl-gbm` in the stack —
+  headless does no KMS scanout, so it never enters NVIDIA's present path).
+- GL clients connect and render via NVIDIA GL through nvkvm (verified with
+  `es2gears_wayland`: full `wl_registry` handshake, continuous rendering).
+- `weston-screenshooter` captured a real **1920×1080** desktop (textured
+  wallpaper + top panel + live clock). Verified 2026-06-02.
+
+### Decision
+
+Deliver a host-visible GPU desktop/game via a **headless GPU compositor →
+capture composited GPU dma-buf → present path (#106/#107) → host
+display/NVENC** — the cloud-gaming architecture. This honors "never forward
+NVKMS" and the buffers-shared-host-side model, and reuses the present path.
+
+Reusable wiring (no new guest ABI): a capture client grabs the headless
+compositor's composited dma-buf each frame, `PRIME`-imports it on `card0` to a
+proxy GEM, and `AddFB2`+`PageFlip`s it on the (now-free) virtual KMS head →
+`nvkvm_pipe_update` → `nvkvm_virtio_present` → host. The virtual head becomes the
+present *trigger*, driven by the capture client.
+
+Repro: `tests/perf/run_headless_compositor.sh`.
+
+### Capture path built; zero-copy blocked on dma-buf re-import (the 60fps gate)
+
+`tests/perf/apps/wcapflip.c` + `run_wcapflip.sh` implement the capture bridge:
+`weston_output_capture_v1` (FRAMEBUFFER source) into a client buffer, then
+`AddFB2`+`PageFlip` on the virtual head → present path.
+
+- **SHM capture WORKS**: 120/120 frames, the live composited desktop (wallpaper +
+  panel + ticking clock) captured by our own client at **~29 fps** (bounded by
+  weston's CPU glReadPixels). Proof: `/tmp/wcapflip_frame.ppm`.
+- **dmabuf capture FAILS**: weston rejects our LINEAR gbm dma-buf with
+  "importing the supplied dmabufs failed". Same wall as the host-side #107
+  import and gbmgl_present.c: **NVIDIA's userspace EGL cannot re-import a dma-buf
+  exported by our guest nvidia-drm.** NVIDIA clients (es2gears) share buffers via
+  `wl_drm`/`wl_eglstream_display` (NVIDIA's own protocol, full metadata) — which
+  is why *their* buffers composite but our generic linux-dmabuf does not.
+
+Root cause: the guest proxy GEM (`nvkvm_gem_object`) is a `drm_gem_private_object`
+with only `.free` — no `.export`/`.get_sg_table`/PRIME import, so its PRIME fd has
+no NVIDIA-recognized allocation behind it. It exists for the #106 *stub-side*
+export (which works because the stub PRIME-exports the real host bo), not for
+guest-side NVIDIA EGL re-import.
+
+**This is the 60fps gate.** Zero-copy capture (and direct render-into-scanout,
+and the host-side #107 EGL import) all need NVIDIA userspace to accept our
+dma-bufs. The fix is graphics buffer parity: real PRIME export/import on the
+proxy GEM that resolves to the forwarded host allocation with the metadata NVIDIA
+EGL needs — a kernel+stub+QEMU effort. Until then, SHM capture (~29 fps, CPU) is
+the working interim; NVENC of the SHM frame is gated by #101.
+
+### Scoped: the dma-buf import fix (memfd-backed proxy GEM)
+
+`tests/perf/apps/dmabuf_import_probe.c` re-imports a gbm bo's own PRIME fd via
+`eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` on the same nvkvm device and straces
+the ioctls. Result: import FAILS (EGL_BAD_PARAMETER 0x300c) but NVIDIA EGL issues
+a burst of RM frontend ioctls (type 'F': RM_FREE/RM_CONTROL/RM_UNMAP...) that all
+return 0, then rejects the buffer. So the import is NOT a userspace bail — NVIDIA
+drives RM to register the dma-buf's pages as a GPU-accessible memory object, and
+fails because our proxy GEM (`drm_gem_private_object`, only `.free`) exports a
+dma-buf with NO page backing (`get_sg_table` absent) → NVIDIA's import gets no
+pages → BAD_PARAMETER.
+
+FIX (user direction 2026-06-02): back the guest dma-buf with real pages via a
+memfd the stub maps — the SAME mechanism as OS_DESCRIPTOR / userptr ioctls
+(`nvkvm_cpu_page_migrate` in nvkvm_mmap.c: pin guest pages → memfd → MAP_FIXED in
+stub at the same VA, so the host RM `pin_user_pages` finds aliasing pages). Apply
+it so an imported buffer's pages live in a memfd shared guest↔stub↔host-GPU. For
+the capture target this is coherent: weston imports the buffer and WRITES the
+composite into it (memfd pages), and the present side reads the same pages — no
+VRAM/dma-buf-reimport mismatch. This makes graphics share-buffers sysmem
+(OS_DESCRIPTOR-style) instead of VRAM, trading some bandwidth for shareability.
+
+Implementation sketch:
+1. Guest: give the proxy GEM (or a dedicated "shared graphics buffer") a memfd
+   backing + `get_sg_table`/mmap so its PRIME dma-buf has real guest pages.
+2. Guest: on NVIDIA's import RM ioctl, migrate those pages to the stub (reuse
+   `nvkvm_cpu_pages_migrate_range`) so the forwarded RM object aliases them.
+3. Stub: already MAP_FIXED-installs migrated memfds (OS_DESCRIPTOR path) — verify
+   it covers the import RM class.
+4. Present: read/forward the memfd pages (already host-accessible).
+
+### ROOT CAUSE of the import BAD_ALLOC (2026-06-02, rmdump byte-compare)
+
+`tests/perf/apps/rmdump.c` (LD_PRELOAD ioctl shim dumping RM_CONTROL structs)
+ran on host (import OK) vs guest (BAD_ALLOC). The import ioctl sequence is
+byte-identical and every guest ioctl returns 0 — the divergence is a single
+missing RM control:
+
+  HOST RM_CONTROL histogram includes `cmd=0x00003d06` ×1; GUEST has ×0.
+  Both do `cmd=0x00003d05` ×3.
+
+- `0x3d05` = `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` (works on guest — our
+  forwarding already bridges it, stub nvkvm_stub.c:862/2071).
+- `0x3d06` = `NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD` — THE primitive that
+  imports the dma-buf's RM memory object into EGL's RM client. Host issues it;
+  guest never does → EGL has no RM backing for the image → BAD_ALLOC.
+
+WHY the guest skips it: our proxy GEM exports via the DRM-core DEFAULT dma-buf
+ops (`drm_gem_prime_dmabuf_ops`). On re-import (`PRIME_FD_TO_HANDLE`),
+`drm_gem_prime_import_dev` sees a same-device DRM dma-buf and SHORT-CIRCUITS to
+the original GEM object — so EGL believes it already holds the object and skips
+`IMPORT_OBJECT_FROM_FD`. But that original proxy GEM has no RM memory backing in
+EGL's (separate) RM client → BAD_ALLOC. NVIDIA's real dma-buf uses CUSTOM ops, so
+the same-dev short-circuit doesn't fire and EGL does the full import.
+
+FIX PATH: make the proxy GEM's dma-buf NOT short-circuit (custom export so
+`IMPORT_OBJECT_FROM_FD` runs), then forward `0x3d06` with guest-fd↔stub-object
+bridging — the import multi-hop: guest dma-buf fd → (our map) → stub bo →
+EXPORT_OBJECT_TO_FD on stub → IMPORT_OBJECT_FROM_FD into EGL's stub RM client.
+The export half (0x3d05) bridging already exists; mirror it for import (0x3d06).
+
+---
+
+## #110 UPDATE (2026-06-02, commit 6f591b8): single-process import FIXED; cross-isolate is the real wall
+
+The fix path above was *partially* right. Byte-diffing the host-vs-guest
+`eglCreateImageKHR(LINUX_DMA_BUF)` ioctl stream showed the import sequence is:
+
+    PRIME_FD_TO_HANDLE → (RM queries) → GEM_IDENTIFY_OBJECT(0x0e)
+      → GEM_EXPORT_NVKMS_MEMORY(DRM 0x09, onto a caller-provided nv-export fd)
+      → IMPORT_OBJECT_FROM_FD(0x3d06, that fd) into EGL's RM client
+
+The LONE host-vs-guest divergence was **DRM 0x09 GEM_EXPORT_NVKMS_MEMORY**:
+EINVAL on the guest (unimplemented → DRM core rejects), 0 on host. So EGL aborted
+with BAD_ALLOC *before* ever issuing 0x3d06 — the 0x3d06 bridge was necessary but
+not the trigger. (strace mis-labels 0x09 as `DRM_IOCTL_VIRTGPU_GET_CAPS`, nr 0x49.)
+
+Implemented (guest + stub + QEMU allowlists):
+- DRM `GEM_EXPORT_NVKMS_MEMORY` (0x09): translate proxy handle→stub handle;
+  marshal the 4-byte `{int memFd}` blob via the aux slot (guest fd→handle_id,
+  zero the params ptr; stub substitutes a host VA at offset 8 and resolves the
+  memFd to its local fd). **Forward on the PROXY's ctx, not the calling
+  drm_file's** — NVIDIA EGL opens renderD128 several times; a cross-file PRIME
+  re-import hands a *different* drm_file a handle pointing back to the original
+  proxy, and the stub GEM handle is only valid in the host fd that ran
+  GEM_ALLOC. Forwarding on the wrong fd → `nvkms_memory_lookup` returns UNKNOWN →
+  EINVAL. (`nvkvm_gem_to_stub_ctx`.)
+- `IMPORT_OBJECT_FROM_FD` (0x3d06): fd at inner offset 0 swapped guest-fd→
+  handle_id (mirror of 0x3d05's fd@16), restored on response, excluded from the
+  SPSC ring.
+- G-6 fixed: `nvkvm_fd_ctx` is now refcounted; a proxy GEM that outlives its
+  drm_file (cross-file PRIME) keeps the ctx — and the stub-side bo — alive until
+  the last proxy ref drops.
+
+VERIFIED: `dmabuf_import_probe` RESULT=OK (LINEAR + block-linear); cuInit PASS.
+This also unblocks the **host-side #107** present import (same-process re-import).
+
+### Still stuck: cross-isolate (cross-process) buffer sharing
+`wcapflip dmabuf` (weston_output_capture into a client-allocated GPU bo) STILL
+fails: weston (isolate B) imports a dma-buf the wcapflip client (isolate A)
+allocated. The bo's host RM object lives in stub A's RM client; 0x09 now forwards
+on the proxy's ctx = stub A (correct for the export), but the `memFd` weston
+supplies belongs to stub B, and `handle_lookup` is per-stub → unresolvable.
+Cross-process GPU buffer sharing is a separate, larger mechanism.
+
+Two candidate paths (decision pending):
+1. **Cross-isolate dma-buf brokering** — QEMU brokers a host export/dma-buf fd
+   between the two stub processes (stub A `EXPORT_OBJECT_TO_FD` → QEMU passes the
+   host fd to stub B → `IMPORT_OBJECT_FROM_FD`). General, but adds host-boundary
+   attack surface (host fds passed between unprivileged stubs) — design with care.
+2. **Single-isolate capture** — make the headless compositor produce the
+   composited bo in ITS OWN isolate and export it via the existing present path
+   (#106), avoiding cross-process entirely. Candidate: a **WRITEBACK connector**
+   on the virtual KMS head (#102 card0) — the GL renderer writes the composite
+   into a weston-owned bo (no NVIDIA scanout-present hang, no cross-process).
+   Likely the cleaner path.
+
+SHM capture (~28 fps, CPU glReadPixels-bound) remains the working interim.

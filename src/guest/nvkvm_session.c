@@ -17,6 +17,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/io.h>
 #include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/sched/mm.h>
@@ -70,6 +71,9 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 	session->refcount   = 1;
 	session->isolate_id = 0;
 	mutex_init(&session->isolate_lock);
+	mutex_init(&session->ring_lock);
+	init_waitqueue_head(&session->pump_wq);
+	spin_lock_init(&session->vcache_lock);
 
 	id = idr_alloc(&nvkvm.sessions_idr, session, 1, 0, GFP_KERNEL);
 	if (id < 0) {
@@ -84,12 +88,23 @@ struct nvkvm_session *nvkvm_session_get_or_create(struct mm_struct *mm,
 	return session;
 }
 
+void nvkvm_session_vcache_clear(struct nvkvm_session *session)
+{
+	unsigned long fl;
+	int k;
+	spin_lock_irqsave(&session->vcache_lock, fl);
+	for (k = 0; k < NVKVM_VCACHE_N; k++)
+		session->vcache[k].valid = false;
+	spin_unlock_irqrestore(&session->vcache_lock, fl);
+}
+
 void nvkvm_session_put(struct nvkvm_session *session)
 {
 	bool last;
 	__u32 isolate_id = 0;
 	struct mm_struct *mm = NULL;
 	struct pid *tgid_pid = NULL;
+	void *ring_base = NULL;
 
 	mutex_lock(&nvkvm.sessions_lock);
 	last = --session->refcount == 0;
@@ -97,6 +112,9 @@ void nvkvm_session_put(struct nvkvm_session *session)
 		idr_remove(&nvkvm.sessions_idr, session->id);
 		isolate_id = session->isolate_id;
 		session->isolate_id = 0;
+		ring_base = session->ring_base;
+		session->ring_base = NULL;
+		session->req_ring = session->resp_ring = NULL;
 		mm = session->mm;
 		session->mm = NULL;
 		tgid_pid = session->tgid_pid;
@@ -105,6 +123,14 @@ void nvkvm_session_put(struct nvkvm_session *session)
 	mutex_unlock(&nvkvm.sessions_lock);
 
 	if (last) {
+		/* Stop the pump before unmapping/killing: it must reach its
+		 * wait_event and exit while the isolate is still alive so any
+		 * in-flight ENTER_LOOP completes (req_ring is already NULL above,
+		 * so the pump sees no work and idles out). */
+		nvkvm_session_stop_pump(session);
+		/* Drop our ring mapping; QEMU frees the GPA + memfd on isolate kill. */
+		if (ring_base)
+			memunmap(ring_base);
 		/* Kill the isolate process before freeing the session struct. */
 		if (isolate_id)
 			nvkvm_virtio_kill_isolate(isolate_id);
