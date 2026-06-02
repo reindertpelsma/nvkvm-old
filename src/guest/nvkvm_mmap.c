@@ -31,6 +31,8 @@
 #include <linux/highmem.h>
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
+#include <linux/pgtable.h>
+#include <asm/pgtable_types.h>
 
 #include "nvkvm.h"
 
@@ -38,6 +40,73 @@
 static void nvkvm_vma_open(struct vm_area_struct *vma);
 static void nvkvm_vma_close(struct vm_area_struct *vma);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
+
+/*
+ * nvkvm_force_range_wb — rewrite the leaf PTEs covering [start,end) to
+ * write-back caching.
+ *
+ * Our GPA window is exposed to the guest as a prefetchable PCI BAR — a
+ * non-System-RAM region.  remap_pfn_range() therefore routes through x86
+ * track_pfn_remap()/reserve_pfn_range(), which SILENTLY downgrades the WB
+ * pgprot we request to UC- (PAT index 2) because the range isn't RAM and the
+ * MTRR over it isn't uniformly write-back.  On an Intel host this was masked:
+ * KVM's EPT sets the IPAT bit and forces WB for any struct-page memslot
+ * regardless of the guest PTE.  On an AMD host (NPT honors the guest PTE
+ * memtype) the UC- sticks, and CPU access to these cache-coherent,
+ * memfd-backed window pages runs ~100x slow (measured 0.12 GB/s vs 14 GB/s on
+ * an EPYC 7K62 / RTX 3060).  The pages are genuine write-back RAM (a host
+ * memfd; the GPU's DMA snoops the CPU cache), so WB is correct and coherent —
+ * see the cacheability discussion in nvkvm_mmap_request_isolate() and the
+ * migrate path.  Rewrite the PAT bits directly: PAT index 0 == WB on Linux's
+ * PAT MSR, i.e. clear PCD/PWT (and the PAT bit) on the leaf entry.
+ *
+ * No TLB flush is needed: callers invoke this on PTEs that remap_pfn_range()
+ * has just created for a VMA being set up inside the mmap/ioctl syscall (the
+ * range was freshly mapped, after a zap in the migrate path), before userspace
+ * can have touched — and thus TLB-cached — them.  Callers must hold mmap lock.
+ */
+static void nvkvm_force_range_wb(struct mm_struct *mm,
+				 unsigned long start, unsigned long end)
+{
+	unsigned long a;
+
+	for (a = start; a < end; a += PAGE_SIZE) {
+		pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
+		unsigned long v;
+
+		pgd = pgd_offset(mm, a);
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			continue;
+		p4d = p4d_offset(pgd, a);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			continue;
+		pud = pud_offset(p4d, a);
+		if (pud_none(*pud))
+			continue;
+		if (pud_large(*pud)) {
+			v = pud_val(*pud);
+			set_pud(pud, __pud(v & ~(_PAGE_PCD | _PAGE_PWT |
+						 _PAGE_PAT_LARGE)));
+			a = ALIGN_DOWN(a, PUD_SIZE) + PUD_SIZE - PAGE_SIZE;
+			continue;
+		}
+		pmd = pmd_offset(pud, a);
+		if (pmd_none(*pmd))
+			continue;
+		if (pmd_large(*pmd)) {
+			v = pmd_val(*pmd);
+			set_pmd(pmd, __pmd(v & ~(_PAGE_PCD | _PAGE_PWT |
+						 _PAGE_PAT_LARGE)));
+			a = ALIGN_DOWN(a, PMD_SIZE) + PMD_SIZE - PAGE_SIZE;
+			continue;
+		}
+		pte = pte_offset_kernel(pmd, a);
+		v = pte_val(*pte);
+		if (!(v & _PAGE_PRESENT))
+			continue;
+		set_pte(pte, __pte(v & ~(_PAGE_PCD | _PAGE_PWT | _PAGE_PAT)));
+	}
+}
 
 
 const struct vm_operations_struct nvkvm_vm_ops = {
@@ -146,6 +215,17 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 		}
 		return ret;
 	}
+
+	/*
+	 * WB-intended mappings (nvidiactl/nvidia-uvm SYSTEM memory) are silently
+	 * downgraded to UC- by x86's PCI-BAR pfn tracking inside remap_pfn_range
+	 * (see nvkvm_force_range_wb).  Force the freshly mapped PTEs back to WB so
+	 * CPU access to the cache-coherent window pages runs at RAM speed.  The
+	 * write-combining branch is left as-is — WC is honored as-requested and is
+	 * required for the doorbell/ring BAR pages.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_CTL || ctx->dev_id == NVKVM_DEV_UVM)
+		nvkvm_force_range_wb(vma->vm_mm, vma->vm_start, vma->vm_end);
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);
 	if (!region)
@@ -848,6 +928,11 @@ chunk_fail:
 	 * while it is still cached anon memory (before this swap) and the stub
 	 * then reads the memfd as host RAM — the guest never reads through the
 	 * window on HtoD.  Leaving vm_page_prot at its default keeps it WB.
+	 *
+	 * NB: requesting WB here is necessary but NOT sufficient — because the GPA
+	 * window is a PCI-BAR (non-RAM) region, remap_pfn_range silently downgrades
+	 * the PTEs to UC-.  On Intel the EPT IPAT bit hid this; on AMD it does not,
+	 * so we rewrite the PTEs to WB with nvkvm_force_range_wb() after the remap.
 	 */
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 	for (i = 0; i < nck; i++) {
@@ -856,6 +941,7 @@ chunk_fail:
 				      ck[i].clen, vma->vm_page_prot);
 		if (ret) { mmap_write_unlock(mm); goto err_handles; }
 	}
+	nvkvm_force_range_wb(mm, start, end);
 	mmap_write_unlock(mm);
 
 	/* The VMA now points at the GPAs (memfds); release the original anon
