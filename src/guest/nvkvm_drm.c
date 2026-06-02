@@ -61,10 +61,18 @@
  * frees the proxy and forwards a GEM_CLOSE(stub_handle) to release the real
  * object.  All translation is intra-VM (guest kernel owns GEM semantics); the
  * stub only ever sees its own handles. */
+/* drm_nvidia_gem_object_type (host nvidia-drm-ioctl.h): what GEM_IDENTIFY_OBJECT
+ * (0x0e) reports.  Our proxies all back ALLOC_NVKMS_MEMORY bos → NVKMS. */
+#define NVKVM_GEM_OBJECT_NVKMS       0
+#define NVKVM_GEM_OBJECT_DMABUF      1
+#define NVKVM_GEM_OBJECT_USERMEMORY  2
+#define NVKVM_GEM_OBJECT_UNKNOWN     0x7fffffff
+
 struct nvkvm_gem_object {
 	struct drm_gem_object base;
 	struct nvkvm_fd_ctx  *ctx;         /* isolate to forward GEM_CLOSE to */
 	__u32                 stub_handle; /* handle in the stub's DRM file   */
+	__u32                 obj_type;    /* NVKVM_GEM_OBJECT_* for IDENTIFY  */
 };
 
 #define to_nvkvm_gem(o) container_of(o, struct nvkvm_gem_object, base)
@@ -125,6 +133,7 @@ static int nvkvm_gem_proxy_create(struct drm_file *file,
 	 */
 	ng->ctx        = ctx;
 	ng->stub_handle = stub_handle;
+	ng->obj_type    = NVKVM_GEM_OBJECT_NVKMS;
 	ret = drm_gem_handle_create(file, &ng->base, guest_handle);
 	/* The handle (or the proxy on failure) now owns the only ref. */
 	drm_gem_object_put(&ng->base);
@@ -209,6 +218,37 @@ struct drm_nvidia_gem_alloc_nvkms_memory_params {    /* 24 bytes */
 	__u32 flags;                /* IN  */
 	__u32 __pad1;
 };
+struct drm_nvidia_gem_identify_object_params {       /* 8 bytes */
+	__u32 handle;               /* IN  GEM handle */
+	__u32 object_type;          /* OUT drm_nvidia_gem_object_type */
+};
+
+/*
+ * GEM_IDENTIFY_OBJECT (0x0e): NVIDIA's EGL/gbm calls this right after
+ * PRIME_FD_TO_HANDLE to learn the imported object's type (NVKMS / DMABUF /
+ * USERMEMORY).  PRIME export+import already round-trip through the DRM core to
+ * our proxy GEM (#109), so we answer LOCALLY — no host forward, no allowlist
+ * surface.  All our proxies back ALLOC_NVKMS_MEMORY bos → NVKMS; anything else
+ * (e.g. a shmem dumb fb) is UNKNOWN.  The host driver returns 0 in every case
+ * (including UNKNOWN), so we do too.  Without this the DRM core rejects the
+ * unknown ioctl with EINVAL and NVIDIA EGL aborts the dma-buf import — the lone
+ * blocker that made compositor capture buffers un-importable.
+ */
+static int nvkvm_drm_gem_identify_object(struct drm_device *dev, void *data,
+					 struct drm_file *file)
+{
+	struct drm_nvidia_gem_identify_object_params *p = data;
+	struct drm_gem_object *obj = drm_gem_object_lookup(file, p->handle);
+
+	(void)dev;
+	if (obj && obj->funcs == &nvkvm_gem_funcs)
+		p->object_type = to_nvkvm_gem(obj)->obj_type;
+	else
+		p->object_type = NVKVM_GEM_OBJECT_UNKNOWN;
+	if (obj)
+		drm_gem_object_put(obj);
+	return 0;
+}
 
 /* Forward an already-kernel-copied DRM param blob to the host render node via
  * the process's isolate.  The DRM core handled the user<->kernel copy using
@@ -414,6 +454,10 @@ static const struct drm_ioctl_desc nvkvm_drm_ioctls[] = {
 				   struct drm_nvidia_gem_alloc_nvkms_memory_params),
 		   .func = nvkvm_drm_fwd_gem_alloc_nvkms_memory,
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GEM_ALLOC_NVKMS_MEMORY" },
+	[0x0e] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x0e,
+				   struct drm_nvidia_gem_identify_object_params),
+		   .func = nvkvm_drm_gem_identify_object,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GEM_IDENTIFY_OBJECT" },
 	[0x0f] = { .cmd = DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f),
 		   .func = nvkvm_drm_fwd_dmabuf_supported,
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_DMABUF_SUPPORTED" },
