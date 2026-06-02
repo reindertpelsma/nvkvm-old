@@ -303,3 +303,34 @@ dma-bufs. The fix is graphics buffer parity: real PRIME export/import on the
 proxy GEM that resolves to the forwarded host allocation with the metadata NVIDIA
 EGL needs — a kernel+stub+QEMU effort. Until then, SHM capture (~29 fps, CPU) is
 the working interim; NVENC of the SHM frame is gated by #101.
+
+### Scoped: the dma-buf import fix (memfd-backed proxy GEM)
+
+`tests/perf/apps/dmabuf_import_probe.c` re-imports a gbm bo's own PRIME fd via
+`eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` on the same nvkvm device and straces
+the ioctls. Result: import FAILS (EGL_BAD_PARAMETER 0x300c) but NVIDIA EGL issues
+a burst of RM frontend ioctls (type 'F': RM_FREE/RM_CONTROL/RM_UNMAP...) that all
+return 0, then rejects the buffer. So the import is NOT a userspace bail — NVIDIA
+drives RM to register the dma-buf's pages as a GPU-accessible memory object, and
+fails because our proxy GEM (`drm_gem_private_object`, only `.free`) exports a
+dma-buf with NO page backing (`get_sg_table` absent) → NVIDIA's import gets no
+pages → BAD_PARAMETER.
+
+FIX (user direction 2026-06-02): back the guest dma-buf with real pages via a
+memfd the stub maps — the SAME mechanism as OS_DESCRIPTOR / userptr ioctls
+(`nvkvm_cpu_page_migrate` in nvkvm_mmap.c: pin guest pages → memfd → MAP_FIXED in
+stub at the same VA, so the host RM `pin_user_pages` finds aliasing pages). Apply
+it so an imported buffer's pages live in a memfd shared guest↔stub↔host-GPU. For
+the capture target this is coherent: weston imports the buffer and WRITES the
+composite into it (memfd pages), and the present side reads the same pages — no
+VRAM/dma-buf-reimport mismatch. This makes graphics share-buffers sysmem
+(OS_DESCRIPTOR-style) instead of VRAM, trading some bandwidth for shareability.
+
+Implementation sketch:
+1. Guest: give the proxy GEM (or a dedicated "shared graphics buffer") a memfd
+   backing + `get_sg_table`/mmap so its PRIME dma-buf has real guest pages.
+2. Guest: on NVIDIA's import RM ioctl, migrate those pages to the stub (reuse
+   `nvkvm_cpu_pages_migrate_range`) so the forwarded RM object aliases them.
+3. Stub: already MAP_FIXED-installs migrated memfds (OS_DESCRIPTOR path) — verify
+   it covers the import RM class.
+4. Present: read/forward the memfd pages (already host-accessible).
