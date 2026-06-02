@@ -287,6 +287,17 @@ the Mode-1 core), after translating the pushbuffer/GPFIFO GPU-VAs to the real
 context. MSI-X to the guest is synthesized when the real op completes / the real
 GSP-equivalent reply is ready.
 
+**Host→guest interrupt delivery (required for parity, [[mode2_interrupt_delivery]]):**
+the real GPU interrupts the *host*; the isolate surfaces GPU events via
+**eventfd/poll** (the existing OS-event mechanism Mode-1 forwards). QEMU wires
+those event fds into its event loop and, on readiness, **synthesizes an MSI-X**
+from the emulated GPU device so the guest's stock-driver ISR runs. This must
+cover **any** host-side ioctl/eventfd/poll event source (GSP status-queue reply,
+engine/channel completion, errors). Honor the guest's MSI-X enable/mask + the
+interrupt-status registers (PMC_INTR) so masking behaves. Per-device / multi-GPU
+aware. Bidirectional with the Mode-1 guest-signal→interrupt-forwarded-wait path
+([[signal_interrupt_delivery_done]]).
+
 ---
 
 ## 8. mmaps — what userspace actually maps
