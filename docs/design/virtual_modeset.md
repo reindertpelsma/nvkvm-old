@@ -274,3 +274,32 @@ proxy GEM, and `AddFB2`+`PageFlip`s it on the (now-free) virtual KMS head →
 present *trigger*, driven by the capture client.
 
 Repro: `tests/perf/run_headless_compositor.sh`.
+
+### Capture path built; zero-copy blocked on dma-buf re-import (the 60fps gate)
+
+`tests/perf/apps/wcapflip.c` + `run_wcapflip.sh` implement the capture bridge:
+`weston_output_capture_v1` (FRAMEBUFFER source) into a client buffer, then
+`AddFB2`+`PageFlip` on the virtual head → present path.
+
+- **SHM capture WORKS**: 120/120 frames, the live composited desktop (wallpaper +
+  panel + ticking clock) captured by our own client at **~29 fps** (bounded by
+  weston's CPU glReadPixels). Proof: `/tmp/wcapflip_frame.ppm`.
+- **dmabuf capture FAILS**: weston rejects our LINEAR gbm dma-buf with
+  "importing the supplied dmabufs failed". Same wall as the host-side #107
+  import and gbmgl_present.c: **NVIDIA's userspace EGL cannot re-import a dma-buf
+  exported by our guest nvidia-drm.** NVIDIA clients (es2gears) share buffers via
+  `wl_drm`/`wl_eglstream_display` (NVIDIA's own protocol, full metadata) — which
+  is why *their* buffers composite but our generic linux-dmabuf does not.
+
+Root cause: the guest proxy GEM (`nvkvm_gem_object`) is a `drm_gem_private_object`
+with only `.free` — no `.export`/`.get_sg_table`/PRIME import, so its PRIME fd has
+no NVIDIA-recognized allocation behind it. It exists for the #106 *stub-side*
+export (which works because the stub PRIME-exports the real host bo), not for
+guest-side NVIDIA EGL re-import.
+
+**This is the 60fps gate.** Zero-copy capture (and direct render-into-scanout,
+and the host-side #107 EGL import) all need NVIDIA userspace to accept our
+dma-bufs. The fix is graphics buffer parity: real PRIME export/import on the
+proxy GEM that resolves to the forwarded host allocation with the metadata NVIDIA
+EGL needs — a kernel+stub+QEMU effort. Until then, SHM capture (~29 fps, CPU) is
+the working interim; NVENC of the SHM frame is gated by #101.
