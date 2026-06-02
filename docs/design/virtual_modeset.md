@@ -200,3 +200,77 @@ FENCE_CONTEXT_CREATE / GEM_FENCE_ATTACH, GET_CLIENT_CAPABILITY, GEM_IDENTIFY_OBJ
 - The graphics delta (new RM alloc classes, DRM/GEM ioctls, guest+stub fd
   translations) added default-ALLOW surface and should get a targeted audit
   before the present path builds on top of it.
+
+---
+
+## UPDATE 2026-06-02 (#110): DRM-scanout compositors hang — headless is the path
+
+Hard-diagnosed why a real Wayland compositor "composites but never flips" on the
+virtual KMS head, via gdb backtraces on the live guest.
+
+### DRM-backend compositor HANGS in NVIDIA EGL
+
+`weston --backend=drm-backend --renderer=gl` on our virtual head:
+
+- Comes up GPU-accelerated (NVIDIA GL renderer, RTX 3060), detects the head
+  (`Virtual-1`, connector 31), enables the output, launches `desktop-shell`.
+- Then issues **zero** `ADDFB`/`ATOMIC`/`PAGEFLIP`/`SETCRTC` ioctls and its main
+  thread blocks **forever**:
+
+  ```
+  poll(timeout=-1)
+   ← libnvidia-eglcore.so
+   ← libEGL_nvidia.so  (x3)
+   ← libnvidia-egl-gbm.so       # NVIDIA GBM EGL platform
+   ← drm-backend.so  (x3)       # weston output scanout-buffer management
+   ← wl_event_loop_dispatch ← wl_display_run
+  ```
+
+- Because it is stuck inside that event-loop callback, the main loop never
+  services clients: a connecting client's `wl_display.get_registry` gets no reply.
+- `qemu.log` shows **no** `DENY nvkms` — the NVKMS commands it issues are all in
+  our allowlist `{0,1,17,18,61,62}` and are forwarded; it is blocked on a
+  *presentation/flip-completion event* that never arrives, not on a denial.
+
+**Root cause:** NVIDIA's userspace EGL GBM *scanout-present* path is coupled to
+`nvidia-modeset` doing a real flip and signaling completion. Our virtual head
+provides KMS ioctls but not NVKMS presentation semantics — by design (we never
+forward NVKMS; that is the rejected Piece 3 above and a host-boundary violation).
+This is intrinsic to NVIDIA's closed userspace: every DRM-backend compositor
+(weston/mutter/sway) uses the same `gbm_surface`→scanout path on NVIDIA.
+
+`gbmflip` (direct `gbm_bo_create` + `drmModePageFlip`, **no** `gbm_surface`, no
+EGL present) flips fine through the present path — confirming the hang is
+specifically NVIDIA EGL's `gbm_surface`→scanout path, not our KMS head.
+
+`weston --renderer=pixman` (software) has a healthy event loop but (a) still
+drives no proxy-GEM flip and (b) a `CREATE_DUMB` buffer lives in guest RAM, not a
+forwarded GPU bo — so it cannot reuse the dma-buf present path regardless.
+(`DRM_IOCTL_MODE_CREATE_DUMB` does succeed on our head, leaving a software
+fallback option open, but it is not GPU-accelerated.)
+
+### Headless-GL compositor WORKS
+
+`weston --backend=headless-backend --renderer=gl`:
+
+- Main thread is a healthy `epoll_wait` (no `nvidia-egl-gbm` in the stack —
+  headless does no KMS scanout, so it never enters NVIDIA's present path).
+- GL clients connect and render via NVIDIA GL through nvkvm (verified with
+  `es2gears_wayland`: full `wl_registry` handshake, continuous rendering).
+- `weston-screenshooter` captured a real **1920×1080** desktop (textured
+  wallpaper + top panel + live clock). Verified 2026-06-02.
+
+### Decision
+
+Deliver a host-visible GPU desktop/game via a **headless GPU compositor →
+capture composited GPU dma-buf → present path (#106/#107) → host
+display/NVENC** — the cloud-gaming architecture. This honors "never forward
+NVKMS" and the buffers-shared-host-side model, and reuses the present path.
+
+Reusable wiring (no new guest ABI): a capture client grabs the headless
+compositor's composited dma-buf each frame, `PRIME`-imports it on `card0` to a
+proxy GEM, and `AddFB2`+`PageFlip`s it on the (now-free) virtual KMS head →
+`nvkvm_pipe_update` → `nvkvm_virtio_present` → host. The virtual head becomes the
+present *trigger*, driven by the capture client.
+
+Repro: `tests/perf/run_headless_compositor.sh`.
