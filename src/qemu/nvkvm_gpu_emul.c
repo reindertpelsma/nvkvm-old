@@ -34,6 +34,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pcie.h"
@@ -77,9 +78,9 @@ typedef struct NvkvmGpuChip {
 static const NvkvmGpuChip nvkvm_chip_ga106 = {
     .name          = "GA106",
     .vendor_id     = 0x10DE,
-    .device_id     = 0x2503,
-    .sub_vendor_id = 0x10DE,
-    .sub_device_id = 0x1517,        /* RTX 3060 reference SSID */
+    .device_id     = 0x2504,        /* RTX 3060 LHR — matches the dev host card */
+    .sub_vendor_id = 0x1462,        /* MSI */
+    .sub_device_id = 0x397D,        /* matches host SSID + dumped VBIOS PCIR */
     .revision      = 0xA1,
     .pmc_boot_0    = 0x176000A1u,
     .pmc_boot_42   = 0x176A1000u,
@@ -103,6 +104,14 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT      0x00118234u /* GROUP_05(0) */
 #define NV_PGC6_GFW_BOOT_PROGRESS_COMPLETED                 0x000000FFu
 
+/* M2 — VBIOS PROM window.  The GSP RM init (kgspExtractVbiosFromRom_TU102)
+ * reads the VBIOS image byte/dword-wise from NV_PROM_DATA(i) = 0x300000 + i in
+ * BAR0, validating the PCI ROM signature, IFR header, PCIR struct and the
+ * expansion-ROM chain.  We back this window with a real GA106 VBIOS dumped from
+ * the host card (matching device id 0x2504), so the driver's parser is exact. */
+#define NV_PROM_DATA_BASE 0x00300000u
+#define NV_PROM_DATA_SIZE 0x00100000u   /* 1 MiB window (dumped image is padded) */
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -120,6 +129,11 @@ struct NvkvmGpuEmul {
     MemoryRegion bar1;   /* FB    — MMIO stub for M0 (address-virt layer L8) */
     MemoryRegion bar3;   /* IMEM/usermode — MMIO stub                        */
     MemoryRegion msix;   /* MSI-X table/PBA BAR (BAR5)                       */
+
+    /* VBIOS served from the BAR0 PROM window (M2) */
+    char    *vbios_path;     /* "vbios=" property: file with a real VBIOS dump */
+    uint8_t *vbios;          /* loaded image (NV_PROM_DATA_SIZE bytes, padded)  */
+    uint64_t prom_reads;     /* count (don't per-access trace — VBIOS is ~1 MiB)*/
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -161,9 +175,32 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     }
 }
 
+/* PROM window: return VBIOS bytes (little-endian dword at the aligned offset).
+ * Not traced per-access — the driver streams the whole ~1 MiB image. */
+static bool nvkvm_prom_read(NvkvmGpuEmul *s, hwaddr off, unsigned size,
+                            uint64_t *out)
+{
+    if (!s->vbios || off < NV_PROM_DATA_BASE ||
+        off >= NV_PROM_DATA_BASE + NV_PROM_DATA_SIZE) {
+        return false;
+    }
+    hwaddr p = off - NV_PROM_DATA_BASE;
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size && p + i < NV_PROM_DATA_SIZE; i++) {
+        v |= (uint64_t)s->vbios[p + i] << (8 * i);
+    }
+    s->prom_reads++;
+    *out = v;
+    return true;
+}
+
 static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
+    uint64_t prom;
+    if (nvkvm_prom_read(s, off, size, &prom)) {
+        return prom;
+    }
     uint64_t val = nvkvm_reg_read(s, off, size);
 
     if (s->trace) {
@@ -241,6 +278,25 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 
     s->chip = chip;
     s->access_count = 0;
+    s->prom_reads = 0;
+
+    /* M2: load the VBIOS image for the PROM window (if a path was given). */
+    s->vbios = NULL;
+    if (s->vbios_path && s->vbios_path[0]) {
+        FILE *f = fopen(s->vbios_path, "rb");
+        if (!f) {
+            error_setg(errp, "nvkvm-gpu-emul: cannot open vbios '%s'",
+                       s->vbios_path);
+            return;
+        }
+        s->vbios = g_malloc0(NV_PROM_DATA_SIZE);
+        size_t n = fread(s->vbios, 1, NV_PROM_DATA_SIZE, f);
+        fclose(f);
+        if (s->vbios[0] != 0x55 || s->vbios[1] != 0xAA) {
+            warn_report("nvkvm-gpu-emul: vbios '%s' lacks 0x55AA signature "
+                        "(read %zu bytes)", s->vbios_path, n);
+        }
+    }
 
     /* Class 0x030000 = VGA-compatible 3D controller, as a real GeForce reports.
      * (Mode-2's "display for free" rides on this.) */
@@ -302,12 +358,14 @@ static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
     NvkvmGpuEmul *s = NVKVM_GPU_EMUL(pci_dev);
     msix_unuse_all_vectors(pci_dev);
     msix_uninit(pci_dev, &s->msix, &s->msix);
+    g_free(s->vbios);
 }
 
 /* ── QOM boilerplate ───────────────────────────────────────────────────────*/
 
 static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("trace", NvkvmGpuEmul, trace, true),
+    DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
     DEFINE_PROP_END_OF_LIST(),
 };
 
