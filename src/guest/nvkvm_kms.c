@@ -208,6 +208,39 @@ static const uint64_t nvkvm_pipe_modifiers[] = {
 	DRM_FORMAT_MOD_INVALID
 };
 
+/*
+ * Plane modifier validation (#110 host-visible last mile).
+ *
+ * drm_simple_display_pipe installs drm_simple_kms_plane_funcs, which has NO
+ * .format_mod_supported callback. On this kernel that makes
+ * drm_any_plane_has_format() reject AddFB2WithModifiers() for our block-linear
+ * scanout modifiers even though they ARE in the plane's modifier list /
+ * IN_FORMATS blob — so a compositor flipping a real NVIDIA scanout bo
+ * (mod 0x...606014) falls back to a no-modifier fb (forwarded mod=0) and the
+ * host imports block-linear data as LINEAR → black frame.
+ *
+ * Provide an explicit callback that accepts exactly the modifiers we advertise.
+ * With format_mod_supported present, drm_plane_check_pixel_format() consults it
+ * directly, so the true modifier survives to the present path (#106) and the
+ * host detiles correctly. We accept any format here — the format itself is
+ * validated against plane->format_types before this is called.
+ */
+static bool nvkvm_plane_format_mod_supported(struct drm_plane *plane,
+					     u32 format, u64 modifier)
+{
+	const uint64_t *m;
+
+	(void)plane; (void)format;
+	for (m = nvkvm_pipe_modifiers; *m != DRM_FORMAT_MOD_INVALID; m++)
+		if (*m == modifier)
+			return true;
+	return false;
+}
+
+/* A copy of whatever funcs drm_simple_display_pipe installed, plus the modifier
+ * callback (filled in at init so we stay version-agnostic). One virtual head. */
+static struct drm_plane_funcs nvkvm_plane_funcs;
+
 /* ── Mode config ─────────────────────────────────────────────────────────── */
 static const struct drm_mode_config_funcs nvkvm_kms_mode_funcs = {
 	.fb_create     = drm_gem_fb_create,
@@ -257,6 +290,21 @@ int nvkvm_kms_init(struct drm_device *ddev)
 					   nvkvm_pipe_modifiers, &kms->conn);
 	if (ret)
 		return ret;
+
+	/* #110: drm_simple_display_pipe installs drm_simple_kms_format_mod_supported,
+	 * which accepts ONLY DRM_FORMAT_MOD_LINEAR and ignores the plane's modifier
+	 * list — so AddFB2WithModifiers() rejected our block-linear scanout modifiers
+	 * (EINVAL) even though they were advertised, and the present path fell back to
+	 * a no-modifier fb (forwarded mod=0) → the host imported block-linear as LINEAR
+	 * → black. Graft our own callback that accepts exactly what we advertise. Copy
+	 * the funcs the helper installed (version-agnostic) and override the callback. */
+	{
+		struct drm_plane *pl = &kms->pipe.plane;
+
+		nvkvm_plane_funcs = *pl->funcs;
+		nvkvm_plane_funcs.format_mod_supported = nvkvm_plane_format_mod_supported;
+		pl->funcs = &nvkvm_plane_funcs;
+	}
 
 	drm_mode_config_reset(ddev);
 	pr_info("nvkvm: virtual KMS head ready (%dx%d, 1 connector/crtc)\n",
