@@ -640,6 +640,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 		return ERR_PTR(-ENOMEM);
 
 	ctx->dev_id  = dev_id;
+	refcount_set(&ctx->refs, 1);   /* G-6: the open file's reference */
 	ctx->session = nvkvm_session_get_or_create(current->mm, current->tgid);
 	if (IS_ERR(ctx->session)) {
 		ret = PTR_ERR(ctx->session);
@@ -671,9 +672,9 @@ err:
 	return ERR_PTR(ret);
 }
 
-/* Tear down a context built by nvkvm_fd_ctx_open_dev (also the body of the
- * char-device release path). */
-void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
+/* Actual teardown — runs only when the last reference (open file + any proxy
+ * GEMs) drops.  See the refs comment in struct nvkvm_fd_ctx. */
+static void nvkvm_fd_ctx_destroy(struct nvkvm_fd_ctx *ctx)
 {
 	/* #101: leave the async-event registry first so no VQ_EVT deliver() can
 	 * touch this ctx after we start tearing it down (unregister blocks until
@@ -725,6 +726,24 @@ void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
 
 	nvkvm_session_put(ctx->session);
 	kfree(ctx);
+}
+
+/* Drop the open file's reference (char-device release / DRM postclose). The
+ * ctx survives until any proxy GEMs that referenced it are freed too. */
+void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx)
+{
+	nvkvm_fd_ctx_put(ctx);
+}
+
+void nvkvm_fd_ctx_get(struct nvkvm_fd_ctx *ctx)
+{
+	refcount_inc(&ctx->refs);
+}
+
+void nvkvm_fd_ctx_put(struct nvkvm_fd_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->refs))
+		nvkvm_fd_ctx_destroy(ctx);
 }
 
 static int nvkvm_open(struct inode *inode, struct file *filp)
@@ -1205,6 +1224,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * the caller's fd to restore on the response (fd is IN/OUT, value kept). */
 	__s32 orig_export_fd = 0;
 	bool have_export_fd  = false;
+	__s32 orig_import_fd = 0;          /* IMPORT_OBJECT_FROM_FD (0x3d06) fd@0 */
+	bool have_import_fd  = false;
 	/* Embedded-fd fields in frontend ioctls: sanitizer overwrites these
 	 * with handle_ids; capture the caller's original guest-fd so the
 	 * response round-trips libcuda's value unchanged. */
@@ -1431,6 +1452,27 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					__s32 hid = guest_fd_to_handle_id(gfd);
 					if (hid >= 0)
 						memcpy((char *)aux_buf + 16, &hid,
+						       sizeof(hid));
+				}
+			}
+
+			/* NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD (0x3d06,
+			 * #110): the dma-buf import counterpart of 0x3d05.  The
+			 * inner params carry the source nv-export fd at offset 0
+			 * (NvS32 fd; then the NV0000_CTRL_OS_UNIX_EXPORT_OBJECT).
+			 * Swap our handle_id in so the stub resolves its own local
+			 * fd and imports the object into the caller's RM client;
+			 * the fd is IN (unchanged), so save it to restore on the
+			 * response. */
+			if (ctrl->cmd == 0x3d06 && aux_size >= 4) {
+				__s32 gfd;
+				memcpy(&gfd, aux_buf, sizeof(gfd));
+				orig_import_fd = gfd;
+				have_import_fd = true;
+				if (gfd >= 0) {
+					__s32 hid = guest_fd_to_handle_id(gfd);
+					if (hid >= 0)
+						memcpy(aux_buf, &hid,
 						       sizeof(hid));
 				}
 			}
@@ -1943,7 +1985,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 * host-VMM handling; everything else the stub PUNTs if it requires
 		 * per-control marshalling, and we drop to the virtqueue below.
 		 */
-		if (!gpi_save && !have_export_fd)
+		if (!gpi_save && !have_export_fd && !have_import_fd)
 			ring_rc = nvkvm_session_ring_try(ctx, cmd,
 							 params_buf, param_size,
 							 aux_buf, aux_size, NULL);
@@ -2009,6 +2051,11 @@ forwarded:;
 		if (have_export_fd && aux_buf && aux_size >= 20)
 			memcpy((char *)aux_buf + 16, &orig_export_fd,
 			       sizeof(orig_export_fd));
+
+		/* IMPORT_OBJECT_FROM_FD: restore the caller's own fd at offset 0
+		 * (we swapped it for a handle_id; the import keeps the fd). */
+		if (have_import_fd && aux_buf && aux_size >= 4)
+			memcpy(aux_buf, &orig_import_fd, sizeof(orig_import_fd));
 	} else {
 		/* Open establishes ctx->handle_id and ctx->session->isolate_id;
 		 * an ioctl on a ctx missing either is a logic bug. The legacy

@@ -88,8 +88,10 @@ static void nvkvm_gem_free(struct drm_gem_object *obj)
 {
 	struct nvkvm_gem_object *ng = to_nvkvm_gem(obj);
 
-	/* Release the real object in the stub.  Guest GEM handles are released
-	 * before the driver's postclose runs, so ctx is still live here. */
+	/* Release the real object in the stub on the ctx that owns the handle,
+	 * then drop the ctx reference taken in nvkvm_gem_proxy_create.  Holding
+	 * that ref guarantees ng->ctx (and its stub fd) is still live here even
+	 * if the creating drm_file closed first (cross-file PRIME re-import). */
 	if (ng->ctx) {
 		struct drm_gem_close close = { .handle = ng->stub_handle };
 		__u64 fault = 0;
@@ -97,6 +99,7 @@ static void nvkvm_gem_free(struct drm_gem_object *obj)
 		nvkvm_virtio_ioctl_on_isolate(ng->ctx, DRM_IOCTL_GEM_CLOSE,
 					      &close, sizeof(close),
 					      NULL, 0, 0, &fault);
+		nvkvm_fd_ctx_put(ng->ctx);
 	}
 	if (ng->import_pages) {
 		unsigned long i;
@@ -173,14 +176,15 @@ static int nvkvm_gem_proxy_create(struct drm_file *file,
 	drm_gem_private_object_init(file->minor->dev, &ng->base, size);
 	ng->base.funcs = &nvkvm_gem_funcs;
 	/*
-	 * Audit G-6 (latent): ng->ctx is cached WITHOUT a refcount.  Safe today
-	 * because guest GEM handles are released before nvkvm_drm_postclose
-	 * closes the ctx (normal drm_release ordering).  BUT once a dma-buf
-	 * export / FLINK path lets a GEM object outlive its drm_file, a later
-	 * nvkvm_gem_free would deref a freed ctx → guest-kernel UAF.  When the
-	 * dma-buf present path (docs/design/virtual_modeset.md) wires export,
-	 * take a ref on ctx here and drop it in nvkvm_gem_free.
+	 * Audit G-6 (fixed #110): take a ctx reference.  A proxy can outlive its
+	 * creating drm_file via a cross-file PRIME re-import (NVIDIA EGL opens
+	 * renderD128 several times); nvkvm_gem_free then forwards GEM_CLOSE — and
+	 * the dma-buf import path forwards GEM_EXPORT_NVKMS_MEMORY — on exactly
+	 * this ctx, since the stub handle is only valid in the host fd it owns.
+	 * Without the ref a later deref would be a guest-kernel UAF.  Dropped in
+	 * nvkvm_gem_free.
 	 */
+	nvkvm_fd_ctx_get(ctx);
 	ng->ctx        = ctx;
 	ng->stub_handle = stub_handle;
 	ng->obj_type    = NVKVM_GEM_OBJECT_NVKMS;
@@ -199,6 +203,32 @@ static __u32 nvkvm_gem_to_stub(struct drm_file *file, __u32 guest_handle)
 	if (obj) {
 		if (obj->funcs == &nvkvm_gem_funcs)
 			sh = to_nvkvm_gem(obj)->stub_handle;
+		drm_gem_object_put(obj);
+	}
+	return sh;
+}
+
+/*
+ * Like nvkvm_gem_to_stub, but also returns the isolate the proxy was created
+ * on (where its stub_handle is valid).  A stub GEM handle lives in exactly one
+ * stub render fd — the ctx that ran GEM_ALLOC_NVKMS_MEMORY.  NVIDIA's EGL opens
+ * renderD128 several times, so a PRIME re-import can hand a *different* drm_file
+ * a handle that points back to the original proxy; forwarding a GEM op on the
+ * calling file's ctx would hit the wrong stub fd (the handle is UNKNOWN there).
+ * Callers that forward by stub_handle MUST forward on *this* ctx, not
+ * file->driver_priv.  Returns 0 (and leaves *ctx untouched) for non-proxies. */
+static __u32 nvkvm_gem_to_stub_ctx(struct drm_file *file, __u32 guest_handle,
+				   struct nvkvm_fd_ctx **ctx)
+{
+	struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
+	__u32 sh = 0;
+
+	if (obj) {
+		if (obj->funcs == &nvkvm_gem_funcs) {
+			sh = to_nvkvm_gem(obj)->stub_handle;
+			if (ctx)
+				*ctx = to_nvkvm_gem(obj)->ctx;
+		}
 		drm_gem_object_put(obj);
 	}
 	return sh;
@@ -271,6 +301,20 @@ struct drm_nvidia_gem_alloc_nvkms_memory_params {    /* 24 bytes */
 struct drm_nvidia_gem_identify_object_params {       /* 8 bytes */
 	__u32 handle;               /* IN  GEM handle */
 	__u32 object_type;          /* OUT drm_nvidia_gem_object_type */
+};
+/*
+ * GEM_EXPORT_NVKMS_MEMORY (0x09) — #110 dma-buf import keystone.  NVIDIA's EGL
+ * calls this on a PRIME-imported render/scanout bo to associate that bo's RM
+ * memory object onto a caller-provided nv-export fd (the kernel runs
+ * EXPORT_OBJECT_TO_FD under the hood), which it then re-imports via
+ * IMPORT_OBJECT_FROM_FD (0x3d06).  Layout MUST match host nvidia-drm-ioctl.h.
+ * nvkms_params_ptr points at a 4-byte NvKmsKapiPrivExportMemoryParams { int
+ * memFd } — IN: the fd is the export target, value unchanged by the call. */
+struct drm_nvidia_gem_export_nvkms_memory_params {   /* 24 bytes */
+	__u32 handle;               /* IN  GEM handle */
+	__u32 __pad;
+	__u64 nvkms_params_ptr;     /* IN  -> { int memFd } */
+	__u64 nvkms_params_size;    /* IN  */
 };
 
 /*
@@ -452,6 +496,86 @@ static int nvkvm_drm_fwd_semsurf_fence_ctx_create(struct drm_device *dev,
 }
 
 /*
+ * GEM_EXPORT_NVKMS_MEMORY (0x09): translate the guest proxy GEM handle to the
+ * stub's, and stage the embedded { int memFd } blob in the aux slot with the
+ * guest fd swapped for our handle_id (the stub resolves its own local fd, then
+ * exports the real bo's RM memory onto it — exactly the EXPORT_OBJECT_TO_FD
+ * frontend path, but the fd rides inside the NVKMS params).  Zero the params
+ * pointer so no guest VA is forwarded; the stub substitutes a host VA at
+ * offset 8.  Both the handle and the memFd are IN/unchanged, so restore them
+ * after.  Without this the DRM core rejects 0x09 (-EINVAL) and NVIDIA EGL
+ * aborts the dma-buf import before it ever issues 0x3d06.
+ */
+static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
+						 void *data,
+						 struct drm_file *file)
+{
+	struct drm_nvidia_gem_export_nvkms_memory_params *p = data;
+	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x09,
+				    struct drm_nvidia_gem_export_nvkms_memory_params);
+	__u32 guest_h = p->handle, stub_h;
+	__u64 orig_ptr;
+	void *aux = NULL;
+	size_t aux_sz = 0;
+	__s32 orig_memfd = 0;
+	bool have_memfd = false;
+	__u64 fault = 0;
+	long r;
+
+	(void)dev;
+	if (!ctx)
+		return -EBADF;
+
+	/* Forward on the PROXY's ctx (where stub_h is a valid GEM handle), not
+	 * the calling file's — see nvkvm_gem_to_stub_ctx. */
+	stub_h = nvkvm_gem_to_stub_ctx(file, guest_h, &ctx);
+	if (stub_h)
+		p->handle = stub_h;
+
+	orig_ptr = p->nvkms_params_ptr;
+	if (orig_ptr && p->nvkms_params_size >= sizeof(__s32) &&
+	    p->nvkms_params_size <= NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+		aux_sz = p->nvkms_params_size;
+		aux = kzalloc(aux_sz, GFP_KERNEL);
+		if (!aux) {
+			p->handle = guest_h;
+			return -ENOMEM;
+		}
+		if (copy_from_user(aux, (void __user *)(uintptr_t)orig_ptr,
+				   aux_sz)) {
+			kfree(aux);
+			p->handle = guest_h;
+			return -EFAULT;
+		}
+		/* { int memFd } at offset 0 → swap for our handle_id. */
+		memcpy(&orig_memfd, aux, sizeof(orig_memfd));
+		have_memfd = true;
+		if (orig_memfd >= 0) {
+			__s32 hid = guest_fd_to_handle_id(orig_memfd);
+			if (hid >= 0)
+				memcpy(aux, &hid, sizeof(hid));
+		}
+		p->nvkms_params_ptr = 0;   /* stub fills host VA at offset 8 */
+	}
+
+	r = nvkvm_virtio_ioctl_on_isolate(ctx, cmd, data, sizeof(*p),
+					  aux, aux_sz, 0, &fault);
+
+	/* memFd is IN (the export keeps its value); restore the caller's fd so a
+	 * later read of the params buffer sees its own fd, never our handle_id. */
+	if (have_memfd && aux)
+		memcpy(aux, &orig_memfd, sizeof(orig_memfd));
+	if (r >= 0 && aux &&
+	    copy_to_user((void __user *)(uintptr_t)orig_ptr, aux, aux_sz))
+		r = -EFAULT;
+	p->nvkms_params_ptr = orig_ptr;
+	p->handle = guest_h;
+	kfree(aux);
+	return (r < 0) ? (int)r : 0;
+}
+
+/*
  * GEM_ALLOC_NVKMS_MEMORY (0x0b): the NVIDIA gbm backend's scanout-buffer
  * allocation.  Flat scalar params (no embedded pointer) — forward as-is; the
  * host allocates a real bo on the stub's render node and writes its GEM handle
@@ -500,6 +624,10 @@ static const struct drm_ioctl_desc nvkvm_drm_ioctls[] = {
 				   struct drm_nvidia_get_dev_info_params),
 		   .func = nvkvm_drm_fwd_get_dev_info,
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GET_DEV_INFO" },
+	[0x09] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x09,
+				   struct drm_nvidia_gem_export_nvkms_memory_params),
+		   .func = nvkvm_drm_fwd_gem_export_nvkms_memory,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GEM_EXPORT_NVKMS_MEMORY" },
 	[0x0b] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x0b,
 				   struct drm_nvidia_gem_alloc_nvkms_memory_params),
 		   .func = nvkvm_drm_fwd_gem_alloc_nvkms_memory,

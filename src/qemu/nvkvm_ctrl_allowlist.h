@@ -175,6 +175,18 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	 * no reg-ops/HWPM/debug/fabric. */
 	0x00000301u,
 	0x00003d05u,
+	/*
+	 * #110 dma-buf import: NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD —
+	 * the counterpart of EXPORT_OBJECT_TO_FD (0x3d05, already allowed).
+	 * NVIDIA's EGL re-imports a render/scanout bo's exported memory object
+	 * into its own RM client (via an nv-export fd) when a compositor capture
+	 * or PRIME re-import happens.  The embedded fd is guest→handle_id
+	 * translated (guest) and handle_id→stub-local-fd (stub); no guest VA or
+	 * host fd ever crosses the boundary.  Same resource class as the export
+	 * it pairs with — RmImportObject dups an existing memory object the stub
+	 * already owns into the caller's client (intra-stub, accounted to the
+	 * stub).  No reg-ops/HWPM/display. */
+	0x00003d06u,
 	0x00730101u,
 	0x00801102u, /* NV0080 device controls */
 	0x00801104u,

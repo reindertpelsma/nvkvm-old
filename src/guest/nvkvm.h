@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/refcount.h>
 #include <linux/virtio.h>
 #include <linux/virtio_ids.h>
 #include <linux/spinlock.h>
@@ -194,6 +195,17 @@ struct nvkvm_fd_ctx {
 	int                    dev_id;      /* NVKVM_DEV_*                */
 	struct nvkvm_session  *session;
 
+	/*
+	 * Lifetime refcount (G-6).  One reference for the open file; each proxy
+	 * GEM minted on this ctx (nvkvm_drm.c) takes another, because a proxy
+	 * can outlive its drm_file via a cross-file PRIME re-import yet still
+	 * forwards GEM ops (GEM_CLOSE / GEM_EXPORT_NVKMS_MEMORY) on this exact
+	 * ctx — the stub handle is only valid in the host fd this ctx owns.
+	 * Teardown (handle close, session put, free) is deferred until the last
+	 * ref drops, which also keeps the stub-side bo alive for the importer.
+	 */
+	refcount_t             refs;
+
 	/* poll support */
 	wait_queue_head_t      poll_wq;
 	atomic_t               poll_events; /* cached POLL* bits from host         */
@@ -327,6 +339,9 @@ static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
 /* nvkvm_main.c — shared fd-context lifecycle (also used by the DRM driver) */
 struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags);
 void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx);
+/* G-6: take/drop a lifetime ref (proxy GEMs that outlive their drm_file). */
+void nvkvm_fd_ctx_get(struct nvkvm_fd_ctx *ctx);
+void nvkvm_fd_ctx_put(struct nvkvm_fd_ctx *ctx);
 
 /* #101 async event delivery: registry of poll-capable fd contexts keyed by
  * (isolate_id, handle_id). register on open, unregister on close. deliver() is

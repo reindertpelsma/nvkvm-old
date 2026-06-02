@@ -788,13 +788,15 @@ static void worker_thread(void *arg)
 		 */
 		unsigned job_type = (job.cmd >> 8) & 0xff;
 		unsigned job_nr   = job.cmd & 0xff;
-		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper and the
-		 * DRM SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) both carry
-		 * their single user ptr there. */
+		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper, the DRM
+		 * SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) and DRM
+		 * GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110) all carry
+		 * their single user ptr (nvkms_params_ptr) there. */
 		if (job.aux_size > 0 &&
 		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
 		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
-		     (job_type == 'd' && job_nr == 0x54 && job.param_size >= 16))) {
+		     (job_type == 'd' && (job_nr == 0x54 || job_nr == 0x49) &&
+		      job.param_size >= 16))) {
 			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
 			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
 					 &aux_ptr, sizeof(uint64_t));
@@ -839,6 +841,31 @@ static void worker_thread(void *arg)
 						regsurf_hid[regsurf_n] = hid;
 						regsurf_n++;
 					}
+				}
+			}
+		}
+
+		/*
+		 * DRM GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110): the aux
+		 * blob is { int memFd } at offset 0, carrying our handle_id; map
+		 * it to the stub's local fd so the kernel exports the bo's RM
+		 * memory onto a real fd in this process (exactly the
+		 * EXPORT_OBJECT_TO_FD path).  Restore the handle_id after.
+		 */
+		int     drm_export_fd_off = -1;
+		int32_t drm_export_fd_hid = 0;
+		if (job_type == 'd' && job_nr == 0x49 &&
+		    job.aux_size >= sizeof(int32_t)) {
+			int32_t hid;
+			__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
+			if (hid > 0) {
+				int lfd = handle_lookup((uint32_t)hid);
+				if (lfd >= 0) {
+					int32_t lfd32 = lfd;
+					__builtin_memcpy(job.aux_buf, &lfd32,
+							 sizeof(lfd32));
+					drm_export_fd_off = 0;
+					drm_export_fd_hid = hid;
 				}
 			}
 		}
@@ -916,6 +943,25 @@ static void worker_thread(void *arg)
 					__builtin_memcpy((char *)job.aux_buf + 16,
 							 &lfd32, sizeof(lfd32));
 					export_fd_off = 16;
+				}
+			}
+			if (inner_cmd == 0x00003d06U &&
+			    job.aux_size >= 4) {
+				/* NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD
+				 * (#110): the source nv-export fd is at aux offset
+				 * 0 and carries a handle_id; map it to our local fd
+				 * so the kernel imports the object into the caller's
+				 * RM client.  Reuse export_fd_off/saved (restore
+				 * writes the handle_id back at that offset). */
+				int32_t hid;
+				__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
+				export_fd_saved = hid;
+				int lfd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
+				if (lfd >= 0) {
+					int32_t lfd32 = lfd;
+					__builtin_memcpy(job.aux_buf, &lfd32,
+							 sizeof(lfd32));
+					export_fd_off = 0;
 				}
 			}
 			if (inner_cmd == 0x0080170dU) {
@@ -1244,6 +1290,13 @@ static void worker_thread(void *arg)
 		if (export_fd_off >= 0)
 			__builtin_memcpy((char *)job.aux_buf + export_fd_off,
 					 &export_fd_saved, sizeof(export_fd_saved));
+
+		/* DRM GEM_EXPORT_NVKMS_MEMORY: put the handle_id back at aux+0
+		 * over the stub fd we substituted (the guest restores its own
+		 * fd); never leak the stub's local fd. */
+		if (drm_export_fd_off >= 0)
+			__builtin_memcpy(job.aux_buf, &drm_export_fd_hid,
+					 sizeof(drm_export_fd_hid));
 
 		/* NVKMS REGISTER_SURFACE: restore handle_ids over the stub fds we
 		 * substituted into the plane slots (don't leak stub fds). */
