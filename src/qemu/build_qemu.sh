@@ -111,6 +111,12 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
   'nvkvm_objects.c',
   'nvkvm_mmap_host.c',
 ), extra_args: ['-I' + meson.current_source_dir() + '/nvkvm_inc'])
+
+# Mode-2 emulated NVIDIA GPU PCI device (reverse driver). Not virtio; plain
+# PCI device, always built into the x86_64 softmmu target.
+system_ss.add(when: ['CONFIG_PCI'], if_true: files(
+  'nvkvm_gpu_emul.c',
+))
 """
 
 # Insert the block before the very last non-empty line.
