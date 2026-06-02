@@ -98,6 +98,19 @@ struct nvkvm_isolate {
 	int         present_fd;     /* dma-buf fd via SCM_RIGHTS; -1 if none */
 
 	/*
+	 * Cross-isolate import slot (#110) — DEDICATED like present, because a
+	 * compositor isolate may import (this) concurrently with presenting its
+	 * own scanout (present_*).  Targets THIS (importer) isolate; QEMU sends a
+	 * dma-buf fd in and gets a GEM handle out.
+	 */
+	pthread_mutex_t xiso_lock;
+	pthread_mutex_t xiso_sync_lock;
+	pthread_cond_t  xiso_cond;
+	bool        xiso_done;
+	int         xiso_err;
+	uint32_t    xiso_gem;       /* importer-local GEM handle on success */
+
+	/*
 	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
 	 * QEMU mints one memfd holding both rings, keeps its own MAP_SHARED
 	 * mapping (for init / the grow handshake / a future QEMU-side ring), and
@@ -161,6 +174,15 @@ pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
 				 uint32_t isolate_id, uint32_t handle_id,
 				 uint32_t gem_handle, int *fd_out);
+
+/*
+ * #110 cross-isolate import: hand `dmabuf_fd` to the importer isolate's stub,
+ * which PRIME_FD_TO_HANDLEs it into a local GEM, returned in *gem_out.  Caller
+ * retains ownership of dmabuf_fd.  Serialized per isolate.  0 / -errno.
+ */
+int nvkvm_isolate_xiso_import(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id, uint32_t handle_id,
+			      int dmabuf_fd, uint32_t *gem_out);
 
 /*
  * Set up the per-isolate SPSC command-buffer ring (docs/design/command_buffer.md).

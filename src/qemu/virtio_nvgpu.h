@@ -354,6 +354,9 @@ int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
 int nvkvm_req_present(VirtIONvgpu *nv,
 		      struct nvkvm_req_present *req,
 		      struct nvkvm_resp_present *resp);
+int nvkvm_req_xiso_import(VirtIONvgpu *nv,
+			  struct nvkvm_req_xiso_import *req,
+			  struct nvkvm_resp_xiso_import *resp);
 int nvkvm_req_open_memory_handle(VirtIONvgpu *nv,
 				  struct nvkvm_req_open_memory_handle *req,
 				  struct nvkvm_resp_open_memory_handle *resp);

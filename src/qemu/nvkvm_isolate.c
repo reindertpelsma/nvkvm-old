@@ -414,6 +414,7 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_ring_ready      ring_ready;
 		struct isolate_resp_loop_exited     loop_exited;
 		struct isolate_resp_present_export  present_export;
+		struct isolate_resp_xiso_import     xiso_import;
 	} u;
 
 	for (;;) {
@@ -626,6 +627,16 @@ static void *isolate_reader_fn(void *arg)
 			break;
 		}
 
+		case ISOLATE_RESP_XISO_IMPORT: {
+			pthread_mutex_lock(&iso->xiso_sync_lock);
+			iso->xiso_err  = u.xiso_import.retval;
+			iso->xiso_gem  = u.xiso_import.gem_handle;
+			iso->xiso_done = true;
+			pthread_cond_signal(&iso->xiso_cond);
+			pthread_mutex_unlock(&iso->xiso_sync_lock);
+			break;
+		}
+
 		default:
 			NVKVM_DBG(
 				"nvkvm_isolate: unknown response type 0x%x\n",
@@ -671,6 +682,9 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 		pthread_mutex_init(&iso->present_lock,      NULL);
 		pthread_mutex_init(&iso->present_sync_lock, NULL);
 		pthread_cond_init(&iso->present_cond,       NULL);
+		pthread_mutex_init(&iso->xiso_lock,         NULL);
+		pthread_mutex_init(&iso->xiso_sync_lock,    NULL);
+		pthread_cond_init(&iso->xiso_cond,          NULL);
 		iso->present_fd = -1;
 	}
 }
@@ -688,6 +702,9 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 		pthread_mutex_destroy(&iso->present_lock);
 		pthread_mutex_destroy(&iso->present_sync_lock);
 		pthread_cond_destroy(&iso->present_cond);
+		pthread_mutex_destroy(&iso->xiso_lock);
+		pthread_mutex_destroy(&iso->xiso_sync_lock);
+		pthread_cond_destroy(&iso->xiso_cond);
 	}
 	pthread_mutex_destroy(&t->lock);
 }
@@ -1638,6 +1655,82 @@ int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
 		*fd_out = fd;
 	else
 		close(fd);
+	return 0;
+}
+
+/*
+ * Cross-isolate import (#110): hand `dmabuf_fd` (a host dma-buf the OWNER stub
+ * exported) to the IMPORTER isolate's stub, which PRIME_FD_TO_HANDLEs it into a
+ * local GEM and returns the handle.  The caller still owns dmabuf_fd afterwards
+ * (the stub takes its own reference via the SCM dup + PRIME import).
+ */
+int nvkvm_isolate_xiso_import(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id, uint32_t handle_id,
+			      int dmabuf_fd, uint32_t *gem_out)
+{
+	if (gem_out)
+		*gem_out = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	if (dmabuf_fd < 0)
+		return -EINVAL;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	uint32_t txn_id = iso->next_txn_id++;
+	if (iso->next_txn_id == 0)
+		iso->next_txn_id = 1;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_xiso_import cmd = {
+		.type      = ISOLATE_CMD_XISO_IMPORT,
+		.handle_id = handle_id,
+		.txn_id    = txn_id,
+	};
+	struct msghdr msg = { 0 };
+	struct iovec  iov = { .iov_base = &cmd, .iov_len = sizeof(cmd) };
+	char          cbuf[CMSG_SPACE(sizeof(int))];
+	msg.msg_iov        = &iov;
+	msg.msg_iovlen     = 1;
+	msg.msg_control    = cbuf;
+	msg.msg_controllen = sizeof(cbuf);
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type  = SCM_RIGHTS;
+	cm->cmsg_len   = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &dmabuf_fd, sizeof(int));
+
+	pthread_mutex_lock(&iso->xiso_lock);
+	pthread_mutex_lock(&iso->xiso_sync_lock);
+	iso->xiso_done = false;
+	iso->xiso_err  = 0;
+	iso->xiso_gem  = 0;
+
+	pthread_mutex_lock(&iso->write_lock);
+	ssize_t sr = sock_sendmsg_fd(iso->sock_fd, &msg);
+	pthread_mutex_unlock(&iso->write_lock);
+	if (sr < 0) {
+		pthread_mutex_unlock(&iso->xiso_sync_lock);
+		pthread_mutex_unlock(&iso->xiso_lock);
+		return (int)sr;
+	}
+
+	while (!iso->xiso_done)
+		pthread_cond_wait(&iso->xiso_cond, &iso->xiso_sync_lock);
+	int err = iso->xiso_err;
+	uint32_t gem = iso->xiso_gem;
+	pthread_mutex_unlock(&iso->xiso_sync_lock);
+	pthread_mutex_unlock(&iso->xiso_lock);
+
+	if (err)
+		return err;
+	if (gem == 0)
+		return -EPROTO;
+	if (gem_out)
+		*gem_out = gem;
 	return 0;
 }
 

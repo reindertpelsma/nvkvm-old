@@ -384,6 +384,9 @@ int  nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us,
 int  nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
 			  __u32 width, __u32 height, __u32 pitch,
 			  __u32 format, __u64 modifier);
+int  nvkvm_virtio_xiso_import(struct nvkvm_fd_ctx *ctx,
+			      __u32 owner_isolate_id, __u32 owner_handle_id,
+			      __u32 owner_stub_handle, __u32 *gem_out);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
 int  nvkvm_virtio_copy_handle_to_isolate(__u32 handle_id, __u32 isolate_id);
 int  nvkvm_virtio_close_handle_on_isolate(__u32 handle_id, __u32 isolate_id);

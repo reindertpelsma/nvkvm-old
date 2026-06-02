@@ -54,6 +54,8 @@
 #define ISOLATE_CMD_SETUP_RING   12   /* mint per-isolate SPSC ring pair; memfd via SCM_RIGHTS */
 #define ISOLATE_CMD_ENTER_LOOP   13   /* drive the SPSC consumer loop until idle */
 #define ISOLATE_CMD_PRESENT_EXPORT 14 /* PRIME_HANDLE_TO_FD a GEM; reply w/ dma-buf via SCM */
+#define ISOLATE_CMD_XISO_IMPORT  15   /* #110 cross-isolate: PRIME_FD_TO_HANDLE a dma-buf
+				       * (arrives via SCM_RIGHTS) → reply w/ GEM handle */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -67,6 +69,7 @@
 #define ISOLATE_RESP_RING_READY  0x17  /* SPSC ring mapped + self-test echo  */
 #define ISOLATE_RESP_LOOP_EXITED 0x18  /* consumer loop drained + idled out  */
 #define ISOLATE_RESP_PRESENT_EXPORT 0x19 /* present export result + dma-buf via SCM */
+#define ISOLATE_RESP_XISO_IMPORT 0x1a    /* #110 cross-isolate import result + GEM handle */
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -348,6 +351,32 @@ struct isolate_resp_present_export {
 	int32_t  retval;      /* 0 on success; -errno on failure (no SCM)   */
 	uint32_t reserved;
 	/* On success: one dma-buf fd attached via SCM_RIGHTS in the same sendmsg. */
+};
+
+/* ── XISO_IMPORT (#110 cross-isolate dma-buf) ──────────────────────────────
+ * QEMU brokers a GPU buffer from one isolate (the owner, which allocated it)
+ * into another (the importer, e.g. a compositor).  QEMU first PRESENT_EXPORTs
+ * the bo from the owner stub (host dma-buf fd), then sends THIS command to the
+ * importer stub with that dma-buf fd attached via SCM_RIGHTS.  The importer
+ * runs DRM_IOCTL_PRIME_FD_TO_HANDLE on its own render-node fd, producing a real
+ * local nvidia-drm GEM backed by the same physical memory — exactly what a
+ * bare-metal cross-process import does.  Subsequent RM export/import (0x09 /
+ * 0x3d06) then run entirely within the importer.  QEMU guarantees both isolates
+ * belong to the same VM; entitlement (which process may import) is enforced
+ * guest-side by the guest kernel gating who holds the guest dma-buf fd. */
+struct isolate_cmd_xiso_import {
+	uint32_t type;        /* ISOLATE_CMD_XISO_IMPORT */
+	uint32_t handle_id;   /* importer render-node handle whose fd does the import */
+	uint32_t txn_id;      /* echoed in response */
+	uint32_t reserved;
+	/* The host dma-buf fd to import arrives via SCM_RIGHTS in the same msg. */
+};
+
+struct isolate_resp_xiso_import {
+	uint32_t type;        /* ISOLATE_RESP_XISO_IMPORT */
+	uint32_t txn_id;      /* echoed from command */
+	int32_t  retval;      /* 0 on success; -errno on failure */
+	uint32_t gem_handle;  /* OUT: the importer-local GEM handle (valid if retval==0) */
 };
 
 /*

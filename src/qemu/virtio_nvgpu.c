@@ -765,6 +765,13 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_present,
 			    nvkvm_resp_present,
 			    nvkvm_req_present)
+		/* #110 cross-isolate dma-buf import: two bounded stub round-trips
+		 * (owner PRIME export + importer PRIME import) inline on the TX
+		 * thread, like PRESENT. */
+		ISOLATE_REQ(NVKVM_REQ_XISO_IMPORT,
+			    nvkvm_req_xiso_import,
+			    nvkvm_resp_xiso_import,
+			    nvkvm_req_xiso_import)
 		ISOLATE_REQ(NVKVM_REQ_OPEN_MEMORY_HANDLE,
 			    nvkvm_req_open_memory_handle,
 			    nvkvm_resp_open_memory_handle,

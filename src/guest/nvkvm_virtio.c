@@ -223,6 +223,12 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->retval = le32_to_cpu(resp->handle_id);
 			break;
 		}
+		case NVKVM_REQ_XISO_IMPORT: {
+			struct nvkvm_resp_xiso_import *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			inf->retval = le32_to_cpu(resp->gem_handle);
+			break;
+		}
 		case NVKVM_REQ_CLOSE_HANDLE: {
 			struct nvkvm_resp_close_handle *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -960,6 +966,41 @@ int nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
 		ret = -(int)inf->status;
 	inflight_free(&nvkvm, inf);
 	kfree(buf);
+	return ret;
+}
+
+/*
+ * #110 cross-isolate dma-buf import.  `ctx` is the importer (the drm_file the
+ * GEM op arrived on); the bo is owned by a different isolate.  QEMU brokers it
+ * (owner PRIME export → importer PRIME import) and returns a stub GEM handle
+ * valid in the importer's render-node fd, which the caller then uses to forward
+ * the RM export/import (0x09 / 0x3d06) entirely within the importer.
+ */
+int nvkvm_virtio_xiso_import(struct nvkvm_fd_ctx *ctx,
+			     __u32 owner_isolate_id, __u32 owner_handle_id,
+			     __u32 owner_stub_handle, __u32 *gem_out)
+{
+	struct {
+		struct nvkvm_hdr             hdr;
+		struct nvkvm_req_xiso_import req;
+	} msg = {};
+	__u64 retval = 0;
+	int ret;
+
+	if (!ctx || !ctx->session)
+		return -EBADF;
+	if (!owner_isolate_id || !owner_handle_id)
+		return -EINVAL;
+
+	msg.req.owner_isolate_id    = cpu_to_le32(owner_isolate_id);
+	msg.req.owner_handle_id     = cpu_to_le32(owner_handle_id);
+	msg.req.owner_stub_handle   = cpu_to_le32(owner_stub_handle);
+	msg.req.importer_isolate_id = cpu_to_le32(ctx->session->isolate_id);
+	msg.req.importer_handle_id  = cpu_to_le32(ctx->handle_id);
+
+	ret = simple_req(NVKVM_REQ_XISO_IMPORT, &msg, sizeof(msg), &retval);
+	if (ret == 0 && gem_out)
+		*gem_out = (__u32)retval;
 	return ret;
 }
 

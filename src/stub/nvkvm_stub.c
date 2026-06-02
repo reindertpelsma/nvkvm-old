@@ -1673,6 +1673,59 @@ static void handle_present_export(struct isolate_cmd_present_export *cmd)
 	stub_close(p.fd);
 }
 
+/* DRM PRIME import (#110 cross-isolate). Mirrors <drm/drm.h>:
+ *   DRM_IOCTL_PRIME_FD_TO_HANDLE = _IOWR('d', 0x2e, struct drm_prime_handle)
+ *   = (3<<30)|(12<<16)|('d'<<8)|0x2e = 0xC00C642E.
+ * The dma-buf fd was exported by the OWNER stub (PRIME_HANDLE_TO_FD) and relayed
+ * here by QEMU via SCM_RIGHTS.  PRIME_FD_TO_HANDLE on our render node creates a
+ * real local nvidia-drm GEM backed by the same physical memory, so the caller's
+ * subsequent RM export/import (0x09 / 0x3d06) run entirely within this stub. */
+#define STUB_DRM_IOCTL_PRIME_FD_TO_HANDLE 0xC00C642EUL
+
+static void handle_xiso_import(struct isolate_cmd_xiso_import *cmd,
+			       struct msghdr *msg_hdr)
+{
+	struct isolate_resp_xiso_import resp = {
+		.type   = ISOLATE_RESP_XISO_IMPORT,
+		.txn_id = cmd->txn_id,
+		.retval = -EINVAL,
+		.gem_handle = 0,
+	};
+	int dbuf = -1;
+	int rfd;
+
+	/* The dma-buf fd arrives via SCM_RIGHTS (QEMU is trusted). */
+	struct cmsghdr *cm = CMSG_FIRSTHDR(msg_hdr);
+	if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+	    cm->cmsg_len == CMSG_LEN(sizeof(int)))
+		__builtin_memcpy(&dbuf, CMSG_DATA(cm), sizeof(int));
+	if (dbuf < 0) {
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	fs_mutex_lock(&fd_mutex);
+	rfd = handle_lookup(cmd->handle_id);
+	fs_mutex_unlock(&fd_mutex);
+	if (rfd < 0) {
+		resp.retval = -EBADF;
+		stub_close(dbuf);
+		locked_send(&resp, sizeof(resp));
+		return;
+	}
+
+	struct stub_drm_prime_handle p = { .handle = 0, .flags = 0, .fd = dbuf };
+	long r = stub_ioctl(rfd, STUB_DRM_IOCTL_PRIME_FD_TO_HANDLE, &p);
+	stub_close(dbuf);   /* PRIME_FD_TO_HANDLE took its own reference */
+	if (r < 0) {
+		resp.retval = (int)r;
+	} else {
+		resp.retval = 0;
+		resp.gem_handle = p.handle;
+	}
+	locked_send(&resp, sizeof(resp));
+}
+
 static void handle_close_fd(uint32_t handle_id)
 {
 	fs_mutex_lock(&fd_mutex);
@@ -2020,6 +2073,7 @@ union stub_cmd {
 	struct isolate_cmd_setup_ring       setup_ring;
 	struct isolate_cmd_enter_loop       enter_loop;
 	struct isolate_cmd_present_export   present_export;
+	struct isolate_cmd_xiso_import      xiso_import;
 };
 
 /* ── Command-buffer consumer loop (docs/design/command_buffer.md, Phase 3) ───
@@ -2342,6 +2396,9 @@ static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
 		return 0;
 	case ISOLATE_CMD_PRESENT_EXPORT:
 		handle_present_export(&c->present_export);
+		return 0;
+	case ISOLATE_CMD_XISO_IMPORT:
+		handle_xiso_import(&c->xiso_import, msg_hdr);
 		return 0;
 	case ISOLATE_CMD_REALIZE_UVM_FD:
 		handle_realize_uvm_fd(&c->realize);

@@ -47,7 +47,8 @@ int ioctl(int fd, unsigned long request, ...)
     unsigned type = (request >> 8) & 0xff, nr = request & 0xff, sz = (request >> 16) & 0x3fff;
 
     int dump = enabled && type == 0x46 && arg &&
-               (nr == 0x2a || nr == 0x2b || nr == 0x4e || nr == 0x4a);
+               (nr == 0x2a || nr == 0x2b || nr == 0x4e || nr == 0x4a ||
+                nr == 0x5c || nr == 0x5d || nr == 0xd4);
     struct nvos54 pre = {0};
     void *pbuf_pre = NULL; uint32_t psz = 0;
     if (dump && nr == 0x2a && sz >= 32) {

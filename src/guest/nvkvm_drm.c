@@ -80,6 +80,13 @@ struct nvkvm_gem_object {
 	 * buffer is actually PRIME-imported (most bos are GPU-only and never are). */
 	struct page         **import_pages;
 	unsigned long         import_npages;
+	/* #110 cross-isolate import cache: when a DIFFERENT isolate (e.g. a
+	 * compositor) PRIME-imports this proxy, QEMU brokers the bo into that
+	 * isolate's stub and returns a stub-local GEM handle.  Cache the last
+	 * importer so repeated GEM ops (per-frame capture) reuse it instead of
+	 * re-brokering.  Single entry: the common case is one compositor. */
+	__u32                 xiso_importer_iso;  /* importer's isolate_id, 0=none */
+	__u32                 xiso_gem;           /* stub GEM handle in that isolate */
 };
 
 #define to_nvkvm_gem(o) container_of(o, struct nvkvm_gem_object, base)
@@ -209,29 +216,82 @@ static __u32 nvkvm_gem_to_stub(struct drm_file *file, __u32 guest_handle)
 }
 
 /*
- * Like nvkvm_gem_to_stub, but also returns the isolate the proxy was created
- * on (where its stub_handle is valid).  A stub GEM handle lives in exactly one
- * stub render fd — the ctx that ran GEM_ALLOC_NVKMS_MEMORY.  NVIDIA's EGL opens
- * renderD128 several times, so a PRIME re-import can hand a *different* drm_file
- * a handle that points back to the original proxy; forwarding a GEM op on the
- * calling file's ctx would hit the wrong stub fd (the handle is UNKNOWN there).
- * Callers that forward by stub_handle MUST forward on *this* ctx, not
- * file->driver_priv.  Returns 0 (and leaves *ctx untouched) for non-proxies. */
-static __u32 nvkvm_gem_to_stub_ctx(struct drm_file *file, __u32 guest_handle,
-				   struct nvkvm_fd_ctx **ctx)
+ * Resolve a guest GEM handle to the (stub_handle, forwarding-ctx) pair a GEM op
+ * should target — handling the cross-isolate case (#110).
+ *
+ * A stub GEM handle lives in exactly one stub render fd: the ctx that ran
+ * GEM_ALLOC_NVKMS_MEMORY (the "owner").  NVIDIA's EGL opens renderD128 several
+ * times, and a guest app can pass a bo's dma-buf to a *different* process (a
+ * compositor) entirely — both reach the SAME guest proxy object via PRIME, but
+ * its stub_handle is meaningless in any isolate other than the owner's.
+ *
+ *  - Same isolate (incl. the multi-open single-process case): forward on the
+ *    owner's ctx with the owner's stub_handle.
+ *  - Different isolate (cross-process compositor import): QEMU brokers the bo
+ *    into the caller's stub (owner PRIME-export → caller PRIME-import) and hands
+ *    back a caller-local GEM handle; forward on the CALLER's ctx with that.
+ *    Cached on the proxy so per-frame re-imports don't re-broker.
+ *
+ * Returns 0 and fills *stub_h_out / *fwd_ctx_out on success; -errno on a failed
+ * cross-isolate broker; -ENOENT if the handle is not one of our proxies. */
+static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
+				 __u32 *stub_h_out, struct nvkvm_fd_ctx **fwd_ctx_out)
 {
 	struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
-	__u32 sh = 0;
+	struct nvkvm_gem_object *ng;
+	struct nvkvm_fd_ctx *owner_ctx, *caller_ctx = file->driver_priv;
+	__u32 owner_iso, caller_iso;
+	int ret = 0;
 
-	if (obj) {
-		if (obj->funcs == &nvkvm_gem_funcs) {
-			sh = to_nvkvm_gem(obj)->stub_handle;
-			if (ctx)
-				*ctx = to_nvkvm_gem(obj)->ctx;
-		}
+	if (!obj)
+		return -ENOENT;
+	if (obj->funcs != &nvkvm_gem_funcs) {
 		drm_gem_object_put(obj);
+		return -ENOENT;
 	}
-	return sh;
+	ng = to_nvkvm_gem(obj);
+	owner_ctx  = ng->ctx;
+	owner_iso  = (owner_ctx && owner_ctx->session) ? owner_ctx->session->isolate_id : 0;
+	caller_iso = (caller_ctx && caller_ctx->session) ? caller_ctx->session->isolate_id : 0;
+
+	if (!caller_ctx) {
+		drm_gem_object_put(obj);
+		return -EBADF;
+	}
+
+	if (owner_iso == 0 || owner_iso == caller_iso) {
+		/* Same isolate — forward on the owner's ctx (where the handle
+		 * is valid), exactly as the multi-open single-process path. */
+		*stub_h_out  = ng->stub_handle;
+		*fwd_ctx_out = owner_ctx ? owner_ctx : caller_ctx;
+		drm_gem_object_put(obj);
+		return 0;
+	}
+
+	/* Cross-isolate: reuse the cached broker result, else broker now. */
+	if (ng->xiso_importer_iso == caller_iso && ng->xiso_gem) {
+		*stub_h_out  = ng->xiso_gem;
+		*fwd_ctx_out = caller_ctx;
+		drm_gem_object_put(obj);
+		return 0;
+	}
+
+	{
+		__u32 gem = 0;
+		ret = nvkvm_virtio_xiso_import(caller_ctx, owner_iso,
+					       owner_ctx->handle_id,
+					       ng->stub_handle, &gem);
+		if (ret == 0 && gem) {
+			ng->xiso_importer_iso = caller_iso;
+			ng->xiso_gem          = gem;
+			*stub_h_out  = gem;
+			*fwd_ctx_out = caller_ctx;
+		} else if (ret == 0) {
+			ret = -EIO;
+		}
+	}
+	drm_gem_object_put(obj);
+	return ret;
 }
 
 /* Present path (#102): map a scanout framebuffer back to the host/stub buffer
@@ -527,11 +587,17 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 	if (!ctx)
 		return -EBADF;
 
-	/* Forward on the PROXY's ctx (where stub_h is a valid GEM handle), not
-	 * the calling file's — see nvkvm_gem_to_stub_ctx. */
-	stub_h = nvkvm_gem_to_stub_ctx(file, guest_h, &ctx);
-	if (stub_h)
-		p->handle = stub_h;
+	/* Resolve to the (stub handle, forwarding ctx) this op targets — handles
+	 * the cross-isolate compositor-import case by brokering the bo into the
+	 * caller's stub (see nvkvm_gem_resolve_fwd).  On a non-proxy handle, fall
+	 * back to forwarding as-is on the caller's ctx. */
+	{
+		int rret = nvkvm_gem_resolve_fwd(file, guest_h, &stub_h, &ctx);
+		if (rret == 0 && stub_h)
+			p->handle = stub_h;
+		else if (rret < 0 && rret != -ENOENT)
+			return rret;
+	}
 
 	orig_ptr = p->nvkms_params_ptr;
 	if (orig_ptr && p->nvkms_params_size >= sizeof(__s32) &&

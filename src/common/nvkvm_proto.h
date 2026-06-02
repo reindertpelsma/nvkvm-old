@@ -162,6 +162,9 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_ENTER_LOOP             29  /* drive the isolate's SPSC consumer loop */
 #define NVKVM_REQ_PRESENT                30  /* #106 present path: virtual head flipped a
                                               * scanout bo; QEMU exports its host dma-buf  */
+#define NVKVM_REQ_XISO_IMPORT            31  /* #110 cross-isolate dma-buf: broker a bo from
+                                              * the owner isolate into the caller's; returns
+                                              * the caller-local stub GEM handle            */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -227,6 +230,24 @@ struct nvkvm_req_present {
 struct nvkvm_resp_present {
 	__le32 status;       /* 0 = QEMU exported/accepted the frame, errno else */
 	__le32 reserved;
+};
+
+/* #110 cross-isolate dma-buf import. The caller (importer) holds a guest GEM
+ * that proxies a bo owned by a different isolate; QEMU PRESENT_EXPORTs the bo
+ * from the owner and PRIME_FD_TO_HANDLEs it into the importer's stub, returning
+ * a stub GEM handle valid in the importer's render-node fd. */
+struct nvkvm_req_xiso_import {
+	__le32 owner_isolate_id;    /* isolate that allocated the bo            */
+	__le32 owner_handle_id;     /* owner's render-node handle holding the bo */
+	__le32 owner_stub_handle;   /* GEM handle in the owner's stub DRM file   */
+	__le32 importer_isolate_id; /* caller's isolate                          */
+	__le32 importer_handle_id;  /* caller's render-node handle (does the import) */
+	__le32 reserved;
+};
+
+struct nvkvm_resp_xiso_import {
+	__le32 status;       /* 0 on success, errno else */
+	__le32 gem_handle;   /* importer-local stub GEM handle (valid if status==0) */
 };
 
 /* Kept for compat with existing open path */

@@ -892,6 +892,79 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	return 0;
 }
 
+/*
+ * XISO_IMPORT (#110 cross-isolate dma-buf) — broker a GPU buffer owned by one
+ * isolate into another (compositor importing a client bo).  Host/cross-VM
+ * boundary, so validate hard, exactly like PRESENT:
+ *   - graphics must be enabled;
+ *   - BOTH the owner and importer handles must be render-node handles, so a
+ *     guest cannot coerce QEMU into PRIME-exporting/importing an arbitrary fd.
+ * Same-VM scoping is inherent: nv->handles / nv->isolates are this VM's only.
+ * WHO may import (cross-UID / cross-container on the guest) is enforced
+ * guest-side — the guest kernel gates which process holds the guest dma-buf fd
+ * that drives this request (the access-model split: intra-VM rights = guest's).
+ * Mechanism: owner stub PRIME_HANDLE_TO_FD → host dma-buf → importer stub
+ * PRIME_FD_TO_HANDLE → local GEM, returned to the guest.  The dma-buf fd never
+ * leaves QEMU's hands; only the same-VM stubs ever touch it.
+ */
+int nvkvm_req_xiso_import(VirtIONvgpu *nv,
+			  struct nvkvm_req_xiso_import *req,
+			  struct nvkvm_resp_xiso_import *resp)
+{
+	resp->gem_handle = 0;
+
+	if (!nv->graphics) {
+		resp->status = EPERM;
+		return 0;
+	}
+	if (req->owner_isolate_id == 0 || req->importer_isolate_id == 0) {
+		resp->status = ENOENT;
+		return 0;
+	}
+
+	struct nvkvm_handle *oh = nvkvm_handle_get(&nv->handles, req->owner_handle_id);
+	struct nvkvm_handle *ih = nvkvm_handle_get(&nv->handles, req->importer_handle_id);
+	if (!oh || oh->dev_id < NVKVM_DEV_DRM_RD(0) ||
+	    oh->dev_id >= NVKVM_DEV_DRM_RD(16) ||
+	    !ih || ih->dev_id < NVKVM_DEV_DRM_RD(0) ||
+	    ih->dev_id >= NVKVM_DEV_DRM_RD(16)) {
+		NVKVM_DBG("nvkvm xiso: non-render handle (owner=%u imp=%u)\n",
+			  req->owner_handle_id, req->importer_handle_id);
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	/* 1. Owner stub exports the bo as a host dma-buf (PRIME_HANDLE_TO_FD). */
+	int dmabuf_fd = -1;
+	int r = nvkvm_isolate_present_export(&nv->isolates, req->owner_isolate_id,
+					     req->owner_handle_id,
+					     req->owner_stub_handle, &dmabuf_fd);
+	if (r < 0 || dmabuf_fd < 0) {
+		NVKVM_DBG("nvkvm xiso: owner export rc=%d iso=%u gem=0x%x\n",
+			  r, req->owner_isolate_id, req->owner_stub_handle);
+		resp->status = (r < 0) ? (uint32_t)(-r) : EIO;
+		return 0;
+	}
+
+	/* 2. Importer stub PRIME_FD_TO_HANDLEs it into a local GEM. */
+	uint32_t gem = 0;
+	r = nvkvm_isolate_xiso_import(&nv->isolates, req->importer_isolate_id,
+				      req->importer_handle_id, dmabuf_fd, &gem);
+	close(dmabuf_fd);
+	if (r < 0) {
+		NVKVM_DBG("nvkvm xiso: importer import rc=%d iso=%u\n",
+			  r, req->importer_isolate_id);
+		resp->status = (uint32_t)(-r);
+		return 0;
+	}
+	NVKVM_DBG("nvkvm xiso: owner(iso=%u gem=0x%x) -> importer(iso=%u) gem=0x%x\n",
+		  req->owner_isolate_id, req->owner_stub_handle,
+		  req->importer_isolate_id, gem);
+	resp->gem_handle = gem;
+	resp->status = 0;
+	return 0;
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
