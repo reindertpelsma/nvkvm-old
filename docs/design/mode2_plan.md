@@ -168,6 +168,28 @@ byte the guest controls → Rust core.
   doorbell at M3.
 - **Self-consistent identity (spike §5.2):** `NV_PMC_BOOT_0`, HWCFG, PMC boot
   regs, and PCI IDs must all describe GA106. Build a single chip-descriptor.
+- **Any open-driver GPU, eventually (user directive 2026-06-03).** GA106 is only
+  the *bring-up* reference (it matches the dev host, so the trace and the
+  downstream forwarding describe the same silicon). The end goal is to emulate
+  **any NVIDIA GPU the open kernel module supports** — every RTX/Ada/Hopper/
+  Blackwell part. The architecture is built for this from the start:
+  - All silicon-specific identity lives in the `NvkvmGpuChip` descriptor
+    (`nvkvm_gpu_emul.c`): PCI IDs, `PMC_BOOT_0/42`, BAR sizes. Adding a chip =
+    adding a table row; the device is selected to match (or be told to mimic)
+    the host GPU it forwards to.
+  - The **register answers** for the boot state machine are mostly arch-stable:
+    the GFW/GSP path routes through the shared `_TU102` HAL for everything
+    Turing-and-newer, so the GFW_BOOT/PLM/RISCV/mailbox offsets are common.
+    Where an arch diverges (Ada/Hopper/Blackwell scratch layouts, CC), the
+    descriptor carries per-arch register tables — same dispatch, different data.
+  - The **GSP firmware + RPC ABI** are per-driver-version, not per-chip; matching
+    the in-guest driver version (we run 580.159.04 to match the host) covers it.
+    Converges with Mode-1's `abi_profile` auto-detect ([[multi_driver_validated]]).
+  - Multi-GPU (N emulated functions, each bound to a host GPU by BDF) is the
+    orthogonal axis already required ([[mode2_perf_dma_multigpu]]); per-instance
+    state + per-chip descriptor compose: each function picks its own chip row.
+  PoC proceeds on GA106; generalize to a chip table once fake-the-boot →
+  GSP_INIT_DONE works on the reference part.
 - **Confidential Compute stays OFF** (spike #8/§5.3) — never advertise CC.
 - **Closed driver / Windows** deferred (spike §5.4): same attestation conclusion,
   unverified poll/RPC set.

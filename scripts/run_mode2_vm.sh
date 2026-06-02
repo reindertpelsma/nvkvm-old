@@ -20,7 +20,12 @@ set -euo pipefail
 QEMU="${QEMU_BIN:-/opt/qemu-nvkvm/bin/qemu-system-x86_64}"
 BASE="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
 SEED="/opt/nvkvm-guest/seed.iso"
-OGKM="/root/open-gpu-kernel-modules"      # open driver source (575.51.03)
+# Open driver source + matching GSP firmware.  Aligned to 580.159.04 = the host
+# driver version (best for downstream Mode-1 forwarding) and the guest's staged
+# userspace (NVML 580.159).  Both shared read-only over 9p.
+OGKM="${OGKM:-/usr/src/nvidia-580.159.04}"   # open driver DKMS source 580.159.04
+NVFW="${NVFW:-/usr/lib/firmware/nvidia/580.159.04}"  # gsp_ga10x.bin etc.
+NVVER="${NVVER:-580.159.04}"
 SSH_PORT="${SSH_PORT:-2223}"
 QLOG="${QLOG:-/tmp/m0_qemu.log}"
 SERIAL="${SERIAL:-/tmp/m0_serial.log}"
@@ -70,8 +75,9 @@ exec "$QEMU" \
     -device pcie-root-port,id=rp0,chassis=0,slot=0 \
     -device nvkvm-gpu-emul,bus=rp0 \
     \
-    `# Open driver source (RO) + repo, both over 9p.` \
+    `# Open driver source + GSP firmware (RO) + repo, all over 9p.` \
     -virtfs local,path="$OGKM",mount_tag=ogkm,security_model=mapped,readonly=on \
+    -virtfs local,path="$NVFW",mount_tag=nvfw,security_model=mapped,readonly=on \
     -virtfs local,path=/workspace/nvkvm,mount_tag=nvkvm_src,security_model=mapped \
     \
     -serial file:"$SERIAL" \

@@ -6,6 +6,7 @@
 #  4. trigger rm_init_adapter (opens /dev/nvidia0) and dump the boot dmesg
 # The QEMU-side BAR0 trace is captured separately by the host via -D.
 set -u
+NVVER=580.159.04
 NVMODS=/home/ubuntu/nvmods
 OPENER=/tmp/nvopen
 
@@ -16,17 +17,26 @@ if [ ! -f /etc/modprobe.d/zz-mode2.conf ]; then
         | sudo tee /etc/modprobe.d/zz-mode2.conf >/dev/null
 fi
 
-# 2. build + stash nvidia.ko once
+# 1b. stage the matching GSP firmware (driver loads nvidia/$NVVER/gsp_*.bin)
+if [ ! -f "/lib/firmware/nvidia/$NVVER/gsp_ga10x.bin" ]; then
+    sudo mkdir -p /mnt/nvfw "/lib/firmware/nvidia/$NVVER"
+    mountpoint -q /mnt/nvfw || sudo mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576,ro nvfw /mnt/nvfw
+    sudo cp /mnt/nvfw/gsp_*.bin "/lib/firmware/nvidia/$NVVER/" 2>/dev/null
+    echo "staged firmware: $(ls /lib/firmware/nvidia/$NVVER/ 2>/dev/null)"
+fi
+
+# 2. build + stash nvidia.ko once (580 DKMS-tree: top Makefile, `make modules`)
 if [ ! -f "$NVMODS/nvidia.ko" ]; then
-    echo "=== building open nvidia.ko (one-time) ==="
+    echo "=== building open nvidia.ko $NVVER (one-time) ==="
     sudo mkdir -p /mnt/ogkm /mnt/build
     mountpoint -q /mnt/ogkm  || sudo mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576,ro ogkm /mnt/ogkm
     mountpoint -q /mnt/build || sudo mount -t tmpfs -o size=5G tmpfs /mnt/build
-    sudo cp -a /mnt/ogkm/. /mnt/build/
+    sudo cp -aL /mnt/ogkm/. /mnt/build/ 2>/dev/null
     ( cd /mnt/build && sudo make modules -j"$(nproc)" >/tmp/ogkm_build.log 2>&1 )
+    KO=$(find /mnt/build -name nvidia.ko | head -1)
     mkdir -p "$NVMODS"
-    cp /mnt/build/kernel-open/nvidia.ko "$NVMODS/"
-    echo "stashed $(ls -la $NVMODS/nvidia.ko)"
+    if [ -n "$KO" ]; then cp "$KO" "$NVMODS/"; echo "stashed $(ls -la $NVMODS/nvidia.ko)";
+    else echo "BUILD FAILED — tail:"; tail -20 /tmp/ogkm_build.log; exit 1; fi
 fi
 
 # 3. load deps + nvidia.ko (fresh; bypass blacklist with insmod-by-path)

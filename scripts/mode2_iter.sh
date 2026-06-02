@@ -21,6 +21,10 @@ if [ "$BUILD" = "1" ]; then
 fi
 
 echo "==> restart VM"
+# Flush guest writes before killing QEMU: kill -9 drops unflushed guest page
+# cache, silently losing overlay changes (stash deletes, blacklist tweaks).
+$SSHG 'sync; sync' 2>/dev/null || true
+pkill -TERM qemu-system 2>/dev/null; sleep 3
 pkill -9 qemu-system 2>/dev/null; sleep 2
 NVKVM_FRESH=$FRESH nohup bash /workspace/nvkvm/scripts/run_mode2_vm.sh \
     >/tmp/m0_launch.log 2>&1 &
