@@ -18,7 +18,7 @@
 set -euo pipefail
 
 QEMU="${QEMU_BIN:-/opt/qemu-nvkvm/bin/qemu-system-x86_64}"
-IMG="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+BASE="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
 SEED="/opt/nvkvm-guest/seed.iso"
 OGKM="/root/open-gpu-kernel-modules"      # open driver source (575.51.03)
 SSH_PORT="${SSH_PORT:-2223}"
@@ -27,8 +27,19 @@ SERIAL="${SERIAL:-/tmp/m0_serial.log}"
 MEM="${MEM:-8G}"
 SMP="${SMP:-4}"
 
-[ -f "$IMG" ]  || { echo "ERROR: $IMG missing"; exit 1; }
+# Persistent overlay backed by the pristine base.  Survives QEMU restarts (so
+# the guest's blacklist tweaks + stashed nvidia.ko persist across Mode-2 device
+# rebuilds), while the 29G base is never modified (read-only backing file).
+# Set NVKVM_FRESH=1 to discard the overlay and start clean.
+OVL="/opt/nvkvm-guest/mode2-overlay.qcow2"
+[ -f "$BASE" ] || { echo "ERROR: $BASE missing"; exit 1; }
 [ -f "$SEED" ] || { echo "ERROR: $SEED missing"; exit 1; }
+if [ "${NVKVM_FRESH:-0}" = "1" ]; then rm -f "$OVL"; fi
+if [ ! -f "$OVL" ]; then
+    qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$OVL" >/dev/null
+    echo "created overlay $OVL"
+fi
+IMG="$OVL"
 
 rm -f "$QLOG" "$SERIAL"
 
@@ -47,7 +58,6 @@ exec "$QEMU" \
     -cpu host \
     -m "$MEM" \
     -smp "$SMP" \
-    -snapshot \
     \
     -drive file="$IMG",format=qcow2,if=virtio \
     -drive file="$SEED",format=raw,if=virtio,readonly=on \
