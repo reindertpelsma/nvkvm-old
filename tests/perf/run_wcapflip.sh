@@ -46,7 +46,8 @@ echo "=== run a continuously-animating GL client (es2gears) ==="
 timeout 30 es2gears_wayland >/tmp/eg.out 2>&1 &
 
 echo "=== run wcapflip ($MODE, $NFRAMES frames) ==="
-"$B/wcapflip" /dev/dri/card0 "$NFRAMES" $( [ "$MODE" = shm ] && echo --shm )
+MARG=""; [ "$MODE" = shm ] && MARG=--shm; [ "$MODE" = udmabuf ] && MARG=--udmabuf
+"$B/wcapflip" /dev/dri/card0 "$NFRAMES" $MARG
 RC=$?
 echo "wcapflip rc=$RC"
 echo "=== present-path flips reported by guest kernel ==="

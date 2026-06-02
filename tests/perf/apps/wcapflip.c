@@ -35,6 +35,8 @@
 #include <errno.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/udmabuf.h>
 #include <time.h>
 #include <wayland-client.h>
 #include <gbm.h>
@@ -96,8 +98,8 @@ struct capbuf {
     /* dmabuf path */
     struct gbm_bo *bo;
     uint32_t fb_id, handle, stride;
-    /* shm path */
-    void *shm_data; size_t shm_size;
+    /* shm / udmabuf path */
+    void *shm_data; size_t shm_size; int memfd;
 };
 
 static int g_card_fd;
@@ -144,6 +146,44 @@ static int make_dmabuf(struct capbuf *cb)
     return 0;
 }
 
+/* udmabuf: a dma-buf backed by a memfd (real guest pages).  weston's NVIDIA EGL
+ * imports it as an EXTERNAL dma-buf → pins the memfd pages → the forwarded RM
+ * OS_DESCRIPTOR path migrates those same pages into the stub (the mechanism that
+ * already backs userptr/OS_DESCRIPTOR ioctls).  Tests whether a memfd-backed
+ * buffer is importable where a hollow proxy-GEM dma-buf is not. */
+static int make_udmabuf(struct capbuf *cb)
+{
+    int stride = cap_w * 4;
+    size_t sz = (size_t)stride * cap_h;
+    sz = (sz + 0xfff) & ~0xfffUL;                  /* page-align (udmabuf req) */
+    cb->shm_size = sz;
+    cb->memfd = memfd_create("wcap-udmabuf", MFD_ALLOW_SEALING | MFD_CLOEXEC);
+    if (cb->memfd < 0) { perror("memfd"); return -1; }
+    if (ftruncate(cb->memfd, sz) < 0) { perror("ftruncate"); return -1; }
+    if (fcntl(cb->memfd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) { perror("F_SEAL_SHRINK"); return -1; }
+    cb->shm_data = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, cb->memfd, 0);
+
+    int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (udev < 0) { perror("open /dev/udmabuf"); return -1; }
+    struct udmabuf_create uc = { .memfd = (uint32_t)cb->memfd,
+                                 .flags = UDMABUF_FLAGS_CLOEXEC,
+                                 .offset = 0, .size = sz };
+    int dbuf = ioctl(udev, UDMABUF_CREATE, &uc);
+    close(udev);
+    if (dbuf < 0) { perror("UDMABUF_CREATE"); return -1; }
+    fprintf(stderr, "udmabuf: %dx%d stride=%d size=%zu dmabuf_fd=%d\n",
+            cap_w, cap_h, stride, sz, dbuf);
+
+    struct zwp_linux_buffer_params_v1 *p = zwp_linux_dmabuf_v1_create_params(dmabuf_factory);
+    zwp_linux_buffer_params_v1_add(p, dbuf, 0, 0, stride,
+                                   DRM_FORMAT_MOD_LINEAR >> 32,
+                                   DRM_FORMAT_MOD_LINEAR & 0xffffffff);
+    cb->wlbuf = zwp_linux_buffer_params_v1_create_immed(p, cap_w, cap_h, cap_format, 0);
+    zwp_linux_buffer_params_v1_destroy(p);
+    close(dbuf);
+    return cb->wlbuf ? 0 : -1;
+}
+
 static int make_shm(struct capbuf *cb)
 {
     int stride = cap_w * 4;
@@ -165,12 +205,14 @@ static int make_shm(struct capbuf *cb)
 int main(int argc, char **argv)
 {
     const char *card = "/dev/dri/card0";
-    int nframes = 120, use_shm = 0;
+    int nframes = 120, use_shm = 0, use_udmabuf = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shm")) use_shm = 1;
+        else if (!strcmp(argv[i], "--udmabuf")) use_udmabuf = 1;
         else if (argv[i][0] == '/') card = argv[i];
         else nframes = atoi(argv[i]);
     }
+    int cpu_read = use_shm || use_udmabuf;   /* CPU-mapped target, no KMS flip */
 
     struct wl_display *dpy = wl_display_connect(NULL);
     if (!dpy) { fprintf(stderr, "wl_display_connect failed (WAYLAND_DISPLAY?)\n"); return 1; }
@@ -183,6 +225,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (!use_shm && !dmabuf_factory) { fprintf(stderr, "no linux-dmabuf; use --shm\n"); return 2; }
+    if (use_shm && !shm) { fprintf(stderr, "no wl_shm\n"); return 2; }
 
     /* DRM master + gbm on card0 (virtual head is free — headless weston uses renderD128) */
     g_card_fd = open(card, O_RDWR | O_CLOEXEC);
@@ -211,12 +254,13 @@ int main(int argc, char **argv)
     weston_capture_source_v1_add_listener(src, &cap_listener, NULL);
     wl_display_roundtrip(dpy);     /* get initial format + size */
     if (!cap_ready) { fprintf(stderr, "no format/size from capture source\n"); return 4; }
-    printf("capture: %dx%d fourcc=0x%08x (%s)\n", cap_w, cap_h, cap_format,
-           use_shm ? "shm" : "dmabuf");
-    if (!use_shm) cap_format = cap_format ? cap_format : DRM_FORMAT_XRGB8888;
+    const char *modename = use_udmabuf ? "udmabuf" : use_shm ? "shm" : "dmabuf";
+    printf("capture: %dx%d fourcc=0x%08x (%s)\n", cap_w, cap_h, cap_format, modename);
+    if (!cpu_read) cap_format = cap_format ? cap_format : DRM_FORMAT_XRGB8888;
 
-    struct capbuf cb = {0};
-    if (use_shm ? make_shm(&cb) : make_dmabuf(&cb)) return 5;
+    struct capbuf cb = { .memfd = -1 };
+    int mret = use_udmabuf ? make_udmabuf(&cb) : use_shm ? make_shm(&cb) : make_dmabuf(&cb);
+    if (mret) return 5;
 
     struct pollfd pfd = { .fd = g_card_fd, .events = POLLIN };
     int presented = 0, first = 1;
@@ -236,9 +280,9 @@ int main(int argc, char **argv)
             /* would realloc here; for the proof, bail */
             break;
         }
-        /* composited frame now in cb. SHM: dump first frame as proof-of-content
-         * (P6 PPM, ARGB bytes B,G,R,A in memory). dmabuf: present on the head. */
-        if (use_shm) {
+        /* composited frame now in cb. CPU-mapped (shm/udmabuf): dump first frame
+         * as proof-of-content (P6 PPM, ARGB B,G,R,A in memory). dmabuf: flip. */
+        if (cpu_read) {
             if (f == 0) {
                 FILE *pp = fopen("/tmp/wcapflip_frame.ppm", "wb");
                 if (pp) {
@@ -274,7 +318,7 @@ out:;
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
     printf("RESULT presented=%d/%d mode=%s  %.1f fps (%.0f ms)\n",
-           presented, nframes, use_shm ? "shm" : "dmabuf",
+           presented, nframes, modename,
            secs > 0 ? presented / secs : 0.0, secs * 1000);
     return presented > 0 ? 0 : 6;
 }
