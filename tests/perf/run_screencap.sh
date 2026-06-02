@@ -31,7 +31,7 @@ echo "=== build wlr_screencap ==="
 cc -O2 -o "$B/wlr_screencap" "$APPS/wlr_screencap.c" \
    "$B/wlr-screencopy-unstable-v1-protocol.c" "$B/linux-dmabuf-unstable-v1-protocol.c" \
    -I"$B" -I/usr/include/libdrm \
-   $(pkg-config --cflags --libs wayland-client gbm) || exit 1
+   $(pkg-config --cflags --libs wayland-client gbm libdrm) || exit 1
 echo "build OK"
 
 echo "=== bring up headless sway (GL, NVIDIA via nvkvm) ==="

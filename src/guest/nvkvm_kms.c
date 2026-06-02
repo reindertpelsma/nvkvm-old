@@ -174,14 +174,37 @@ static const uint32_t nvkvm_pipe_formats[] = {
  * (detiling on the GPU) for the present path. So "accepting" the modifier is
  * correct support, not a fake — the host honours the real layout.
  */
+/*
+ * The DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(h) macro omits the KIND/GEN/SECTOR bits
+ * (yields 0x...000010+h), but REAL NVIDIA gbm/EGL buffers carry them:
+ * uncompressed scanout/render bos are BLOCK_LINEAR_2D(c=0,s=1,g=2,k=6,h) =
+ * 0x...606010+h, and compressed (k=8) = 0x...e08010+h.  Advertising only the
+ * macro values made AddFB2 reject real bos (modifier mismatch) → the present
+ * path fell back to a no-modifier fb (forwarded mod=0), so the host could not
+ * detile and read black.  Advertise the real families (GOB heights 0..5) so
+ * AddFB2 keeps the true modifier and the host detiles correctly on present.
+ * Uncompressed (k=6) imports cleanly cross-context (use these for capture/
+ * present); compressed (k=8) is accepted for completeness but its compression
+ * state isn't shared, so a compositor capture target should use k=6.
+ */
+#define NVKVM_MOD_BL2D(c, s, g, k, h) \
+	fourcc_mod_code(NVIDIA, (0x10ULL | ((h) & 0xf) | (((uint64_t)(k) & 0xff) << 12) | \
+				 (((uint64_t)(g) & 0x3) << 20) | (((uint64_t)(s) & 0x1) << 22) | \
+				 (((uint64_t)(c) & 0x7) << 23)))
 static const uint64_t nvkvm_pipe_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(0),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(1),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(2),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(3),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(4),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(5),
+	/* uncompressed 16Bx2 block-linear (KIND=6) — the host-importable family */
+	NVKVM_MOD_BL2D(0, 1, 2, 6, 0), NVKVM_MOD_BL2D(0, 1, 2, 6, 1),
+	NVKVM_MOD_BL2D(0, 1, 2, 6, 2), NVKVM_MOD_BL2D(0, 1, 2, 6, 3),
+	NVKVM_MOD_BL2D(0, 1, 2, 6, 4), NVKVM_MOD_BL2D(0, 1, 2, 6, 5),
+	/* compressed (KIND=8) — gbm's default render pick; accepted so flips work */
+	NVKVM_MOD_BL2D(1, 1, 2, 8, 0), NVKVM_MOD_BL2D(1, 1, 2, 8, 1),
+	NVKVM_MOD_BL2D(1, 1, 2, 8, 2), NVKVM_MOD_BL2D(1, 1, 2, 8, 3),
+	NVKVM_MOD_BL2D(1, 1, 2, 8, 4), NVKVM_MOD_BL2D(1, 1, 2, 8, 5),
+	/* the bare macro values too (harmless, some paths may use them) */
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(0), DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(1),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(2), DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(3),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(4), DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(5),
 	DRM_FORMAT_MOD_INVALID
 };
 
