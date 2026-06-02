@@ -40,11 +40,19 @@ int main(int argc, char **argv)
         (void *)eglGetProcAddress("eglCreateImageKHR");
 
     const int W = 256, H = 256;
-    /* LINEAR bo (what weston capture / generic dmabuf import expects) */
-    const uint64_t lin = DRM_FORMAT_MOD_LINEAR;
-    struct gbm_bo *bo = gbm_bo_create_with_modifiers(gbm, W, H, GBM_FORMAT_XRGB8888, &lin, 1);
-    if (!bo) bo = gbm_bo_create(gbm, W, H, GBM_FORMAT_XRGB8888,
-                                GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    /* arg2: "linear" (default) or "blocklinear" — isolate whether NVIDIA EGL
+     * import rejects the LINEAR modifier. */
+    int want_linear = !(argc > 2 && !strcmp(argv[2], "blocklinear"));
+    struct gbm_bo *bo;
+    if (want_linear) {
+        const uint64_t lin = DRM_FORMAT_MOD_LINEAR;
+        bo = gbm_bo_create_with_modifiers(gbm, W, H, GBM_FORMAT_XRGB8888, &lin, 1);
+        if (!bo) bo = gbm_bo_create(gbm, W, H, GBM_FORMAT_XRGB8888,
+                                    GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    } else {
+        bo = gbm_bo_create(gbm, W, H, GBM_FORMAT_XRGB8888,
+                           GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    }
     if (!bo) { fprintf(stderr, "gbm_bo_create\n"); return 4; }
     uint32_t stride = gbm_bo_get_stride(bo);
     uint64_t mod = gbm_bo_get_modifier(bo);

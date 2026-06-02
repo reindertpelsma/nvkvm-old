@@ -36,6 +36,8 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>   /* #102: dumb buffers for KMS scanout */
 #include <drm/drm_framebuffer.h>        /* #102: fb->obj[] for the present path */
+#include <drm/drm_prime.h>              /* #110: get_sg_table for dma-buf import */
+#include <linux/scatterlist.h>
 
 #include "nvkvm.h"
 
@@ -73,6 +75,11 @@ struct nvkvm_gem_object {
 	struct nvkvm_fd_ctx  *ctx;         /* isolate to forward GEM_CLOSE to */
 	__u32                 stub_handle; /* handle in the stub's DRM file   */
 	__u32                 obj_type;    /* NVKVM_GEM_OBJECT_* for IDENTIFY  */
+	/* #110 dma-buf import backing: lazily-allocated pages so NVIDIA EGL's
+	 * dma_buf_map_attachment(get_sg_table) succeeds. Only populated when the
+	 * buffer is actually PRIME-imported (most bos are GPU-only and never are). */
+	struct page         **import_pages;
+	unsigned long         import_npages;
 };
 
 #define to_nvkvm_gem(o) container_of(o, struct nvkvm_gem_object, base)
@@ -91,12 +98,55 @@ static void nvkvm_gem_free(struct drm_gem_object *obj)
 					      &close, sizeof(close),
 					      NULL, 0, 0, &fault);
 	}
+	if (ng->import_pages) {
+		unsigned long i;
+		for (i = 0; i < ng->import_npages; i++)
+			if (ng->import_pages[i])
+				__free_page(ng->import_pages[i]);
+		kvfree(ng->import_pages);
+	}
 	drm_gem_object_release(obj);
 	kfree(ng);
 }
 
+/*
+ * get_sg_table (#110): NVIDIA's EGL imports a scanout/capture bo's dma-buf via
+ * dma_buf_map_attachment, which calls here for the backing sg_table.  Our proxy
+ * GEM has no real pages (the bo lives in the stub), so without this the import
+ * fails BAD_ALLOC.  Lazily allocate guest pages on first import (most bos are
+ * GPU-only and never imported, so we never pay this).  ITERATION 1: plain pages
+ * to unblock the map and observe what NVIDIA EGL does next; stub page-sharing
+ * (so the host GPU reaches the same memory) is wired onto the registration
+ * ioctl the next strace reveals.
+ */
+static struct sg_table *nvkvm_gem_get_sg_table(struct drm_gem_object *obj)
+{
+	struct nvkvm_gem_object *ng = to_nvkvm_gem(obj);
+	unsigned long n = obj->size >> PAGE_SHIFT, i;
+
+	if (!ng->import_pages) {
+		ng->import_pages = kvmalloc_array(n, sizeof(struct page *),
+						  GFP_KERNEL | __GFP_ZERO);
+		if (!ng->import_pages)
+			return ERR_PTR(-ENOMEM);
+		for (i = 0; i < n; i++) {
+			ng->import_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+			if (!ng->import_pages[i]) {
+				while (i--)
+					__free_page(ng->import_pages[i]);
+				kvfree(ng->import_pages);
+				ng->import_pages = NULL;
+				return ERR_PTR(-ENOMEM);
+			}
+		}
+		ng->import_npages = n;
+	}
+	return drm_prime_pages_to_sg(obj->dev, ng->import_pages, n);
+}
+
 static const struct drm_gem_object_funcs nvkvm_gem_funcs = {
-	.free = nvkvm_gem_free,
+	.free         = nvkvm_gem_free,
+	.get_sg_table = nvkvm_gem_get_sg_table,
 };
 
 /* Create a guest proxy GEM for a stub-side handle; returns the guest handle.
