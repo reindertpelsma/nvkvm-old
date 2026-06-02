@@ -40,6 +40,83 @@ BAR1 is the crux of address virtualization — the windows the driver programs
 point at GPU-physical/sysmem addresses we record and translate to host/stub
 addresses; raw guest addresses never reach the real GPU.
 
+### 1.1 BAR0 register-block prefixes (the "priv" map)
+
+Every block below sits at a fixed offset range in the BAR0 priv aperture. `P` =
+priv/BAR0 register space; the suffix names the hardware unit:
+
+- **PMC** — Master Control. `NV_PMC_BOOT_0` (chip ID), `NV_PMC_ENABLE` (engine
+  enables), `NV_PMC_INTR` (master interrupt status/dispatch). First reads on probe.
+- **PFB** — Frame Buffer / memory controller. VRAM config, the GPU **MMU**
+  (`NV_PFB_PRI_MMU_*`), BAR1/BAR2 window setup, and **WPR** write-protect regions
+  (`WPR2_ADDR_HI`, boot check #5).
+- **PFIFO** — Host / FIFO engine. Channels, **GPFIFO**, runlists, scheduling —
+  the work front-end ("HOST") that snoops USERD and takes doorbells (§6).
+- **PFALCON** — generic Falcon microcontroller interface. Per-engine
+  (SEC2/PMU/NVDEC/GSP-boot-falcon) control regs at each engine base: IMEM/DMEM,
+  CPUCTL, **MAILBOX0/1**, **HWCFG2._RISCV** (boot check #2/#4).
+- **PRISCV** — RISC-V ("Peregrine") core interface; the **GSP** is RISC-V.
+  `RISCV_STATUS._ACTIVE_STAT` is the single "GSP booted" signal (boot check #3).
+- **PGC6** — GC6 deep-sleep power island ("AON" always-on). Its **secure scratch**
+  survives power transitions, so **GFW boot progress** (`GFW_BOOT`, check #1)
+  lives here.
+
+Boot handshake order: PMC (identity) → PGC6 (firmware booted?) → PFALCON/PRISCV
+(GSP core alive?) → PFB (WPR up?) → sysmem RPC (§4).
+
+### 1.2 Performance model — emulate the kernel-only regs, FORWARD the userspace mmaps
+
+Parity (v2 must match Mode-1/native) hinges on NOT trapping the hot path. Two
+classes of BAR access, handled differently:
+
+1. **Kernel-driver register pokes** (boot regs, PFIFO/PFB control, GSP doorbell):
+   low-frequency, kernel-only. → **Trap + emulate** in the QEMU C shell; parity
+   here is irrelevant.
+2. **Userspace fast-path mappings** (USERD, the usermode doorbell page, BAR1
+   apertures onto channel/compute buffers, semaphores): the hot path. → **Back
+   with the REAL host-isolate NVIDIA mappings**, installed into the guest as KVM
+   memory regions exactly like Mode-1's GPA-window double-mmap. Guest-userspace
+   accesses then hit real hardware at **native speed, no trap**.
+
+So the emulated MMIO BAR the guest sees = **self-filled data** (the registers
+only the NVIDIA *kernel* reads) **+ real forwarded mmaps** of the isolate's
+NVIDIA device (the regions normally handed to guest userspace). Identical to how
+Mode-1 forwards mmap fds — just presented through an emulated PCI BAR instead of
+the virtio device.
+
+**Doorbell + CR3 reconciliation:** we do NOT trap every doorbell (that would kill
+parity). The CR3→isolate binding ([[mode2_isolation_cr3_key]]) is captured at the
+**control path** — the channel-alloc / USERD-mmap, which is already trapped — and
+the real host channel's doorbell page is then mapped through so the submit write
+goes straight to hardware. CR3 is read once at setup, not per-submit.
+
+### 1.3 DMA model — VA-range commands run in QEMU; honor guest DMA protection
+
+DMA is the tricky part; the model (user-specified 2026-06-03):
+
+- **All VA-range / memory commands execute in QEMU.** QEMU maps every guest GPA
+  (guest RAM *is* QEMU VMM memory), so QEMU translates GPA→QEMU-HVA and issues the
+  real NVIDIA ioctl (e.g. validate/map a VA range) itself, on the owning
+  **isolate's control fd**. QEMU already holds all isolate fds, the same way it
+  holds the forwarded mmap fds today — so it has the access rights to broker.
+- **Honor guest-declared DMA protection (VFIO-like).** If the guest tells the
+  PCIe/CPU side that the GPU device may only DMA into certain GPA ranges (the
+  device's allowed-DMA window / IOMMU mapping), we enforce that: the
+  address-virtualization layer maps **only** those authorized GPAs into the real
+  GPU context. This is the Mode-2 analogue of how VFIO + the host IOMMU protect
+  the host from a malicious device's DMA — here QEMU + the isolate sandbox
+  constrain the real GPU's DMA-on-behalf-of-guest to exactly what the guest
+  authorized, translated to host pages. Raw guest addresses never reach silicon.
+
+### 1.4 Multi-GPU — design for N PCIe devices from the start
+
+The device model is **per-instance, no globals**: support multiple emulated
+NVIDIA GPU PCI functions in one VM, each bound to a host GPU (by BDF) or sharing
+one. Isolates are keyed by **(emulated-device, CR3)**, not CR3 alone. (Mode-1 has
+a `g_nvkvm_device` singleton — Mode-2 must avoid that pattern: thread the device
+instance through all state.) Every register block, RPC endpoint, address-
+translation table, and isolate table is per-device.
+
 ---
 
 ## 2. Memory & address spaces
