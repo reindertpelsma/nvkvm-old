@@ -445,10 +445,20 @@ __s32  guest_fd_to_handle_id(int guest_fd);
  * driver's `f->f_op == nv_frontend_fops` check in osUserHandleToKernelPtr.
  */
 extern const struct file_operations nvkvm_fops;
+#ifdef NVKVM_GRAPHICS
 extern const struct file_operations nvkvm_drm_fops;
+#endif
 static inline bool nvkvm_file_is_ours(struct file *f)
 {
-	return f && (f->f_op == &nvkvm_fops || f->f_op == &nvkvm_drm_fops);
+	if (!f)
+		return false;
+	if (f->f_op == &nvkvm_fops)
+		return true;
+#ifdef NVKVM_GRAPHICS
+	if (f->f_op == &nvkvm_drm_fops)
+		return true;
+#endif
+	return false;
 }
 
 /* nvkvm_mmap.c */

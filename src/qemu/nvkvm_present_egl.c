@@ -16,8 +16,9 @@
  * are handled for us.
  */
 #include "qemu/osdep.h"
+#include "virtio_nvgpu.h"   /* NVKVM_QEMU_GRAPHICS compile-time gate */
 
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && NVKVM_QEMU_GRAPHICS
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "ui/egl-helpers.h"
@@ -224,7 +225,7 @@ out:
     return ret;
 }
 
-#else /* !CONFIG_OPENGL */
+#else /* !CONFIG_OPENGL || !NVKVM_QEMU_GRAPHICS */
 #include "nvkvm_present_egl.h"
 int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
                           uint32_t stride, uint32_t fourcc, uint64_t modifier,

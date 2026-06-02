@@ -182,6 +182,7 @@ static int __init register_devices(void)
 	 * so graphics_enabled already reflects the host's NVKVM_CONFIG_F_GRAPHICS
 	 * by now; compute-only VMs never create the modeset device.
 	 */
+#ifdef NVKVM_GRAPHICS
 	if (nvkvm.graphics_enabled) {
 		dev_t mdev = MKDEV(NV_MAJOR_DEVICE_NUMBER,
 				   NV_MINOR_DEVICE_NUMBER_MODESET);
@@ -200,6 +201,7 @@ static int __init register_devices(void)
 			pr_warn("nvkvm: could not reserve nvidia-modeset (195:254)\n");
 		}
 	}
+#endif /* NVKVM_GRAPHICS */
 
 	pr_info("nvkvm: registered nvidiactl (major %u), nvidia0-%d (major %u), nvidia-uvm/uvm-tools (major %u)\n",
 		nvkvm.ctl_major, nvkvm.num_gpus - 1, nvkvm.gpu_major,
@@ -2396,19 +2398,28 @@ static int nvkvm_virtio_probe(struct virtio_device *vdev)
 	 * compute works without it.  Parent = the virtio device so the DRM core
 	 * builds /sys/.../<virtio-dev>/drm/renderD128 that the NVIDIA ICD needs.
 	 */
+#ifdef NVKVM_GRAPHICS
 	if (nvkvm.graphics_enabled)
 		nvkvm_drm_init(&vdev->dev);
 	else {
 		nvkvm_modeset_unregister();
 		pr_info("nvkvm: graphics disabled by host — compute-only\n");
 	}
+#else
+	/* Compute-only build (NVKVM_GRAPHICS=0): no DRM/KMS code is linked in, so
+	 * never expose a graphics surface regardless of what the host advertises. */
+	nvkvm_modeset_unregister();
+	pr_info("nvkvm: compute-only build (no DRM/KMS/modeset)\n");
+#endif
 
 	return 0;
 }
 
 static void nvkvm_virtio_remove(struct virtio_device *vdev)
 {
+#ifdef NVKVM_GRAPHICS
 	nvkvm_drm_fini();
+#endif
 	nvkvm_virtio_fini(&nvkvm);
 }
 

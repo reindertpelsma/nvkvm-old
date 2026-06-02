@@ -30,6 +30,25 @@
 #ifndef VIRTIO_NVGPU_H
 #define VIRTIO_NVGPU_H
 
+/*
+ * NVKVM_QEMU_GRAPHICS — compile-time graphics/display gate (default 1).
+ *
+ *   1 (default): full backend — DRM render node forwarding, NVKMS, and the
+ *                host present/EGL path are built in; per-VM availability is
+ *                still chosen at runtime via the `graphics=on|off` device prop.
+ *   0          : compute-only build, like gVisor's nvproxy. The graphics= prop
+ *                is forced off (all runtime graphics gates fire) AND the host
+ *                EGL present code (nvkvm_present_egl.c) is compiled out, so the
+ *                binary carries no display attack surface. This is the QEMU twin
+ *                of the guest module's `make NVKVM_GRAPHICS=0` build; deploy the
+ *                two consistently.
+ *
+ * Override at build time with -DNVKVM_QEMU_GRAPHICS=0.
+ */
+#ifndef NVKVM_QEMU_GRAPHICS
+#define NVKVM_QEMU_GRAPHICS 1
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>

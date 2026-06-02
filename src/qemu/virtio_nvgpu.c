@@ -1050,6 +1050,14 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 
 	g_nvkvm_device = nv;
 
+#if !NVKVM_QEMU_GRAPHICS
+	/* Compute-only QEMU build (NVKVM_QEMU_GRAPHICS=0): the graphics/display
+	 * code (DRM render node, NVKMS modeset, present/EGL path) is compiled out,
+	 * so force the runtime gate off regardless of the graphics= property. This
+	 * is the QEMU-side twin of the guest module's NVKVM_GRAPHICS=0 build. */
+	nv->graphics = false;
+#endif
+
 	/*
 	 * Find QEMU's KVM VM fd by scanning our own /proc/self/fd for the
 	 * "anon_inode:kvm-vm" entry, so the nvidia/UVM mmap path in
