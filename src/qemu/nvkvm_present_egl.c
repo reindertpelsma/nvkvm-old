@@ -61,6 +61,67 @@ static bool nvkvm_present_egl_ensure(void)
     return true;
 }
 
+/* Diagnostic dma-buf import: same single-plane attr set as QEMU's
+ * egl_dmabuf_import_texture, but logs eglGetError() and the exact attributes on
+ * failure so we can chase the NVIDIA block-linear import requirement (#107).
+ * Returns a GL texture name, or 0 on failure (after logging why). */
+static uint32_t nvkvm_import_dmabuf_tex(int fd, uint32_t width, uint32_t height,
+                                        uint32_t stride, uint32_t fourcc,
+                                        uint64_t modifier)
+{
+    EGLint attrs[64];
+    int i = 0;
+
+    attrs[i++] = EGL_WIDTH;                      attrs[i++] = width;
+    attrs[i++] = EGL_HEIGHT;                     attrs[i++] = height;
+    attrs[i++] = EGL_LINUX_DRM_FOURCC_EXT;       attrs[i++] = fourcc;
+    attrs[i++] = EGL_DMA_BUF_PLANE0_FD_EXT;      attrs[i++] = fd;
+    attrs[i++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;   attrs[i++] = stride;
+    attrs[i++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;  attrs[i++] = 0;
+#ifdef EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT
+    if (modifier) {
+        attrs[i++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+        attrs[i++] = (EGLint)(modifier & 0xffffffff);
+        attrs[i++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+        attrs[i++] = (EGLint)((modifier >> 32) & 0xffffffff);
+    }
+#endif
+    attrs[i++] = EGL_NONE;
+
+    fprintf(stderr,
+            "nvkvm present: import fd=%d %ux%u stride=%u fourcc=0x%08x "
+            "modifier=0x%016llx\n",
+            fd, width, height, stride, fourcc,
+            (unsigned long long)modifier);
+
+    EGLImageKHR image = eglCreateImageKHR(qemu_egl_display, EGL_NO_CONTEXT,
+                                          EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    if (image == EGL_NO_IMAGE_KHR) {
+        fprintf(stderr,
+                "nvkvm present: eglCreateImageKHR FAILED, eglGetError=0x%04x\n",
+                (unsigned)eglGetError());
+        return 0;
+    }
+
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    GLenum glerr = glGetError();
+    eglDestroyImageKHR(qemu_egl_display, image);
+    if (glerr != GL_NO_ERROR) {
+        fprintf(stderr,
+                "nvkvm present: glEGLImageTargetTexture2DOES glGetError=0x%04x\n",
+                (unsigned)glerr);
+        glDeleteTextures(1, &texture);
+        return 0;
+    }
+    fprintf(stderr, "nvkvm present: import OK tex=%u\n", texture);
+    return texture;
+}
+
 /* Write a DisplaySurface (pixman ARGB32 / BGRA bytes) to a binary PPM (P6). */
 static int nvkvm_write_ppm(const char *path, DisplaySurface *s)
 {
@@ -97,26 +158,44 @@ int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
         return -EINVAL;
     }
 
+    /* The present is dispatched on a QEMU isolate/virtio worker thread, which
+     * is generally NOT the thread egl_init made the context current on.  EGL
+     * contexts are per-thread, so we must bind qemu_egl_rn_ctx on THIS thread
+     * (else glGenTextures silently returns 0).  Released at exit so the next
+     * present's (possibly different) thread can claim it.  Presents are
+     * throttled/serialized, so no two threads contend here in practice. */
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        qemu_egl_rn_ctx)) {
+        fprintf(stderr,
+                "nvkvm present: eglMakeCurrent failed, eglGetError=0x%04x\n",
+                (unsigned)eglGetError());
+        return -EIO;
+    }
+
     /* qemu_dmabuf_new dups nothing — it takes ownership of fd? No: it stores fd
      * and qemu_dmabuf_free()/close() manage it.  We pass a dup so our caller's
      * fd lifetime is independent. */
     int dup_fd = dup(dmabuf_fd);
     if (dup_fd < 0) {
-        return -errno;
+        int e = -errno;
+        eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
+        return e;
     }
     QemuDmaBuf *buf = qemu_dmabuf_new(width, height, stride, 0, 0,
                                       width, height, fourcc, modifier,
                                       dup_fd, false, false);
     if (!buf) {
         close(dup_fd);
+        eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
         return -ENOMEM;
     }
 
     int ret = 0;
-    egl_dmabuf_import_texture(buf);
-    uint32_t tex = qemu_dmabuf_get_texture(buf);
+    uint32_t tex = nvkvm_import_dmabuf_tex(dup_fd, width, height, stride,
+                                           fourcc, modifier);
     if (!tex) {
-        fprintf(stderr, "nvkvm present: dmabuf import produced no texture\n");
         ret = -EIO;
         goto out;
     }
@@ -135,10 +214,13 @@ int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
 
 out_fb:
     egl_fb_destroy(&fb);
+    glDeleteTextures(1, &tex);
 out:
-    egl_dmabuf_release_texture(buf);
     qemu_dmabuf_close(buf);
     qemu_dmabuf_free(buf);
+    /* Release the context from this thread so the next present can bind it. */
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
     return ret;
 }
 
