@@ -88,11 +88,20 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
     .bar3_size     = 32ull  << 20,  /* 32 MiB  */
 };
 
-/* ── Register offsets we already answer at M0 ──────────────────────────────
+/* ── Register offsets ──────────────────────────────────────────────────────
  * (full glossary in docs/design/nvidia_gpu_internals.md §1.1) */
+/* M0 — chip identity (dev_boot / nv_ref.h) */
 #define NV_PMC_BOOT_0   0x00000000u
 #define NV_PMC_BOOT_1   0x00000004u
 #define NV_PMC_BOOT_42  0x00000A00u
+
+/* M1 — GFW (GPU firmware) boot completion, spike check #1.
+ * PGC6 AON secure-scratch (dev_gc6_island{,_addendum}.h, ga102).  The driver
+ * (_gpuIsGfwBootCompleted_TU102) first checks the PLM was lowered, then reads
+ * the GFW_BOOT progress and requires COMPLETED (0xFF). */
+#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK 0x00118128u
+#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT      0x00118234u /* GROUP_05(0) */
+#define NV_PGC6_GFW_BOOT_PROGRESS_COMPLETED                 0x000000FFu
 
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
@@ -125,6 +134,8 @@ static const char *nvkvm_reg_name(hwaddr off)
     case NV_PMC_BOOT_0:  return "PMC_BOOT_0";
     case NV_PMC_BOOT_1:  return "PMC_BOOT_1";
     case NV_PMC_BOOT_42: return "PMC_BOOT_42";
+    case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK: return "GFW_BOOT_PLM";
+    case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT:      return "GFW_BOOT";
     default:             return NULL;
     }
 }
@@ -138,6 +149,14 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     case NV_PMC_BOOT_0:  return s->chip->pmc_boot_0;
     case NV_PMC_BOOT_42: return s->chip->pmc_boot_42;
     case NV_PMC_BOOT_1:  return 0; /* VGPU=REAL, no virtualization advertised */
+
+    /* M1 — fake the GFW boot.  PLM "fully lowered" (all privilege levels
+     * granted: bit0 READ_PROTECTION_LEVEL0 must be ENABLE); GFW_BOOT progress
+     * COMPLETED so gpuWaitForGfwBootComplete_TU102 succeeds. */
+    case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK: return 0xFFFFFFFFu;
+    case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT:
+        return NV_PGC6_GFW_BOOT_PROGRESS_COMPLETED;
+
     default:             return 0;
     }
 }
