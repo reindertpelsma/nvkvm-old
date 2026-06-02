@@ -869,11 +869,23 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 		  req->stub_handle);
 
 	/*
+	 * #102: hand the frame to the live QEMU display window.  The console
+	 * takes ownership of the dma-buf fd (retires it once presented), so on
+	 * acceptance we must NOT close it here.  If no console is active
+	 * (compute-only build, graphics=off, or no display backend), submit
+	 * returns false and we fall through to close it ourselves.
+	 */
+	if (nvkvm_present_submit(nv, dmabuf_fd, req->width, req->height,
+				 req->pitch, req->format, req->modifier)) {
+		resp->status = 0;
+		return 0;
+	}
+
+	/*
 	 * #107: capture the composited frame on the host.  Gated by
 	 * NVKVM_PRESENT_CAPTURE=<path> (the readback is a synchronous glReadPixels
 	 * — too costly to do every frame) and throttled to ~1/30 frames.  This is
-	 * the interim "view it" mechanism on a headless host; the steady-state
-	 * present will be dpy_gl_scanout_dmabuf / NVENC (#107 follow-up, #101).
+	 * the interim "view it" mechanism on a headless host with no window.
 	 */
 	const char *cap = getenv("NVKVM_PRESENT_CAPTURE");
 	if (cap) {

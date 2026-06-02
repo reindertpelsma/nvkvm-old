@@ -42,6 +42,7 @@
 #include <stdio.h>
 
 #include "virtio_nvgpu.h"
+#include "nvkvm_present_egl.h"   /* #102 present-to-window console */
 #include <dirent.h>
 
 /*
@@ -1228,11 +1229,23 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	if (!nv->graphics)
 		info_report("nvkvm: graphics disabled (compute-only): DRM render "
 			    "node + NVKMS modeset device + ioctls refused");
+
+	/*
+	 * #102: register a QemuConsole so the guest's GPU-composited scanout can
+	 * be shown in a live QEMU display window.  Graphics-gated; no-op in the
+	 * compute-only build.  The console is host-private and strictly a sink —
+	 * frames flow guest→host only.
+	 */
+	if (nv->graphics)
+		nvkvm_present_console_init(dev, nv);
 }
 
 static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(dev);
+
+	/* #102: close the present console before tearing down the device. */
+	nvkvm_present_console_fini(nv);
 
 	/* Tear down isolates and handles before shared memory */
 	nvkvm_isolate_table_fini(&nv->isolates);

@@ -317,6 +317,15 @@ typedef struct VirtIONvgpu {
 	uint32_t            admin_hclient;
 	uint32_t            admin_hsubdev;
 	int                 admin_state;    /* 0 untried, 1 ready, -1 failed   */
+
+	/*
+	 * #102 present-to-window: opaque NvkvmPresent context (QemuConsole +
+	 * pending-frame slot + dual GL/readback path).  Allocated at realize
+	 * when graphics is on; owned by nvkvm_present_egl.c.  NULL in the
+	 * compute-only build or when graphics=off.  void* so this header stays
+	 * free of ui/console.h.
+	 */
+	void               *present_ctx;
 } VirtIONvgpu;
 
 #define TYPE_VIRTIO_NVGPU  "virtio-nvgpu-device"
