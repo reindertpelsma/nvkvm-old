@@ -174,6 +174,9 @@ struct NvkvmGpuEmul {
     uint64_t chan_inst_block;  /* instanceMem.base: channel instance block (unused: GSP-managed, empty) */
     bool     chan_inst_sys;    /* instanceMem.addressSpace == ADDR_SYSMEM(1)        */
     uint32_t chan_payload;     /* completion payload counter (incr per doorbell)    */
+    uint64_t chan_userd;       /* userdMem.base: USERD memory (holds GP_PUT/GP_GET) */
+    bool     chan_userd_sys;   /* userdMem.addressSpace == ADDR_SYSMEM              */
+    uint32_t chan_gp_get;      /* our consumed GPFIFO index (entries [get,put) pend)*/
     /* VAS root page-dir bases snooped from VASPACE_COPY_SERVER_RESERVED_PDES
      * (0x90f10106): levels[0].physAddress roots the WHOLE VAS (the params' VA
      * range is only the reserved window, not the VAS extent), keyed by the
@@ -547,6 +550,9 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 s->chan_inst_block = ldq_le_p(cmd + 256);   /* instanceMem.base */
                 s->chan_inst_sys   = (ldl_le_p(cmd + 272) == 1u); /* ADDR_SYSMEM */
                 s->chan_hvaspace   = ldl_le_p(cmd + 140);   /* hVASpace handle */
+                s->chan_userd      = ldq_le_p(cmd + 280);   /* userdMem.base */
+                s->chan_userd_sys  = (ldl_le_p(cmd + 296) == 1u);
+                s->chan_gp_get     = 0;
                 qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
                          "0x%llx ent=%u instblk=0x%llx(%s)\n",
                          s->chip->name, hclass,
@@ -845,6 +851,7 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
 }
 
 static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys);
+static void nvkvm_chan_execute(NvkvmGpuEmul *s);
 
 static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
@@ -892,6 +899,9 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * gpFifoOffset + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004.  Translate
          * via the channel PDB and write the incrementing payload (RM submits
          * payload = lastSubmittedPayload+1 starting at 1). */
+        /* Execute the submitted copy-engine work for real (memset/memcpy) so the
+         * scrubber's CE self-verify (mem_mgr.c:469) sees moved data. */
+        nvkvm_chan_execute(s);
         uint64_t sema_va = s->chan_gpfifo_va + 0x8004ull;
         bool is_sys = false;
         uint64_t phys = s->chan_gpfifo_va
@@ -1118,9 +1128,6 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
             break;
         }
     }
-    qemu_log("nvkvm-gpu[%s] M5: chan walk va=0x%llx hvas=0x%08x -> PDB=0x%llx "
-             "(%d VAS)\n", s->chip->name, (unsigned long long)va,
-             s->chan_hvaspace, (unsigned long long)tbl, s->chan_vas_n);
     if (tbl == 0) {
         return NVKVM_GMMU_FAULT;
     }
@@ -1130,11 +1137,7 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
         uint32_t idx = (uint32_t)((va >> lvl[i].lo) &
                                   ((1ull << (lvl[i].hi - lvl[i].lo + 1)) - 1));
         uint64_t pde = nvkvm_fb_rd64(s, tbl + (uint64_t)idx * 8);
-        uint64_t next = NVKVM_VER2_ADDR_VID(pde);
-        qemu_log("nvkvm-gpu[%s] M5:   PD%d idx=%u @0x%llx pde=0x%llx -> 0x%llx\n",
-                 s->chip->name, 3 - i, idx, (unsigned long long)(tbl + idx * 8),
-                 (unsigned long long)pde, (unsigned long long)next);
-        tbl = next;
+        tbl = NVKVM_VER2_ADDR_VID(pde);
         if (tbl == 0) {
             return NVKVM_GMMU_FAULT;
         }
@@ -1171,6 +1174,140 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
     }
     (void)pgmask;
     return page + (va & ((1ull << pgshift) - 1));
+}
+
+/* M5 — read/write a 32-bit word at a PHYSICAL address in either aperture. */
+static uint32_t nvkvm_phys_rd32(NvkvmGpuEmul *s, uint64_t phys, bool sys)
+{
+    if (sys) {
+        uint8_t b[4];
+        if (pci_dma_read(&s->parent_obj, phys, b, 4) != MEMTX_OK) return 0;
+        return ldl_le_p(b);
+    }
+    return (uint32_t)nvkvm_fb_read(s, phys, 4);
+}
+static void nvkvm_phys_wr32(NvkvmGpuEmul *s, uint64_t phys, bool sys, uint32_t v)
+{
+    if (sys) {
+        uint8_t b[4]; stl_le_p(b, v);
+        pci_dma_write(&s->parent_obj, phys, b, 4);
+    } else {
+        nvkvm_fb_write(s, phys, v, 4);
+    }
+}
+/* Read one 32-bit word at a CHANNEL GPU VA (translate then phys read). */
+static bool nvkvm_chan_rd32(NvkvmGpuEmul *s, uint64_t va, uint32_t *out)
+{
+    bool sys; uint64_t p = nvkvm_chan_translate(s, va, &sys);
+    if (p == NVKVM_GMMU_FAULT) return false;
+    *out = nvkvm_phys_rd32(s, p, sys);
+    return true;
+}
+
+/* M5 — EXECUTE the copy-engine work submitted on the doorbell-rung channel.
+ * Walk the GPFIFO [chan_gp_get, GP_PUT) (GP_PUT read from USERD @ +0x8C), and for
+ * each pushbuffer parse the FERMI method stream (header: SEC_OP[31:29],
+ * METHOD_ADDR[11:0]<<2, COUNT[28:16]) for the NVB0B5/NVC7B5 copy class.  On
+ * LAUNCH_DMA (0x300) perform the op for real: REMAP_ENABLE(bit10) => fill
+ * OFFSET_OUT with SET_REMAP_CONST_A (memset); else copy OFFSET_IN->OFFSET_OUT for
+ * LINE_LENGTH_IN bytes (x LINE_COUNT).  All addresses are channel VAs translated
+ * per-word.  This makes the scrubber's CE self-verify (mem_mgr.c:469) see real
+ * data.  Bounded + fault-safe (bail on any miss). */
+static void nvkvm_chan_execute(NvkvmGpuEmul *s)
+{
+    if (!s->chan_gpfifo_va || !s->chan_userd || !s->chan_gpfifo_ent) {
+        return;
+    }
+    uint32_t gp_put = s->chan_userd_sys
+        ? nvkvm_phys_rd32(s, s->chan_userd + 0x8C, true)
+        : (uint32_t)nvkvm_fb_read(s, s->chan_userd + 0x8C, 4);
+    if (gp_put >= s->chan_gpfifo_ent) {
+        return;                                  /* implausible -> bail */
+    }
+    uint32_t guard = 0;
+    for (uint32_t idx = s->chan_gp_get; idx != gp_put &&
+         guard < s->chan_gpfifo_ent; idx = (idx + 1) % s->chan_gpfifo_ent, guard++) {
+        uint32_t e0, e1;
+        uint64_t eva = s->chan_gpfifo_va + (uint64_t)idx * 8;
+        if (!nvkvm_chan_rd32(s, eva, &e0) || !nvkvm_chan_rd32(s, eva + 4, &e1)) {
+            break;
+        }
+        uint64_t pb   = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
+        uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;   /* GP_ENTRY1_LENGTH: # method words */
+        /* method-stream parse */
+        uint64_t off_in = 0, off_out = 0;
+        uint32_t llen = 0, lcount = 1, remapA = 0;
+        uint32_t src_pm = 0, dst_pm = 0;   /* SET_SRC/DST_PHYS_MODE target */
+        for (uint32_t w = 0; w < pblen; ) {
+            uint32_t hdr;
+            if (!nvkvm_chan_rd32(s, pb + (uint64_t)w * 4, &hdr)) { break; }
+            w++;
+            uint32_t secop = (hdr >> 29) & 0x7;
+            uint32_t maddr = (hdr & 0xFFFu) << 2;
+            uint32_t cnt   = (hdr >> 16) & 0x1FFFu;
+            if (secop != 1 && secop != 3 && secop != 5) { continue; } /* INC/NON_INC/ONE_INC */
+            for (uint32_t j = 0; j < cnt && w < pblen; j++, w++) {
+                uint32_t d;
+                if (!nvkvm_chan_rd32(s, pb + (uint64_t)w * 4, &d)) { w = pblen; break; }
+                uint32_t m = (secop == 3) ? maddr : maddr + j * 4; /* NON_INC holds */
+                switch (m) {
+                case 0x400: off_in  = (off_in  & 0xFFFFFFFFull) | ((uint64_t)d << 32); break; /* IN_UPPER  */
+                case 0x404: off_in  = (off_in  & ~0xFFFFFFFFull) | d; break;                  /* IN_LOWER  */
+                case 0x408: off_out = (off_out & 0xFFFFFFFFull) | ((uint64_t)d << 32); break; /* OUT_UPPER */
+                case 0x40C: off_out = (off_out & ~0xFFFFFFFFull) | d; break;                  /* OUT_LOWER */
+                case 0x418: llen   = d; break;                                               /* LINE_LENGTH_IN */
+                case 0x41C: lcount = d ? d : 1; break;                                        /* LINE_COUNT */
+                case 0x260: src_pm = d & 3; break;                                           /* SET_SRC_PHYS_MODE */
+                case 0x264: dst_pm = d & 3; break;                                           /* SET_DST_PHYS_MODE */
+                case 0x700: remapA = d; break;                                               /* SET_REMAP_CONST_A */
+                case 0x300: {                                                                /* LAUNCH_DMA */
+                    bool remap    = (d >> 10) & 1;
+                    bool src_phys = (d >> 12) & 1;   /* SRC_TYPE PHYSICAL */
+                    bool dst_phys = (d >> 13) & 1;   /* DST_TYPE PHYSICAL */
+                    uint64_t bytes = (uint64_t)llen * lcount;
+                    if (bytes > (16u << 20)) bytes = 16u << 20;  /* safety cap */
+                    /* Resolve a CE address: PHYSICAL -> the offset IS the phys addr
+                     * (aperture from PHYS_MODE: 0=FB else sysmem); VIRTUAL ->
+                     * translate via the channel VAS (leaf PTE picks FB/sys). */
+                    #define NVKVM_CE_RESOLVE(off, phys, pm, sysv) \
+                        ((phys) ? ((sysv) = ((pm) != 0), (off)) \
+                                : nvkvm_chan_translate(s, (off), &(sysv)))
+                    if (remap) {
+                        for (uint64_t b = 0; b + 4 <= bytes; b += 4) {
+                            bool sy; uint64_t p = NVKVM_CE_RESOLVE(off_out + b, dst_phys, dst_pm, sy);
+                            if (p == NVKVM_GMMU_FAULT) break;
+                            nvkvm_phys_wr32(s, p, sy, remapA);
+                        }
+                    } else {
+                        for (uint64_t b = 0; b + 4 <= bytes; b += 4) {
+                            bool ssy, dsy;
+                            uint64_t sp = NVKVM_CE_RESOLVE(off_in + b,  src_phys, src_pm, ssy);
+                            uint64_t dp = NVKVM_CE_RESOLVE(off_out + b, dst_phys, dst_pm, dsy);
+                            if (sp == NVKVM_GMMU_FAULT || dp == NVKVM_GMMU_FAULT) break;
+                            uint32_t v = nvkvm_phys_rd32(s, sp, ssy);
+                            nvkvm_phys_wr32(s, dp, dsy, v);
+                            if (b == 0) {
+                                qemu_log("nvkvm-gpu[%s] M5:   COPY[0] src 0x%llx(%s)"
+                                  "=0x%08x -> dst 0x%llx(%s)\n", s->chip->name,
+                                  (unsigned long long)sp, ssy?"sys":"fb", v,
+                                  (unsigned long long)dp, dsy?"sys":"fb");
+                            }
+                        }
+                    }
+                    #undef NVKVM_CE_RESOLVE
+                    qemu_log("nvkvm-gpu[%s] M5: CE %s in=0x%llx(%s) out=0x%llx(%s) "
+                             "bytes=%llu const=0x%x\n", s->chip->name,
+                             remap ? "MEMSET" : "COPY", (unsigned long long)off_in,
+                             src_phys ? "phys" : "virt", (unsigned long long)off_out,
+                             dst_phys ? "phys" : "virt", (unsigned long long)bytes, remapA);
+                    break;
+                }
+                default: break;
+                }
+            }
+        }
+    }
+    s->chan_gp_get = gp_put;
 }
 
 static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
