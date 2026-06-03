@@ -145,6 +145,15 @@ Open: confirm CR3 is observable at every relevant MMIO exit (it is, via the vCPU
 state at the KVM MMIO exit) and define the CR3→isolate table lifecycle (process
 exit = guest frees its mappings → reap the isolate, reusing Mode-1's reaper).
 
+## Address virtualization (the reverse-driver core)
+
+See **docs/design/mode2_address_virtualization.md** — GPU-physical is pure
+bookkeeping between the guest kernel module and the QEMU extension; two
+translation chains (GPU-VA -> GPU-phys -> BAR / or -> GPA-in-KVM-slot); a
+7-state GPU-phys page model with a clear-on-assign simplification; lazy FB.
+This is what the current UVM_REGISTER_GPU blocker needs (capture every VAS
+root PDB, then walk chain #2 into guest RAM).
+
 ## Doorbell trapping: kernel vs userspace (decided 2026-06-03)
 
 A consequence of the privilege model, NOT a perf choice:
