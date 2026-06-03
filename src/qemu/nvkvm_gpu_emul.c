@@ -247,6 +247,9 @@ struct NvkvmGpuEmul {
      * that with a sparse page table so writes read back (kbusVerifyBar2). */
     uint32_t bar0_window;    /* NV_PBUS_BAR0_WINDOW (0x1700): BASE[23:0]|TARGET[25:24] */
     GHashTable *fb_pages;    /* sparse FB: page index (addr>>12) -> malloc'd 4KB  */
+    bool     bar2_virtual;   /* BAR2_BLOCK MODE bit31: 1=VIRTUAL (walk), 0=PHYSICAL (id) */
+    uint64_t bar2_pdb;       /* BAR2 page-dir base from GspStaticConfigInfo.bar2PdeBase
+                              * (the GSP binds BAR2; CPU bind is a no-op on GSP-client) */
     uint64_t bar2_inst_block;/* FB addr of the BAR2 instance block (NV_PBUS_BAR2_BLOCK
                               * 0x1714: PTR[27:0]<<12).  Holds the BAR2 page-dir base;
                               * BAR2 accesses are GMMU-VER2-walked through it.        */
@@ -615,6 +618,17 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                  * rpc.length = 32(hdr) + sizeof(struct); single element. */
                 memcpy(resp + 80, gspstaticinfo_ga106, sizeof(gspstaticinfo_ga106));
                 stl_le_p(resp + 56, 32u + GSPSTATICINFO_GA106_SIZE);
+                /* GspStaticConfigInfo.bar2PdeBase @ offset 1672 (verified by a
+                 * host printk) = the GSP-chosen BAR2 page-dir base.  The guest
+                 * reads this and roots its BAR2 page tables here; use it as our
+                 * GMMU walk root + enable VIRTUAL translation. */
+                if (GSPSTATICINFO_GA106_SIZE >= 1672 + 8) {
+                    s->bar2_pdb = ldq_le_p(gspstaticinfo_ga106 + 1672);
+                    s->bar2_virtual = (s->bar2_pdb != 0);
+                    qemu_log("nvkvm-gpu[%s] M6: BAR2 PDB from GSP static info = "
+                             "0x%llx (virtual)\n", s->chip->name,
+                             (unsigned long long)s->bar2_pdb);
+                }
             }
             if (s->trace && (fn == 76 || fn == 65)) {
                 qemu_log("nvkvm-gpu[%s] M4:   fn=%u ctrl cmd=0x%x reqPsize=%u -> "
@@ -782,13 +796,17 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     /* M6: NV_PBUS_BAR2_BLOCK (0x1714) PTR[27:0] = BAR2 instance-block FB addr
      * (in NV_RAMIN_BASE_SHIFT=12 units).  Caches the page-dir base source for
      * the BAR2 GMMU walk. */
-    if (off == 0x00001714u) {
+    /* BAR2 bind register: NV_PBUS_BAR2_BLOCK (0x1714) on Maxwell, OR the
+     * Turing/Ampere VF variant NV_VIRTUAL_FUNCTION_PRIV_BAR2_BLOCK at BAR0
+     * 0xB80F48 (NV_VIRTUAL_FUNCTION_FULL_PHYS_OFFSET 0xB80000 + 0xF48).  PTR
+     * [27:0]<<12 = instblk FB addr; MODE bit31 = 1 VIRTUAL / 0 PHYSICAL. */
+    if (off == 0x00001714u || off == 0x00B80F48u) {
         s->bar2_inst_block = (uint64_t)(val & 0x0FFFFFFFu) << 12;
-        if (s->trace) {
-            qemu_log("nvkvm-gpu[%s] M6: BAR2_BLOCK -> instblk FB 0x%llx (mode=%s)\n",
-                     s->chip->name, (unsigned long long)s->bar2_inst_block,
-                     (val & 0x80000000u) ? "VIRTUAL" : "PHYSICAL");
-        }
+        s->bar2_virtual    = (val & 0x80000000u) != 0;
+        qemu_log("nvkvm-gpu[%s] M6: BAR2_BLOCK@0x%llx -> instblk FB 0x%llx mode=%s\n",
+                 s->chip->name, (unsigned long long)off,
+                 (unsigned long long)s->bar2_inst_block,
+                 s->bar2_virtual ? "VIRTUAL" : "PHYSICAL");
         return;
     }
 
@@ -892,14 +910,23 @@ static uint64_t nvkvm_fb_rd64(NvkvmGpuEmul *s, uint64_t fb_addr)
  * NVKVM_GMMU_FAULT on an unmapped/SYSMEM path. */
 static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
 {
-    if (s->bar2_inst_block == 0) {
+    uint64_t tbl;
+    if (s->bar2_pdb != 0) {
+        /* Page-dir base reported by GSP in GspStaticConfigInfo.bar2PdeBase
+         * (offset 1672), which we replay for GET_GSP_STATIC_INFO.  The guest
+         * reads the same value and builds its BAR2 page tables (on demand, via
+         * the PRAMIN window into our FB backing) rooted here, so this is the
+         * walk root. */
+        tbl = s->bar2_pdb;
+    } else if (s->bar2_inst_block != 0) {
+        /* Fallback: read PDB from an instance block (word128 @ +0x200 LO[31:12],
+         * word129 @ +0x204 HI[31:0]). */
+        uint64_t w128 = nvkvm_fb_read(s, s->bar2_inst_block + 128 * 4, 4);
+        uint64_t w129 = nvkvm_fb_read(s, s->bar2_inst_block + 129 * 4, 4);
+        tbl = (w128 & 0xFFFFF000ull) | (w129 << 32);
+    } else {
         return NVKVM_GMMU_FAULT;
     }
-    /* Page-dir base from the instance block: word128 @ +0x200 (TARGET[1:0],
-     * LO[31:12]), word129 @ +0x204 (HI[31:0]). */
-    uint64_t w128 = nvkvm_fb_read(s, s->bar2_inst_block + 128 * 4, 4);
-    uint64_t w129 = nvkvm_fb_read(s, s->bar2_inst_block + 129 * 4, 4);
-    uint64_t tbl  = (w128 & 0xFFFFF000ull) | (w129 << 32);
 
     /* PD3 -> PD2 -> PD1 : single 8B PDEs. */
     static const struct { int hi, lo; } lvl[3] = {
@@ -947,7 +974,10 @@ static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
 static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
-    uint64_t pa = nvkvm_bar2_translate(s, off);
+    /* PHYSICAL mode (or not yet bound) = identity FB access; VIRTUAL = GMMU walk.
+     * During bootstrap the driver accesses the BAR2 page tables via BAR2-physical
+     * before binding it virtual, so identity must work then. */
+    uint64_t pa = s->bar2_virtual ? nvkvm_bar2_translate(s, off) : off;
     if (pa == NVKVM_GMMU_FAULT) {
         return 0;
     }
@@ -958,7 +988,7 @@ static void nvkvm_bar2_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
-    uint64_t pa = nvkvm_bar2_translate(s, off);
+    uint64_t pa = s->bar2_virtual ? nvkvm_bar2_translate(s, off) : off;
     if (pa == NVKVM_GMMU_FAULT) {
         return;
     }
@@ -994,6 +1024,8 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     /* M6: sparse FB backing for the BAR0 PRAMIN window (value = g_malloc0'd 4 KiB). */
     s->bar0_window = 0;
     s->bar2_inst_block = 0;
+    s->bar2_virtual = false;
+    s->bar2_pdb = 0;
     s->fb_pages = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                         NULL, g_free);
 
