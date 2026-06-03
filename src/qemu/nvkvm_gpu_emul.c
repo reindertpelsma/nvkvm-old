@@ -1444,6 +1444,11 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     uint32_t gp_put = s->chan_userd_sys
         ? nvkvm_phys_rd32(s, s->chan_userd + 0x8C, true)
         : (uint32_t)nvkvm_fb_read(s, s->chan_userd + 0x8C, 4);
+    qemu_log("nvkvm-gpu[%s] M5: chan_exec gpfifo=0x%llx userd=0x%llx(%s) "
+             "gp_get=%u gp_put=%u ent=%u\n", s->chip->name,
+             (unsigned long long)s->chan_gpfifo_va,
+             (unsigned long long)s->chan_userd, s->chan_userd_sys ? "sys" : "fb",
+             s->chan_gp_get, gp_put, s->chan_gpfifo_ent);
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
     }
