@@ -185,8 +185,11 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
  * 0x111000 + 0x240) and requires _ACTIVE_STAT (bit0).  After the Booter
  * "starts" the RISC-V (modelled by FWSEC having run), report it active so
  * kgspBootstrap proceeds to the GSP message queue + GSP_INIT_DONE wait. */
-#define NV_PGSP_RISCV_CORE_SWITCH_RISCV_STATUS 0x00111240u
-#define NV_PRISCV_RISCV_ACTIVE_STAT_ACTIVE     0x00000001u  /* bit 0 */
+/* GA10x kflcnIsRiscvActive reads RISCV_CPUCTL (riscv base 0x111000 + 0x388),
+ * _ACTIVE_STAT bit 7 (confirmed by trace: driver reads 0x111388, not the 0x240
+ * CORE_SWITCH variant). */
+#define NV_PGSP_RISCV_CPUCTL                   0x00111388u
+#define NV_PRISCV_RISCV_CPUCTL_ACTIVE_STAT_VAL 0x00000080u  /* bit 7 */
 
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
@@ -285,8 +288,8 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     case NV_USABLE_FB_SIZE_IN_MB: return NVKVM_FB_SIZE_MB;
 
     /* M3 — GSP RISC-V core active once the Booter "started" it (post-FWSEC). */
-    case NV_PGSP_RISCV_CORE_SWITCH_RISCV_STATUS:
-        return s->fwsec_ran ? NV_PRISCV_RISCV_ACTIVE_STAT_ACTIVE : 0;
+    case NV_PGSP_RISCV_CPUCTL:
+        return s->fwsec_ran ? NV_PRISCV_RISCV_CPUCTL_ACTIVE_STAT_VAL : 0;
 
     /* M3 — WPR2 is stateful: DOWN (0) until FWSEC "runs" (GSP STARTCPU), then
      * UP.  The driver requires WPR2 down before FWSEC, up after. */
