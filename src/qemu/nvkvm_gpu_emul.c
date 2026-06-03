@@ -105,6 +105,11 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 /* GMMU walk "no translation" sentinel (returned by nvkvm_{bar2,chan}_translate). */
 #define NVKVM_GMMU_FAULT        (~0ull)
 
+/* DIAG (removable): low-FB window where the UVM/RM-internal channel's
+ * GPFIFO/USERD/instblk/semaphore are allocated (observed 0x311xxxx..0x315xxxx). */
+#define NVKVM_DIAG_LOFB_LO      0x3000000ull
+#define NVKVM_DIAG_LOFB_HI      0x3300000ull
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -206,9 +211,28 @@ struct NvkvmGpuEmul {
     struct nvkvm_chan_entry {
         uint64_t gpfifo_va, userd;
         uint32_t gpfifo_ent, gp_get, hvaspace, payload;
+        uint32_t client;        /* owning RM client (hClient) — VAS scope key */
         bool     userd_sys;
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
+    uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
+
+    /* ── Address-virtualization #2 side-table (the reverse-driver core) ────────
+     * For GSP-managed VASes the leaf PTEs are filled GSP-side and never land in
+     * our FB, so nvkvm_walk_pdb FAULTs.  Instead we reconstruct GPU-VA -> physical
+     * from the RM op that establishes the mapping: NV2080_CTRL_CMD_GPU_PROMOTE_CTX
+     * (0x2080012b) hands GSP a table of context-buffer entries
+     * {gpuPhysAddr, gpuVirtAddr, size, physAttr(aperture)}.  We record them here,
+     * keyed by the channel's RM client (hChanClient) so VAs don't collide across
+     * processes/VASes.  nvkvm_chan_translate consults this FIRST.
+     * docs/design/mode2_address_virtualization.md (capture path #2). */
+#define NVKVM_MAX_MAPS 1024
+    struct nvkvm_va_map {
+        uint32_t client;
+        uint64_t va, phys, size;
+        bool     sys;           /* aperture: true=sysmem(COH/NCOH), false=FB(vidmem) */
+    } va_map[NVKVM_MAX_MAPS];
+    int va_map_n;
 
     /* M7 — CPU interrupt tree (raise MSI-X on LEAF_TRIGGER; ISR reads TOP/LEAF) */
     uint32_t intr_leaf[NVKVM_VF_INTR_NLEAF];     /* pending per leaf reg */
@@ -551,6 +575,174 @@ static void nvkvm_m3_post_init_done(NvkvmGpuEmul *s)
              "RmInitAdapter should pass kgspWaitForRmInitDone\n", s->chip->name);
 }
 
+/* ── DIAG (address-virtualization bring-up, removable) ──────────────────────
+ * Decode the alloc/control RPCs so we can build the GPU-VA -> physical side
+ * table from the GSP_RM_ALLOC memory descriptors and GSP_RM_CONTROL map cmds.
+ * fn=103 (GSP_RM_ALLOC) body: hClient@80, hParent@84, hObject@88, hClass@92,
+ * paramsSize@100, params@112.  fn=76 (GSP_RM_CONTROL) body: hClient@80,
+ * hObject@84, cmd@88, status@92, paramsSize@96, params@120. */
+static void nvkvm_diag_hex(const char *tag, const char *chip, uint32_t key,
+                           const uint8_t *p, int n)
+{
+    char line[256]; int o = 0;
+    o += snprintf(line + o, sizeof(line) - o, "nvkvm-gpu[%s] DIAG %s key=0x%x:",
+                  chip, tag, key);
+    for (int i = 0; i < n && o < (int)sizeof(line) - 4; i++) {
+        o += snprintf(line + o, sizeof(line) - o, "%s%02x",
+                      (i % 8 == 0) ? " " : "", p[i]);
+    }
+    qemu_log("%s\n", line);
+}
+
+/* Scan a params blob for any 64-bit value within [base, base+span) and log the
+ * offset + value.  Used to find which RPC carries the GPFIFO GPU-VA so we learn
+ * the op that establishes the mapping (no struct-layout guessing). */
+static void nvkvm_diag_scan_va(NvkvmGpuEmul *s, const char *what, uint32_t fn,
+                               uint32_t cmd_or_class, const uint8_t *params,
+                               int psize, uint64_t base, uint64_t span)
+{
+    int lim = psize < 1024 ? psize : 1024;
+    for (int o = 0; o + 8 <= lim; o += 4) {
+        uint64_t v = ldq_le_p(params + o);
+        if (v >= base && v < base + span) {
+            qemu_log("nvkvm-gpu[%s] DIAG %s fn=%u cc=0x%08x VAhit@+%d val=0x%llx\n",
+                     s->chip->name, what, fn, cmd_or_class, o,
+                     (unsigned long long)v);
+        }
+    }
+}
+
+/* Broad scan: log any 64-bit value that looks like a GPU VA (0x1.2-5.xx_xxxx)
+ * or a sysmem GPA near the channel-semaphore region (0x1.0-1.8_xxxx_xxxx).  This
+ * reveals EVERY VA<->phys association the guest communicates, so we can find
+ * where the UVM channel's GPFIFO/pushbuffer/semaphore sysmem GPA is conveyed. */
+static void nvkvm_diag_broad(NvkvmGpuEmul *s, const char *what, uint32_t cc,
+                             const uint8_t *params, int psize)
+{
+    static uint32_t budget = 600;
+    int lim = psize < 1024 ? psize : 1024;
+    for (int o = 0; o + 8 <= lim; o += 4) {
+        uint64_t v = ldq_le_p(params + o);
+        bool va  = (v >= 0x120000000ull && v < 0x500000000ull);
+        bool gpa = (v >= 0x100000000ull && v < 0x180000000ull);
+        bool uvmsema = (v >= 0x121000000ull && v < 0x121100000ull);
+        if ((va || gpa || uvmsema) && budget-- > 0) {
+            qemu_log("nvkvm-gpu[%s] DIAG SCAN %s cc=0x%08x +%d = 0x%llx%s\n",
+                     s->chip->name, what, cc, o, (unsigned long long)v,
+                     uvmsema ? " [UVM-VA]" : va ? " [VA]" : " [GPA]");
+        }
+    }
+}
+
+static void nvkvm_diag_rpc(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn)
+{
+    if (fn == 103) {                                  /* GSP_RM_ALLOC */
+        uint32_t hClient = ldl_le_p(cmd + 80), hParent = ldl_le_p(cmd + 84);
+        uint32_t hObject = ldl_le_p(cmd + 88), hClass = ldl_le_p(cmd + 92);
+        uint32_t psize   = ldl_le_p(cmd + 100);
+        const uint8_t *params = cmd + 112;
+        qemu_log("nvkvm-gpu[%s] DIAG ALLOC class=0x%04x hClient=0x%08x "
+                 "hParent=0x%08x hObject=0x%08x psize=%u\n", s->chip->name,
+                 hClass, hClient, hParent, hObject, psize);
+        /* Memory classes: dump the descriptor head (base/size/aperture live here
+         * for OS_DESC/SYSTEM/LOCAL_USER/VIRTUAL). */
+        if (hClass == 0x003eu || hClass == 0x0040u || hClass == 0x0071u ||
+            hClass == 0x50a0u || hClass == 0x90f1u || hClass == 0x00deu ||
+            hClass == 0x007eu || hClass == 0x0070u) {
+            nvkvm_diag_hex("ALLOCMEM", s->chip->name, hClass, params,
+                           psize < 64 ? psize : 64);
+        }
+        nvkvm_diag_broad(s, "ALLOC", hClass, params, (int)psize);
+        /* Full channel-params dump: reveals hVASpace + all memory descriptors
+         * (instance/userd/ramfc/mthdbuf) so we see where the GPFIFO/sema live. */
+        if (hClass == 0xc56fu || hClass == 0xc36fu) {
+            int n = psize < 384 ? (int)psize : 384;
+            for (int o = 0; o < n; o += 32) {
+                nvkvm_diag_hex("CHANPARAMS", s->chip->name, (uint32_t)o,
+                               params + o, (n - o) < 32 ? (n - o) : 32);
+            }
+        }
+        /* Scan any alloc params for a reference to a known channel's GPFIFO VA. */
+        for (int i = 0; i < s->chan_n; i++) {
+            nvkvm_diag_scan_va(s, "ALLOC", fn, hClass, params, (int)psize,
+                               s->chans[i].gpfifo_va & ~0xFFFFFull, 0x100000);
+        }
+    } else if (fn == 76) {                            /* GSP_RM_CONTROL */
+        uint32_t hObject = ldl_le_p(cmd + 84), ctrl = ldl_le_p(cmd + 88);
+        uint32_t psize   = ldl_le_p(cmd + 96);
+        const uint8_t *params = cmd + 120;
+        nvkvm_diag_broad(s, "CTRL", ctrl, params, (int)psize);
+        /* Scan control params for any known channel GPFIFO VA neighborhood. */
+        for (int i = 0; i < s->chan_n; i++) {
+            uint64_t b = s->chans[i].gpfifo_va & ~0xFFFFFull;
+            int lim = psize < 1024 ? (int)psize : 1024;
+            for (int o = 0; o + 8 <= lim; o += 4) {
+                uint64_t v = ldq_le_p(params + o);
+                if (v >= b && v < b + 0x100000) {
+                    qemu_log("nvkvm-gpu[%s] DIAG CTRL cmd=0x%08x hObject=0x%08x "
+                             "VAhit@+%d val=0x%llx psize=%u\n", s->chip->name,
+                             ctrl, hObject, o, (unsigned long long)v, psize);
+                    nvkvm_diag_hex("CTRLwin", s->chip->name, ctrl,
+                                   params + (o > 16 ? o - 16 : 0), 64);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* Record (or update) a GPU-VA -> physical mapping in the #2 side-table.  Keyed
+ * by (client, va): a re-promote of the same VA replaces the entry. */
+static void nvkvm_record_va_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                uint64_t phys, uint64_t size, bool sys)
+{
+    if (!va || !size) {
+        return;
+    }
+    for (int i = 0; i < s->va_map_n; i++) {
+        struct nvkvm_va_map *m = &s->va_map[i];
+        if (m->client == client && m->va == va) {
+            m->phys = phys; m->size = size; m->sys = sys;
+            return;
+        }
+    }
+    if (s->va_map_n >= NVKVM_MAX_MAPS) {
+        return;                 /* table full — DoS-bounded; oldest stay */
+    }
+    struct nvkvm_va_map *m = &s->va_map[s->va_map_n++];
+    m->client = client; m->va = va; m->phys = phys; m->size = size; m->sys = sys;
+    qemu_log("nvkvm-gpu[%s] M5: va_map[%d] client=0x%08x va=0x%llx -> %s "
+             "phys=0x%llx size=0x%llx\n", s->chip->name, s->va_map_n - 1, client,
+             (unsigned long long)va, sys ? "SYS" : "FB",
+             (unsigned long long)phys, (unsigned long long)size);
+}
+
+/* Parse NV2080_CTRL_CMD_GPU_PROMOTE_CTX (0x2080012b) and fold its context-buffer
+ * entries into the #2 side-table.  Params @cmd+120 (GSP_RM_CONTROL body):
+ *   hChanClient@+12, entryCount@+40, promoteEntry[]@+48 (32B each:
+ *   gpuPhysAddr@0, gpuVirtAddr@8, size@16, physAttr@24, bufferId@28,
+ *   bInitialize@30, bNonmapped@31).  physAttr[1:0]: 0=VIDMEM, 1/2=SYSMEM. */
+static void nvkvm_snoop_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
+{
+    const uint8_t *p = cmd + 120;
+    uint32_t client = ldl_le_p(p + 12);
+    uint32_t ec     = ldl_le_p(p + 40);
+    if (ec > 64) {              /* NV2080_CTRL_GPU_PROMOTE_CONTEXT_MAX_ENTRIES=20;
+                                 * clamp generously, never trust guest count. */
+        ec = 64;
+    }
+    for (uint32_t i = 0; i < ec; i++) {
+        const uint8_t *e = p + 48 + (uint64_t)i * 32;
+        uint64_t phys = ldq_le_p(e + 0), va = ldq_le_p(e + 8), sz = ldq_le_p(e + 16);
+        uint32_t physAttr = ldl_le_p(e + 24);
+        uint8_t  bNonmapped = e[31];
+        if (!va || !sz || bNonmapped) {
+            continue;           /* unmapped/phys-only entries don't enter the VAS */
+        }
+        nvkvm_record_va_map(s, client, va, phys, sz, (physAttr & 0x3u) != 0);
+    }
+}
+
 /* M4: service the CPU->GSP command queue.  Called when the driver rings the cmd
  * QUEUE_HEAD doorbell (0x110c00).  For each new command, echo a response
  * (same function, rpc_result=NV_OK) onto the status queue so _issueRpcAndWait
@@ -595,6 +787,13 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             qemu_log("nvkvm-gpu[%s] M4: cmd fn=%u seq=%u -> %s\n",
                      s->chip->name, fn, ldl_le_p(cmd + 36),
                      async ? "async (no response)" : "echo NV_OK");
+        }
+        nvkvm_diag_rpc(s, cmd, fn);   /* DIAG: decode alloc/control for side-table */
+        /* #2 side-table: capture GPU-VA -> physical from PROMOTE_CTX (the GSP-RM
+         * map op).  This is what makes GSP-managed-VAS channels (UVM) resolvable
+         * without leaf PTEs in our FB. */
+        if (fn == 76 && ldl_le_p(cmd + 88) == 0x2080012bu) {
+            nvkvm_snoop_promote_ctx(s, cmd);
         }
         /* fn=47 UNLOADING_GUEST_DRIVER: the guest is tearing down.  On real HW the
          * teardown runs Booter Unload, which brings WPR2 back DOWN.  We don't run
@@ -657,6 +856,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         s->chans[cslot].gpfifo_ent = s->chan_gpfifo_ent;
                         s->chans[cslot].userd_sys  = s->chan_userd_sys;
                         s->chans[cslot].hvaspace   = s->chan_hvaspace;
+                        s->chans[cslot].client     = ldl_le_p(cmd + 80); /* hClient */
                         s->chans[cslot].gp_get     = 0;
                         s->chans[cslot].payload    = 0;
                     }
@@ -1128,6 +1328,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             s->chan_gpfifo_ent = c->gpfifo_ent;
             s->chan_userd_sys  = c->userd_sys;
             s->chan_hvaspace   = c->hvaspace;
+            s->chan_client     = c->client;
             s->chan_gp_get     = c->gp_get;
             uint32_t before = c->gp_get;
             nvkvm_chan_execute(s);
@@ -1287,12 +1488,27 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
     if (pa == NVKVM_GMMU_FAULT) {
         return 0;
     }
+    uint64_t rv;
     if (sys) {
         uint8_t b[8] = {0};
         if (pci_dma_read(&s->parent_obj, pa, b, size) != MEMTX_OK) return 0;
-        return ldn_le_p(b, size);
+        rv = ldn_le_p(b, size);
+    } else {
+        rv = nvkvm_fb_read(s, pa, size);
     }
-    return nvkvm_fb_read(s, pa, size);
+    /* DIAG: BAR1 reads landing in the low-FB region (where the UVM channel's
+     * GPFIFO/USERD/semaphore live) — a poll spin shows up as repeated reads of
+     * one address; that address is the completion semaphore the guest waits on. */
+    if (!sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
+        static uint64_t last_pa; static uint32_t rep; static uint32_t total;
+        if (pa != last_pa) { last_pa = pa; rep = 0; }
+        if ((rep++ % 4096) == 0 && total++ < 4000) {
+            qemu_log("nvkvm-gpu[GA106] DIAG BAR1 RD off=0x%llx -> FB 0x%llx "
+                     "= 0x%llx (rep~%u)\n", (unsigned long long)off,
+                     (unsigned long long)pa, (unsigned long long)rv, rep);
+        }
+    }
+    return rv;
 }
 
 static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
@@ -1313,6 +1529,16 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
         pci_dma_write(&s->parent_obj, pa, b, size);
     } else {
         nvkvm_fb_write(s, pa, val, size);
+    }
+    /* DIAG: BAR1 writes into the low-FB region reveal where the guest CPU lays
+     * down the UVM channel's GPFIFO entry, pushbuffer, and inits the semaphore. */
+    if (!sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
+        static uint32_t total;
+        if (total++ < 2000) {
+            qemu_log("nvkvm-gpu[GA106] DIAG BAR1 WR off=0x%llx -> FB 0x%llx "
+                     "<- 0x%llx sz=%u\n", (unsigned long long)off,
+                     (unsigned long long)pa, (unsigned long long)val, size);
+        }
     }
 }
 
@@ -1507,6 +1733,17 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
  * (a valid leaf PTE) rather than by the channel's hVASpace handle. */
 static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
 {
+    /* #2 side-table (PROMOTE_CTX) — authoritative and required for GSP-managed
+     * VASes whose leaf PTEs never land in our FB (so the PDB walk below FAULTs).
+     * Scoped to the executing channel's RM client so VAs can't collide across
+     * processes.  Longest-prefix not needed: PROMOTE_CTX ranges are disjoint. */
+    for (int i = 0; i < s->va_map_n; i++) {
+        struct nvkvm_va_map *m = &s->va_map[i];
+        if (m->client == s->chan_client && va >= m->va && va < m->va + m->size) {
+            *out_sys = m->sys;
+            return m->phys + (va - m->va);
+        }
+    }
     /* Authoritative: the executing channel's own PDB (from its instance block).
      * Correct even for hVASpace=0 (device-default) channels that don't match any
      * snooped VAS handle.  0 = instblk empty -> fall through to the heuristic. */
@@ -1604,6 +1841,26 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                  "gpfifoVA=0x%llx\n", s->chip->name, s->chan_hvaspace,
                  (unsigned long long)s->chan_pdb,
                  (unsigned long long)s->chan_gpfifo_va);
+        /* DIAG: when content-pick fails, show what EACH snooped VAS resolves the
+         * GPFIFO entry VA to (fault / phys+aperture) and the value read there. */
+        if (s->chan_pdb == 0) {
+            for (int i = 0; i < s->chan_vas_n; i++) {
+                bool sy = false;
+                uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, eva, &sy);
+                if (p == NVKVM_GMMU_FAULT) {
+                    qemu_log("nvkvm-gpu[%s] DIAG vas[%d] hvas=0x%08x pdb=0x%llx "
+                             "eva=0x%llx -> FAULT\n", s->chip->name, i,
+                             s->chan_vas[i].hvas, (unsigned long long)s->chan_vas[i].pdb,
+                             (unsigned long long)eva);
+                } else {
+                    qemu_log("nvkvm-gpu[%s] DIAG vas[%d] hvas=0x%08x pdb=0x%llx "
+                             "eva=0x%llx -> %s phys=0x%llx val=0x%08x\n", s->chip->name,
+                             i, s->chan_vas[i].hvas, (unsigned long long)s->chan_vas[i].pdb,
+                             (unsigned long long)eva, sy ? "SYS" : "FB",
+                             (unsigned long long)p, nvkvm_phys_rd32(s, p, sy));
+                }
+            }
+        }
     }
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
