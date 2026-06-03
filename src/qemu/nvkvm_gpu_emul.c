@@ -247,6 +247,9 @@ struct NvkvmGpuEmul {
      * that with a sparse page table so writes read back (kbusVerifyBar2). */
     uint32_t bar0_window;    /* NV_PBUS_BAR0_WINDOW (0x1700): BASE[23:0]|TARGET[25:24] */
     GHashTable *fb_pages;    /* sparse FB: page index (addr>>12) -> malloc'd 4KB  */
+    uint64_t bar2_inst_block;/* FB addr of the BAR2 instance block (NV_PBUS_BAR2_BLOCK
+                              * 0x1714: PTR[27:0]<<12).  Holds the BAR2 page-dir base;
+                              * BAR2 accesses are GMMU-VER2-walked through it.        */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -759,6 +762,18 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         s->bar0_window = (uint32_t)val;
         return;
     }
+    /* M6: NV_PBUS_BAR2_BLOCK (0x1714) PTR[27:0] = BAR2 instance-block FB addr
+     * (in NV_RAMIN_BASE_SHIFT=12 units).  Caches the page-dir base source for
+     * the BAR2 GMMU walk. */
+    if (off == 0x00001714u) {
+        s->bar2_inst_block = (uint64_t)(val & 0x0FFFFFFFu) << 12;
+        if (s->trace) {
+            qemu_log("nvkvm-gpu[%s] M6: BAR2_BLOCK -> instblk FB 0x%llx (mode=%s)\n",
+                     s->chip->name, (unsigned long long)s->bar2_inst_block,
+                     (val & 0x80000000u) ? "VIRTUAL" : "PHYSICAL");
+        }
+        return;
+    }
 
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
      * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
@@ -839,6 +854,107 @@ static const MemoryRegionOps nvkvm_aperture_ops = {
     .valid      = { .min_access_size = 1, .max_access_size = 8 },
 };
 
+/* ── M6: RM BAR2 aperture — GA10x GMMU VER2 page-walk over the FB backing ─────
+ * BAR2 (PCI BAR3, 32 MiB) is a GPU virtual aperture: the guest programs page
+ * tables (in FB) and an instance block (NV_PBUS_BAR2_BLOCK 0x1714) holding the
+ * page-directory base, then accesses VRAM through BAR2.  We walk those tables to
+ * translate a BAR2 offset (== GPU VA) to an FB phys addr, then hit fb_pages.
+ * VER2 levels (kern_gmmu_fmt_gp10x.c): PD3 VA[48:47], PD2 [46:38], PD1 [37:29],
+ * PD0 [28:21] (16B dual PDE), PT_small [20:12] (4 KiB) / PT_big [20:bigShift].
+ * Entry addr = field<<shift; PTE/PDE ADDRESS_VID = bits 32:8 (<<12). */
+#define NVKVM_VER2_ADDR_VID(e)  ((((e) >> 8) & ((1ull << 25) - 1)) << 12)
+#define NVKVM_GMMU_FAULT        (~0ull)
+
+static uint64_t nvkvm_fb_rd64(NvkvmGpuEmul *s, uint64_t fb_addr)
+{
+    return nvkvm_fb_read(s, fb_addr, 8);
+}
+
+/* Translate a BAR2 GPU VA to an FB physical address (VID_MEM path only — the
+ * page tables and BAR2-mapped surfaces during init live in FB).  Returns
+ * NVKVM_GMMU_FAULT on an unmapped/SYSMEM path. */
+static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
+{
+    if (s->bar2_inst_block == 0) {
+        return NVKVM_GMMU_FAULT;
+    }
+    /* Page-dir base from the instance block: word128 @ +0x200 (TARGET[1:0],
+     * LO[31:12]), word129 @ +0x204 (HI[31:0]). */
+    uint64_t w128 = nvkvm_fb_read(s, s->bar2_inst_block + 128 * 4, 4);
+    uint64_t w129 = nvkvm_fb_read(s, s->bar2_inst_block + 129 * 4, 4);
+    uint64_t tbl  = (w128 & 0xFFFFF000ull) | (w129 << 32);
+
+    /* PD3 -> PD2 -> PD1 : single 8B PDEs. */
+    static const struct { int hi, lo; } lvl[3] = {
+        {48, 47}, {46, 38}, {37, 29}
+    };
+    for (int i = 0; i < 3; i++) {
+        uint32_t idx = (uint32_t)((va >> lvl[i].lo) &
+                                  ((1ull << (lvl[i].hi - lvl[i].lo + 1)) - 1));
+        uint64_t pde = nvkvm_fb_rd64(s, tbl + (uint64_t)idx * 8);
+        tbl = NVKVM_VER2_ADDR_VID(pde);
+        if (tbl == 0) {
+            return NVKVM_GMMU_FAULT;
+        }
+    }
+
+    /* PD0: 16B dual PDE (big-page + small-page sub-tables). */
+    uint32_t idx0 = (uint32_t)((va >> 21) & 0xFF);            /* [28:21], 8 bits */
+    uint64_t lo = nvkvm_fb_rd64(s, tbl + (uint64_t)idx0 * 16);
+    uint64_t hi = nvkvm_fb_rd64(s, tbl + (uint64_t)idx0 * 16 + 8);
+    uint64_t small_tbl = (((hi >> 8) & ((1ull << 25) - 1)) << 12); /* SMALL bits 96:72, <<12 */
+    uint64_t big_tbl   = (((lo >> 4) & ((1ull << 28) - 1)) << 8);  /* BIG  bits 32:4,  <<8  */
+
+    uint64_t pte, page;
+    if (small_tbl != 0) {                       /* 4 KiB pages: PT VA[20:12] */
+        uint32_t idx = (uint32_t)((va >> 12) & 0x1FF);
+        pte  = nvkvm_fb_rd64(s, small_tbl + (uint64_t)idx * 8);
+        if (!(pte & 1)) {
+            return NVKVM_GMMU_FAULT;            /* PTE VALID bit 0 */
+        }
+        page = NVKVM_VER2_ADDR_VID(pte);
+        return page + (va & 0xFFFull);
+    }
+    if (big_tbl != 0) {                          /* 64 KiB pages: PT VA[20:16] */
+        uint32_t idx = (uint32_t)((va >> 16) & 0x1F);
+        pte  = nvkvm_fb_rd64(s, big_tbl + (uint64_t)idx * 8);
+        if (!(pte & 1)) {
+            return NVKVM_GMMU_FAULT;
+        }
+        page = NVKVM_VER2_ADDR_VID(pte);
+        return page + (va & 0xFFFFull);
+    }
+    return NVKVM_GMMU_FAULT;
+}
+
+static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
+{
+    NvkvmGpuEmul *s = opaque;
+    uint64_t pa = nvkvm_bar2_translate(s, off);
+    if (pa == NVKVM_GMMU_FAULT) {
+        return 0;
+    }
+    return nvkvm_fb_read(s, pa, size);
+}
+
+static void nvkvm_bar2_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    NvkvmGpuEmul *s = opaque;
+    uint64_t pa = nvkvm_bar2_translate(s, off);
+    if (pa == NVKVM_GMMU_FAULT) {
+        return;
+    }
+    nvkvm_fb_write(s, pa, val, size);
+}
+
+static const MemoryRegionOps nvkvm_bar2_ops = {
+    .read       = nvkvm_bar2_read,
+    .write      = nvkvm_bar2_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid      = { .min_access_size = 1, .max_access_size = 8 },
+};
+
 /* ── realize / unrealize ───────────────────────────────────────────────────*/
 
 static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
@@ -860,6 +976,7 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 
     /* M6: sparse FB backing for the BAR0 PRAMIN window (value = g_malloc0'd 4 KiB). */
     s->bar0_window = 0;
+    s->bar2_inst_block = 0;
     s->fb_pages = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                         NULL, g_free);
 
@@ -901,8 +1018,10 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 
     /* BAR3: usermode/IMEM aperture, 64-bit prefetchable (occupies BAR3+BAR4).
      * Driver assigns FB then IMEM to the next valid 64-bit BARs after REGS. */
-    memory_region_init_io(&s->bar3, OBJECT(s), &nvkvm_aperture_ops, s,
-                          "nvkvm-gpu-usermode", chip->bar3_size);
+    /* BAR3 == RM "BAR2": the 32 MiB GPU-virtual instance/PTE aperture.  GMMU-VER2
+     * walked to the FB backing (M6).  (PCI BAR0=regs, BAR1=RM BAR1 FB window.) */
+    memory_region_init_io(&s->bar3, OBJECT(s), &nvkvm_bar2_ops, s,
+                          "nvkvm-gpu-bar2", chip->bar3_size);
     pci_register_bar(pci_dev, 3,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_TYPE_64 |
