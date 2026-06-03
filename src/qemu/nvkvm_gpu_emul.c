@@ -165,8 +165,12 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
  * dev_fb.h: WPR2_ADDR_LO=0x1FA824, WPR2_ADDR_HI=0x1FA828, 4KB-aligned. */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_LO  0x001FA824u
 #define NV_PFB_PRI_MMU_WPR2_ADDR_HI  0x001FA828u
-#define NVKVM_WPR2_LO_VAL            0x10000000u  /* nominal FB region base */
-#define NVKVM_WPR2_HI_VAL            0x10100000u  /* base + ~16 MiB (HI>LO,!=0) */
+/* The driver checks WPR2_ADDR_LO _VAL (bits 31:4) == frtsOffset >> 12, where
+ * frtsOffset is derived from the 12 GiB FB: expected _VAL = 0x002FFE00 (==
+ * frtsOffset 0x2FFE00000 >> 12).  Register value = _VAL << 4.  HI just above
+ * (frtsSize region); the post-LO HI check refines this if needed. */
+#define NVKVM_WPR2_LO_VAL            0x02FFE000u  /* _VAL=0x2FFE00 = expected LO */
+#define NVKVM_WPR2_HI_VAL            0x02FFF000u  /* _VAL=0x2FFF00 (LO + ~1 MiB) */
 
 /* M3 — usable FB size in MiB.  kmemsysReadUsableFbSize_GA102 reads
  * NV_USABLE_FB_SIZE_IN_MB (= NV_PGC6_AON_SECURE_SCRATCH_GROUP_42 = 0x1183a4),
