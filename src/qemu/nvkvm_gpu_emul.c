@@ -134,6 +134,12 @@ struct NvkvmGpuEmul {
     bool     fwsec_ran;      /* set when GSP falcon STARTCPU written: FWSEC "ran"
                               * -> WPR2 becomes "initialized" (stateful: the
                               * driver checks WPR2 DOWN before FWSEC, UP after).  */
+    bool     gsp_suspended;  /* set on fn=47 UNLOADING teardown.  kgspUnloadRm ->
+                              * kgspWaitForProcessorSuspend polls FALCON_MAILBOX0
+                              * for INTERRUPT_PROCESSOR_SUSPENDED_VALUE(0x80000000);
+                              * the faked GSP must report suspended or the close
+                              * hangs 4s (_threadNodeCheckTimeout) and WPR2 stays
+                              * up -> next open EIO (WPR2 re-boot cascade).        */
 
     /* M4 — GSP-RM RPC shim. Cached message-queue layout (from RMARGS) + ring
      * state. The driver posts a command on the cmd queue then writes the cmd
@@ -372,6 +378,11 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     case NV_PFB_PRI_MMU_WPR2_ADDR_LO: return s->fwsec_ran ? NVKVM_WPR2_LO_VAL : 0;
     case NV_PFB_PRI_MMU_WPR2_ADDR_HI: return s->fwsec_ran ? NVKVM_WPR2_HI_VAL : 0;
 
+    /* GSP falcon MAILBOX0: on teardown (kgspUnloadRm) the driver polls this for
+     * INTERRUPT_PROCESSOR_SUSPENDED_VALUE (0x80000000).  Report suspended once
+     * the UNLOADING RPC arrived so close() doesn't hang 4s. */
+    case NV_PGSP_FALCON_MAILBOX0: return s->gsp_suspended ? 0x80000000u : 0;
+
     default:             return 0;
     }
 }
@@ -568,9 +579,10 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * sees WPR2 still up and _kgspBootGspRm bails with NV_ERR_INVALID_STATE
          * ("unexpected WPR2 already up") — a false cascade that masks the real
          * init failure and forces a full VM/QEMU restart between iterations. */
-        if (fn == 47 && s->fwsec_ran) {
-            s->fwsec_ran = false;
-            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> clear GSP-boot state (WPR2 down)\n",
+        if (fn == 47) {
+            s->fwsec_ran = false;       /* WPR2 down (booter-unload effect)      */
+            s->gsp_suspended = true;    /* MAILBOX0 -> SUSPENDED for the close poll */
+            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> WPR2 down + GSP suspended\n",
                      s->chip->name);
         }
         /* M5: snoop GSP_RM_ALLOC (fn 103) for a *_CHANNEL_GPFIFO_A alloc so we can
@@ -1143,6 +1155,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
      * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
     if ((off == NV_PGSP_FALCON_CPUCTL || off == 0x00110130u) && (val & 0x2u)) {
+        s->gsp_suspended = false;       /* fresh GSP boot — no longer suspended  */
         if (!s->fwsec_ran) {
             s->fwsec_ran = true;
             if (s->trace) {
