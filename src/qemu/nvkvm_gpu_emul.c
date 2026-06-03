@@ -249,6 +249,14 @@ struct NvkvmGpuEmul {
     int      chan_vas_n;
     uint32_t chan_hvaspace;    /* the tracked channel's hVASpace handle */
 
+    /* DEBUG-PROOF backdoor (mode2_uvm_complete): the patched guest UVM reports
+     * its tracking-semaphore GPA + payload here so QEMU can forge the channel
+     * completion for GSP-internal UVM channels whose sysmem mappings aren't in
+     * the RPC stream (see docs/design/mode2_address_virtualization.md).  This is
+     * a bring-up PROOF that forging the completion unblocks cuInit; production
+     * needs a validated guest<->VMM mapping-report channel (untrusted guest). */
+    uint32_t dbg_gpa_lo, dbg_gpa_hi;
+
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
     uint64_t access_count;   /* monotonically increasing, for the trace      */
@@ -1303,6 +1311,23 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     }
     if (off == NVKVM_BAR0_WINDOW) {
         s->bar0_window = (uint32_t)val;
+        return;
+    }
+    /* DEBUG-PROOF backdoor: the patched guest UVM reports a tracking-semaphore
+     * GPA (lo@0xFFF500, hi@0xFFF504) then writes the payload@0xFFF508 to commit;
+     * QEMU forges the GPU's CE SEM_RELEASE by DMA-writing the payload to that
+     * guest-RAM GPA, unblocking the UVM channel busy-poll that no observable RPC
+     * lets us resolve. Bring-up proof only (see struct comment). */
+    if (off == 0xFFF500u) { s->dbg_gpa_lo = (uint32_t)val; return; }
+    if (off == 0xFFF504u) { s->dbg_gpa_hi = (uint32_t)val; return; }
+    if (off == 0xFFF508u) {
+        uint64_t gpa = ((uint64_t)s->dbg_gpa_hi << 32) | s->dbg_gpa_lo;
+        uint8_t b[4]; stl_le_p(b, (uint32_t)val);
+        if (gpa) {
+            pci_dma_write(&s->parent_obj, gpa, b, 4);
+            qemu_log("nvkvm-gpu[%s] M5: DBG-FORGE uvm sema GPA=0x%llx <- payload=%u\n",
+                     s->chip->name, (unsigned long long)gpa, (uint32_t)val);
+        }
         return;
     }
     /* M5 — work-submit doorbell.  Detect the channel submission (the guest wrote

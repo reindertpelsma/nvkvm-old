@@ -164,6 +164,30 @@ AMPERE_CHANNEL_GPFIFO_A 0xc56f, gpFifoVA 0x121010000, hVASpace=0). Facts:
   cannot derive: the push is unreadable (sysmem VA 0x120000000 in a GSP-managed
   VAS) and no RPC conveys the GPA.
 
+### PROVEN 2026-06-04: forging the UVM completion unblocks cuInit
+A debug backdoor validates the mechanism end-to-end. Patched guest UVM
+(`docs/kernel_patches/mode2_uvm_complete_proof.patch`) reports, in
+`uvm_channel_end_push` for CE channels, the tracking-semaphore GPA + payload to
+the emulated GPU via a BAR0 backdoor (offsets 0xFFF500/4/8, written through a
+temporary `ioremap` of BAR0 — UVM has `parent->pci_dev`). QEMU
+(`nvkvm_bar0_write`) DMA-writes the payload to that guest-RAM GPA, forging the
+GPU's CE SEM_RELEASE. Result — **Mode-2 cuInit now PASSES**:
+```
+ok cuInit(0); devices=1; ok cuDeviceGet; ok cuDeviceGetName
+```
+The semaphore GPA varies per boot (not hardcodable) but is stable within a boot;
+the pool holds many 4-byte semaphores (0x121000000 + 4*n), payloads increment
+per channel — the forge handles all of them. NEXT WALL: libcuda segfaults right
+after `cuDeviceGetName` (near-NULL deref, `at ...ffc8`), in `cuDeviceGetAttribute`
+or `cuCtxCreate` — a downstream Mode-2 gap, not the UVM wall.
+
+This is a DEBUG PROOF (the guest is untrusted; QEMU blindly DMA-writes a
+guest-supplied GPA — a write-anywhere primitive). Production needs a validated
+guest<->VMM mapping-report channel: the guest reports GPU-VA->GPA *mappings*
+(bounded to its own RAM), QEMU records them in the #2 side-table, and the
+existing chan_exec executes the real CE SEM_RELEASE (or forwards real work),
+rather than the guest dictating an arbitrary write. See [[access-model-split]].
+
 ### Consequence for the plan — two ways past the wall
 1. **Fuller fake-GSP page-table ownership.** When RM hands the channel's memory
    descriptors (instanceMem/userd/ramfc are in the c56f alloc; FB) and GSP would
