@@ -170,3 +170,32 @@ providing a real FB size + matching WPR2) clears this. After WPR2: Booter exec
 
 Spike checks status: #1 GFW_BOOT ✓, #2 RISCV-enable ✓, #3/#4 falcon-halt ✓,
 #5 WPR2 (in progress, exact-location), then #6/#7 GSP message queue + INIT_DONE.
+
+## UPDATE 3 (2026-06-03): full boot faked; AT the msgq handshake (verified queue GPA)
+
+The whole pre-GSP boot is now faked (commits through 07963a4): PTIMER, Falcon
+DMA (DMATRFCMD), SEC2 CPUCTL, WPR2 (stateful, location matched via FB-size
+12GiB at 0x1183a4), GSP RISC-V active (RISCV_CPUCTL 0x111388 bit7, post-FWSEC).
+The stock driver reaches **GspStatusQueueInit -> msgqRxLink** and times out
+(139677 polls) waiting for the GSP status-queue tx header. This is the keystone.
+
+QEMU now reads the boot args from guest RAM (M3-step-1) AND locates the queue:
+the LibOS region "RMARGS" holds GSP_ARGUMENTS_CACHED whose first struct is
+MESSAGE_QUEUE_INIT_ARGUMENTS { u64 sharedMemPhysAddr@0; u32 pageTableEntryCount@8;
+NvLength cmdQueueOffset@16; NvLength statQueueOffset@24 }. Verified read:
+  sharedMemPA=0x139c00000  pteCount=129  cmdQOff=0x1000  statQOff=0x41000
+  => status queue @ sharedMemPA + statQOff = 0x139c41000
+
+**NEXT (the remaining keystone implementation):**
+1. The shared region is page-table-described (pteCount=129): sharedMemPA points
+   to a radix/PTE page table; the queue pages follow. Walk it (or, if contiguous,
+   use sharedMemPA+off directly) to get the status-queue backing-store HVA.
+2. Write a valid status-queue msgqTxHeader (version=0, size=statusQueueSize,
+   msgSize=GSP_MSG_QUEUE_ELEMENT_SIZE_MIN, msgCount, writePtr=0, rxHdrOff,
+   entryOff) via pci_dma_write so msgqRxLink links (check msgqRxLink in
+   src/common/shared/msgq for the exact validated fields).
+3. Decode the CPU->GSP command queue (init RPCs) and post GSP_INIT_DONE
+   (rpc_init_done_v17_00, rpc_result=NV_OK) into the status queue: build the
+   GSP_MSG_QUEUE_ELEMENT (zero authTag/aad, seqNum, elemCount, checkSum so the
+   sum is 0), bump txHeader.writePtr, raise MSI-X.
+Then kgspWaitForRmInitDone returns NV_OK and RmInitAdapter succeeds = PoC gate.

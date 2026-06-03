@@ -376,17 +376,25 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                  (unsigned long long)id8, (unsigned long long)pa,
                  (unsigned long long)sz, kind, loc);
 
-        /* The message-queue shared region is the SYSMEM one; peek its
-         * command-queue msgqTxHeader (32 bytes at pa). */
-        if (loc == LIBOS_REGION_LOC_SYSMEM && sz >= 0x40000) {
-            uint8_t h[32];
-            if (pci_dma_read(pdev, pa, h, sizeof(h)) == MEMTX_OK) {
-                qemu_log("nvkvm-gpu[%s] M3:   cmdq txHdr ver=%u size=0x%x "
-                         "msgSize=%u msgCount=%u writePtr=%u flags=0x%x "
-                         "rxHdrOff=0x%x entryOff=0x%x\n", s->chip->name,
-                         ldl_le_p(h+0), ldl_le_p(h+4), ldl_le_p(h+8),
-                         ldl_le_p(h+12), ldl_le_p(h+16), ldl_le_p(h+20),
-                         ldl_le_p(h+24), ldl_le_p(h+28));
+        /* RMARGS region (id8 "RMARGS") holds GSP_ARGUMENTS_CACHED, which begins
+         * with MESSAGE_QUEUE_INIT_ARGUMENTS { u64 sharedMemPhysAddr; u32
+         * pageTableEntryCount; NvLength cmdQueueOffset; NvLength statQueueOffset }.
+         * The CPU<->GSP message-queue shared region is at sharedMemPhysAddr; the
+         * GSP->CPU status queue (whose msgqTxHeader we must init for msgqRxLink)
+         * is at sharedMemPhysAddr + statQueueOffset. */
+        if (id8 == 0x0000524d41524753ULL /* "RMARGS" */) {
+            uint8_t a[32];
+            if (pci_dma_read(pdev, pa, a, sizeof(a)) == MEMTX_OK) {
+                uint64_t shmem = ldq_le_p(a + 0);
+                uint32_t ptec  = ldl_le_p(a + 8);
+                uint64_t cmdoff = ldq_le_p(a + 16);
+                uint64_t statoff = ldq_le_p(a + 24);
+                qemu_log("nvkvm-gpu[%s] M3:   RMARGS msgq: sharedMemPA=0x%llx "
+                         "pteCount=%u cmdQOff=0x%llx statQOff=0x%llx "
+                         "=> statusQueue@0x%llx\n", s->chip->name,
+                         (unsigned long long)shmem, ptec,
+                         (unsigned long long)cmdoff, (unsigned long long)statoff,
+                         (unsigned long long)(shmem + statoff));
             }
         }
     }
