@@ -1163,7 +1163,6 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
     uint64_t lo = nvkvm_pt_rd64(s, tbl + (uint64_t)idx0 * 16, tsys);
     uint64_t hi = nvkvm_pt_rd64(s, tbl + (uint64_t)idx0 * 16 + 8, tsys);
     uint32_t big_ap = (uint32_t)((lo >> 1) & 0x3), small_ap = (uint32_t)((hi >> 1) & 0x3);
-
     uint64_t pte; uint32_t pgshift; bool stsys;
     if (small_ap == 1 || small_ap == 2 || small_ap == 3) {
         stsys = (small_ap != 1);
