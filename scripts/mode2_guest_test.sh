@@ -30,9 +30,9 @@ if [ ! -f "$NVMODS/nvidia.ko" ]; then
     echo "=== building open nvidia.ko $NVVER (one-time) ==="
     sudo mkdir -p /mnt/ogkm /mnt/build
     mountpoint -q /mnt/ogkm  || sudo mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576,ro ogkm /mnt/ogkm
-    mountpoint -q /mnt/build || sudo mount -t tmpfs -o size=5G tmpfs /mnt/build
+    mountpoint -q /mnt/build || sudo mount -t tmpfs -o size=4G tmpfs /mnt/build
     sudo cp -aL /mnt/ogkm/. /mnt/build/ 2>/dev/null
-    ( cd /mnt/build && sudo make modules -j"$(nproc)" >/tmp/ogkm_build.log 2>&1 )
+    ( cd /mnt/build && sudo make modules -j2 >/tmp/ogkm_build.log 2>&1 )
     KO=$(find /mnt/build -name nvidia.ko | head -1)
     mkdir -p "$NVMODS"
     if [ -n "$KO" ]; then cp "$KO" "$NVMODS/"; echo "stashed $(ls -la $NVMODS/nvidia.ko)";
