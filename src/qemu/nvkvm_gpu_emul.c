@@ -469,6 +469,13 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
              * host-captured), so the echo only gets void/SET controls through. */
             if (fn == 76) {
                 stl_le_p(cmd + 92, 0); /* rpc_gsp_rm_control_v.status = NV_OK */
+                /* NOTE: GET controls (e.g. GET_CONSTRUCTED_FALCON_INFO 0x208001b0
+                 * at cmd@88) cannot be answered by a fabricated flat params
+                 * struct — the response is FINN-serialized and the driver's
+                 * serverDeserializeCtrlUp rejects an un-framed payload with 0x3a
+                 * even for numConstructedFalcons=0.  GET controls need REAL
+                 * FINN-serialized responses: capture them from a host GSP (M5),
+                 * or implement FINN ser/deser.  Echo only carries void/SET. */
             }
             if (s->trace) {
                 qemu_log("nvkvm-gpu[%s] M4:   cmd rpc: len=%u seq(rpc)=%u "
