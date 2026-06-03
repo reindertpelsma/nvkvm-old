@@ -819,9 +819,11 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
      * ce_utils.c:349).  For now, log it so the doorbell offset/token are
      * confirmed against the GA100 HAL. */
     if (off == NVKVM_VF_DOORBELL) {
-        qemu_log("nvkvm-gpu[%s] M5: DOORBELL ring, workSubmitToken=0x%08x "
-                 "(runlist/chId) -- channel submitted, completion TODO\n",
-                 s->chip->name, (uint32_t)val);
+        qemu_log("nvkvm-gpu[%s] M5: DOORBELL token=0x%08x -> runlist=%u chId=%u "
+                 "-- channel submitted, execution TODO (GPFIFO->pb->CE sema)\n",
+                 s->chip->name, (uint32_t)val,
+                 NVKVM_DOORBELL_RUNLIST((uint32_t)val),
+                 NVKVM_DOORBELL_CHID((uint32_t)val));
         return;
     }
     /* M6: NV_PBUS_BAR2_BLOCK (0x1714) PTR[27:0] = BAR2 instance-block FB addr
