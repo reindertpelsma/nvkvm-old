@@ -1106,6 +1106,17 @@ static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
     return NVKVM_GMMU_FAULT;
 }
 
+/* Read 8 bytes from a page-table entry in FB (vidmem) or sysmem (GPA). */
+static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
+{
+    if (sys) {
+        uint8_t b[8];
+        if (pci_dma_read(&s->parent_obj, addr, b, 8) != MEMTX_OK) return 0;
+        return ldq_le_p(b);
+    }
+    return nvkvm_fb_rd64(s, addr);
+}
+
 /* M5 — translate a CHANNEL GPU VA to a physical address, rooted at the channel's
  * own PDB (read from its instance block), and report whether the leaf page is in
  * sysmem (GPA) or vidmem (FB) via *out_sys.  Unlike BAR2, channel buffers (the
@@ -1132,47 +1143,59 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
         return NVKVM_GMMU_FAULT;
     }
     /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE) — page tables in FB. */
+    bool tsys = false;     /* PDB in FB; each PDE aperture says where next lives */
     static const struct { int hi, lo; } lvl[3] = { {48,47}, {46,38}, {37,29} };
     for (int i = 0; i < 3; i++) {
         uint32_t idx = (uint32_t)((va >> lvl[i].lo) &
                                   ((1ull << (lvl[i].hi - lvl[i].lo + 1)) - 1));
-        uint64_t pde = nvkvm_fb_rd64(s, tbl + (uint64_t)idx * 8);
-        tbl = NVKVM_VER2_ADDR_VID(pde);
+        uint64_t pde = nvkvm_pt_rd64(s, tbl + (uint64_t)idx * 8, tsys);
+        uint32_t ap = (uint32_t)((pde >> 1) & 0x3);  /* PDE APERTURE: 1=VID,2/3=SYS */
+        if (ap == 1) { tbl = ((pde >> 8) & ((1ull << 25) - 1)) << 12; tsys = false; }
+        else if (ap == 2 || ap == 3) { tbl = ((pde >> 8) & ((1ull << 46) - 1)) << 12; tsys = true; }
+        else { return NVKVM_GMMU_FAULT; }            /* INVALID */
         if (tbl == 0) {
             return NVKVM_GMMU_FAULT;
         }
     }
+    /* PD0: 16B dual PDE.  BIG aperture lo bits2:1, SMALL aperture hi bits2:1.
+     * SMALL addr VID hi32:8 / SYS hi53:8 (<<12); BIG addr VID lo32:4 / SYS lo53:4 (<<8). */
     uint32_t idx0 = (uint32_t)((va >> 21) & 0xFF);
-    uint64_t lo = nvkvm_fb_rd64(s, tbl + (uint64_t)idx0 * 16);
-    uint64_t hi = nvkvm_fb_rd64(s, tbl + (uint64_t)idx0 * 16 + 8);
-    uint64_t small_tbl = (((hi >> 8) & ((1ull << 25) - 1)) << 12);
-    uint64_t big_tbl   = (((lo >> 4) & ((1ull << 28) - 1)) << 8);
+    uint64_t lo = nvkvm_pt_rd64(s, tbl + (uint64_t)idx0 * 16, tsys);
+    uint64_t hi = nvkvm_pt_rd64(s, tbl + (uint64_t)idx0 * 16 + 8, tsys);
+    uint32_t big_ap = (uint32_t)((lo >> 1) & 0x3), small_ap = (uint32_t)((hi >> 1) & 0x3);
 
-    uint64_t pte; uint32_t pgshift; uint64_t pgmask;
-    if (small_tbl != 0) {
-        pte = nvkvm_fb_rd64(s, small_tbl + (uint64_t)((va >> 12) & 0x1FF) * 8);
-        pgshift = 12; pgmask = 0xFFFull;
-    } else if (big_tbl != 0) {
-        pte = nvkvm_fb_rd64(s, big_tbl + (uint64_t)((va >> 16) & 0x1F) * 8);
-        pgshift = 16; pgmask = 0xFFFFull;
+    uint64_t pte; uint32_t pgshift; bool stsys;
+    if (small_ap == 1 || small_ap == 2 || small_ap == 3) {
+        stsys = (small_ap != 1);
+        uint64_t st = stsys ? (((hi >> 8) & ((1ull << 46) - 1)) << 12)
+                            : (((hi >> 8) & ((1ull << 25) - 1)) << 12);
+        if (st == 0) { return NVKVM_GMMU_FAULT; }
+        pte = nvkvm_pt_rd64(s, st + (uint64_t)((va >> 12) & 0x1FF) * 8, stsys);
+        pgshift = 12;
+    } else if (big_ap == 1 || big_ap == 2 || big_ap == 3) {
+        stsys = (big_ap != 1);
+        uint64_t bt = stsys ? (((lo >> 4) & ((1ull << 50) - 1)) << 8)
+                            : (((lo >> 4) & ((1ull << 29) - 1)) << 8);
+        if (bt == 0) { return NVKVM_GMMU_FAULT; }
+        pte = nvkvm_pt_rd64(s, bt + (uint64_t)((va >> 16) & 0x1F) * 8, stsys);
+        pgshift = 16;
     } else {
         return NVKVM_GMMU_FAULT;
     }
     if (!(pte & 1)) {                       /* PTE VALID bit0 */
         return NVKVM_GMMU_FAULT;
     }
-    uint32_t aperture = (uint32_t)((pte >> 1) & 0x3);  /* APERTURE bits 2:1 */
+    uint32_t aperture = (uint32_t)((pte >> 1) & 0x3);  /* PTE APERTURE: 0=VID,2/3=SYS */
     uint64_t page;
-    if (aperture == 0) {                    /* VIDEO_MEMORY: ADDRESS_VID 32:8 */
+    if (aperture == 0) {
         page = ((pte >> 8) & ((1ull << 25) - 1)) << 12;
         *out_sys = false;
-    } else if (aperture == 2 || aperture == 3) { /* SYSTEM_*: ADDRESS_SYS 53:8 */
+    } else if (aperture == 2 || aperture == 3) {
         page = ((pte >> 8) & ((1ull << 46) - 1)) << 12;
         *out_sys = true;
     } else {
-        return NVKVM_GMMU_FAULT;            /* PEER — unsupported */
+        return NVKVM_GMMU_FAULT;
     }
-    (void)pgmask;
     return page + (va & ((1ull << pgshift) - 1));
 }
 
