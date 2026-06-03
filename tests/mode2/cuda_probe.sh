@@ -12,6 +12,11 @@ sudo mknod /dev/nvidia-uvm c 235 0 2>/dev/null
 sudo chmod 666 /dev/nvidia* 2>/dev/null
 sudo dmesg -C
 sudo insmod "$KO" NVreg_EnableGpuFirmware=1 NVreg_RegistryDwords="RmGspBootRetryAttempts=1" 2>&1 | tail -1
+sudo insmod "$HOME/nvmods/nvidia-uvm.ko" 2>&1 | tail -1
+sudo mknod /dev/nvidia-uvm c 235 0 2>/dev/null
+sudo mknod /dev/nvidia-uvm-tools c 235 1 2>/dev/null
+sudo chmod 666 /dev/nvidia-uvm* 2>/dev/null
+echo "uvm loaded: $(lsmod | grep -c nvidia_uvm)"
 sleep 2
 cat > /tmp/cup.c <<'EOF'
 #include <cuda.h>
