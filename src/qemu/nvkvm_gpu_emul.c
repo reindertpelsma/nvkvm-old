@@ -35,6 +35,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pcie.h"
@@ -136,6 +137,15 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define LIBOS_REGION_STRIDE          32u
 #define LIBOS_REGION_LOC_SYSMEM      1u  /* enum: NONE,SYSMEM,FB (loc) */
 
+/* PTIMER — the GPU nanosecond clock.  On GA10x relocated to 0xbb0000:
+ * TIME_0 (low) = 0xbb0080, TIME_1 (high) = 0xbb0084 (confirmed by the call
+ * chain timeoutSet->tmrGetCurrentTimeEx->tmrGetTimeEx_GM107->_regRead).
+ * CRITICAL: must return a real, monotonically increasing counter — every RM
+ * timeout loop computes (now - start); a constant value never elapses and the
+ * driver spins forever.  Back it with QEMU's virtual clock (ns). */
+#define NV_PTIMER_TIME_0_GA10X       0x00BB0080u
+#define NV_PTIMER_TIME_1_GA10X       0x00BB0084u
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -180,6 +190,8 @@ static const char *nvkvm_reg_name(hwaddr off)
     case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT:      return "GFW_BOOT";
     case NV_PGSP_FALCON_CPUCTL:                              return "GSP_CPUCTL";
     case NV_PGSP_FALCON_HWCFG2:                              return "GSP_HWCFG2";
+    case NV_PTIMER_TIME_0_GA10X:                            return "PTIMER_TIME_0";
+    case NV_PTIMER_TIME_1_GA10X:                            return "PTIMER_TIME_1";
     default:             return NULL;
     }
 }
@@ -205,6 +217,14 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     case NV_PGSP_FALCON_CPUCTL: return NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE;
     /* M2 — GSP falcon has a RISC-V core, memory scrubbing done. */
     case NV_PGSP_FALCON_HWCFG2: return NV_PFALCON_FALCON_HWCFG2_RISCV_ENABLE_VAL;
+
+    /* M3 — PTIMER (GPU ns clock). Real monotonic counter from QEMU's virtual
+     * clock so RM timeout loops actually elapse (constant value => infinite
+     * spin). TIME_0 low 32 (5-bit aligned), TIME_1 high 32. */
+    case NV_PTIMER_TIME_0_GA10X:
+        return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & 0xFFFFFFE0u;
+    case NV_PTIMER_TIME_1_GA10X:
+        return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >> 32);
 
     default:             return 0;
     }
@@ -238,7 +258,9 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
     }
     uint64_t val = nvkvm_reg_read(s, off, size);
 
-    if (s->trace) {
+    /* Don't trace PTIMER reads — RM timeout loops poll them millions of times. */
+    if (s->trace && off != NV_PTIMER_TIME_0_GA10X &&
+        off != NV_PTIMER_TIME_1_GA10X) {
         const char *nm = nvkvm_reg_name(off);
         qemu_log("nvkvm-gpu[%s] #%llu BAR0 RD  off=0x%06llx sz=%u -> 0x%08llx%s%s\n",
                  s->chip->name, (unsigned long long)s->access_count++,
