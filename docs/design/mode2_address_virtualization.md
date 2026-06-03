@@ -124,6 +124,67 @@ it explicitly. Once the walk resolves, the GPFIFO/pushbuffer/semaphore read
 correctly and the init push completes (emulate-completion bucket); real compute
 channels then use category-6 "assigned" forwarding.
 
+## IMPLEMENTED + MEASURED 2026-06-04 (GA106, open 580.159.04 guest)
+
+Hardware bring-up turned the design into concrete findings. Read these before
+extending the side-table — they overturn two earlier assumptions.
+
+### The GSP-RM map op is PROMOTE_CTX, not FILL_PTE_MEM
+In GSP offload mode the legacy paravirt RPCs (ALLOC_MEMORY=4, MAP_MEMORY=7,
+MAP_MEMORY_DMA=14, DMA_FILL_PTE_MEM=27) **never fire**. The whole init runs on
+GSP_RM_ALLOC (103), GSP_RM_CONTROL (76), FREE (10). Leaf PTEs are filled
+GSP-side, so `nvkvm_walk_pdb` FAULTs on every GSP-managed VAS (the PDB root from
+`VASPACE_COPY_SERVER_RESERVED_PDES` 0x90f10106 only covers *reserved* PDEs, not
+arbitrary leaf PTEs). The GR/compute context-buffer mappings, however, ARE
+communicated to GSP via **`NV2080_CTRL_CMD_GPU_PROMOTE_CTX` (0x2080012b)**:
+`NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS` { hChanClient@+12, entryCount@+40,
+promoteEntry[]@+48 } with each 32-byte entry
+{ gpuPhysAddr@0, gpuVirtAddr@8, size@16, physAttr@24 }, physAttr[1:0] aperture
+(0=VIDMEM, 1/2=SYSMEM). **This is the #2 side-table capture point** and is
+implemented in `nvkvm_gpu_emul.c` (`nvkvm_snoop_promote_ctx` →
+`nvkvm_record_va_map`, keyed by hChanClient; `nvkvm_chan_translate` consults it
+first). Resolves every GR/compute channel — the path real matmul/LLM/Vulkan
+workloads use.
+
+### The wall: UVM-internal channel sysmem mappings are GSP-internal & UNOBSERVABLE
+cuInit hangs busy-polling (`uvm_gpu_semaphore_get_cpu_va`, process RUNNING) on
+the **UVM bootstrap CE channel's tracking semaphore** (client 0xc1d00001, class
+AMPERE_CHANNEL_GPFIFO_A 0xc56f, gpFifoVA 0x121010000, hVASpace=0). Facts:
+- That client allocates NO sysmem memory objects, NO os-descriptor, and never
+  calls PROMOTE_CTX. Its GPFIFO/pushbuffer/semaphore mappings are established
+  entirely **GSP-internally** — NO fn=76/103/10 RPC carries their physical.
+- The GPFIFO physical is observable ONLY via the CPU's BAR1 write (FB 0x3130000
+  for gpFifoVA 0x121010000). The pushbuffer (GP_ENTRY → VA 0x120000000) and the
+  tracking semaphore are **SYSMEM** (`uvm_gpu_semaphore_pool` is always
+  `UVM_APERTURE_SYS`); the CPU polls the semaphore in plain guest RAM (no BAR1
+  read seen). The GPU releases it via a CE SEM_RELEASE in the push:
+  payload = `(NvU32)(++channel->tracking_sem.queued_value)`, wait is
+  `completed >= queued` with **no hard timeout** (warns at 30 s, spins forever).
+- To satisfy it we must write the payload to the semaphore's **GPA**, which we
+  cannot derive: the push is unreadable (sysmem VA 0x120000000 in a GSP-managed
+  VAS) and no RPC conveys the GPA.
+
+### Consequence for the plan — two ways past the wall
+1. **Fuller fake-GSP page-table ownership.** When RM hands the channel's memory
+   descriptors (instanceMem/userd/ramfc are in the c56f alloc; FB) and GSP would
+   map the channel's GPFIFO/pushbuffer/semaphore, WE must allocate GPU-phys and
+   *write the leaf PTEs into our FB ourselves* so the walk resolves. The gap:
+   the sysmem pushbuffer/semaphore GPA is chosen by RM and not in the RPC stream
+   — so this still needs the GPA from somewhere.
+2. **Guest instrumentation (Mode-2 has no nvkvm guest module — stock driver).**
+   The decisive empirical step: add a printk in `uvm_channel_end_push`
+   (`uvm_channel.c`) dumping the channel's tracking-semaphore GPU VA + payload +
+   the backing sysmem **GPA**, and the pushbuffer GPA. With the GPA, forge the
+   release on the ch doorbell (write payload to the GPA via `pci_dma_write`).
+   This is user-endorsed (guest printk OK) and is the next concrete step.
+
+The deeper lesson: "fake the GSP" is leak-free for the boot/compute path
+(PROMOTE_CTX gives us the maps) but NOT for RM/UVM-internal channels whose
+mappings GSP would own end-to-end. Those need either (1) us to fully own those
+VASes' page tables, or (2) the eventual reverse-driver guest module reporting
+the GPU-phys↔GPA bookkeeping (the original design's premise — which the stock
+Mode-2 driver does not provide).
+
 ## Capture strategy: #2 primary (map-call side-table), #1 only for correctness
 
 Refined 2026-06-03 (user). Two ways to obtain the guest's GPU-VA → physical
