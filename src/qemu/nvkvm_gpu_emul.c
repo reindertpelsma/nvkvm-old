@@ -44,6 +44,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qom/object.h"
+#include "mode2_devinfo_ga106.h"  /* captured GA106 engine table (M5 replay) */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -481,6 +482,28 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     stl_le_p(cmd + 96, 1284u);             /* paramsSize */
                     memset(cmd + 120, 0, 1284);            /* numConstructedFalcons=0 */
                     stl_le_p(cmd + 56, 32u + 40u + 1284u); /* rpc.length = 1356 */
+                } else if (ctrl == 0x20801112u) {
+                    /* NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: replay the REAL
+                     * GA106 engine table captured from the host GSP (this control
+                     * is ROUTE_TO_PHYSICAL and cannot be answered empty — the
+                     * guest builds its engine/interrupt tables from it).  Params
+                     * @120: baseIndex@120, numEntries@124, bMore@128, entries@132
+                     * (each NV2080_CTRL_FIFO_DEVICE_ENTRY = 100B).  Single page
+                     * (bMore=0); for baseIndex>0 return an empty page. */
+                    uint32_t base = ldl_le_p(cmd + 120);
+                    uint32_t psize = 12u + 32u * DEVINFO_GA106_ENTRY_SIZE; /* 3212 */
+                    memset(cmd + 124, 0, psize - 4u);  /* clear numEntries..entries */
+                    if (base == 0) {
+                        stl_le_p(cmd + 124, DEVINFO_GA106_NUM_ENTRIES);
+                        cmd[128] = 0; /* bMore = NV_FALSE */
+                        memcpy(cmd + 132, devinfo_ga106_entries,
+                               sizeof(devinfo_ga106_entries));
+                    } else {
+                        stl_le_p(cmd + 124, 0);
+                        cmd[128] = 0;
+                    }
+                    stl_le_p(cmd + 96, psize);             /* paramsSize = 3212 */
+                    stl_le_p(cmd + 56, 32u + 40u + psize); /* rpc.length = 3284 */
                 }
             }
             if (s->trace) {
