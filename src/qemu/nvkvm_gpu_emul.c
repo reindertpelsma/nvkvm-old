@@ -523,9 +523,29 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 if (GSPSTATICINFO_GA106_SIZE >= NVKVM_GSPSTATIC_BAR2PDEBASE_OFF + 8) {
                     s->bar2_pdb = ldq_le_p(gspstaticinfo_ga106 + NVKVM_GSPSTATIC_BAR2PDEBASE_OFF);
                     s->bar2_virtual = (s->bar2_pdb != 0);
-                    qemu_log("nvkvm-gpu[%s] M6: BAR2 PDB from GSP static info = "
-                             "0x%llx (virtual)\n", s->chip->name,
-                             (unsigned long long)s->bar2_pdb);
+                    qemu_log("nvkvm-gpu[%s] M6: BAR2 root PDB (GSP static) = 0x%llx\n",
+                             s->chip->name, (unsigned long long)s->bar2_pdb);
+                }
+            }
+            if (fn == 70) {
+                /* UPDATE_BAR_PDE (fn 70): on bare-metal GSP-client the GSP binds
+                 * BAR2; the kernel sends GSP the BAR2 root PDE to write into the
+                 * bound root page directory (kern_bus.c:880).  Body @ element+80:
+                 * barType@80 (1=BAR2), entryValue@88 (the root PDE -> kernel's
+                 * next-level table), entryLevelShift@96.  We emulate the bind by
+                 * writing entryValue into our FB backing at the GSP root PDB
+                 * (bar2_pdb) index 0 — the GMMU walk then follows it into the
+                 * kernel's page tables (already in FB via PRAMIN). */
+                uint32_t bartype = ldl_le_p(cmd + 80);
+                uint64_t entryval = ldq_le_p(cmd + 88);
+                uint64_t lvlshift = ldq_le_p(cmd + 96);
+                if (bartype == 1 /* NV_RPC_UPDATE_PDE_BAR_2 */ && s->bar2_pdb) {
+                    nvkvm_fb_write(s, s->bar2_pdb, entryval, 8);
+                    qemu_log("nvkvm-gpu[%s] M6: UPDATE_BAR_PDE BAR2 root[0] @ "
+                             "0x%llx <- 0x%llx (shift=%llu)\n", s->chip->name,
+                             (unsigned long long)s->bar2_pdb,
+                             (unsigned long long)entryval,
+                             (unsigned long long)lvlshift);
                 }
             }
             if (s->trace && (fn == 76 || fn == 65)) {
