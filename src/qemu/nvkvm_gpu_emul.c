@@ -194,6 +194,9 @@ struct NvkvmGpuEmul {
     /* M3 — GSP-RPC message queue */
     uint32_t mbox0, mbox1;   /* GSP falcon mailbox halves (LibOS boot-args GPA) */
     bool     bootargs_dumped;/* one-shot: read+log the queue region once        */
+    bool     fwsec_ran;      /* set when GSP falcon STARTCPU written: FWSEC "ran"
+                              * -> WPR2 becomes "initialized" (stateful: the
+                              * driver checks WPR2 DOWN before FWSEC, UP after).  */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -258,9 +261,10 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     case NV_PSEC_FALCON_CPUCTL:    return NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE;
     case NV_PSEC_FALCON_HWCFG2:    return 0;
 
-    /* M3 — WPR2 "initialized" by FWSEC (HI_VAL != 0, HI > LO). */
-    case NV_PFB_PRI_MMU_WPR2_ADDR_LO: return NVKVM_WPR2_LO_VAL;
-    case NV_PFB_PRI_MMU_WPR2_ADDR_HI: return NVKVM_WPR2_HI_VAL;
+    /* M3 — WPR2 is stateful: DOWN (0) until FWSEC "runs" (GSP STARTCPU), then
+     * UP.  The driver requires WPR2 down before FWSEC, up after. */
+    case NV_PFB_PRI_MMU_WPR2_ADDR_LO: return s->fwsec_ran ? NVKVM_WPR2_LO_VAL : 0;
+    case NV_PFB_PRI_MMU_WPR2_ADDR_HI: return s->fwsec_ran ? NVKVM_WPR2_HI_VAL : 0;
 
     default:             return 0;
     }
@@ -363,6 +367,18 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
 {
     NvkvmGpuEmul *s = opaque;
 
+    /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
+     * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
+    if ((off == NV_PGSP_FALCON_CPUCTL || off == 0x00110130u) && (val & 0x2u)) {
+        if (!s->fwsec_ran) {
+            s->fwsec_ran = true;
+            if (s->trace) {
+                qemu_log("nvkvm-gpu[%s] M3: GSP STARTCPU -> FWSEC ran, WPR2 up\n",
+                         s->chip->name);
+            }
+        }
+    }
+
     /* M3: capture the LibOS boot-args GPA from the GSP falcon mailboxes. */
     if (off == NV_PGSP_FALCON_MAILBOX0) {
         s->mbox0 = (uint32_t)val;
@@ -438,6 +454,7 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     s->mbox0 = 0;
     s->mbox1 = 0;
     s->bootargs_dumped = false;
+    s->fwsec_ran = false;
 
     /* M2: load the VBIOS image for the PROM window (if a path was given). */
     s->vbios = NULL;
