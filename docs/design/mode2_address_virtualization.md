@@ -110,19 +110,47 @@ it explicitly. Once the walk resolves, the GPFIFO/pushbuffer/semaphore read
 correctly and the init push completes (emulate-completion bucket); real compute
 channels then use category-6 "assigned" forwarding.
 
+## Capture strategy: #2 primary (map-call side-table), #1 only for correctness
+
+Refined 2026-06-03 (user). Two ways to obtain the guest's GPU-VA → physical
+mappings:
+
+- **#2 — reconstruct from the map/alloc calls (PRIMARY).** As the guest issues
+  the RM ops that *establish* a mapping (channel alloc's gpFifoOffset, MAP_MEMORY
+  / MAP_MEMORY_DMA, UVM maps), record `GPU-VA span → physical (GPU-phys/GPA) →
+  owning context/channel` in a side-table. `chan_translate` (and the forwarder)
+  consult this table directly — **no page-table walk / VAS-root needed.** This is
+  better because it inherently ties the virtualized GPU-physical to a context
+  (the unit of forwarding/isolation). **This is also the fix for the current
+  UVM-channel blocker**: capture the op that placed the GPFIFO at GPU-VA
+  0x121010000 → its physical, instead of trying to walk the device-default VAS
+  we can't root.
+- **#1 — intercept PTE writes (CORRECTNESS-ONLY, possibly skippable).** Needed
+  only for the "unassigned" case: GPU-phys written with data *before* any context
+  maps it (anonymous RM/UVM data later transferred into a context). **If the
+  guest never writes a GPU-phys range before it is mapped to a context (always
+  alloc→map→write, never write→map), #1 is unnecessary** and we rely on
+  clear-on-assign. Worth verifying empirically; early evidence supports skipping:
+  `DMA_FILL_PTE_MEM` is never used in our run, and CPU-RM PTE writes go via
+  PRAMIN (already visible). Action: instrument for a write to a GPU-phys range
+  that precedes its first map-to-context; if it never fires, drop #1.
+
 ## Implementation order (proposed)
 
-1. **Capture all VAS root PDBs** — find every RPC/path where the guest module
-   communicates a VAS page-dir base (device-default VAS included); index by VAS
-   handle AND make `chan_exec` resolve via the channel's true VAS. Unblocks the
-   UVM channel (chain #2, sysmem GPFIFO).
-2. **Range translator** — generalize `nvkvm_walk_pdb` into a batched GPU-VA-span
-   → physical-range translator with the GPU-phys category model, reading PTEs
-   across FB/sysmem apertures.
+1. **Map-call side-table (#2)** — snoop the RM ops that establish GPU-VA →
+   physical mappings (channel alloc gpFifoOffset, MAP_MEMORY/MAP_MEMORY_DMA, UVM
+   maps), record `GPU-VA span → physical → context` in a table; `chan_translate`
+   consults it (no VAS-root/page-table walk). Unblocks the UVM channel: capture
+   what placed the GPFIFO at 0x121010000. Also instrument the write-before-map
+   check to confirm #1 is skippable.
+2. **Range translator** — keep the PDB-walk fallback for VASes we *can* root
+   (already works for snooped channels), but the side-table is authoritative;
+   batch GPU-VA spans → physical ranges, FB/sysmem apertures.
 3. **Category state machine** — track GPU-phys pages (1–7); default unallocated,
    clear-on-assign simplification; lazy FB.
 4. **Chain #1 (BAR/MMIO install)** and **chain #2 (GPA via KVM slots)** wired to
    the stub: assigned pages become real host-context mmaps installed at the
    guest GPA (the double-mmap + GPA window).
 
-Steps 1–2 unblock cuInit/UVM; 3–4 are the parity compute path.
+Step 1 unblocks cuInit/UVM (and is the primary capture); 3–4 are the parity
+compute path. PTE-interception (#1) only if the write-before-map check fires.
