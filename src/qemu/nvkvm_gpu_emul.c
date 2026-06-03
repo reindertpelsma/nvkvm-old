@@ -812,6 +812,18 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         s->bar0_window = (uint32_t)val;
         return;
     }
+    /* M5 — work-submit doorbell.  Detect the channel submission (the guest wrote
+     * the work-submit token).  TODO(M5): execute the channel — walk its GPFIFO ->
+     * pushbuffer -> CE semaphore release and write the payload so the driver's
+     * channelWaitForFinishPayload poll completes (currently times out at
+     * ce_utils.c:349).  For now, log it so the doorbell offset/token are
+     * confirmed against the GA100 HAL. */
+    if (off == NVKVM_VF_DOORBELL) {
+        qemu_log("nvkvm-gpu[%s] M5: DOORBELL ring, workSubmitToken=0x%08x "
+                 "(runlist/chId) -- channel submitted, completion TODO\n",
+                 s->chip->name, (uint32_t)val);
+        return;
+    }
     /* M6: NV_PBUS_BAR2_BLOCK (0x1714) PTR[27:0] = BAR2 instance-block FB addr
      * (in NV_RAMIN_BASE_SHIFT=12 units).  Caches the page-dir base source for
      * the BAR2 GMMU walk. */

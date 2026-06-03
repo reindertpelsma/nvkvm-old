@@ -85,6 +85,15 @@
  * MODE bit31 (1=VIRTUAL/0=PHYSICAL). NOTE: on bare-metal GSP-client the CPU bind
  * is a no-op (GSP binds BAR2); the PDB comes from GspStaticConfigInfo instead. */
 #define NVKVM_VF_BAR2_BLOCK 0x00B80F48u
+/* M5 — work-submit doorbell: kfifoUpdateUsermodeDoorbell_GA100 does
+ * GPU_VREG_WR32(NV_VIRTUAL_FUNCTION_DOORBELL=0x30090) with the work-submit token
+ * (DOORBELL_VECTOR[11:0]=chId, RUNLIST_ID[22:16]).  TODO(M5): the absolute BAR0
+ * offset is UNCONFIRMED — a probe at 0xB82200 saw ZERO rings, so the usermode
+ * doorbell aperture (NV_USERMODE / GPU_VREG base) is NOT at 0xB80000+off and may
+ * be a separate BAR/region the emulator doesn't route yet.  First M5 task: find
+ * where the guest writes the token (trace all BARs incl. BAR1/usermode), then
+ * execute the channel (GPFIFO->pushbuffer->CE semaphore release). */
+#define NVKVM_VF_DOORBELL   0x00030090u  /* relative; base TBD */
 #define NVKVM_BAR2_BLOCK_PTR_SHIFT 12         /* instblk addr = PTR << 12 */
 #define NVKVM_BAR2_BLOCK_MODE_VIRTUAL 0x80000000u /* MODE bit31 */
 
