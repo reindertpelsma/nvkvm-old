@@ -340,6 +340,56 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
     return val;
 }
 
+/* GSP msgq checksum: u64 XOR-fold over the element, returned folded to 32 bits
+ * (mirrors _checkSum32 in message_queue_priv.h). The driver requires the whole
+ * element to fold to 0, so the sender stores checkSum = fold(element|checkSum=0). */
+static uint32_t nvkvm_msgq_checksum32(const uint8_t *p, uint32_t len)
+{
+    uint64_t cs = 0;
+    for (uint32_t i = 0; i < len; i += 8) {   /* matches "while (p < pEnd)" */
+        cs ^= ldq_le_p(p + i);
+    }
+    return (uint32_t)(cs >> 32) ^ (uint32_t)cs;
+}
+
+/* M3 keystone step 2: post a GSP_INIT_DONE event into the GSP->CPU status queue
+ * so the driver's kgspWaitForRmInitDone -> rpcRecvPoll returns NV_OK and
+ * RmInitAdapter succeeds.  statusBase = shmem+statoff; entry slot 0 at
+ * statusBase+entryOff; element = GSP_MSG_QUEUE_ELEMENT (authTag[16]/aad[16]/
+ * checkSum@32/seqNum@36/elemCount@40/rpc@48) with rpc.function=GSP_INIT_DONE. */
+static void nvkvm_m3_post_init_done(NvkvmGpuEmul *s, uint64_t statusBase,
+                                    uint32_t entryOff)
+{
+    PCIDevice *pdev = &s->parent_obj;
+    uint8_t el[4096];           /* GSP_MSG_QUEUE_ELEMENT_SIZE_MIN */
+    memset(el, 0, sizeof(el));
+
+    stl_le_p(el + 40, 1);            /* elemCount = 1 */
+    /* rpc_message_header_v03_00 at offset 48 (HDR_SIZE) */
+    stl_le_p(el + 48, 0x03000000u);  /* header_version MAJOR=3 MINOR=0 */
+    stl_le_p(el + 52, 0x43505256u);  /* signature NV_VGPU_MSG_SIGNATURE_VALID */
+    stl_le_p(el + 56, 36u);          /* length = sizeof(rpc_message_header_v03_00) */
+    stl_le_p(el + 60, 0x1001u);      /* function = NV_VGPU_MSG_EVENT_GSP_INIT_DONE */
+    stl_le_p(el + 64, 0u);           /* rpc_result = NV_OK */
+    stl_le_p(el + 36, 0u);           /* seqNum = 0 (first GSP->CPU message) */
+    /* checksum over HDR_SIZE(48) + rpc.length(36), with checkSum field = 0 */
+    stl_le_p(el + 32, nvkvm_msgq_checksum32(el, 48 + 36));
+
+    uint64_t entryGpa = statusBase + entryOff;
+    if (pci_dma_write(pdev, entryGpa, el, sizeof(el)) != MEMTX_OK) {
+        qemu_log("nvkvm-gpu[%s] M3: post GSP_INIT_DONE write failed\n",
+                 s->chip->name);
+        return;
+    }
+    /* bump status-queue tx header writePtr (offset 16) to 1 */
+    uint8_t wp[4];
+    stl_le_p(wp, 1);
+    pci_dma_write(pdev, statusBase + 16, wp, sizeof(wp));
+    qemu_log("nvkvm-gpu[%s] M3: posted GSP_INIT_DONE @0x%llx, writePtr=1 "
+             "-> RmInitAdapter should succeed\n", s->chip->name,
+             (unsigned long long)entryGpa);
+}
+
 /* M3-step-1: read the LibOS init-args region array from guest RAM at the GPA
  * the driver programmed into the mailboxes, log each region, and (for the
  * SYSMEM message-queue region) dump the command-queue msgqTxHeader.  This
@@ -417,6 +467,9 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                                      ldl_le_p(txh+0), ldl_le_p(txh+4),
                                      ldl_le_p(txh+8), ldl_le_p(txh+12),
                                      ldl_le_p(txh+24), ldl_le_p(txh+28));
+                            /* step 2: post GSP_INIT_DONE into entry slot 0 */
+                            nvkvm_m3_post_init_done(s, shmem + statoff,
+                                                    ldl_le_p(txh + 28));
                         }
                     }
                 }
