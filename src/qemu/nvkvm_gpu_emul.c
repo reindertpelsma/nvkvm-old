@@ -469,13 +469,19 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
              * host-captured), so the echo only gets void/SET controls through. */
             if (fn == 76) {
                 stl_le_p(cmd + 92, 0); /* rpc_gsp_rm_control_v.status = NV_OK */
-                /* NOTE: GET controls (e.g. GET_CONSTRUCTED_FALCON_INFO 0x208001b0
-                 * at cmd@88) cannot be answered by a fabricated flat params
-                 * struct — the response is FINN-serialized and the driver's
-                 * serverDeserializeCtrlUp rejects an un-framed payload with 0x3a
-                 * even for numConstructedFalcons=0.  GET controls need REAL
-                 * FINN-serialized responses: capture them from a host GSP (M5),
-                 * or implement FINN ser/deser.  Echo only carries void/SET. */
+                /* CORRECTED (audit #7 vs 580 source): GET_CONSTRUCTED_FALCON_INFO
+                 * (0x208001b0) is NOT FINN-serialized in 580 (only GET_ENGINES /
+                 * GET_ENGINE_CLASSLIST / RPC_GSP_TEST are), so the response is
+                 * flat-copied — a fabricated empty response IS structurally valid.
+                 * Body@80: cmd@88, status@92, paramsSize@96, params@120.  Provide
+                 * numConstructedFalcons=0; params struct = 4 + 0x40*20 = 1284;
+                 * rpc.length@56 = 32(hdr)+40(body)+1284 = 1356. */
+                uint32_t ctrl = ldl_le_p(cmd + 88);
+                if (ctrl == 0x208001b0u) {
+                    stl_le_p(cmd + 96, 1284u);             /* paramsSize */
+                    memset(cmd + 120, 0, 1284);            /* numConstructedFalcons=0 */
+                    stl_le_p(cmd + 56, 32u + 40u + 1284u); /* rpc.length = 1356 */
+                }
             }
             if (s->trace) {
                 qemu_log("nvkvm-gpu[%s] M4:   cmd rpc: len=%u seq(rpc)=%u "
@@ -505,7 +511,24 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 }
             }
         }
-        s->cmd_readptr++;
+        /* Advance by the command's ELEMENT COUNT, not by 1.  A GSP_MSG_QUEUE
+         * message spans ceil((HDR_SIZE(48) + rpc.length) / SIZE_MIN(4096))
+         * queue elements; large controls (e.g. 0x20800a41 paramsSize=8204 =>
+         * 3 elements) occupy continuation elements that carry raw payload, NOT
+         * rpc headers.  Reading them as separate commands posted bogus fn=0
+         * len=0 responses that later failed the driver's
+         * GspMsgQueueReceiveStatus ("Incorrect message length 0", msgLen <
+         * sizeof(GSP_MSG_QUEUE_ELEMENT)=80) -> NV_ERR_INVALID_PARAM_STRUCT 0x3a.
+         * The continuation elements are consumed silently (one response per
+         * logical command). */
+        {
+            uint32_t msglen = 48u + ldl_le_p(cmd + 56);
+            uint32_t elems = (msglen + 4095u) / 4096u;
+            if (elems == 0) {
+                elems = 1;
+            }
+            s->cmd_readptr += elems;
+        }
     }
     /* ack consumption: we are the RX side of the cmd queue (rx header readPtr
      * at cmd_base + rxHdrOff(0x20)). */
