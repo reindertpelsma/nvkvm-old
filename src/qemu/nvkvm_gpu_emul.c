@@ -125,6 +125,17 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define NV_PGSP_FALCON_HWCFG2        0x001100F4u
 #define NV_PFALCON_FALCON_HWCFG2_RISCV_ENABLE_VAL 0x00000400u /* bit 10 */
 
+/* M3 — GSP-RPC. The driver hands the LibOS init-args descriptor GPA via the
+ * GSP falcon mailboxes (kgspProgramLibosBootArgsAddr_TU102). We capture it and
+ * read the message-queue shared region from guest RAM. See
+ * docs/design/mode2_m3_gsp_rpc.md. */
+#define NV_PGSP_FALCON_MAILBOX0      0x00110040u
+#define NV_PGSP_FALCON_MAILBOX1      0x00110044u
+/* LibosMemoryRegionInitArgument: {u64 id8; u64 pa; u64 size; u8 kind; u8 loc;}
+ * padded to 8 → 32-byte stride. */
+#define LIBOS_REGION_STRIDE          32u
+#define LIBOS_REGION_LOC_SYSMEM      1u  /* enum: NONE,SYSMEM,FB (loc) */
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -147,6 +158,10 @@ struct NvkvmGpuEmul {
     char    *vbios_path;     /* "vbios=" property: file with a real VBIOS dump */
     uint8_t *vbios;          /* loaded image (NV_PROM_DATA_SIZE bytes, padded)  */
     uint64_t prom_reads;     /* count (don't per-access trace — VBIOS is ~1 MiB)*/
+
+    /* M3 — GSP-RPC message queue */
+    uint32_t mbox0, mbox1;   /* GSP falcon mailbox halves (LibOS boot-args GPA) */
+    bool     bootargs_dumped;/* one-shot: read+log the queue region once        */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -233,10 +248,73 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
     return val;
 }
 
+/* M3-step-1: read the LibOS init-args region array from guest RAM at the GPA
+ * the driver programmed into the mailboxes, log each region, and (for the
+ * SYSMEM message-queue region) dump the command-queue msgqTxHeader.  This
+ * proves the GPA path and gives ground truth before we synthesize responses. */
+static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
+{
+    uint64_t gpa = ((uint64_t)s->mbox1 << 32) | s->mbox0;
+    PCIDevice *pdev = &s->parent_obj;
+
+    qemu_log("nvkvm-gpu[%s] M3: LibOS boot-args GPA = 0x%016llx\n",
+             s->chip->name, (unsigned long long)gpa);
+    if (gpa == 0) {
+        return;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        uint8_t e[LIBOS_REGION_STRIDE];
+        if (pci_dma_read(pdev, gpa + (uint64_t)i * LIBOS_REGION_STRIDE,
+                         e, sizeof(e)) != MEMTX_OK) {
+            qemu_log("nvkvm-gpu[%s] M3:  region[%d] read failed\n",
+                     s->chip->name, i);
+            break;
+        }
+        uint64_t id8  = ldq_le_p(e + 0);
+        uint64_t pa   = ldq_le_p(e + 8);
+        uint64_t sz   = ldq_le_p(e + 16);
+        uint8_t  kind = e[24];
+        uint8_t  loc  = e[25];
+        if (id8 == 0 && pa == 0 && sz == 0) {
+            break; /* end of array */
+        }
+        qemu_log("nvkvm-gpu[%s] M3:  region[%d] id8=0x%016llx pa=0x%016llx "
+                 "size=0x%llx kind=%u loc=%u\n", s->chip->name, i,
+                 (unsigned long long)id8, (unsigned long long)pa,
+                 (unsigned long long)sz, kind, loc);
+
+        /* The message-queue shared region is the SYSMEM one; peek its
+         * command-queue msgqTxHeader (32 bytes at pa). */
+        if (loc == LIBOS_REGION_LOC_SYSMEM && sz >= 0x40000) {
+            uint8_t h[32];
+            if (pci_dma_read(pdev, pa, h, sizeof(h)) == MEMTX_OK) {
+                qemu_log("nvkvm-gpu[%s] M3:   cmdq txHdr ver=%u size=0x%x "
+                         "msgSize=%u msgCount=%u writePtr=%u flags=0x%x "
+                         "rxHdrOff=0x%x entryOff=0x%x\n", s->chip->name,
+                         ldl_le_p(h+0), ldl_le_p(h+4), ldl_le_p(h+8),
+                         ldl_le_p(h+12), ldl_le_p(h+16), ldl_le_p(h+20),
+                         ldl_le_p(h+24), ldl_le_p(h+28));
+            }
+        }
+    }
+}
+
 static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
+
+    /* M3: capture the LibOS boot-args GPA from the GSP falcon mailboxes. */
+    if (off == NV_PGSP_FALCON_MAILBOX0) {
+        s->mbox0 = (uint32_t)val;
+    } else if (off == NV_PGSP_FALCON_MAILBOX1) {
+        s->mbox1 = (uint32_t)val;
+        if (!s->bootargs_dumped && (s->mbox0 | s->mbox1)) {
+            s->bootargs_dumped = true;
+            nvkvm_m3_dump_bootargs(s);
+        }
+    }
 
     if (s->trace) {
         const char *nm = nvkvm_reg_name(off);
@@ -299,6 +377,9 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     s->chip = chip;
     s->access_count = 0;
     s->prom_reads = 0;
+    s->mbox0 = 0;
+    s->mbox1 = 0;
+    s->bootargs_dumped = false;
 
     /* M2: load the VBIOS image for the PROM window (if a path was given). */
     s->vbios = NULL;
