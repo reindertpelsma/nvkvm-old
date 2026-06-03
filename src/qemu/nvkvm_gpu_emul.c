@@ -1126,23 +1126,17 @@ static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
  * itself is assumed to live in FB (the GSP-client RM allocates the page directory
  * from FB, as for BAR2) — read via the PRAMIN/FB backing.  Returns
  * NVKVM_GMMU_FAULT on any miss (caller then does nothing — safe). */
-static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
+/* Walk VER2 from an explicit page-directory base `pdb`.  Returns the physical
+ * address (and *out_sys = leaf in sysmem) or NVKVM_GMMU_FAULT. */
+static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
+                               bool *out_sys)
 {
     *out_sys = false;
-    /* Root the walk at the VAS page-directory base whose VA range contains `va`
-     * (snooped from VASPACE_COPY_SERVER_RESERVED_PDES) — the GSP-managed channel
-     * instance block is empty in our FB so we can't read the PDB from it. */
-    uint64_t tbl = 0;
-    for (int i = 0; i < s->chan_vas_n; i++) {
-        if (s->chan_vas[i].hvas == s->chan_hvaspace) {
-            tbl = s->chan_vas[i].pdb;
-            break;
-        }
-    }
+    uint64_t tbl = pdb;
     if (tbl == 0) {
         return NVKVM_GMMU_FAULT;
     }
-    /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE) — page tables in FB. */
+    /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE); aperture per level. */
     bool tsys = false;     /* PDB in FB; each PDE aperture says where next lives */
     static const struct { int hi, lo; } lvl[3] = { {48,47}, {46,38}, {37,29} };
     for (int i = 0; i < 3; i++) {
@@ -1196,6 +1190,29 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
         return NVKVM_GMMU_FAULT;
     }
     return page + (va & ((1ull << pgshift) - 1));
+}
+
+/* Translate a channel GPU VA by trying every snooped VAS PDB (from
+ * VASPACE_COPY_SERVER_RESERVED_PDES) and returning the first that resolves.  The
+ * channel's pushbuffer/sema live in its own VAS, but the scrubber's vid/sys test
+ * surfaces may be in a different VAS, so match by which PD actually maps the VA
+ * (a valid leaf PTE) rather than by the channel's hVASpace handle. */
+static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
+{
+    /* Prefer the channel's own hVASpace first (fast path / disambiguation). */
+    for (int i = 0; i < s->chan_vas_n; i++) {
+        if (s->chan_vas[i].hvas == s->chan_hvaspace) {
+            uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, va, out_sys);
+            if (p != NVKVM_GMMU_FAULT) { return p; }
+            break;
+        }
+    }
+    for (int i = 0; i < s->chan_vas_n; i++) {
+        uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, va, out_sys);
+        if (p != NVKVM_GMMU_FAULT) { return p; }
+    }
+    *out_sys = false;
+    return NVKVM_GMMU_FAULT;
 }
 
 /* M5 — read/write a 32-bit word at a PHYSICAL address in either aperture. */
