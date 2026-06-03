@@ -395,6 +395,31 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                          (unsigned long long)shmem, ptec,
                          (unsigned long long)cmdoff, (unsigned long long)statoff,
                          (unsigned long long)(shmem + statoff));
+
+                /* M3 keystone step 1: init the GSP->CPU status-queue tx header
+                 * so the driver's msgqRxLink links (it polls forever otherwise).
+                 * The status queue is structurally identical to the cmd queue
+                 * (same size/msgSize/align), so copy the driver's known-good
+                 * cmd-queue tx header verbatim, with writePtr=0 (no messages
+                 * yet).  GSP is the TX side of the status queue. */
+                if (shmem && statoff) {
+                    uint8_t txh[32];
+                    if (pci_dma_read(pdev, shmem + cmdoff, txh, sizeof(txh))
+                            == MEMTX_OK) {
+                        stl_le_p(txh + 16, 0); /* writePtr = 0 */
+                        if (pci_dma_write(pdev, shmem + statoff, txh,
+                                          sizeof(txh)) == MEMTX_OK) {
+                            qemu_log("nvkvm-gpu[%s] M3:   wrote status-queue tx "
+                                     "header @0x%llx (ver=%u size=0x%x msgSize=%u "
+                                     "msgCount=%u rxHdrOff=0x%x entryOff=0x%x) "
+                                     "-> msgqRxLink should link\n", s->chip->name,
+                                     (unsigned long long)(shmem + statoff),
+                                     ldl_le_p(txh+0), ldl_le_p(txh+4),
+                                     ldl_le_p(txh+8), ldl_le_p(txh+12),
+                                     ldl_le_p(txh+24), ldl_le_p(txh+28));
+                        }
+                    }
+                }
             }
         }
     }
