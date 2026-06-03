@@ -101,6 +101,9 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
  * at paramsSize=24580 (+120 hdr); round up with headroom. */
 #define NVKVM_RESP_MAX 40960u
 
+/* GMMU walk "no translation" sentinel (returned by nvkvm_{bar2,chan}_translate). */
+#define NVKVM_GMMU_FAULT        (~0ull)
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -168,6 +171,9 @@ struct NvkvmGpuEmul {
     uint64_t chan_gpfifo_va;   /* gpFifoOffset: GPU VA of the channel's GPFIFO ring */
     uint32_t chan_gpfifo_ent;  /* gpFifoEntries */
     uint32_t chan_class;       /* hClass of the tracked channel                     */
+    uint64_t chan_inst_block;  /* instanceMem.base: channel instance block (PDB src)*/
+    bool     chan_inst_sys;    /* instanceMem.addressSpace == ADDR_SYSMEM(1)        */
+    uint32_t chan_payload;     /* completion payload counter (incr per doorbell)    */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -513,10 +519,14 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 s->chan_class      = hclass;
                 s->chan_gpfifo_va  = ldq_le_p(cmd + 120);
                 s->chan_gpfifo_ent = ldl_le_p(cmd + 128);
+                s->chan_inst_block = ldq_le_p(cmd + 256);   /* instanceMem.base */
+                s->chan_inst_sys   = (ldl_le_p(cmd + 272) == 1u); /* ADDR_SYSMEM */
                 qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
-                         "0x%llx entries=%u (tracked for doorbell execution)\n",
+                         "0x%llx ent=%u instblk=0x%llx(%s)\n",
                          s->chip->name, hclass,
-                         (unsigned long long)s->chan_gpfifo_va, s->chan_gpfifo_ent);
+                         (unsigned long long)s->chan_gpfifo_va, s->chan_gpfifo_ent,
+                         (unsigned long long)s->chan_inst_block,
+                         s->chan_inst_sys ? "sys" : "fb");
             }
         }
         if (!async) {
@@ -808,6 +818,8 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
     }
 }
 
+static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys);
+
 static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
 {
@@ -846,11 +858,40 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
      * ce_utils.c:349).  For now, log it so the doorbell offset/token are
      * confirmed against the GA100 HAL. */
     if (off == NVKVM_VF_DOORBELL) {
-        qemu_log("nvkvm-gpu[%s] M5: DOORBELL token=0x%08x -> runlist=%u chId=%u "
-                 "-- channel submitted, execution TODO (GPFIFO->pb->CE sema)\n",
-                 s->chip->name, (uint32_t)val,
-                 NVKVM_DOORBELL_RUNLIST((uint32_t)val),
-                 NVKVM_DOORBELL_CHID((uint32_t)val));
+        /* Work submitted on the channel.  We don't run the CE; instead we
+         * complete the submission by advancing the channel's finish-payload
+         * semaphore, which is what channelWaitForFinishPayload polls.  Channel
+         * buffer layout [pushbuffer|GPFIFO|hostSema(4)|finishPayload(4)] with
+         * gpFifoOffset = pbGpuVA + channelPbSize, so the finish-payload VA =
+         * gpFifoOffset + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004.  Translate
+         * via the channel PDB and write the incrementing payload (RM submits
+         * payload = lastSubmittedPayload+1 starting at 1). */
+        uint64_t sema_va = s->chan_gpfifo_va + 0x8004ull;
+        bool is_sys = false;
+        uint64_t phys = s->chan_gpfifo_va
+            ? nvkvm_chan_translate(s, sema_va, &is_sys) : NVKVM_GMMU_FAULT;
+        if (phys != NVKVM_GMMU_FAULT) {
+            uint32_t payload = ++s->chan_payload;
+            if (is_sys) {
+                uint8_t b[4]; stl_le_p(b, payload);
+                pci_dma_write(&s->parent_obj, phys, b, 4);
+            } else {
+                nvkvm_fb_write(s, phys, payload, 4);
+            }
+            qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x rl=%u ch=%u -> "
+                     "completed: semaVA=0x%llx -> %s phys=0x%llx payload=%u\n",
+                     s->chip->name, (uint32_t)val,
+                     NVKVM_DOORBELL_RUNLIST((uint32_t)val),
+                     NVKVM_DOORBELL_CHID((uint32_t)val),
+                     (unsigned long long)sema_va, is_sys ? "SYS" : "FB",
+                     (unsigned long long)phys, payload);
+        } else {
+            qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x -> sema VA 0x%llx "
+                     "FAULTED (no completion); gpfifo=0x%llx instblk=0x%llx\n",
+                     s->chip->name, (uint32_t)val, (unsigned long long)sema_va,
+                     (unsigned long long)s->chan_gpfifo_va,
+                     (unsigned long long)s->chan_inst_block);
+        }
         return;
     }
     /* M6: NV_PBUS_BAR2_BLOCK (0x1714) PTR[27:0] = BAR2 instance-block FB addr
@@ -957,7 +998,6 @@ static const MemoryRegionOps nvkvm_aperture_ops = {
  * VER2 levels (kern_gmmu_fmt_gp10x.c): PD3 VA[48:47], PD2 [46:38], PD1 [37:29],
  * PD0 [28:21] (16B dual PDE), PT_small [20:12] (4 KiB) / PT_big [20:bigShift].
  * Entry addr = field<<shift; PTE/PDE ADDRESS_VID = bits 32:8 (<<12). */
-#define NVKVM_GMMU_FAULT        (~0ull)
 
 static uint64_t nvkvm_fb_rd64(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
@@ -1028,6 +1068,94 @@ static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
         return page + (va & 0xFFFFull);
     }
     return NVKVM_GMMU_FAULT;
+}
+
+/* M5 — translate a CHANNEL GPU VA to a physical address, rooted at the channel's
+ * own PDB (read from its instance block), and report whether the leaf page is in
+ * sysmem (GPA) or vidmem (FB) via *out_sys.  Unlike BAR2, channel buffers (the
+ * scrubber's pushbuffer/semaphore) live in SYSMEM, so the leaf PTE APERTURE
+ * (NV_MMU_VER2_PTE_APERTURE bits 2:1: 0=VID, 2/3=SYS) selects ADDRESS_VID
+ * (bits32:8) vs ADDRESS_SYS (bits53:8), both <<12.  The page-table hierarchy
+ * itself is assumed to live in FB (the GSP-client RM allocates the page directory
+ * from FB, as for BAR2) — read via the PRAMIN/FB backing.  Returns
+ * NVKVM_GMMU_FAULT on any miss (caller then does nothing — safe). */
+static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
+{
+    *out_sys = false;
+    if (s->chan_inst_block == 0) {
+        return NVKVM_GMMU_FAULT;
+    }
+    /* Read the channel PDB from the instance block (NV_RAMIN_PAGE_DIR_BASE
+     * word128 @ +0x200 = TARGET[1:0]+LO[31:12], word129 @ +0x204 = HI[31:0]). */
+    uint64_t w128, w129;
+    if (s->chan_inst_sys) {
+        uint8_t b[8];
+        PCIDevice *pdev = &s->parent_obj;
+        if (pci_dma_read(pdev, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF,
+                         b, 8) != MEMTX_OK) {
+            return NVKVM_GMMU_FAULT;
+        }
+        w128 = ldl_le_p(b); w129 = ldl_le_p(b + 4);
+    } else {
+        w128 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, 4);
+        w129 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, 4);
+    }
+    uint64_t tbl = (w128 & 0xFFFFF000ull) | (w129 << 32);
+    qemu_log("nvkvm-gpu[%s] M5: chan walk va=0x%llx instblk=0x%llx(%s) "
+             "w128=0x%llx w129=0x%llx PDB=0x%llx\n", s->chip->name,
+             (unsigned long long)va, (unsigned long long)s->chan_inst_block,
+             s->chan_inst_sys ? "sys" : "fb", (unsigned long long)w128,
+             (unsigned long long)w129, (unsigned long long)tbl);
+    if (tbl == 0) {
+        return NVKVM_GMMU_FAULT;
+    }
+    /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE) — page tables in FB. */
+    static const struct { int hi, lo; } lvl[3] = { {48,47}, {46,38}, {37,29} };
+    for (int i = 0; i < 3; i++) {
+        uint32_t idx = (uint32_t)((va >> lvl[i].lo) &
+                                  ((1ull << (lvl[i].hi - lvl[i].lo + 1)) - 1));
+        uint64_t pde = nvkvm_fb_rd64(s, tbl + (uint64_t)idx * 8);
+        uint64_t next = NVKVM_VER2_ADDR_VID(pde);
+        qemu_log("nvkvm-gpu[%s] M5:   PD%d idx=%u @0x%llx pde=0x%llx -> 0x%llx\n",
+                 s->chip->name, 3 - i, idx, (unsigned long long)(tbl + idx * 8),
+                 (unsigned long long)pde, (unsigned long long)next);
+        tbl = next;
+        if (tbl == 0) {
+            return NVKVM_GMMU_FAULT;
+        }
+    }
+    uint32_t idx0 = (uint32_t)((va >> 21) & 0xFF);
+    uint64_t lo = nvkvm_fb_rd64(s, tbl + (uint64_t)idx0 * 16);
+    uint64_t hi = nvkvm_fb_rd64(s, tbl + (uint64_t)idx0 * 16 + 8);
+    uint64_t small_tbl = (((hi >> 8) & ((1ull << 25) - 1)) << 12);
+    uint64_t big_tbl   = (((lo >> 4) & ((1ull << 28) - 1)) << 8);
+
+    uint64_t pte; uint32_t pgshift; uint64_t pgmask;
+    if (small_tbl != 0) {
+        pte = nvkvm_fb_rd64(s, small_tbl + (uint64_t)((va >> 12) & 0x1FF) * 8);
+        pgshift = 12; pgmask = 0xFFFull;
+    } else if (big_tbl != 0) {
+        pte = nvkvm_fb_rd64(s, big_tbl + (uint64_t)((va >> 16) & 0x1F) * 8);
+        pgshift = 16; pgmask = 0xFFFFull;
+    } else {
+        return NVKVM_GMMU_FAULT;
+    }
+    if (!(pte & 1)) {                       /* PTE VALID bit0 */
+        return NVKVM_GMMU_FAULT;
+    }
+    uint32_t aperture = (uint32_t)((pte >> 1) & 0x3);  /* APERTURE bits 2:1 */
+    uint64_t page;
+    if (aperture == 0) {                    /* VIDEO_MEMORY: ADDRESS_VID 32:8 */
+        page = ((pte >> 8) & ((1ull << 25) - 1)) << 12;
+        *out_sys = false;
+    } else if (aperture == 2 || aperture == 3) { /* SYSTEM_*: ADDRESS_SYS 53:8 */
+        page = ((pte >> 8) & ((1ull << 46) - 1)) << 12;
+        *out_sys = true;
+    } else {
+        return NVKVM_GMMU_FAULT;            /* PEER — unsupported */
+    }
+    (void)pgmask;
+    return page + (va & ((1ull << pgshift) - 1));
 }
 
 static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
