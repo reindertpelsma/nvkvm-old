@@ -26,6 +26,21 @@ to the host GPU via the existing Mode-1 core. Consequences:
 The Mode-1 present/console/readback work (commit `eaf90fc`) is **mode-agnostic**
 and reused as Mode-2's host-side display sink — not stranded.
 
+## Definition of done (north star, user 2026-06-03)
+
+Mode-2 is "done" when it passes the **same** acceptance suite Mode-1 already
+passes, at **host parity**, with the stock driver and no guest agent:
+- the 22-app real-application matrix (`tests/perf/run_matrix.sh`: PyTorch
+  CNN/ViT/BERT, HPC GEMM/FFT/nbody, crypto, gpu-burn, 7B LLM, Vulkan compute,
+  OpenGL render) — [[realapp_matrix_done]];
+- the host-vs-guest parity harness (`tests/perf/run_parity.sh`: GEMM/LLM/DMA
+  within a few % + byte-exact) — [[parity_harness_next]];
+- graphics (`run_graphics.sh`) and the desktop present path — [[present_path_b_done]].
+These already exist for Mode-1, so Mode-2 reuses them verbatim; the only
+difference is the device front end. Each milestone below is a step toward
+re-running that suite green. M5 = first app passes; the full matrix at parity is
+the finish line.
+
 ## Architecture
 
 ```
@@ -191,6 +206,16 @@ byte the guest controls → Rust core.
   PoC proceeds on GA106; generalize to a chip table once fake-the-boot →
   GSP_INIT_DONE works on the reference part.
 - **Confidential Compute stays OFF** (spike #8/§5.3) — never advertise CC.
+- **QEMU is unprivileged at runtime (user directive 2026-06-03).** In prod the
+  VMM process is unprivileged and may issue ONLY unprivileged nvidia ioctls
+  (the Mode-1 isolate/access model, [[access_model_split]]). Nothing on the
+  runtime host-GPU path may need root. The emulated device (BAR traps, register
+  answers, PROM/VBIOS serving, MSI-X) is pure userspace QEMU — unprivileged. The
+  **VBIOS image is a static provisioned asset**: dumping it from a host card
+  (driver unbind + BAR0 PROM mmap) is a one-time root *provisioning/debug* step,
+  not a runtime op — at runtime the unprivileged device just `fopen()`s the blob
+  and serves bytes. Downstream compute forwarding stays unprivileged-ioctl-only
+  inside the sandboxed per-process isolate, exactly as Mode-1.
 - **Closed driver / Windows** deferred (spike §5.4): same attestation conclusion,
   unverified poll/RPC set.
 

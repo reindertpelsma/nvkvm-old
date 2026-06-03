@@ -112,6 +112,19 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define NV_PROM_DATA_BASE 0x00300000u
 #define NV_PROM_DATA_SIZE 0x00100000u   /* 1 MiB window (dumped image is padded) */
 
+/* M2 — GSP falcon bring-up.  The driver resets/starts the GSP falcon to run
+ * FWSEC/Booter, then kflcnWaitForHalt_TU102 spin-polls CPUCTL_HALTED.  In
+ * fake-the-boot the falcon never runs, so we report it halted immediately.
+ * GSP falcon register block = NV_PGSP base 0x110000; CPUCTL = base + 0x100. */
+#define NV_PGSP_FALCON_CPUCTL        0x00110100u
+#define NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE 0x00000010u  /* bit 4 */
+
+/* GSP falcon HWCFG2 (base+0xf4): kflcnIsRiscvCpuEnabled_TU102 requires
+ * _RISCV=ENABLE (bit10); _MEM_SCRUBBING=DONE is value 0 (bit12 clear). So a
+ * RISCV-capable, scrubbing-done config = bit10 set only. */
+#define NV_PGSP_FALCON_HWCFG2        0x001100F4u
+#define NV_PFALCON_FALCON_HWCFG2_RISCV_ENABLE_VAL 0x00000400u /* bit 10 */
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -150,6 +163,8 @@ static const char *nvkvm_reg_name(hwaddr off)
     case NV_PMC_BOOT_42: return "PMC_BOOT_42";
     case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK: return "GFW_BOOT_PLM";
     case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT:      return "GFW_BOOT";
+    case NV_PGSP_FALCON_CPUCTL:                              return "GSP_CPUCTL";
+    case NV_PGSP_FALCON_HWCFG2:                              return "GSP_HWCFG2";
     default:             return NULL;
     }
 }
@@ -170,6 +185,11 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK: return 0xFFFFFFFFu;
     case NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT:
         return NV_PGC6_GFW_BOOT_PROGRESS_COMPLETED;
+
+    /* M2 — GSP falcon already halted (FWSEC/Booter "finished"). */
+    case NV_PGSP_FALCON_CPUCTL: return NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE;
+    /* M2 — GSP falcon has a RISC-V core, memory scrubbing done. */
+    case NV_PGSP_FALCON_HWCFG2: return NV_PFALCON_FALCON_HWCFG2_RISCV_ENABLE_VAL;
 
     default:             return 0;
     }
