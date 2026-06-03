@@ -199,3 +199,39 @@ NvLength cmdQueueOffset@16; NvLength statQueueOffset@24 }. Verified read:
    GSP_MSG_QUEUE_ELEMENT (zero authTag/aad, seqNum, elemCount, checkSum so the
    sum is 0), bump txHeader.writePtr, raise MSI-X.
 Then kgspWaitForRmInitDone returns NV_OK and RmInitAdapter succeeds = PoC gate.
+
+## M5 — GSP_RM_CONTROL forwarding (executable design, 2026-06-03)
+
+State: the echo shim drives the stock driver into RmInitNvDevice; the first RPC
+needing real data is GSP_RM_CONTROL (fn 76) / NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_
+FALCON_INFO (cmd 0x208001b0). Its params are FLAT (numConstructedFalcons +
+constructedFalconsTable[MAX], no embedded pointers) → FINN-serialized == flat, so
+the response can be copied verbatim once obtained from a real GPU.
+
+Two classes of GSP_RM_CONTROL:
+1. **GPU-static subdevice controls** (falcon info, FB/GPU caps, bus info, clock
+   ranges, …): the answer depends only on the silicon, not on guest-created
+   objects. QEMU opens its OWN host RM client/device/subdevice (unprivileged:
+   NV_ESC_RM_ALLOC root client 0x0 → NV01_DEVICE_0 → NV20_SUBDEVICE_0, then
+   NV_ESC_RM_CONTROL) and reissues the SAME cmd on its own subdevice, ignoring
+   the guest hClient/hObject, copying the flat response params + status=NV_OK
+   into the status-queue element. Handles the bulk of init queries.
+2. **Object/handle controls + GSP_RM_ALLOC** (allocations, vaspaces, channels):
+   reference guest-GSP-RM handles that don't exist on the host. These need the
+   guest→host handle-mapping layer — reuse the Mode-1 stub's handle translation
+   ([[hclient_not_fd_scoped]], [[rmclient_validate_strict_fix]]): forward
+   GSP_RM_ALLOC to create real host objects, record guest→host handle, and
+   rewrite handles on subsequent controls. This is the deep long-tail.
+
+Concrete next code step: in nvkvm_gpu_emul.c, at realize, open a host nvidia
+client+subdevice (port the alloc sequence from the Mode-1 stub / src/abi/nvgpu.h
+nvos21/nvos64 + NV_ESC_RM_CONTROL). In nvkvm_m3_service_cmdq, for fn==76 unwrap
+{cmd,paramsSize,params@elem+? } and, if cmd is in a GPU-static allowlist, issue
+NV_ESC_RM_CONTROL on the host subdevice with the flat params, copy the response
+back into the echoed element (params + body.status=NV_OK), recompute checksum.
+Start the allowlist with 0x208001b0; grow it per the trace. Keep QEMU
+unprivileged (queries only). This is the RPC->host-RM bridge = first compute (M5).
+
+Reference dump tool option: a standalone host C program issuing 0x208001b0 can
+capture the GA106 falcon table for record/replay if live-forward setup is
+deferred.
