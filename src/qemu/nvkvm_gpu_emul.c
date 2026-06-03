@@ -636,6 +636,9 @@ static void nvkvm_diag_broad(NvkvmGpuEmul *s, const char *what, uint32_t cc,
 
 static void nvkvm_diag_rpc(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn)
 {
+    if (!s->trace) {
+        return;                 /* verbose bring-up decode — gated behind -trace */
+    }
     if (fn == 103) {                                  /* GSP_RM_ALLOC */
         uint32_t hClient = ldl_le_p(cmd + 80), hParent = ldl_le_p(cmd + 84);
         uint32_t hObject = ldl_le_p(cmd + 88), hClass = ldl_le_p(cmd + 92);
@@ -1499,7 +1502,7 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
     /* DIAG: BAR1 reads landing in the low-FB region (where the UVM channel's
      * GPFIFO/USERD/semaphore live) — a poll spin shows up as repeated reads of
      * one address; that address is the completion semaphore the guest waits on. */
-    if (!sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
+    if (s->trace && !sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
         static uint64_t last_pa; static uint32_t rep; static uint32_t total;
         if (pa != last_pa) { last_pa = pa; rep = 0; }
         if ((rep++ % 4096) == 0 && total++ < 4000) {
@@ -1532,7 +1535,7 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
     }
     /* DIAG: BAR1 writes into the low-FB region reveal where the guest CPU lays
      * down the UVM channel's GPFIFO entry, pushbuffer, and inits the semaphore. */
-    if (!sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
+    if (s->trace && !sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
         static uint32_t total;
         if (total++ < 2000) {
             qemu_log("nvkvm-gpu[GA106] DIAG BAR1 WR off=0x%llx -> FB 0x%llx "
@@ -1843,7 +1846,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                  (unsigned long long)s->chan_gpfifo_va);
         /* DIAG: when content-pick fails, show what EACH snooped VAS resolves the
          * GPFIFO entry VA to (fault / phys+aperture) and the value read there. */
-        if (s->chan_pdb == 0) {
+        if (s->trace && s->chan_pdb == 0) {
             for (int i = 0; i < s->chan_vas_n; i++) {
                 bool sy = false;
                 uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, eva, &sy);
