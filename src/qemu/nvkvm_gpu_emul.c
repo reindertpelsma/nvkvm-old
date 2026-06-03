@@ -845,12 +845,13 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                              (unsigned long long)lvlshift);
                 }
             }
-            if (s->trace && (fn == 76 || fn == 65)) {
-                qemu_log("nvkvm-gpu[%s] M4:   fn=%u ctrl cmd=0x%x reqPsize=%u -> "
-                         "respPsize=%u status=0x%x rpclen=%u\n", s->chip->name, fn,
-                         ctrl, ldl_le_p(cmd + 96), ldl_le_p(resp + 96),
-                         ldl_le_p(resp + 92), ldl_le_p(resp + 56));
-            }
+            /* DIAG(init-stall): log every serviced RPC so we can see the last
+             * one before the 4s _threadNodeCheckTimeout.  fn=76 controls also
+             * print their ctrl cmd. */
+            qemu_log("nvkvm-gpu[%s] M4: RPC fn=%u cmd=0x%x reqPsize=%u -> "
+                     "respPsize=%u status=0x%x rpclen=%u\n", s->chip->name, fn,
+                     (fn == 76 ? ctrl : 0), ldl_le_p(cmd + 96), ldl_le_p(resp + 96),
+                     ldl_le_p(resp + 92), ldl_le_p(resp + 56));
             nvkvm_m3_post_status(s, resp, fn, 0 /* rpc_result NV_OK */);
         }
         /* Advance by the command's ELEMENT COUNT, not by 1.  A GSP_MSG_QUEUE
