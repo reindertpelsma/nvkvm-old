@@ -14,19 +14,54 @@ parity. QEMU stays UNPRIVILEGED.
 - The address-translation core (nvkvm_walk_pdb: guest GR-VA → GPA/FB, aperture-aware,
   2M/64K/4K) and channel tracking (gpfifo/USERD/instblk/doorbell) are already built.
 
-## Architecture: "host-backed GR channel, guest-driven"
-The guest RM is authoritative — it builds its own channel/VAS/context buffers in
-guest memory against the emulated device. We do NOT mirror all of that. Instead:
-- QEMU (the emulated device) talks to an UNPRIVILEGED host helper (reuse the
-  Mode-1 stub model: it holds the real RM client/device/subdevice/GR-context fds
-  and issues the host nvidia ioctls; QEMU never touches /dev/nvidia* directly).
-- The host helper sets up a real GR/compute channel + context on the host GPU.
-- The guest's GR pushbuffer submissions (doorbell → GPFIFO → methods, already
-  parsed for CE) are REPLAYED on the host channel.
-- Data stays in **guest RAM (GPAs)**; the host channel's VAS maps guest RAM
-  (RM OS-descriptor of the guest-RAM HVA — Mode-1's mechanism, unprivileged), so
-  guest GR-VA → GPA → host-GPU-VA. The host GPU reads kernels/inputs and writes
-  outputs directly into guest RAM. No bounce.
+## Architecture: DIRECT-MAP FIRST (user steer 2026-06-03), not trap-and-replay
+Decision principle (user): the production hot path is **userspace-mmap-only** — a
+CUDA app mmaps the channel USERD + work-submit doorbell and writes them directly
+(no kernel, no trap). So **trap-and-emulate of submissions is throwaway AND
+non-performant**; do NOT build it. Test for every GPU range: "would the guest
+kernel mmap this into userspace?" If yes (USERD, doorbell, semaphore surfaces) →
+**direct-map it to the real host-GPU MMIO/memory from the start.**
+
+The real axis is EMULATE vs FORWARD, not trap vs mmap:
+- FORBIDDEN — a GR/compute METHOD *emulator* (execute GR pushbuffers in QEMU).
+  THIS is the throwaway + non-performant thing. Never build it.
+- FINE & CHEAP — trap-to-FORWARD: trap the doorbell write and forward the token to
+  a real host channel. ~20 lines, NOT throwaway: it's a thin shim over the SAME
+  host-channel infra that direct-map also needs. Good correctness-first step.
+- PARITY FINISH — direct-map: forwarded-mmap the host doorbell/USERD MMIO into the
+  guest BAR so the guest writes it directly (no per-submit trap). Removes the only
+  cost of trap-to-forward (the per-submit trap+RTT latency).
+- BRING-UP ONLY — fake a one-time KERNEL-channel completion (CE scrubber, golden).
+  Not the hot path, not mmap'd; a ~10-line stepping stone to get the driver loaded.
+
+So the THROWAWAY risk is EMULATION, not trapping. The investment order:
+  1. Shared infra (the real bulk, needed either way): a real host channel whose
+     GPFIFO/pushbuffer = the guest's (guest RAM mapped into the host VAS via
+     OS-descriptor), so the host GPU runs the guest's actual work.
+  2. trap-to-forward the doorbell → CORRECTNESS (cheap, reuses step 1).
+  3. direct-map doorbell/USERD → PARITY (removes per-submit trap).
+  4. NEVER emulate GR methods.
+Step 1 dominates the effort and is identical for trap-forward and direct-map;
+2→3 is a small late swap, so we are not throwing work away by doing 2 first.
+
+Model: "host-backed channel, guest-driven, direct-mapped":
+- QEMU (emulated device) ↔ UNPRIVILEGED host helper (reuse the Mode-1 stub: holds
+  real RM client/device/GR-context fds, issues host nvidia ioctls; QEMU never
+  touches /dev/nvidia*).
+- At the guest's channel/context ALLOC (GSP_RM_ALLOC), allocate a REAL host-GPU
+  channel/context and arrange that the regions the guest RM will mmap to userspace
+  (USERD, doorbell/work-submit, semaphore) are **backed by the host channel's real
+  MMIO/memory** — so the guest userspace mmap resolves to host HW (forwarded mmap,
+  Mode-1 style). Guest doorbell write → real host doorbell → real HW. No trap, no
+  per-submit replay, parity.
+- Data stays in **guest RAM (GPAs)**; map guest RAM into the host context VAS
+  (RM OS-descriptor of the guest-RAM HVA — Mode-1, unprivileged). guest GR-VA →
+  GPA → host-GPU-VA; host GPU reads kernels/inputs + writes outputs into guest RAM.
+- The hard part (and the core of Phase B): Mode-2's guest RM CHOOSES its own
+  channel layout against the emulated device, so we must INTERCEPT the channel /
+  USERD / context-buffer allocs and substitute host-backed memory, so the
+  addresses the guest mmaps line up with host resources. This replaces the
+  submission-time replay layer the earlier draft leaned on.
 
 ## Golden context: content doesn't matter for BOOT
 Critical simplification: the guest's golden-context buffer content is only USED at
