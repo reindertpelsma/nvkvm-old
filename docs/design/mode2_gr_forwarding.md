@@ -107,3 +107,28 @@ need to produce a real golden image.
 - nvkvm_walk_pdb / nvkvm_chan_translate (VA→phys), channel tracking, doorbell,
   the GSP-RPC shim, the CE method parser (extend for GR/compute classes), and the
   Mode-1 stub (unprivileged host RM proxy + OS-descriptor guest-RAM mapping).
+
+## Security: host-side calls reuse the Mode-1 hardened stack (user requirement, 2026-06-03)
+No new ioctls are introduced by Mode-2. The guest issues its own ioctls to its own
+stock nvidia.ko inside the guest (a real driver — nothing to allowlist there). The
+reverse driver's HOST-side calls (allocating the real host GR channel/context,
+OS-descriptor of guest RAM, RM controls whose response data we replay, forwarded
+mmaps of USERD/doorbell) are the SAME RM ioctls Mode-1 already forwards. They MUST
+go through the identical hardened path Mode-1 uses — never a new unvalidated route:
+
+    emulated device (nvkvm_gpu_emul.c)
+      -> nvkvm_dispatch.c        (size / _IOC_SIZE / fd-presence validation)
+      -> nvkvm_isolate_handlers.c (the sanitizer: fd->handle rewrite, struct field
+                                   validation, prot/flag allowlist, alloc-class
+                                   allowlist nvkvm_fe_alloc_allowlist.h, OOB-read
+                                   kill-switch max(param_size,_IOC_SIZE))
+      -> unprivileged stub (nvkvm_stub.c) -> host /dev/nvidia* ioctl
+
+QEMU stays unprivileged; the stub stays in its rootless/namespaced/cap-less
+sandbox (nvkvm_isolate.c). Concretely: when nvkvm_gpu_emul needs a host RM op it
+hands a request to the dispatch/isolate layer (same struct path as a guest-
+originated ioctl), so every host call inherits Mode-1's arg/size/struct/fd
+validation for free. Implementation rule: do NOT add a side-channel that calls the
+stub or /dev/nvidia* directly from the emulated-device code — always go via
+nvkvm_dispatch so the sanitizer runs. This keeps the cross-VM/host boundary exactly
+as hardened as Mode-1 (see security audits) while adding compute forwarding.
