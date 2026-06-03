@@ -240,6 +240,14 @@ struct NvkvmGpuEmul {
     uint32_t stat_writeptr;  /* status queue monotonic writePtr == next seqNum   */
     uint32_t cmd_readptr;    /* cmd queue messages we've consumed/answered        */
 
+    /* M6 — GPU memory: sparse FB backing + BAR0 PRAMIN window.  The driver
+     * accesses VRAM before BAR2 is up via a 1MB window in BAR0 (NV_PRAMIN @
+     * 0x700000): it programs NV_PBUS_BAR0_WINDOW (0x1700) BASE=FBaddr>>16,
+     * TARGET=aperture, then reads/writes NV_PRAMIN+(FBaddr&0xffff).  We back
+     * that with a sparse page table so writes read back (kbusVerifyBar2). */
+    uint32_t bar0_window;    /* NV_PBUS_BAR0_WINDOW (0x1700): BASE[23:0]|TARGET[25:24] */
+    GHashTable *fb_pages;    /* sparse FB: page index (addr>>12) -> malloc'd 4KB  */
+
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
     uint64_t access_count;   /* monotonically increasing, for the trace      */
@@ -266,11 +274,72 @@ static const char *nvkvm_reg_name(hwaddr off)
     }
 }
 
+/* ── M6: sparse FB backing + BAR0 PRAMIN window ───────────────────────────── */
+#define NVKVM_PRAMIN_BASE 0x00700000u
+#define NVKVM_PRAMIN_SIZE 0x00100000u      /* 1 MiB window */
+#define NVKVM_BAR0_WINDOW 0x00001700u      /* NV_PBUS_BAR0_WINDOW */
+
+/* FB address that PRAMIN+off currently maps to: BASE[23:0]<<16 + window offset. */
+static uint64_t nvkvm_pramin_fb_addr(NvkvmGpuEmul *s, hwaddr off)
+{
+    uint64_t base = (uint64_t)(s->bar0_window & 0x00FFFFFFu) << 16;
+    return base + (off - NVKVM_PRAMIN_BASE);
+}
+
+static uint8_t *nvkvm_fb_page(NvkvmGpuEmul *s, uint64_t fb_addr, bool alloc)
+{
+    gpointer key = (gpointer)(uintptr_t)(fb_addr >> 12);
+    uint8_t *p = g_hash_table_lookup(s->fb_pages, key);
+    if (!p && alloc) {
+        p = g_malloc0(4096);
+        g_hash_table_insert(s->fb_pages, key, p);
+    }
+    return p;
+}
+
+/* Aligned reg accesses never straddle a 4 KiB page. */
+static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
+{
+    uint8_t *p = nvkvm_fb_page(s, fb_addr, false);
+    uint32_t o = fb_addr & 0xfffu;
+    if (!p) {
+        return 0;
+    }
+    switch (size) {
+    case 1: return p[o];
+    case 2: return lduw_le_p(p + o);
+    case 4: return ldl_le_p(p + o);
+    case 8: return ldq_le_p(p + o);
+    default: return 0;
+    }
+}
+
+static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
+                           unsigned size)
+{
+    uint8_t *p = nvkvm_fb_page(s, fb_addr, true);
+    uint32_t o = fb_addr & 0xfffu;
+    switch (size) {
+    case 1: p[o] = (uint8_t)val; break;
+    case 2: stw_le_p(p + o, (uint16_t)val); break;
+    case 4: stl_le_p(p + o, (uint32_t)val); break;
+    case 8: stq_le_p(p + o, val); break;
+    default: break;
+    }
+}
+
 /* M0: identity registers answered; everything else reads 0.  M1/M2 extend this
  * switch into the fake-the-boot state machine (GFW_BOOT, HWCFG2, RISCV_STATUS,
  * FWSEC/Booter mailboxes). */
 static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
 {
+    /* M6: BAR0 PRAMIN window -> sparse FB backing. */
+    if (off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE) {
+        return nvkvm_fb_read(s, nvkvm_pramin_fb_addr(s, off), size);
+    }
+    if (off == NVKVM_BAR0_WINDOW) {
+        return s->bar0_window;
+    }
     switch (off) {
     case NV_PMC_BOOT_0:  return s->chip->pmc_boot_0;
     case NV_PMC_BOOT_42: return s->chip->pmc_boot_42;
@@ -347,9 +416,11 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
     }
     uint64_t val = nvkvm_reg_read(s, off, size);
 
-    /* Don't trace PTIMER reads — RM timeout loops poll them millions of times. */
+    /* Don't trace PTIMER reads (RM timeout loops poll millions of times) or the
+     * PRAMIN window (BAR2/page-table setup hammers it). */
     if (s->trace && off != NV_PTIMER_TIME_0_GA10X &&
-        off != NV_PTIMER_TIME_1_GA10X) {
+        off != NV_PTIMER_TIME_1_GA10X &&
+        !(off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE)) {
         const char *nm = nvkvm_reg_name(off);
         qemu_log("nvkvm-gpu[%s] #%llu BAR0 RD  off=0x%06llx sz=%u -> 0x%08llx%s%s\n",
                  s->chip->name, (unsigned long long)s->access_count++,
@@ -679,6 +750,16 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
 {
     NvkvmGpuEmul *s = opaque;
 
+    /* M6: BAR0 PRAMIN window write -> sparse FB backing; window-base register. */
+    if (off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE) {
+        nvkvm_fb_write(s, nvkvm_pramin_fb_addr(s, off), val, size);
+        return;
+    }
+    if (off == NVKVM_BAR0_WINDOW) {
+        s->bar0_window = (uint32_t)val;
+        return;
+    }
+
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
      * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
     if ((off == NV_PGSP_FALCON_CPUCTL || off == 0x00110130u) && (val & 0x2u)) {
@@ -777,6 +858,11 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     s->stat_writeptr = 0;
     s->cmd_readptr = 0;
 
+    /* M6: sparse FB backing for the BAR0 PRAMIN window (value = g_malloc0'd 4 KiB). */
+    s->bar0_window = 0;
+    s->fb_pages = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                        NULL, g_free);
+
     /* M2: load the VBIOS image for the PROM window (if a path was given). */
     s->vbios = NULL;
     if (s->vbios_path && s->vbios_path[0]) {
@@ -856,6 +942,9 @@ static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
     msix_unuse_all_vectors(pci_dev);
     msix_uninit(pci_dev, &s->msix, &s->msix);
     g_free(s->vbios);
+    if (s->fb_pages) {
+        g_hash_table_destroy(s->fb_pages);
+    }
 }
 
 /* ── QOM boilerplate ───────────────────────────────────────────────────────*/
