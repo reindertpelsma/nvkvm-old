@@ -121,3 +121,24 @@ and shims it into the Mode-1 core.
 - **msgq ring semantics**: reuse the `msgq` library logic (`src/common/shared/msgq`)
   for pointer math rather than reimplementing — port to Rust.
 - This is per-(device) state; multi-GPU keeps it per-instance.
+
+## UPDATE (2026-06-03): the stall is PRE-mailbox
+
+Hardware finding: across a full 6.5M-access run, the driver **never writes
+NV_PGSP_FALCON_MAILBOX0/1** (0x110040/44) — only 0x110c00 (cmd queue head, ×2),
+0x100c10/40 (PFB), 0x088080 (XVE/PCI-cfg mirror). So the unbounded **0xbb0080
+poll happens BEFORE `kgspProgramLibosBootArgsAddr`** (which for GA106 IS the
+_TU102 mailbox writer — `_f2d351` is VF/Tegra only). The driver is stuck at an
+early GSP-liveness wait and never reaches the boot-args programming. Therefore
+M3-step-1 (capture mailbox GPA) cannot fire yet; **0xbb0080 must be identified
+and answered first.**
+
+0xbb0000 is absent from the 575 *and* 580 public swref → computed at runtime
+(likely a RISCV/PRGNLCL or engine-descriptor space). The DKMS tree
+`/usr/src/nvidia-580.159.04` ships the RM core as a precompiled blob, so it
+can't be instrumented. **Next step: build the fully-open 580.159.04 driver from
+`/root/open-gpu-kernel-modules` (builds nv-kernel.o from source) and add a
+one-shot `dump_stack()` in `kflcnRegRead_TU102`/`kflcnRiscvRegRead_TU102` when
+`registerBase+offset == 0xbb0080`** — that names the function + the base (riscv
+vs falcon vs other) definitively. Then answer it and resume toward the mailbox /
+queue / GSP_INIT_DONE path above.
