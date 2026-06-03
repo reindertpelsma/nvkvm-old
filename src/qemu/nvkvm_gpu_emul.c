@@ -47,6 +47,7 @@
 #include "mode2_devinfo_ga106.h"   /* captured GA106 engine table (M5 replay) */
 #include "mode2_initctrl_ga106.h"  /* captured GA106 init-control responses    */
 #include "mode2_intrtable_ga106.h" /* captured GA106 interrupt table (M5)      */
+#include "mode2_gspstaticinfo_ga106.h" /* captured GA106 GSP static config (M5) */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -531,11 +532,21 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 }
                 /* else: void/SET control — echo with status=NV_OK */
             }
-            if (s->trace && fn == 76) {
-                qemu_log("nvkvm-gpu[%s] M4:   ctrl cmd=0x%x reqPsize=%u -> "
-                         "respPsize=%u status=0x%x\n", s->chip->name, ctrl,
-                         ldl_le_p(cmd + 96), ldl_le_p(resp + 96),
-                         ldl_le_p(resp + 92));
+            if (fn == 65) {
+                /* GET_GSP_STATIC_INFO (fn 65): NOT a control — the GSP returns the
+                 * full GspStaticConfigInfo struct directly at the rpc body
+                 * (rpc_message->get_gsp_static_info_v14_00.data = element+80,
+                 * right after the 32B rpc header).  Replay the captured GA106
+                 * struct (1792B incl. fbRegionInfoParams numFBRegions=5).
+                 * rpc.length = 32(hdr) + sizeof(struct); single element. */
+                memcpy(resp + 80, gspstaticinfo_ga106, sizeof(gspstaticinfo_ga106));
+                stl_le_p(resp + 56, 32u + GSPSTATICINFO_GA106_SIZE);
+            }
+            if (s->trace && (fn == 76 || fn == 65)) {
+                qemu_log("nvkvm-gpu[%s] M4:   fn=%u ctrl cmd=0x%x reqPsize=%u -> "
+                         "respPsize=%u status=0x%x rpclen=%u\n", s->chip->name, fn,
+                         ctrl, ldl_le_p(cmd + 96), ldl_le_p(resp + 96),
+                         ldl_le_p(resp + 92), ldl_le_p(resp + 56));
             }
             nvkvm_m3_post_status(s, resp, fn, 0 /* rpc_result NV_OK */);
         }
