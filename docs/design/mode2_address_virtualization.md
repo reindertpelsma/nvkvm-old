@@ -33,6 +33,20 @@ denotes:
    (usually guest RAM). Iterate the KVM memslots to map GPA → VMM VA, then
    read/write or OS-descriptor it into the host context's VAS.
 
+   **`DMA_FILL_PTE_MEM` is exactly this (user 2026-06-04):** it means "for this
+   context / GPU-VA space, when this VA is accessed, DMA directly into my (the
+   guest's) host-process RAM." So a PDB/PTE entry can be a **DMA entry to a GPA**
+   (system memory) rather than to virtual GPU-physical. Mechanism:
+   - PTE is a sysmem/DMA entry → take its GPA → convert GPA → QEMU VMM VA by
+     iterating KVM memory regions → hand `(VMM-VA pointer, size)` to the real
+     NVIDIA ioctl on the host (OS-descriptor: `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`
+     0x00DE) so the host GPU context DMAs the guest's actual RAM at the guest's
+     chosen GPU-VA. Batch adjacent PTEs into one descriptor (size = the run).
+   - PTE removed / PFB torn down → revoke the host access (free the OS-descriptor
+     mapping in QEMU/stub) so a stale GPU-VA can't reach freed guest RAM.
+   This is the unprivileged Mode-1 OS-descriptor path; the guest's GPU-VA
+   resolves through the host context's MMU to the same guest RAM bytes.
+
 The walk is a **range translation**: a set of contiguous GPU-VA pages goes in;
 follow the PDB/PTEs; a set of (possibly more, if fragmented) physical page
 ranges comes out. Batch adjacent pages — it is fast and the common case is large
