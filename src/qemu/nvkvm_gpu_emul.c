@@ -146,6 +146,28 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define NV_PTIMER_TIME_0_GA10X       0x00BB0080u
 #define NV_PTIMER_TIME_1_GA10X       0x00BB0084u
 
+/* M3 — Falcon DMA (FWSEC/Booter ucode load).  s_dmaTransfer_GA102 polls
+ * DMATRFCMD (falcon+0x118) for FULL==FALSE (queue not full) and IDLE==TRUE
+ * (engine idle/done).  We don't run the falcons, so report the DMA always
+ * idle+not-full => value 0x2 (IDLE=TRUE bit1, FULL=FALSE bit0).  FWSEC runs on
+ * the GSP falcon (0x110000); Booter runs on SEC2 (0x840000).  CPUCTL+0x100
+ * HALTED so kflcnWaitForHalt passes for both. */
+#define NV_PFALCON_DMATRFCMD_IDLE_VAL 0x00000002u
+#define NV_PGSP_FALCON_DMATRFCMD     0x00110118u
+#define NV_PSEC_FALCON_DMATRFCMD     0x00840118u
+#define NV_PSEC_FALCON_CPUCTL        0x00840100u
+#define NV_PSEC_FALCON_HWCFG2        0x008400F4u
+
+/* M3 — WPR2 (Write-Protect Region 2 in FB), set up by FWSEC.  After "running"
+ * FWSEC the driver reads WPR2_ADDR_HI and requires _VAL (bits 31:4) != 0
+ * (_kgspIsWpr2Initialized).  Report a plausible positive region [LO,HI] so the
+ * check passes (we don't have real FB; the region is nominal in fake-the-boot).
+ * dev_fb.h: WPR2_ADDR_LO=0x1FA824, WPR2_ADDR_HI=0x1FA828, 4KB-aligned. */
+#define NV_PFB_PRI_MMU_WPR2_ADDR_LO  0x001FA824u
+#define NV_PFB_PRI_MMU_WPR2_ADDR_HI  0x001FA828u
+#define NVKVM_WPR2_LO_VAL            0x10000000u  /* nominal FB region base */
+#define NVKVM_WPR2_HI_VAL            0x10100000u  /* base + ~16 MiB (HI>LO,!=0) */
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -192,6 +214,9 @@ static const char *nvkvm_reg_name(hwaddr off)
     case NV_PGSP_FALCON_HWCFG2:                              return "GSP_HWCFG2";
     case NV_PTIMER_TIME_0_GA10X:                            return "PTIMER_TIME_0";
     case NV_PTIMER_TIME_1_GA10X:                            return "PTIMER_TIME_1";
+    case NV_PGSP_FALCON_DMATRFCMD:                          return "GSP_DMATRFCMD";
+    case NV_PSEC_FALCON_DMATRFCMD:                          return "SEC_DMATRFCMD";
+    case NV_PSEC_FALCON_CPUCTL:                             return "SEC_CPUCTL";
     default:             return NULL;
     }
 }
@@ -225,6 +250,17 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
         return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & 0xFFFFFFE0u;
     case NV_PTIMER_TIME_1_GA10X:
         return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >> 32);
+
+    /* M3 — Falcon DMA always idle+not-full (FWSEC on GSP, Booter on SEC2). */
+    case NV_PGSP_FALCON_DMATRFCMD:
+    case NV_PSEC_FALCON_DMATRFCMD: return NV_PFALCON_DMATRFCMD_IDLE_VAL;
+    /* SEC2 falcon halted (Booter "finished"); SEC2 has no RISC-V advertised. */
+    case NV_PSEC_FALCON_CPUCTL:    return NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE;
+    case NV_PSEC_FALCON_HWCFG2:    return 0;
+
+    /* M3 — WPR2 "initialized" by FWSEC (HI_VAL != 0, HI > LO). */
+    case NV_PFB_PRI_MMU_WPR2_ADDR_LO: return NVKVM_WPR2_LO_VAL;
+    case NV_PFB_PRI_MMU_WPR2_ADDR_HI: return NVKVM_WPR2_HI_VAL;
 
     default:             return 0;
     }
