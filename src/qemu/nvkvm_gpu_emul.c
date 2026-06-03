@@ -755,7 +755,24 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
 
     /* M6: BAR0 PRAMIN window write -> sparse FB backing; window-base register. */
     if (off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE) {
-        nvkvm_fb_write(s, nvkvm_pramin_fb_addr(s, off), val, size);
+        uint64_t fa = nvkvm_pramin_fb_addr(s, off);
+        nvkvm_fb_write(s, fa, val, size);
+        /* Snoop the BAR2 instance-block PAGE_DIR_BASE.  On the GSP-client path the
+         * CPU never writes NV_PBUS_BAR2_BLOCK (0x1714) — the GSP (which we fake)
+         * binds BAR2 from the instance block the CPU builds in FB.  The instblk's
+         * NV_RAMIN_PAGE_DIR_BASE is word128 (byte 0x200): TARGET[1:0]=VID_MEM(0),
+         * PDB_LO[31:12].  Instance blocks are 4 KiB-aligned, so a 4-byte write at
+         * (fb&0xFFF)==0x200 with a non-zero VID_MEM page-dir base is an instblk
+         * bind; the most-recent one before kbusVerifyBar2 is BAR2's. */
+        if (size == 4 && (fa & 0xFFFu) == 0x200u &&
+            (val & 0x3u) == 0u && (val & 0xFFFFF000u) != 0u) {
+            s->bar2_inst_block = fa - 0x200u;
+            if (s->trace) {
+                qemu_log("nvkvm-gpu[%s] M6: snooped BAR2 instblk @ FB 0x%llx "
+                         "(PDB_LO word=0x%08x)\n", s->chip->name,
+                         (unsigned long long)s->bar2_inst_block, (uint32_t)val);
+            }
+        }
         return;
     }
     if (off == NVKVM_BAR0_WINDOW) {
