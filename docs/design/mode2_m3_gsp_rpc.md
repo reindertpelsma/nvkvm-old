@@ -235,3 +235,41 @@ unprivileged (queries only). This is the RPC->host-RM bridge = first compute (M5
 Reference dump tool option: a standalone host C program issuing 0x208001b0 can
 capture the GA106 falcon table for record/replay if live-forward setup is
 deferred.
+
+## M5 — PIVOTAL FINDING (2026-06-03): internal controls aren't userspace-forwardable
+
+GET_CONSTRUCTED_FALCON_INFO (and the init GSP_RM_CONTROL stream) is issued by the
+guest KERNEL RM on hInternalClient/hInternalSubdevice and is GSP-internal /
+physical-routed (NV2080 *_GSP handler, gpu.c:5441). Such internal controls are
+NOT callable from an unprivileged userspace RM client — so the Mode-1 trick
+(forward the guest's USERSPACE ioctl to the host's userspace RM) does NOT apply
+to these kernel↔GSP-RM controls. The GSP-RM is the authority for them and we are
+impersonating it.
+
+Consequences for M5 (the RPC long-tail). Three ways to satisfy an internal
+control, by type:
+1. **GPU-static internal controls** (falcon table, FB/GPU caps, engine list,
+   clock domains): the answer is silicon-derived and constant. Provide it from
+   chip knowledge — derive from the open driver's chip engine tables (e.g. the
+   GA106 constructed-falcon set: engDesc/ctxAttr/ctxBufferSize/addrSpaceList/
+   registerBase per falcon) and return a correct FLAT params struct. Bounded,
+   trace-driven, per-control. Gets RmInitAdapter to COMPLETE with a real device
+   model. This is the chosen incremental path.
+2. **Object/alloc + dynamic controls** (GSP_RM_ALLOC, vaspace/channel/ctx, and
+   controls on those objects): need a live GSP-RM. Options: (a) a privileged
+   HOST KERNEL HELPER that exposes the host's real GSP-RM internal controls to
+   QEMU over a side channel (QEMU stays unprivileged; the helper is a separate
+   trusted host component) and forwards with guest->host handle mapping; or
+   (b) reimplement the needed GSP-RM control handlers (large). (a) is the
+   architecturally right path for first compute (M5/M6); it is the Mode-2
+   analogue of the Mode-1 isolate but at the GSP-RPC layer.
+3. **Reimplement GSP-RM** wholesale — not viable.
+
+So Mode-2's M5 is NOT "wire in Mode-1 forwarding"; it is "impersonate GSP-RM":
+static controls from chip tables (incremental, now), dynamic/object controls via
+a host-kernel GSP-RM forwarding helper (next major design). The keystone (M0-M3)
++ init RPC shim (M4) are done; this is the path to first compute.
+
+Next concrete code step (chosen path 1): hardcode the GA106 constructed-falcon
+table response for cmd 0x208001b0 (numConstructedFalcons + the GA106 falcon
+entries), then continue trace-driven through the next internal controls.
