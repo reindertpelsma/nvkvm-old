@@ -459,10 +459,24 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      async ? "async (no response)" : "echo NV_OK");
         }
         if (!async) {
+            /* GSP_RM_CONTROL (fn 76): the body is rpc_gsp_rm_control_v
+             * {hClient,hObject,cmd,status,paramsSize,...} at element offset 84;
+             * RmRpc control reads body.status (offset 84+12=96).  Echo can't
+             * fabricate GET data, but set status=NV_OK so void/SET controls and
+             * GETs the driver tolerates with zero data proceed.  (Real GET data
+             * needs Mode-1 forwarding — M5.) */
+            if (fn == 76) {
+                stl_le_p(cmd + 96, 0); /* rpc_gsp_rm_control_v.status = NV_OK */
+            }
             if (s->trace) {
                 qemu_log("nvkvm-gpu[%s] M4:   cmd rpc: len=%u seq(rpc)=%u "
-                         "result=0x%x\n", s->chip->name, ldl_le_p(cmd + 56),
-                         ldl_le_p(cmd + 48 + 24), ldl_le_p(cmd + 64));
+                         "result=0x%x%s\n", s->chip->name, ldl_le_p(cmd + 56),
+                         ldl_le_p(cmd + 48 + 24), ldl_le_p(cmd + 64),
+                         fn == 76 ? " [ctrl cmd=0x" : "");
+                if (fn == 76) {
+                    qemu_log("nvkvm-gpu[%s] M4:   ctrl cmd=0x%x paramsSize=%u\n",
+                             s->chip->name, ldl_le_p(cmd + 92), ldl_le_p(cmd + 100));
+                }
             }
             uint32_t resp_slot = s->stat_writeptr % s->q_msgcount;
             uint64_t resp_gpa = s->q_shmem + s->q_stat_base + s->q_stat_entryoff +
