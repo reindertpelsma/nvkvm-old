@@ -69,3 +69,19 @@ driver believes it has a live GPU. That is the proof-of-concept gate.
   whose RM core is a precompiled blob (so the RM core is NOT instrumentable from
   that tree; use the full open source build if printk instrumentation is needed).
 - Runtime stays unprivileged (VBIOS = one-time provisioning asset).
+
+## KEYSTONE PASSED (2026-06-03): GSP_INIT_DONE consumed, driver in live RPC
+
+After the full fake-the-boot chain + msgq handshake (status-queue tx header +
+GSP_INIT_DONE post, commit eacea2d), the stock 580 driver's failure moved from
+"kgspWaitForRmInitDone / rpcRecvPoll(GSP_INIT_DONE) timeout" to
+"_issueRpcAndWait: rpcRecvPoll timedout for fn 1 (SET_GUEST_SYSTEM_INFO)".
+=> GSP_INIT_DONE was accepted, kgspBootstrap returned NV_OK, RmInitAdapter
+advanced into kgspInitRm and the driver is now issuing real GSP-RM RPCs against
+the emulated device. **Fake-the-boot is proven end to end (M0-M3 done).**
+
+Next (M4 RPC shim): respond to each _issueRpcAndWait — read the CPU->GSP command
+(cmd queue at sharedMemPA+cmdQueueOffset), post a response element (same fn,
+next seqNum, rpc_result NV_OK + expected body) to the status queue, bump
+writePtr. SET_GUEST_SYSTEM_INFO (fn 1) first. See
+[[mode2_keystone_gsp_init_done]].
