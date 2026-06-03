@@ -444,12 +444,20 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             break;
         }
         uint32_t fn = ldl_le_p(cmd + 60);
+        /* Async one-way init RPCs expect NO response — echoing them shows up in
+         * the driver as "Unexpected RPC event" and desyncs the seqNum.  Consume
+         * them silently.  (72=GSP_SET_SYSTEM_INFO, 73=SET_REGISTRY, sent by
+         * kgspSendInitRpcs before GSP-RM is up.)  Grow this list as the trace
+         * reveals more one-way functions. */
+        bool async = (fn == 72 || fn == 73);
         if (s->trace) {
-            qemu_log("nvkvm-gpu[%s] M4: cmd fn=%u seq=%u -> echo NV_OK (resp "
-                     "seq=%u)\n", s->chip->name, fn, ldl_le_p(cmd + 36),
-                     s->stat_writeptr);
+            qemu_log("nvkvm-gpu[%s] M4: cmd fn=%u seq=%u -> %s\n",
+                     s->chip->name, fn, ldl_le_p(cmd + 36),
+                     async ? "async (no response)" : "echo NV_OK");
         }
-        nvkvm_m3_post_status(s, cmd, fn, 0 /* NV_OK */);
+        if (!async) {
+            nvkvm_m3_post_status(s, cmd, fn, 0 /* NV_OK */);
+        }
         s->cmd_readptr++;
     }
     /* ack consumption: we are the RX side of the cmd queue (rx header readPtr
