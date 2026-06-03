@@ -168,6 +168,14 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define NVKVM_WPR2_LO_VAL            0x10000000u  /* nominal FB region base */
 #define NVKVM_WPR2_HI_VAL            0x10100000u  /* base + ~16 MiB (HI>LO,!=0) */
 
+/* M3 — usable FB size in MiB.  kmemsysReadUsableFbSize_GA102 reads
+ * NV_USABLE_FB_SIZE_IN_MB (= NV_PGC6_AON_SECURE_SCRATCH_GROUP_42 = 0x1183a4),
+ * VALUE[31:0] << 20 = bytes.  GFW_BOOT writes it on real HW; we must too, or
+ * the GSP WprMeta math (frtsOffset = gspFwWprEnd - frtsSize) degenerates and
+ * the WPR2-location check uses a garbage expected value.  RTX 3060 = 12 GiB. */
+#define NV_USABLE_FB_SIZE_IN_MB      0x001183A4u
+#define NVKVM_FB_SIZE_MB             12288u  /* 12 GiB */
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -260,6 +268,9 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     /* SEC2 falcon halted (Booter "finished"); SEC2 has no RISC-V advertised. */
     case NV_PSEC_FALCON_CPUCTL:    return NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE;
     case NV_PSEC_FALCON_HWCFG2:    return 0;
+
+    /* M3 — usable FB size (MiB) for the GSP WprMeta computation. */
+    case NV_USABLE_FB_SIZE_IN_MB: return NVKVM_FB_SIZE_MB;
 
     /* M3 — WPR2 is stateful: DOWN (0) until FWSEC "runs" (GSP STARTCPU), then
      * UP.  The driver requires WPR2 down before FWSEC, up after. */
