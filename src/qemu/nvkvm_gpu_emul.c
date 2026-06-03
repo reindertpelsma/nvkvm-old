@@ -1794,8 +1794,34 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
      * Only valid when actually on a PCIe bus (q35 root complex / root port);
      * on a conventional PCI bus we enumerate as a plain PCI device.  A real
      * GeForce is express, so prefer plugging this behind a pcie-root-port. */
+    /* This device is a "hybrid" — it declares BOTH INTERFACE_CONVENTIONAL_PCI_
+     * DEVICE and INTERFACE_PCIE_DEVICE, so QEMU does NOT auto-set
+     * QEMU_PCI_CAP_EXPRESS (see do_pci_register_device: only pure-PCIe devices
+     * get it).  Behind a pcie-root-port the bus IS express, so set it manually
+     * — otherwise pci_is_express() is false, the Express cap is never added,
+     * and the driver's link-rate read at config 0x88 returns 0. */
+    if (pci_bus_is_express(pci_get_bus(pci_dev))) {
+        pci_dev->cap_present |= QEMU_PCI_CAP_EXPRESS;
+    }
     if (pci_is_express(pci_dev)) {
-        pcie_endpoint_cap_init(pci_dev, 0x60);
+        /* Place the PCIe Express capability at config 0x78 — EXACTLY where a real
+         * GA10x / RTX 3060 puts it ("Capabilities: [78] Express").  The NVIDIA
+         * driver reads its link via GPU_BUS_CFG_RD32 at the ABSOLUTE config
+         * offset NV_XVE_LINK_CONTROL_STATUS=0x88, which is only the cap's
+         * LINK_CONTROL_STATUS when the cap base is 0x78 (0x78+0x10).  With the
+         * cap elsewhere (QEMU default 0x60) the driver read garbage ->
+         * calculatePCIELinkRateMBps "Unknown PCIe speed" -> NV_ERR_INVALID_STATE.
+         * MSI-X auto-placed near 0x40, so 0x78..0xB4 is free. */
+        uint8_t exp = 0x78;
+        pcie_endpoint_cap_init(pci_dev, exp);
+        /* LINK_CAP @ 0x84 (cap+0xC): MAX_LINK_SPEED[3:0]=4 (16GT/s), width[9:4]=16
+         * — matches the real card's LnkCap 0x00453d04. */
+        uint32_t lnkcap = pci_get_long(cfg + exp + PCI_EXP_LNKCAP);
+        lnkcap = (lnkcap & ~0x3FFu) | 4u | (16u << 4);
+        pci_set_long(cfg + exp + PCI_EXP_LNKCAP, lnkcap);
+        /* LINK_CONTROL_STATUS @ 0x88: LNKSTA @ 0x8A -> dword 0x88[31:16].
+         * CURRENT_LINK_SPEED[19:16]=4, NEG_LINK_WIDTH[25:20]=16. */
+        pci_set_word(cfg + exp + PCI_EXP_LNKSTA, (uint16_t)(4u | (16u << 4)));
     }
 }
 
