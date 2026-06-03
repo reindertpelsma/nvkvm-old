@@ -1,5 +1,55 @@
 # Mode-2 device data model + auto-generation from NVIDIA source
 
+## Data-source PRIORITY (user, 2026-06-03 — canonical ordering)
+For every value we must hand the guest driver, prefer sources in this order
+(cheapest / most-trustworthy / most-portable first). This supersedes the
+by-source A/B/C/D taxonomy below as the *decision procedure* — A/B/C/D still
+describe the kinds of data; this says which source to reach for first.
+
+1. **Static** — identical across all GPU families, or a handful of arch branches.
+   Compile-time constants. (e.g. GMMU walk algorithm, GSP-RPC msg-queue protocol,
+   the interrupt subtreeMap which is computed from arch constants.)
+2. **Unprivileged host ioctl, collected at Mode-2 boot.** The host GPU is present
+   (Mode-2 forwards compute to it), so query it through *unprivileged* NVML/CUDA/
+   RM ioctls and fill the structs: GPU name, VRAM size, chip id / architecture /
+   PCI ids, compute capability, #SMs, clocks, ECC. MOST trustworthy and MOST
+   likely to work on a new card — anything observable from unprivileged guest
+   userspace is, by construction, correct. nvidia-smi mostly surfaces exactly
+   these (name + a few caps). KEEPS QEMU UNPRIVILEGED.
+3. **NVIDIA kernel source, auto-generated.** Per-arch register offsets, GMMU/PTE
+   formats, instblk field offsets, alloc-param/ctrl-struct sizes. Selected AFTER
+   (2) tells us the target chip. Re-generate when NVIDIA ships a new card/driver.
+   (tools/mode2_gen_regs.py.)
+4. **Synthetic / minimal-to-pass.** Data that exists only to get the guest driver
+   to boot and is irrelevant to operation: VBIOS image (placeholder with valid
+   PCI-ROM/PCIR/BIT headers + version, no real code), fake-GSP-reported blobs.
+   Build the minimal structure the kernel *parser/validator* accepts.
+5. **Requires a real/host GPU AND root — AVOID.** Only if 1–4 cannot. If
+   unavoidable, do it as a ONE-TIME root setup utility that collects the bytes,
+   stores them, and then serves them to the *unprivileged* QEMU (which survives
+   restarts). The current captured GA106 tables (devinfo/intr/gspstatic/initctrl)
+   are effectively this tier (minus root) and are to be REPLACED by 1–4 over time.
+
+Cross-cutting rule (applies to every tier): the value served must be
+**self-consistent with what the emulator actually does** — interrupt vectors must
+match the MSI-X vectors we raise, FB size must match the FB we back, engine list
+must match the engines we expose. WE control the emulation, so when a value isn't
+fixed by an upstream source, generate it and use the same value on both sides.
+
+What tier (2) can and cannot reach: unprivileged host userspace gets the headline
+identity + caps (name, VRAM, chipId/arch, PCI ids, CC, SM count). It does NOT
+reach GSP-internal RM control responses (device-info engine fault IDs, interrupt
+vectors, GspStaticConfigInfo internals) — those are tier 1 (static/arch) or 3
+(source-gen), with capture (tier 5) as the stopgap we are migrating off.
+
+Worked examples from the M3→M5 bring-up (2026-06-03):
+- interrupt subtreeMap → tier 1 (computed: UVM_OWNED=subtree1, etc.).
+- numDispChannels → moot once we report display fused-off (tier 1 decision).
+- CE fault-method-buffer size → synthesized one page (tier 4); a cleaner home is
+  tier 2/3 if an unprivileged host ioctl or source constant exposes it.
+- GET_DEVICE_INFO_TABLE (engine topology + LCE fault IDs) → currently captured
+  (tier 5); target is tier 3 (arch source) + tier 2 (which engines the host has).
+
 ## Goal (user, 2026-06-03)
 What matters is **not** that we impersonate the exact host GPU — it's that **CUDA
 compiles and runs in the guest** against whatever GPU we advertise. Implications:
