@@ -125,15 +125,21 @@ mappings:
   UVM-channel blocker**: capture the op that placed the GPFIFO at GPU-VA
   0x121010000 → its physical, instead of trying to walk the device-default VAS
   we can't root.
-- **#1 — intercept PTE writes (CORRECTNESS-ONLY, possibly skippable).** Needed
-  only for the "unassigned" case: GPU-phys written with data *before* any context
-  maps it (anonymous RM/UVM data later transferred into a context). **If the
-  guest never writes a GPU-phys range before it is mapped to a context (always
-  alloc→map→write, never write→map), #1 is unnecessary** and we rely on
-  clear-on-assign. Worth verifying empirically; early evidence supports skipping:
-  `DMA_FILL_PTE_MEM` is never used in our run, and CPU-RM PTE writes go via
-  PRAMIN (already visible). Action: instrument for a write to a GPU-phys range
-  that precedes its first map-to-context; if it never fires, drop #1.
+- **#1 — capture PTE writes / `DMA_FILL_PTE_MEM` (LIKELY REQUIRED FOR PROD).**
+  Two roles: (a) the "unassigned" write-before-map correctness case, and (b) the
+  bulk mapping path — `DMA_FILL_PTE_MEM` is the RPC RM uses to fill PTEs for
+  LARGE mappings. **Caveat (user 2026-06-03): "never in OUR run" ≠ "never in
+  prod".** Our only evidence is a minimal cuInit probe (`cup.c`); it allocates
+  almost nothing. Real targets — 7B LLM (huge VRAM), games (textures/vertex/cmd
+  buffers), full PyTorch/Vulkan — WILL do large allocations and very likely DO
+  use `DMA_FILL_PTE_MEM`. So **do NOT conclude #1 is skippable from the cuInit
+  run.** Validate any skip decision against the **full real-app matrix**
+  (`tests/perf/run_matrix.sh`: PyTorch CNN/ViT/BERT, HPC, gpu-burn, 7B LLM,
+  Vulkan, OpenGL), not a probe. Default: **support both #1 and #2.** The
+  write-before-map / unknown-mapping path must **error / fall back gracefully**
+  (per the [[mode2-plan]] validation policy), never silently mistranslate.
+  Instrument both: a write-before-first-map detector AND a `DMA_FILL_PTE_MEM`
+  (RPC fn=27) counter across the matrix.
 
 ## Implementation order (proposed)
 
@@ -152,5 +158,9 @@ mappings:
    the stub: assigned pages become real host-context mmaps installed at the
    guest GPA (the double-mmap + GPA window).
 
-Step 1 unblocks cuInit/UVM (and is the primary capture); 3–4 are the parity
-compute path. PTE-interception (#1) only if the write-before-map check fires.
+Step 1 (#2 side-table) unblocks cuInit/UVM and is the primary capture; 3–4 are
+the parity compute path. **#1 (`DMA_FILL_PTE_MEM` / PTE capture) is a separate
+prod requirement, NOT optional** — add it before the real-app matrix (large
+mappings in LLM/games/Vulkan will use it); the cuInit probe just never triggers
+it. Gate the matrix on a `DMA_FILL_PTE_MEM` counter + write-before-map detector
+so we know exactly when it's exercised.
