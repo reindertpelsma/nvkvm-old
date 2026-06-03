@@ -46,6 +46,7 @@
 #include "qom/object.h"
 #include "mode2_devinfo_ga106.h"   /* captured GA106 engine table (M5 replay) */
 #include "mode2_initctrl_ga106.h"  /* captured GA106 init-control responses    */
+#include "mode2_intrtable_ga106.h" /* captured GA106 interrupt table (M5)      */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -485,7 +486,17 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         break;
                     }
                 }
-                if (ctrl == 0x20801112u) {
+                if (ctrl == 0x20800a5cu) {
+                    /* INTERNAL_INTR_GET_KERNEL_TABLE: the real GSP supplies the
+                     * interrupt table via boot static-info so the host CPU-RM
+                     * never issues this control; the guest's fake GSP forces the
+                     * fallback.  Replay the captured GA106 table (tableLen@120 +
+                     * 24 entries of 16B).  Full struct = 4 + 128*16 = 2052B. */
+                    memset(resp + 120, 0, INTRTABLE_GA106_PSIZE);
+                    memcpy(resp + 120, intrtable_ga106, sizeof(intrtable_ga106));
+                    stl_le_p(resp + 96, INTRTABLE_GA106_PSIZE);
+                    stl_le_p(resp + 56, 32u + 40u + INTRTABLE_GA106_PSIZE);
+                } else if (ctrl == 0x20801112u) {
                     /* FIFO_GET_DEVICE_INFO_TABLE: paginated; replay real GA106
                      * engine table (separate capture). params@120: baseIndex@120,
                      * numEntries@124, bMore@128, entries@132 (100B each). */
