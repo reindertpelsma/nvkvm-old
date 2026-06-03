@@ -459,14 +459,16 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      async ? "async (no response)" : "echo NV_OK");
         }
         if (!async) {
-            /* GSP_RM_CONTROL (fn 76): the body is rpc_gsp_rm_control_v
-             * {hClient,hObject,cmd,status,paramsSize,...} at element offset 84;
-             * RmRpc control reads body.status (offset 84+12=96).  Echo can't
-             * fabricate GET data, but set status=NV_OK so void/SET controls and
-             * GETs the driver tolerates with zero data proceed.  (Real GET data
-             * needs Mode-1 forwarding — M5.) */
+            /* GSP_RM_CONTROL (fn 76): rpc_gsp_rm_control_v body starts at
+             * element+80 (rpc header is 32B here, not 36 — verified by trace:
+             * cmd lands at +88).  Body: hClient@80, hObject@84, cmd@88,
+             * status@92, paramsSize@96, ..., params@~120.  RmRpc control reads
+             * body.status (@92).  Set it NV_OK.  NOTE: for GET controls the
+             * request paramsSize is 0 (empty input); a correct response must
+             * FILL params + paramsSize with real data (M5: chip-static table or
+             * host-captured), so the echo only gets void/SET controls through. */
             if (fn == 76) {
-                stl_le_p(cmd + 96, 0); /* rpc_gsp_rm_control_v.status = NV_OK */
+                stl_le_p(cmd + 92, 0); /* rpc_gsp_rm_control_v.status = NV_OK */
             }
             if (s->trace) {
                 qemu_log("nvkvm-gpu[%s] M4:   cmd rpc: len=%u seq(rpc)=%u "
@@ -474,8 +476,11 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                          ldl_le_p(cmd + 48 + 24), ldl_le_p(cmd + 64),
                          fn == 76 ? " [ctrl cmd=0x" : "");
                 if (fn == 76) {
-                    qemu_log("nvkvm-gpu[%s] M4:   ctrl cmd=0x%x paramsSize=%u\n",
-                             s->chip->name, ldl_le_p(cmd + 92), ldl_le_p(cmd + 100));
+                    /* body@80: hClient@80 hObject@84 cmd@88 status@92
+                     * paramsSize@96 */
+                    qemu_log("nvkvm-gpu[%s] M4:   ctrl cmd=0x%x paramsSize=%u "
+                             "(body@80)\n", s->chip->name,
+                             ldl_le_p(cmd + 88), ldl_le_p(cmd + 96));
                 }
             }
             uint32_t resp_slot = s->stat_writeptr % s->q_msgcount;
