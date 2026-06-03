@@ -142,3 +142,31 @@ one-shot `dump_stack()` in `kflcnRegRead_TU102`/`kflcnRiscvRegRead_TU102` when
 `registerBase+offset == 0xbb0080`** — that names the function + the base (riscv
 vs falcon vs other) definitively. Then answer it and resume toward the mailbox /
 queue / GSP_INIT_DONE path above.
+
+## UPDATE 2 (2026-06-03): PTIMER fix unblocked deep FWSEC progress
+
+The 0xbb0080 spin was the **PTIMER** (GA10x relocated it to 0xbb0080/84;
+constant 0 => RM timeout loops never elapse => infinite spin). Fixed by serving
+qemu_clock_get_ns (commit 795be45). The driver then advances cleanly (real
+timeouts) through the FWSEC/WPR bring-up. Faked, in order (all committed):
+ - Falcon DMA: DMATRFCMD (GSP 0x110118, SEC2 0x840118) -> 0x2 (IDLE,!FULL) so
+   s_dmaTransfer_GA102 ucode-load loops pass; SEC2 CPUCTL 0x840100 HALTED.
+ - WPR2 stateful: WPR2_ADDR_LO/HI (0x1FA824/28) = 0 until the driver writes
+   STARTCPU to the GSP falcon CPUCTL (FWSEC "runs"), then a region. (Driver
+   checks WPR2 DOWN before FWSEC, UP after — _kgspBootGspRm + _kgspIsWpr2Initialized.)
+
+**Current stall (NEXT):** `kgspExecuteFwsec_TU102: WPR2 initialized at an
+unexpected location: 0x01000000 (expected 0xfffffe00)`. The driver computes the
+*exact* expected WPR2 region from the FB layout
+(kgspbuildWprMeta: frtsOffset = gspFwWprEnd - frtsSize; gspFwWprEnd derives from
+FB size) and requires WPR2_ADDR_HI/LO to decode to it. Our nominal region
+(0x10000000/0x10100000) doesn't match. FIX: model the emulated **FB size** (the
+memory-size register the driver reads — currently 0) so its WPR computation is
+deterministic, then set WPR2_ADDR_LO/HI to exactly frtsOffset/(frtsOffset+
+frtsSize-1) in the WPR2_ADDR _VAL (bits 31:4, 4K-aligned) encoding. The expected
+0xfffffe00 is the degenerate value when FB size reads 0; matching it (or
+providing a real FB size + matching WPR2) clears this. After WPR2: Booter exec
+-> GSP RISC-V boot -> the GSP message queue + GSP_INIT_DONE (the steps above).
+
+Spike checks status: #1 GFW_BOOT ✓, #2 RISCV-enable ✓, #3/#4 falcon-halt ✓,
+#5 WPR2 (in progress, exact-location), then #6/#7 GSP message queue + INIT_DONE.
