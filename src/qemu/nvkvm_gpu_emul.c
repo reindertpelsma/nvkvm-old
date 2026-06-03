@@ -393,6 +393,9 @@ static void nvkvm_m3_post_status(NvkvmGpuEmul *s, const uint8_t *src,
     stl_le_p(el + 40, 1);                /* elemCount = 1 */
     stl_le_p(el + 60, function);         /* rpc.function */
     stl_le_p(el + 64, rpc_result);       /* rpc.rpc_result */
+    stl_le_p(el + 68, rpc_result);       /* rpc.rpc_result_private — RmRpc*() reads
+                                          * THIS (not rpc_result); echoed commands
+                                          * carry RPC_PENDING (0xffffffff) here. */
     stl_le_p(el + 36, s->stat_writeptr); /* seqNum = current monotonic writePtr */
     stl_le_p(el + 32, 0);                /* zero checksum field before folding */
     uint32_t len = 48 + ldl_le_p(el + 56);
@@ -456,7 +459,25 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      async ? "async (no response)" : "echo NV_OK");
         }
         if (!async) {
+            if (s->trace) {
+                qemu_log("nvkvm-gpu[%s] M4:   cmd rpc: len=%u seq(rpc)=%u "
+                         "result=0x%x\n", s->chip->name, ldl_le_p(cmd + 56),
+                         ldl_le_p(cmd + 48 + 24), ldl_le_p(cmd + 64));
+            }
+            uint32_t resp_slot = s->stat_writeptr % s->q_msgcount;
+            uint64_t resp_gpa = s->q_shmem + s->q_stat_base + s->q_stat_entryoff +
+                                (uint64_t)resp_slot * s->q_msgsize;
             nvkvm_m3_post_status(s, cmd, fn, 0 /* NV_OK */);
+            if (s->trace) {  /* read back what we actually wrote */
+                uint8_t rb[80];
+                if (pci_dma_read(pdev, resp_gpa, rb, sizeof(rb)) == MEMTX_OK) {
+                    qemu_log("nvkvm-gpu[%s] M4:   resp@0x%llx: msgqSeq=%u cks=0x%x "
+                             "fn=%u rpcSeq=%u result=0x%x\n", s->chip->name,
+                             (unsigned long long)resp_gpa, ldl_le_p(rb+36),
+                             ldl_le_p(rb+32), ldl_le_p(rb+60), ldl_le_p(rb+48+24),
+                             ldl_le_p(rb+64));
+                }
+            }
         }
         s->cmd_readptr++;
     }
