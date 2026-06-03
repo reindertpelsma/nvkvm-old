@@ -145,6 +145,55 @@ Open: confirm CR3 is observable at every relevant MMIO exit (it is, via the vCPU
 state at the KVM MMIO exit) and define the CR3→isolate table lifecycle (process
 exit = guest frees its mappings → reap the isolate, reusing Mode-1's reaper).
 
+## Doorbell trapping: kernel vs userspace (decided 2026-06-03)
+
+A consequence of the privilege model, NOT a perf choice:
+
+- **Kernel doorbells / PRI writes** (interrupts, BAR/PDB binds, GSP control,
+  page-map setup) poke *privileged* GPU control registers the host kernel driver
+  alone owns; the unprivileged stub **cannot** mmap them. So they **must** be
+  trapped and reverse-translated into the equivalent unprivileged operations
+  (forwarded RM ioctls the stub performs) + bookkeeping of guest structures.
+- **Userspace work-submit doorbells** (USERD / VOLTA_USERMODE_A) are part of the
+  normal *unprivileged* RM userspace mapping. **Binding happens at channel
+  *creation* time** (the trapped/forwarded kernel-ioctl path already created the
+  matching host channel + work-submit token in the right isolate), so at *ring*
+  time there is nothing to disambiguate — the doorbell page is 1:1 bound to one
+  host channel and the mapping itself encodes isolation. These can be
+  **direct-mapped** to the host channel's real USERD/doorbell (HW-direct rings,
+  no per-ring trap) exactly as Mode-1 proved at native speed. CR3-keying is the
+  **fallback** for the kernel/ambiguous path, not the hot path. Bridge
+  requirement: the guest's channel USERD/doorbell GPA (chosen by the guest's own
+  RM against the emulated GPU) must be backed by the host channel's real
+  USERD/doorbell, wired when we intercept channel-create.
+
+## Input validation & guest-data trust (policy — implement once compute works)
+
+Today the emulator/reverse-driver parses guest-supplied input (GSP-RPC bodies,
+page-table/PDE/PTE walks, channel pushbuffers, control params) **without bounds
+checking**. Before any multi-tenant use this MUST be hardened. The rule
+(user-specified 2026-06-03):
+
+- **Reachable from malicious guest *userspace*** (anything a userspace
+  doorbell/USERD submission or a userspace-issued ioctl can drive out of range):
+  **never panic** — return an error / clamp, and where sensible **mimic what
+  real NVIDIA hardware does on the violation** (e.g. a GMMU fault, an RC error,
+  a method-error notifier) so the guest sees hardware-faithful behavior.
+- **Reachable only if the guest *kernel module* broke its contract** (a value
+  that could never go out of range from a normal, uncompromised guest kernel):
+  a QEMU `abort()`/panic is acceptable — it means the guest kernel is
+  compromised/buggy, outside the normal trust model. Prefer a logged error
+  where cheap.
+- All host-side forwarded ioctls reuse the **Mode-1 hardened dispatch/sanitizer
+  stack** (size/_IOC_SIZE/struct/fd/alloc-class validation) — no new bypass.
+- Ties into the doorbell model above: userspace can ring doorbells and write
+  USERD/pushbuffers, so every field the emulator reads from those paths is
+  userspace-reachable and must take the graceful-error branch, not panic.
+
+Deferred until the compute path works end-to-end (correctness first), but a
+launch blocker for "secure multi-tenant VM". Track alongside the existing
+Mode-1 hardening ([[security_audit_2026_05_30]], [[access_model_split]]).
+
 ## Language: Rust core, thin C shell
 
 Mode-2 is the right place to introduce Rust (decision 2026-06-03):
