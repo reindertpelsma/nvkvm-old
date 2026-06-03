@@ -27,32 +27,53 @@ they **auto-update when NVIDIA ships a new arch's headers**:
    open driver supports = run the generator against that driver tree. This directly
    satisfies "offsets auto-update for new cards."
 
-**B. CAPTURE-REQUIRED — GSP-firmware/hardware-derived runtime values.**
-These are computed by GSP firmware at boot from **silicon fuses + board config**;
-they are NOT static tables in source, so they cannot be "generated", only captured
-(their *structure* is in source, so we parse/validate the captured bytes):
-- Device-info engine table (GET_DEVICE_INFO_TABLE): engine list w/ runlist/fault/
-  pbdma IDs — fuse/floorsweeping dependent.
-- Interrupt table (INTR_GET_KERNEL_TABLE): MC vectors per engine.
-- GSP static config (GET_GSP_STATIC_INFO): FB regions, fb size, ECC, board name,
-  fuses.
-=> One-time capture per supported card via scripts/mode2_capture_host.sh (the
-   streamed-dmesg harness). Stored as `data/mode2/<chip>/{devinfo,intr,gspstatic}.bin`.
-   We CAN partially derive structure/engine-presence from the HAL in source to
-   sanity-check or synthesize a plausible table when no card is available, but the
-   authoritative values are captured.
+**B. GENERATE-TO-SATISFY — device-info table, interrupt table, GSP static config.**
+(REVISED 2026-06-03 per user: these are NOT "capture-required". The goal is to
+SATISFY THE DRIVER, not to be truthful. The driver imposes *constraints* (from
+source); we synthesize any values that pass them. We don't need the real
+fuse/board values, and we don't want a card-ownership or proprietary-dump
+dependency.) The constraints come in two flavors — both satisfiable by generation:
+  - STRUCTURAL/VALIDATION (struct sizes, valid flags, count ranges, name string,
+    checksums): trivially generated from source. nvidia-smi surfaces mostly the
+    **GPU name** (gpuNameString in GSP static config) + a few caps — it does not
+    deeply inspect engine/fault internals, so a sane synthesized set passes.
+  - FUNCTIONAL/CONSISTENCY (interrupt vectors per engine, engine runlist IDs, FB
+    region size): the value isn't arbitrary — it must be self-consistent with what
+    our emulation actually DOES (the MSI-X vectors we raise, the engines we expose,
+    the FB we back). But WE control that emulation, so we GENERATE the table and
+    use the same values on both sides. Still generation, just self-consistent.
+  => Generate per chip from the source constraints (engine list from the HAL/chip
+     config, intr vectors we assign, FB size we choose, name we advertise). No card
+     needed. `tools/mode2_gen_devtables.py`.
+  => CAPTURE is now only a *validation reference*: a one-time real capture (the
+     streamed-dmesg harness) to cross-check that our generated tables have the
+     right SHAPE for a known card. Not a requirement, not shipped as the source of
+     truth. The existing GA106 captures serve exactly this role.
+  !! NOT in this class: things the driver *functionally exercises* rather than
+     stores — e.g. kbusVerifyBar2 writes real VRAM through BAR2 and reads it back.
+     No generated "value" satisfies that; it needs real emulation (the GMMU walk +
+     FB backing). That is functionality (class D below), not data.
 
 **C. CONTROL RESPONSES (the 56 init controls)** — mostly chip-static; captured today.
 Many could be derived (caps/clock tables) but capture is the reliable baseline.
 
-## Honest summary for the user's question
-- "Auto-update offsets when NVIDIA releases a new card" → **YES**, fully: a header
-  generator over the open driver's swref tree (class A). This is the high-value,
-  clearly-doable piece.
-- "Generate the whole per-device dataset from source" → **partially**: classes A+C
-  largely yes; class B (devinfo/intr/gspstatic) are physically fuse/firmware-derived
-  and need a one-time capture per card (structure validated against source). That's
-  not a limitation of our approach — those bytes don't exist as static source.
+**D. REAL FUNCTIONALITY — not data, must be emulated/forwarded.**
+Things the driver exercises for real: BAR0-PRAMIN/BAR2 memory round-trips (GMMU
+walk + FB backing), DMA, channel/USERD doorbell, and the actual compute (forwarded
+to a host GPU). These can never be "a value that passes" — they are the emulator's
+real work. Independent of the data tables.
+
+## Honest summary (REVISED per user 2026-06-03)
+- "Auto-update offsets for new cards" → **YES, fully** (class A header generator).
+- "Generate the whole per-device dataset from source" → **YES**, for all the DATA
+  (classes A+B+C): the driver only *validates/stores* these, so we generate values
+  that satisfy the source-derived constraints + are self-consistent with our
+  emulation. No card ownership, no proprietary dumps. Capture is demoted to a
+  one-time *validation reference* per card, not a requirement.
+- The only things that aren't generatable are class D — REAL functionality (memory,
+  DMA, compute) — but those were never "data" anyway; they're the emulator's job.
+- Net: Mode-2 device support for a new GPU = run the generators against that chip's
+  open-driver headers/HAL; no capture needed (capture optional, to validate shape).
 
 ## Repo layout (target)
 ```
