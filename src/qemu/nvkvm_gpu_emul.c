@@ -161,6 +161,14 @@ struct NvkvmGpuEmul {
                               * 0x1714: PTR[27:0]<<12).  Holds the BAR2 page-dir base;
                               * BAR2 accesses are GMMU-VER2-walked through it.        */
 
+    /* M5 channel tracking: captured from the most-recent *_CHANNEL_GPFIFO_A
+     * GSP_RM_ALLOC (fn 103).  During init there is a single CE channel (the
+     * scrubber), so the doorbell-rung channel is the last one allocated.  These
+     * locate the GPFIFO ring so the doorbell handler can walk submitted work. */
+    uint64_t chan_gpfifo_va;   /* gpFifoOffset: GPU VA of the channel's GPFIFO ring */
+    uint32_t chan_gpfifo_ent;  /* gpFifoEntries */
+    uint32_t chan_class;       /* hClass of the tracked channel                     */
+
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
     uint64_t access_count;   /* monotonically increasing, for the trace      */
@@ -491,6 +499,25 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             qemu_log("nvkvm-gpu[%s] M4: cmd fn=%u seq=%u -> %s\n",
                      s->chip->name, fn, ldl_le_p(cmd + 36),
                      async ? "async (no response)" : "echo NV_OK");
+        }
+        /* M5: snoop GSP_RM_ALLOC (fn 103) for a *_CHANNEL_GPFIFO_A alloc so we can
+         * locate the GPFIFO ring when the doorbell rings.  rpc_gsp_rm_alloc body
+         * @cmd+80: hClass@+12 (cmd+92), paramsSize@+20 (cmd+100), params@+32
+         * (cmd+112).  NV_CHANNEL_ALLOC_PARAMS: gpFifoOffset@+8 (cmd+120, u64),
+         * gpFifoEntries@+16 (cmd+128). Classes: PASCAL..BLACKWELL _GPFIFO_A all
+         * end in 0x6F with the family nibble (C0/C3/C4/C5/C8/C9). */
+        if (fn == 103) {
+            uint32_t hclass = ldl_le_p(cmd + 92);
+            if ((hclass & 0xFFFFu) >= 0xC06Fu && (hclass & 0xFFu) == 0x6Fu &&
+                (hclass & 0xF000u) == 0xC000u) {
+                s->chan_class      = hclass;
+                s->chan_gpfifo_va  = ldq_le_p(cmd + 120);
+                s->chan_gpfifo_ent = ldl_le_p(cmd + 128);
+                qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
+                         "0x%llx entries=%u (tracked for doorbell execution)\n",
+                         s->chip->name, hclass,
+                         (unsigned long long)s->chan_gpfifo_va, s->chan_gpfifo_ent);
+            }
         }
         if (!async) {
             /* Build the response in a large buffer — GSP_RM_CONTROL responses can
