@@ -413,6 +413,19 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
     if (nvkvm_prom_read(s, off, size, &prom)) {
         return prom;
     }
+    /* NV_PCFG config mirror in BAR0 (DEVICE_BASE(NV_PCFG)=0x88000).  The kernel
+     * BIF reads the PCIe link registers here via GPU_BUS_CFG_RD32 (NOT real PCI
+     * config space), and UVM's getPCIELinkRateMBps reads LINK_CAPABILITIES for
+     * BUS_INFO PCIE_GPU_LINK_CAPS — 0 => "Unknown PCIe speed" => NV_ERR_INVALID_
+     * STATE => UVM_REGISTER_GPU fails => cuInit bails.  Report Gen4 x16.
+     *   0x88084 NV_XVE_LINK_CAPABILITIES: MAX_SPEED[3:0]=4, MAX_WIDTH[9:4]=16
+     *   0x88088 NV_XVE_LINK_CONTROL_STATUS: CUR_SPEED[19:16]=4, WIDTH[25:20]=16 */
+    if (off == 0x88084u) {
+        return 4u | (16u << 4);
+    }
+    if (off == 0x88088u) {
+        return (4u << 16) | (16u << 20);
+    }
     uint64_t val = nvkvm_reg_read(s, off, size);
 
     /* Don't trace PTIMER reads (RM timeout loops poll millions of times) or the
@@ -742,6 +755,35 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     }
                     stl_le_p(resp + 92, 0);              /* NV_OK */
                     stl_le_p(resp + 56, 32u + 40u + ps); /* psize unchanged */
+                } else if (ctrl == 0x20801823u) {
+                    /* BUS_GET_INFO_V2: inline {count; {index,data}[]}.  Fill the
+                     * PCIe link entries so the driver's getPCIELinkRateMBps()
+                     * succeeds; otherwise it returns NV_ERR_INVALID_STATE
+                     * ("Unknown PCIe speed"), which propagates out of
+                     * UVM_REGISTER_GPU (rmStatus=0x40) and makes cuInit bail.
+                     * idx 0x2D PCIE_GEN_INFO: LINK_CAP_GEN[15:12]=3 (GEN4),
+                     * CURR_LEVEL[19:16]=3; idx 0x07 LINK_CTRL_STATUS:
+                     * LINK_SPEED[19:16]=4 (16GT/s), LINK_WIDTH[25:20]=16 (x16). */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    uint32_t cnt = ldl_le_p(resp + 120);
+                    if (cnt > 256) cnt = 256;
+                    for (uint32_t e = 0; e < cnt; e++) {
+                        uint32_t eoff = 124u + e * 8u;
+                        if (eoff + 8u > 120u + ps) break;
+                        uint32_t idx = ldl_le_p(resp + eoff);
+                        if (idx == 0x03u) {
+                            /* PCIE_GPU_LINK_CAPS: MAX_SPEED[3:0]=4 (16000MBPS),
+                             * MAX_WIDTH[9:4]=16.  UVM's getPCIELinkRateMBps reads
+                             * exactly this; 0 -> "Unknown PCIe speed" INVALID_STATE. */
+                            stl_le_p(resp + eoff + 4, 4u | (16u << 4));
+                        } else if (idx == 0x2Du) {
+                            stl_le_p(resp + eoff + 4, (3u << 12) | (3u << 16));
+                        } else if (idx == 0x07u) {
+                            stl_le_p(resp + eoff + 4, (4u << 16) | (16u << 20));
+                        }
+                    }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
                 } else if (ctrl == 0x20803801u) {
                     /* GRMGR_GET_GR_FS_INFO: replay captured GA106 floorsweep blob
                      * (GPC/TPC/PES enable masks).  Capture is a 256B prefix; the
