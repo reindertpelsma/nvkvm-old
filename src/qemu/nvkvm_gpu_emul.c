@@ -174,6 +174,8 @@ struct NvkvmGpuEmul {
     uint64_t chan_inst_block;  /* instanceMem.base: channel instance block (unused: GSP-managed, empty) */
     bool     chan_inst_sys;    /* instanceMem.addressSpace == ADDR_SYSMEM(1)        */
     uint32_t chan_payload;     /* completion payload counter (incr per doorbell)    */
+    bool     chan_sem_released; /* set by chan_execute when it honored an explicit
+                                  * NVC56F SEM_EXECUTE release from the pushbuffer    */
     uint64_t chan_userd;       /* userdMem.base: USERD memory (holds GP_PUT/GP_GET) */
     bool     chan_userd_sys;   /* userdMem.addressSpace == ADDR_SYSMEM              */
     uint32_t chan_gp_get;      /* our consumed GPFIFO index (entries [get,put) pend)*/
@@ -538,6 +540,18 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             qemu_log("nvkvm-gpu[%s] M4: cmd fn=%u seq=%u -> %s\n",
                      s->chip->name, fn, ldl_le_p(cmd + 36),
                      async ? "async (no response)" : "echo NV_OK");
+        }
+        /* fn=47 UNLOADING_GUEST_DRIVER: the guest is tearing down.  On real HW the
+         * teardown runs Booter Unload, which brings WPR2 back DOWN.  We don't run
+         * Booter Unload, so mirror its effect: clear the GSP-boot state (WPR2,
+         * RISCV-active, FWSEC-ran).  Without this, a re-insmod (no QEMU restart)
+         * sees WPR2 still up and _kgspBootGspRm bails with NV_ERR_INVALID_STATE
+         * ("unexpected WPR2 already up") — a false cascade that masks the real
+         * init failure and forces a full VM/QEMU restart between iterations. */
+        if (fn == 47 && s->fwsec_ran) {
+            s->fwsec_ran = false;
+            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> clear GSP-boot state (WPR2 down)\n",
+                     s->chip->name);
         }
         /* M5: snoop GSP_RM_ALLOC (fn 103) for a *_CHANNEL_GPFIFO_A alloc so we can
          * locate the GPFIFO ring when the doorbell rings.  rpc_gsp_rm_alloc body
@@ -923,6 +937,14 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         /* Execute the submitted copy-engine work for real (memset/memcpy) so the
          * scrubber's CE self-verify (mem_mgr.c:469) sees moved data. */
         nvkvm_chan_execute(s);
+        /* If the channel's pushbuffer carried an explicit NVC56F SEM_EXECUTE
+         * RELEASE, nvkvm_chan_execute already wrote the real completion
+         * semaphore (golden/watchdog/compute channels do this).  Only fall back
+         * to the implicit finish-payload at gpfifo+0x8004 (the CE scrubber's
+         * layout) when no explicit release was honored. */
+        if (s->chan_sem_released) {
+            return;
+        }
         uint64_t sema_va = s->chan_gpfifo_va + 0x8004ull;
         bool is_sys = false;
         uint64_t phys = s->chan_gpfifo_va
@@ -1337,6 +1359,17 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
     }
+    /* NVC56F host-channel semaphore-release tracking (methods 0x5c..0x6c).  The
+     * golden-image / watchdog / scrubber channels append a SEM_EXECUTE RELEASE
+     * after their engine work to signal completion; channelWaitForFinishPayload
+     * polls that semaphore.  We honor the EXPLICIT release here (translate the
+     * SEM addr, write the payload) WITHOUT running the GR/compute methods — per
+     * the Phase-B design we never emulate GR, we only signal completion.  Tracked
+     * at function scope so addr/payload set in one method group apply to a later
+     * SEM_EXECUTE.  ADDR is 64-bit: LO bits[31:2] | HI<<32. */
+    uint64_t sem_addr = 0;
+    uint32_t sem_pay_lo = 0, sem_pay_hi = 0;
+    s->chan_sem_released = false;
     uint32_t guard = 0;
     for (uint32_t idx = s->chan_gp_get; idx != gp_put &&
          guard < s->chan_gpfifo_ent; idx = (idx + 1) % s->chan_gpfifo_ent, guard++) {
@@ -1413,6 +1446,37 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                              remap ? "MEMSET" : "COPY", (unsigned long long)off_in,
                              src_phys ? "phys" : "virt", (unsigned long long)off_out,
                              dst_phys ? "phys" : "virt", (unsigned long long)bytes, remapA);
+                    break;
+                }
+                /* NVC56F host-channel semaphore methods. */
+                case 0x5c: sem_addr = (sem_addr & ~0xFFFFFFFFull) | (d & 0xFFFFFFFCu); break; /* SEM_ADDR_LO[31:2] */
+                case 0x60: sem_addr = (sem_addr & 0xFFFFFFFFull) | ((uint64_t)d << 32); break;/* SEM_ADDR_HI */
+                case 0x64: sem_pay_lo = d; break;                                            /* SEM_PAYLOAD_LO */
+                case 0x68: sem_pay_hi = d; break;                                            /* SEM_PAYLOAD_HI */
+                case 0x6c: {                                                                 /* SEM_EXECUTE */
+                    if ((d & 0x7u) == 0x1u && sem_addr) {   /* OPERATION == RELEASE */
+                        bool sy = false;
+                        uint64_t p = nvkvm_chan_translate(s, sem_addr, &sy);
+                        if (p != NVKVM_GMMU_FAULT) {
+                            bool sz64 = (d >> 24) & 1;       /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
+                            if (sz64) {
+                                if (sy) { uint8_t b[4]; stl_le_p(b, sem_pay_lo);
+                                          pci_dma_write(&s->parent_obj, p, b, 4); }
+                                else    { nvkvm_fb_write(s, p, sem_pay_lo, 4); }
+                            } else {
+                                if (sy) { uint8_t b[8]; stl_le_p(b, sem_pay_lo);
+                                          stl_le_p(b + 4, sem_pay_hi);
+                                          pci_dma_write(&s->parent_obj, p, b, 8); }
+                                else    { nvkvm_fb_write(s, p, sem_pay_lo, 4);
+                                          nvkvm_fb_write(s, p + 4, sem_pay_hi, 4); }
+                            }
+                            s->chan_sem_released = true;
+                            qemu_log("nvkvm-gpu[%s] M5: SEM_RELEASE addr=0x%llx -> %s "
+                                     "phys=0x%llx payload=%u\n", s->chip->name,
+                                     (unsigned long long)sem_addr, sy ? "SYS" : "FB",
+                                     (unsigned long long)p, sem_pay_lo);
+                        }
+                    }
                     break;
                 }
                 default: break;
