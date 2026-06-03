@@ -383,6 +383,13 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
      * the UNLOADING RPC arrived so close() doesn't hang 4s. */
     case NV_PGSP_FALCON_MAILBOX0: return s->gsp_suspended ? 0x80000000u : 0;
 
+    /* NV_VIRTUAL_FUNCTION_PRIV_ACCESS_COUNTER_NOTIFY_BUFFER_SIZE (VF 0xB80000 +
+     * 0x3110): UVM_REGISTER_GPU's uvmGetAccessCounterBufferSize reads this and
+     * multiplies by 32 for the notify-buffer byte size; 0 => memdescCreate(0) =>
+     * NV_ERR_INVALID_ARGUMENT (access_cntr_buffer.c:72) => UVM register fails =>
+     * cuInit bails.  Report 256 entries (8 KiB buffer). */
+    case 0x00B83110u: return 256u;
+
     default:             return 0;
     }
 }
