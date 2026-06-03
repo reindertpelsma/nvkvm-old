@@ -762,6 +762,21 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     }
                     stl_le_p(resp + 92, 0);              /* NV_OK */
                     stl_le_p(resp + 56, 32u + 40u + ps); /* psize unchanged */
+                } else if (ctrl == 0x20802a07u) {
+                    /* CE_GET_PHYSICAL_CAPS V2 {u32 ceEngineType; u8 capsTbl[2]}.
+                     * UVM channel-manager ces_validate requires each usable CE
+                     * to advertise SYSMEM + P2P; a zero capsTbl -> "Failed to
+                     * initialize the channel manager: NV_ERR_NOT_SUPPORTED"
+                     * (uvm_gpu.c init_gpu) -> UVM_REGISTER_GPU fails -> cuInit
+                     * bails.  Set SYSMEM_READ(0x04)|SYSMEM_WRITE(0x08)|
+                     * SYSMEM(0x20)|P2P(0x40) in capsTbl[0]. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    if (ps >= 6) {
+                        resp[124] = 0x6Cu;
+                        resp[125] = 0x00u;
+                    }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
                 } else if (ctrl == 0x20801823u) {
                     /* BUS_GET_INFO_V2: inline {count; {index,data}[]}.  Fill the
                      * PCIe link entries so the driver's getPCIELinkRateMBps()
