@@ -1136,7 +1136,7 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
     if (tbl == 0) {
         return NVKVM_GMMU_FAULT;
     }
-    /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE); aperture per level. */
+    /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE or 2 MiB PTE); aperture per level. */
     bool tsys = false;     /* PDB in FB; each PDE aperture says where next lives */
     static const struct { int hi, lo; } lvl[3] = { {48,47}, {46,38}, {37,29} };
     for (int i = 0; i < 3; i++) {
@@ -1157,6 +1157,17 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
     uint64_t lo = nvkvm_pt_rd64(s, tbl + (uint64_t)idx0 * 16, tsys);
     uint64_t hi = nvkvm_pt_rd64(s, tbl + (uint64_t)idx0 * 16 + 8, tsys);
     uint32_t big_ap = (uint32_t)((lo >> 1) & 0x3), small_ap = (uint32_t)((hi >> 1) & 0x3);
+    /* A PD0 entry with VALID(bit0)=1 is itself a 2 MiB LEAF PTE (NV_MMU_VER2_PTE),
+     * not a dual PDE pointing to 4K/64K sub-tables.  APERTURE bits2:1 (0=VID,
+     * 2/3=SYS); VA[20:0] is the 2 MiB page offset. */
+    if (lo & 1) {
+        uint32_t lap = (uint32_t)((lo >> 1) & 0x3);
+        uint64_t pg;
+        if (lap == 0) { pg = ((lo >> 8) & ((1ull << 25) - 1)) << 12; *out_sys = false; }
+        else if (lap == 2 || lap == 3) { pg = ((lo >> 8) & ((1ull << 46) - 1)) << 12; *out_sys = true; }
+        else { return NVKVM_GMMU_FAULT; }
+        return pg + (va & 0x1FFFFFull);
+    }
     uint64_t pte; uint32_t pgshift; bool stsys;
     if (small_ap == 1 || small_ap == 2 || small_ap == 3) {
         stsys = (small_ap != 1);
