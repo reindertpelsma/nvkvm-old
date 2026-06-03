@@ -164,6 +164,11 @@ struct NvkvmGpuEmul {
     uint64_t bar2_inst_block;/* FB addr of the BAR2 instance block (NV_PBUS_BAR2_BLOCK
                               * 0x1714: PTR[27:0]<<12).  Holds the BAR2 page-dir base;
                               * BAR2 accesses are GMMU-VER2-walked through it.        */
+    uint64_t bar1_pdb;       /* BAR1 (FB aperture) page-dir base from
+                              * GspStaticConfigInfo.bar1PdeBase (offset 1664) + the
+                              * UPDATE_BAR_PDE(BAR_1) root entry.  The driver maps
+                              * channel USERD/pushbuffers into BAR1 and the CPU
+                              * writes GP_PUT through it — must GMMU-walk to FB.     */
 
     /* M5 channel tracking: captured from the most-recent *_CHANNEL_GPFIFO_A
      * GSP_RM_ALLOC (fn 103).  During init there is a single CE channel (the
@@ -803,8 +808,13 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 if (GSPSTATICINFO_GA106_SIZE >= NVKVM_GSPSTATIC_BAR2PDEBASE_OFF + 8) {
                     s->bar2_pdb = ldq_le_p(gspstaticinfo_ga106 + NVKVM_GSPSTATIC_BAR2PDEBASE_OFF);
                     s->bar2_virtual = (s->bar2_pdb != 0);
-                    qemu_log("nvkvm-gpu[%s] M6: BAR2 root PDB (GSP static) = 0x%llx\n",
-                             s->chip->name, (unsigned long long)s->bar2_pdb);
+                    /* bar1PdeBase precedes bar2PdeBase (consecutive NvU64). */
+                    s->bar1_pdb = ldq_le_p(gspstaticinfo_ga106 +
+                                           NVKVM_GSPSTATIC_BAR2PDEBASE_OFF - 8);
+                    qemu_log("nvkvm-gpu[%s] M6: BAR2 root PDB (GSP static) = 0x%llx "
+                             "BAR1 root PDB = 0x%llx\n", s->chip->name,
+                             (unsigned long long)s->bar2_pdb,
+                             (unsigned long long)s->bar1_pdb);
                 }
             }
             if (fn == 70) {
@@ -824,6 +834,13 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     qemu_log("nvkvm-gpu[%s] M6: UPDATE_BAR_PDE BAR2 root[0] @ "
                              "0x%llx <- 0x%llx (shift=%llu)\n", s->chip->name,
                              (unsigned long long)s->bar2_pdb,
+                             (unsigned long long)entryval,
+                             (unsigned long long)lvlshift);
+                } else if (bartype == 0 /* NV_RPC_UPDATE_PDE_BAR_1 */ && s->bar1_pdb) {
+                    nvkvm_fb_write(s, s->bar1_pdb, entryval, 8);
+                    qemu_log("nvkvm-gpu[%s] M6: UPDATE_BAR_PDE BAR1 root[0] @ "
+                             "0x%llx <- 0x%llx (shift=%llu)\n", s->chip->name,
+                             (unsigned long long)s->bar1_pdb,
                              (unsigned long long)entryval,
                              (unsigned long long)lvlshift);
                 }
@@ -970,6 +987,8 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
 
 static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys);
 static void nvkvm_chan_execute(NvkvmGpuEmul *s);
+static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
+                               bool *out_sys);
 
 static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
@@ -1167,28 +1186,51 @@ static const MemoryRegionOps nvkvm_bar0_ops = {
     .valid      = { .min_access_size = 1, .max_access_size = 8 },
 };
 
-/* BAR1 (FB) and BAR3 (usermode/IMEM): M0 stubs that log and read 0.  These
- * become the address-virtualization windows backed by real host-isolate
- * mappings (parity; see mode2_perf_dma_multigpu) at M4/M5. */
+/* BAR1 — RM "BAR1" FB aperture.  The driver maps channel USERD, pushbuffers and
+ * semaphores (in FB) into BAR1 and the CPU reads/writes them through it — most
+ * importantly GP_PUT @ USERD+0x8C, the channel work-submit.  A no-op stub here
+ * silently dropped those writes (GP_PUT never reached the FB backing → the CE
+ * scrubber's channel never advanced → ce_utils.c:349 timeout).  BAR1 is a GPU
+ * virtual aperture (its own page tables in FB, root = bar1_pdb from
+ * GspStaticConfigInfo.bar1PdeBase + the UPDATE_BAR_PDE(BAR_1) root entry), so a
+ * BAR1 offset is a GPU VA: GMMU-VER2-walk it to FB/sysmem (nvkvm_walk_pdb). */
 static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
-    if (s->trace) {
-        qemu_log("nvkvm-gpu[%s] #%llu APER RD  off=0x%llx sz=%u -> 0\n",
-                 s->chip->name, (unsigned long long)s->access_count++,
-                 (unsigned long long)off, size);
+    if (!s->bar1_pdb) {
+        return 0;
     }
-    return 0;
+    bool sys = false;
+    uint64_t pa = nvkvm_walk_pdb(s, s->bar1_pdb, off, &sys);
+    if (pa == NVKVM_GMMU_FAULT) {
+        return 0;
+    }
+    if (sys) {
+        uint8_t b[8] = {0};
+        if (pci_dma_read(&s->parent_obj, pa, b, size) != MEMTX_OK) return 0;
+        return ldn_le_p(b, size);
+    }
+    return nvkvm_fb_read(s, pa, size);
 }
 
 static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
                                     unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
-    if (s->trace) {
-        qemu_log("nvkvm-gpu[%s] #%llu APER WR  off=0x%llx sz=%u <- 0x%llx\n",
-                 s->chip->name, (unsigned long long)s->access_count++,
-                 (unsigned long long)off, size, (unsigned long long)val);
+    if (!s->bar1_pdb) {
+        return;
+    }
+    bool sys = false;
+    uint64_t pa = nvkvm_walk_pdb(s, s->bar1_pdb, off, &sys);
+    if (pa == NVKVM_GMMU_FAULT) {
+        return;
+    }
+    if (sys) {
+        uint8_t b[8];
+        stn_le_p(b, size, val);
+        pci_dma_write(&s->parent_obj, pa, b, size);
+    } else {
+        nvkvm_fb_write(s, pa, val, size);
     }
 }
 
