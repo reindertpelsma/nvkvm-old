@@ -44,7 +44,8 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qom/object.h"
-#include "mode2_devinfo_ga106.h"  /* captured GA106 engine table (M5 replay) */
+#include "mode2_devinfo_ga106.h"   /* captured GA106 engine table (M5 replay) */
+#include "mode2_initctrl_ga106.h"  /* captured GA106 init-control responses    */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -378,6 +379,13 @@ static uint32_t nvkvm_msgq_checksum32(const uint8_t *p, uint32_t len)
  * its rpc header/body and just override function + rpc_result.  Else build a
  * minimal header (used for GSP_INIT_DONE event).  Recomputes checksum, writes
  * the element to the ring slot, bumps the status tx writePtr. */
+/* Post a SINGLE-element message to the GSP->CPU status queue.  The guest reads
+ * the element-count from the elemCount field (@40), so a single 4096-byte
+ * element with elemCount=1 keeps the status-queue seqNum in lockstep with the
+ * guest's rxSeqNum.  Responses must therefore fit one element (params <= ~3976
+ * bytes); larger captured controls are echoed instead (see service_cmdq).
+ * `el` is a 4096-byte buffer already populated with the response (element
+ * header + rpc header + body + params). */
 static void nvkvm_m3_post_status(NvkvmGpuEmul *s, const uint8_t *src,
                                  uint32_t function, uint32_t rpc_result)
 {
@@ -394,9 +402,7 @@ static void nvkvm_m3_post_status(NvkvmGpuEmul *s, const uint8_t *src,
     stl_le_p(el + 40, 1);                /* elemCount = 1 */
     stl_le_p(el + 60, function);         /* rpc.function */
     stl_le_p(el + 64, rpc_result);       /* rpc.rpc_result */
-    stl_le_p(el + 68, rpc_result);       /* rpc.rpc_result_private — RmRpc*() reads
-                                          * THIS (not rpc_result); echoed commands
-                                          * carry RPC_PENDING (0xffffffff) here. */
+    stl_le_p(el + 68, rpc_result);       /* rpc.rpc_result_private (RmRpc reads this) */
     stl_le_p(el + 36, s->stat_writeptr); /* seqNum = current monotonic writePtr */
     stl_le_p(el + 32, 0);                /* zero checksum field before folding */
     uint32_t len = 48 + ldl_le_p(el + 56);
@@ -460,79 +466,67 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      async ? "async (no response)" : "echo NV_OK");
         }
         if (!async) {
-            /* GSP_RM_CONTROL (fn 76): rpc_gsp_rm_control_v body starts at
-             * element+80 (rpc header is 32B here, not 36 — verified by trace:
-             * cmd lands at +88).  Body: hClient@80, hObject@84, cmd@88,
-             * status@92, paramsSize@96, ..., params@~120.  RmRpc control reads
-             * body.status (@92).  Set it NV_OK.  NOTE: for GET controls the
-             * request paramsSize is 0 (empty input); a correct response must
-             * FILL params + paramsSize with real data (M5: chip-static table or
-             * host-captured), so the echo only gets void/SET controls through. */
+            /* Build the response in a large buffer — GSP_RM_CONTROL responses can
+             * span multiple queue elements (paramsSize up to ~34 KB).  Seed it
+             * from the command element (element header + 32B rpc header + 40B
+             * rpc_gsp_rm_control body), then fill the control response.
+             * Body@80: hClient@80, hObject@84, cmd@88, status@92, paramsSize@96,
+             * ..., params@120.  RmRpc control reads body.status (@92). */
+            static uint8_t resp[40960];
+            memset(resp, 0, sizeof(resp));
+            memcpy(resp, cmd, 4096);
+            uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
             if (fn == 76) {
-                stl_le_p(cmd + 92, 0); /* rpc_gsp_rm_control_v.status = NV_OK */
-                /* CORRECTED (audit #7 vs 580 source): GET_CONSTRUCTED_FALCON_INFO
-                 * (0x208001b0) is NOT FINN-serialized in 580 (only GET_ENGINES /
-                 * GET_ENGINE_CLASSLIST / RPC_GSP_TEST are), so the response is
-                 * flat-copied — a fabricated empty response IS structurally valid.
-                 * Body@80: cmd@88, status@92, paramsSize@96, params@120.  Provide
-                 * numConstructedFalcons=0; params struct = 4 + 0x40*20 = 1284;
-                 * rpc.length@56 = 32(hdr)+40(body)+1284 = 1356. */
-                uint32_t ctrl = ldl_le_p(cmd + 88);
-                if (ctrl == 0x208001b0u) {
-                    stl_le_p(cmd + 96, 1284u);             /* paramsSize */
-                    memset(cmd + 120, 0, 1284);            /* numConstructedFalcons=0 */
-                    stl_le_p(cmd + 56, 32u + 40u + 1284u); /* rpc.length = 1356 */
-                } else if (ctrl == 0x20801112u) {
-                    /* NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: replay the REAL
-                     * GA106 engine table captured from the host GSP (this control
-                     * is ROUTE_TO_PHYSICAL and cannot be answered empty — the
-                     * guest builds its engine/interrupt tables from it).  Params
-                     * @120: baseIndex@120, numEntries@124, bMore@128, entries@132
-                     * (each NV2080_CTRL_FIFO_DEVICE_ENTRY = 100B).  Single page
-                     * (bMore=0); for baseIndex>0 return an empty page. */
-                    uint32_t base = ldl_le_p(cmd + 120);
-                    uint32_t psize = 12u + 32u * DEVINFO_GA106_ENTRY_SIZE; /* 3212 */
-                    memset(cmd + 124, 0, psize - 4u);  /* clear numEntries..entries */
-                    if (base == 0) {
-                        stl_le_p(cmd + 124, DEVINFO_GA106_NUM_ENTRIES);
-                        cmd[128] = 0; /* bMore = NV_FALSE */
-                        memcpy(cmd + 132, devinfo_ga106_entries,
-                               sizeof(devinfo_ga106_entries));
-                    } else {
-                        stl_le_p(cmd + 124, 0);
-                        cmd[128] = 0;
+                stl_le_p(resp + 92, 0); /* body.status = NV_OK (default) */
+                const nvkvm_ctrl_resp_t *cr = NULL;
+                for (uint32_t i = 0; i < NVKVM_CTRL_RESP_COUNT; i++) {
+                    if (nvkvm_ctrl_resps[i].cmd == ctrl) {
+                        cr = &nvkvm_ctrl_resps[i];
+                        break;
                     }
-                    stl_le_p(cmd + 96, psize);             /* paramsSize = 3212 */
-                    stl_le_p(cmd + 56, 32u + 40u + psize); /* rpc.length = 3284 */
                 }
-            }
-            if (s->trace) {
-                qemu_log("nvkvm-gpu[%s] M4:   cmd rpc: len=%u seq(rpc)=%u "
-                         "result=0x%x%s\n", s->chip->name, ldl_le_p(cmd + 56),
-                         ldl_le_p(cmd + 48 + 24), ldl_le_p(cmd + 64),
-                         fn == 76 ? " [ctrl cmd=0x" : "");
-                if (fn == 76) {
-                    /* body@80: hClient@80 hObject@84 cmd@88 status@92
-                     * paramsSize@96 */
-                    qemu_log("nvkvm-gpu[%s] M4:   ctrl cmd=0x%x paramsSize=%u "
-                             "(body@80)\n", s->chip->name,
-                             ldl_le_p(cmd + 88), ldl_le_p(cmd + 96));
+                if (ctrl == 0x20801112u) {
+                    /* FIFO_GET_DEVICE_INFO_TABLE: paginated; replay real GA106
+                     * engine table (separate capture). params@120: baseIndex@120,
+                     * numEntries@124, bMore@128, entries@132 (100B each). */
+                    uint32_t base = ldl_le_p(resp + 120);
+                    uint32_t psize = 12u + 32u * DEVINFO_GA106_ENTRY_SIZE; /* 3212 */
+                    memset(resp + 120, 0, psize);
+                    stl_le_p(resp + 120, base);
+                    if (base == 0) {
+                        stl_le_p(resp + 124, DEVINFO_GA106_NUM_ENTRIES);
+                        memcpy(resp + 132, devinfo_ga106_entries,
+                               sizeof(devinfo_ga106_entries));
+                    }
+                    stl_le_p(resp + 96, psize);
+                    stl_le_p(resp + 56, 32u + 40u + psize);
+                } else if (cr && (32u + 40u + cr->psize) <= (4096u - 48u)) {
+                    /* general replay: captured GA106 init-control response
+                     * (ROUTE_TO_PHYSICAL GET controls the echo can't fabricate).
+                     * Single-element only (params <= ~3976B) — the status queue
+                     * tracks elemCount=1 per message.  Larger captured controls
+                     * (0x20800a22/b03/b05, also truncated at 8192B) fall through
+                     * to echo for now; revisit with multi-element + full capture. */
+                    memset(resp + 120, 0, cr->psize);
+                    memcpy(resp + 120, cr->data, cr->dlen);
+                    stl_le_p(resp + 92, cr->status);
+                    stl_le_p(resp + 96, cr->psize);
+                    stl_le_p(resp + 56, 32u + 40u + cr->psize);
+                } else if (ctrl == 0x208001b0u) {
+                    /* GET_CONSTRUCTED_FALCON_INFO: empty list is valid */
+                    stl_le_p(resp + 96, 1284u);
+                    memset(resp + 120, 0, 1284);
+                    stl_le_p(resp + 56, 32u + 40u + 1284u);
                 }
+                /* else: void/SET control — echo with status=NV_OK */
             }
-            uint32_t resp_slot = s->stat_writeptr % s->q_msgcount;
-            uint64_t resp_gpa = s->q_shmem + s->q_stat_base + s->q_stat_entryoff +
-                                (uint64_t)resp_slot * s->q_msgsize;
-            nvkvm_m3_post_status(s, cmd, fn, 0 /* NV_OK */);
-            if (s->trace) {  /* read back what we actually wrote */
-                uint8_t rb[80];
-                if (pci_dma_read(pdev, resp_gpa, rb, sizeof(rb)) == MEMTX_OK) {
-                    qemu_log("nvkvm-gpu[%s] M4:   resp@0x%llx: msgqSeq=%u cks=0x%x "
-                             "fn=%u rpcSeq=%u result=0x%x\n", s->chip->name,
-                             (unsigned long long)resp_gpa, ldl_le_p(rb+36),
-                             ldl_le_p(rb+32), ldl_le_p(rb+60), ldl_le_p(rb+48+24),
-                             ldl_le_p(rb+64));
-                }
+            if (s->trace && fn == 76) {
+                qemu_log("nvkvm-gpu[%s] M4:   ctrl cmd=0x%x reqPsize=%u -> "
+                         "respPsize=%u status=0x%x\n", s->chip->name, ctrl,
+                         ldl_le_p(cmd + 96), ldl_le_p(resp + 96),
+                         ldl_le_p(resp + 92));
             }
+            nvkvm_m3_post_status(s, resp, fn, 0 /* rpc_result NV_OK */);
         }
         /* Advance by the command's ELEMENT COUNT, not by 1.  A GSP_MSG_QUEUE
          * message spans ceil((HDR_SIZE(48) + rpc.length) / SIZE_MIN(4096))
