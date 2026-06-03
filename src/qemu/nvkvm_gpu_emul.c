@@ -1598,10 +1598,17 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
         uint32_t e0, e1;
         uint64_t eva = s->chan_gpfifo_va + (uint64_t)idx * 8;
         if (!nvkvm_chan_rd32(s, eva, &e0) || !nvkvm_chan_rd32(s, eva + 4, &e1)) {
+            qemu_log("nvkvm-gpu[%s] M5: chan_exec GPFIFO entry[%u] @VA 0x%llx "
+                     "FAULTED (no VAS maps it)\n", s->chip->name, idx,
+                     (unsigned long long)eva);
             break;
         }
         uint64_t pb   = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
         uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;   /* GP_ENTRY1_LENGTH: # method words */
+        { uint32_t w0 = 0; bool pbok = nvkvm_chan_rd32(s, pb, &w0);
+          qemu_log("nvkvm-gpu[%s] M5: chan_exec entry[%u] pb=0x%llx pblen=%u "
+                   "pb_read=%s w0=0x%08x\n", s->chip->name, idx,
+                   (unsigned long long)pb, pblen, pbok ? "ok" : "FAULT", w0); }
         /* method-stream parse */
         uint64_t off_in = 0, off_out = 0;
         uint32_t llen = 0, lcount = 1, remapA = 0;
