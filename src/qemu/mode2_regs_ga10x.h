@@ -97,6 +97,21 @@
 #define NVKVM_VF_DOORBELL   0x00BB0090u
 #define NVKVM_DOORBELL_CHID(tok)     ((tok) & 0xFFFu)
 #define NVKVM_DOORBELL_RUNLIST(tok)  (((tok) >> 16) & 0x7Fu)
+
+/* M7 — CPU interrupt tree (NV_VIRTUAL_FUNCTION_PRIV_CPU_INTR_*, VF base 0xB80000).
+ * The driver tests IRQ delivery (osVerifySystemEnvironment/_osVerifyInterrupts):
+ * it writes the SW-intr/doorbell vector (=129) to LEAF_TRIGGER, expecting the HW
+ * to set the leaf+top pending bits and raise an MSI so the ISR fires.  TOP(0) bit
+ * = subtree; LEAF(i) bit = vector%32; subtree = (vector/32)/2; leaf reg = vec/32. */
+#define NVKVM_VF_INTR_LEAF0          0x00B81000u  /* LEAF(i)=+i*4, i<8 (RW1C pending) */
+#define NVKVM_VF_INTR_LEAF_EN_SET0   0x00B81200u
+#define NVKVM_VF_INTR_LEAF_EN_CLR0   0x00B81400u
+#define NVKVM_VF_INTR_TOP0           0x00B81600u  /* TOP(i)=+i*4, i<1 */
+#define NVKVM_VF_INTR_TOP_EN_SET0    0x00B81608u
+#define NVKVM_VF_INTR_TOP_EN_CLR0    0x00B81610u
+#define NVKVM_VF_INTR_LEAF_TRIGGER   0x00B81640u
+#define NVKVM_VF_INTR_NLEAF          8u
+#define NVKVM_SW_INTR_VECTOR         129u  /* NV_CTRL_CPU_DOORBELL_VECTORID_VALUE_CONSTANT */
 #define NVKVM_BAR2_BLOCK_PTR_SHIFT 12         /* instblk addr = PTR << 12 */
 #define NVKVM_BAR2_BLOCK_MODE_VIRTUAL 0x80000000u /* MODE bit31 */
 

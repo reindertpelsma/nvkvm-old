@@ -177,6 +177,12 @@ struct NvkvmGpuEmul {
     uint64_t chan_userd;       /* userdMem.base: USERD memory (holds GP_PUT/GP_GET) */
     bool     chan_userd_sys;   /* userdMem.addressSpace == ADDR_SYSMEM              */
     uint32_t chan_gp_get;      /* our consumed GPFIFO index (entries [get,put) pend)*/
+
+    /* M7 — CPU interrupt tree (raise MSI-X on LEAF_TRIGGER; ISR reads TOP/LEAF) */
+    uint32_t intr_leaf[NVKVM_VF_INTR_NLEAF];     /* pending per leaf reg */
+    uint32_t intr_leaf_en[NVKVM_VF_INTR_NLEAF];  /* enables */
+    uint32_t intr_top;                           /* pending subtree bitmask (TOP(0)) */
+    uint32_t intr_top_en;
     /* VAS root page-dir bases snooped from VASPACE_COPY_SERVER_RESERVED_PDES
      * (0x90f10106): levels[0].physAddress roots the WHOLE VAS (the params' VA
      * range is only the reserved window, not the VAS extent), keyed by the
@@ -276,6 +282,21 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     }
     if (off == NVKVM_BAR0_WINDOW) {
         return s->bar0_window;
+    }
+    /* M7 — CPU interrupt tree reads (the ISR reads TOP to find pending subtrees,
+     * then LEAF for the vectors). */
+    if (off == NVKVM_VF_INTR_TOP0)        { return s->intr_top; }
+    if (off == NVKVM_VF_INTR_TOP_EN_SET0 || off == NVKVM_VF_INTR_TOP_EN_CLR0) {
+        return s->intr_top_en;
+    }
+    if (off >= NVKVM_VF_INTR_LEAF0 && off < NVKVM_VF_INTR_LEAF0 + NVKVM_VF_INTR_NLEAF*4) {
+        return s->intr_leaf[(off - NVKVM_VF_INTR_LEAF0)/4];
+    }
+    if (off >= NVKVM_VF_INTR_LEAF_EN_SET0 && off < NVKVM_VF_INTR_LEAF_EN_SET0 + NVKVM_VF_INTR_NLEAF*4) {
+        return s->intr_leaf_en[(off - NVKVM_VF_INTR_LEAF_EN_SET0)/4];
+    }
+    if (off >= NVKVM_VF_INTR_LEAF_EN_CLR0 && off < NVKVM_VF_INTR_LEAF_EN_CLR0 + NVKVM_VF_INTR_NLEAF*4) {
+        return s->intr_leaf_en[(off - NVKVM_VF_INTR_LEAF_EN_CLR0)/4];
     }
     switch (off) {
     case NV_PMC_BOOT_0:  return s->chip->pmc_boot_0;
@@ -930,6 +951,48 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         }
         return;
     }
+    /* M7 — CPU interrupt tree writes. */
+    if (off == NVKVM_VF_INTR_LEAF_TRIGGER) {
+        /* The driver triggers an interrupt by writing its vector here: set the
+         * leaf+top pending bits and raise the MSI so the ISR fires (this is what
+         * _osVerifyInterrupts polls for). */
+        uint32_t vec = (uint32_t)val & 0xFFFu;
+        uint32_t leaf = vec / 32u, bit = vec % 32u, subtree = leaf / 2u;
+        if (leaf < NVKVM_VF_INTR_NLEAF) {
+            s->intr_leaf[leaf] |= (1u << bit);
+            s->intr_top |= (1u << subtree);
+            PCIDevice *pd = &s->parent_obj;
+            if (msix_enabled(pd)) {
+                msix_notify(pd, 0);   /* single stall vector; ISR demuxes via TOP/LEAF */
+            } else {
+                pci_set_irq(pd, 1);
+            }
+            qemu_log("nvkvm-gpu[%s] M7: INTR trigger vec=%u -> leaf[%u] bit%u "
+                     "subtree%u, MSI raised\n", s->chip->name, vec, leaf, bit, subtree);
+        }
+        return;
+    }
+    if (off >= NVKVM_VF_INTR_LEAF0 && off < NVKVM_VF_INTR_LEAF0 + NVKVM_VF_INTR_NLEAF*4) {
+        uint32_t i = (off - NVKVM_VF_INTR_LEAF0) / 4;     /* LEAF(i): write-1-to-clear */
+        s->intr_leaf[i] &= ~(uint32_t)val;
+        uint32_t st = i / 2u;
+        if (s->intr_leaf[st*2] == 0 && (st*2+1 >= NVKVM_VF_INTR_NLEAF ||
+            s->intr_leaf[st*2+1] == 0)) {
+            s->intr_top &= ~(1u << st);
+        }
+        if (s->intr_top == 0 && !msix_enabled(&s->parent_obj)) {
+            pci_set_irq(&s->parent_obj, 0);
+        }
+        return;
+    }
+    if (off >= NVKVM_VF_INTR_LEAF_EN_SET0 && off < NVKVM_VF_INTR_LEAF_EN_SET0 + NVKVM_VF_INTR_NLEAF*4) {
+        s->intr_leaf_en[(off - NVKVM_VF_INTR_LEAF_EN_SET0)/4] |= (uint32_t)val; return;
+    }
+    if (off >= NVKVM_VF_INTR_LEAF_EN_CLR0 && off < NVKVM_VF_INTR_LEAF_EN_CLR0 + NVKVM_VF_INTR_NLEAF*4) {
+        s->intr_leaf_en[(off - NVKVM_VF_INTR_LEAF_EN_CLR0)/4] &= ~(uint32_t)val; return;
+    }
+    if (off == NVKVM_VF_INTR_TOP_EN_SET0) { s->intr_top_en |= (uint32_t)val; return; }
+    if (off == NVKVM_VF_INTR_TOP_EN_CLR0) { s->intr_top_en &= ~(uint32_t)val; return; }
     /* M6: NV_PBUS_BAR2_BLOCK (0x1714) PTR[27:0] = BAR2 instance-block FB addr
      * (in NV_RAMIN_BASE_SHIFT=12 units).  Caches the page-dir base source for
      * the BAR2 GMMU walk. */
