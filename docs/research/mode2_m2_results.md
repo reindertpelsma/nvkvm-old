@@ -85,3 +85,22 @@ Next (M4 RPC shim): respond to each _issueRpcAndWait — read the CPU->GSP comma
 next seqNum, rpc_result NV_OK + expected body) to the status queue, bump
 writePtr. SET_GUEST_SYSTEM_INFO (fn 1) first. See
 [[mode2_keystone_gsp_init_done]].
+
+## M5 progress 2026-06-03 (commit eb502e9): RPC seq 5 -> 20
+
+Multi-element GSP cmd-consumption bug FIXED (advance cmd_readptr by elemCount, not
+1) — the prior 0x3a at GET_CONSTRUCTED_FALCON_INFO was actually corrupted status
+queue from mis-reading continuation elements of the 3-element control 0x20800a41.
+Driver now runs deep into RmInitNvDevice and stalls at kfifoGetHostDeviceInfoTable
+(NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE 0x20801112) returning NV_ERR_NO_MEMORY
+on an empty echoed table.
+
+NEXT (capture tool, non-disruptive — host RTX 3060 is idle): build a host
+userspace RM client (reuse src/abi/nvgpu.h + tests/integration/test_ioctl_fwd.c
+alloc helpers) that opens nvidiactl+nvidia0, allocs NV01_ROOT_CLIENT(0x41) ->
+NV01_DEVICE_0(0x80, NV0080_ALLOC_PARAMETERS) -> NV20_SUBDEVICE_0(0x2080,
+NV2080_ALLOC_PARAMETERS), then calls 0x20801112 (paginated by baseIndex,
+MAX_ENTRIES=32) and dumps the GA106 engine table. Bake the bytes into the
+emulator fn-76 handler keyed by cmd 0x20801112. Watch for the device-attach
+sequence (REGISTER_FD / NV_ESC_NUMA / attach) that real RM clients need before
+subdevice alloc succeeds. See memory mode2_keystone_gsp_init_done #8.
