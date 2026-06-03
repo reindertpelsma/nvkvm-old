@@ -171,9 +171,18 @@ struct NvkvmGpuEmul {
     uint64_t chan_gpfifo_va;   /* gpFifoOffset: GPU VA of the channel's GPFIFO ring */
     uint32_t chan_gpfifo_ent;  /* gpFifoEntries */
     uint32_t chan_class;       /* hClass of the tracked channel                     */
-    uint64_t chan_inst_block;  /* instanceMem.base: channel instance block (PDB src)*/
+    uint64_t chan_inst_block;  /* instanceMem.base: channel instance block (unused: GSP-managed, empty) */
     bool     chan_inst_sys;    /* instanceMem.addressSpace == ADDR_SYSMEM(1)        */
     uint32_t chan_payload;     /* completion payload counter (incr per doorbell)    */
+    /* VAS root page-dir bases snooped from VASPACE_COPY_SERVER_RESERVED_PDES
+     * (0x90f10106): levels[0].physAddress roots the WHOLE VAS (the params' VA
+     * range is only the reserved window, not the VAS extent), keyed by the
+     * VASpace handle (control hObject).  Matched to a channel via the channel's
+     * hVASpace.  This is the channel PDB source (the GSP-managed instblk is empty
+     * in our FB). */
+    struct { uint32_t hvas; uint64_t pdb; } chan_vas[16];
+    int      chan_vas_n;
+    uint32_t chan_hvaspace;    /* the tracked channel's hVASpace handle */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -512,6 +521,22 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * (cmd+112).  NV_CHANNEL_ALLOC_PARAMS: gpFifoOffset@+8 (cmd+120, u64),
          * gpFifoEntries@+16 (cmd+128). Classes: PASCAL..BLACKWELL _GPFIFO_A all
          * end in 0x6F with the family nibble (C0/C3/C4/C5/C8/C9). */
+        /* M5: snoop VASPACE_COPY_SERVER_RESERVED_PDES (0x90f10106) — the CPU
+         * hands GSP its page-directory level phys addrs for a VA range.  Record
+         * levels[0].physAddress (root PDB) + [virtAddrLo,virtAddrHi] so the
+         * doorbell can root the channel GMMU walk (the GSP-managed instblk is
+         * empty in our FB).  body @cmd+80: control cmd@+88 (cmd+88); params@cmd+120;
+         * virtAddrLo@cmd+136, virtAddrHi@cmd+144, levels[0].physAddress@cmd+160. */
+        if (fn == 76 && ldl_le_p(cmd + 88) == 0x90f10106u) {
+            if (s->chan_vas_n < 16) {
+                int k = s->chan_vas_n++;
+                s->chan_vas[k].hvas = ldl_le_p(cmd + 84);   /* control hObject = VASpace */
+                s->chan_vas[k].pdb  = ldq_le_p(cmd + 160);  /* levels[0].physAddress */
+                qemu_log("nvkvm-gpu[%s] M5: VAS hObject=0x%08x PDB=0x%llx\n",
+                         s->chip->name, s->chan_vas[k].hvas,
+                         (unsigned long long)s->chan_vas[k].pdb);
+            }
+        }
         if (fn == 103) {
             uint32_t hclass = ldl_le_p(cmd + 92);
             if ((hclass & 0xFFFFu) >= 0xC06Fu && (hclass & 0xFFu) == 0x6Fu &&
@@ -521,6 +546,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 s->chan_gpfifo_ent = ldl_le_p(cmd + 128);
                 s->chan_inst_block = ldq_le_p(cmd + 256);   /* instanceMem.base */
                 s->chan_inst_sys   = (ldl_le_p(cmd + 272) == 1u); /* ADDR_SYSMEM */
+                s->chan_hvaspace   = ldl_le_p(cmd + 140);   /* hVASpace handle */
                 qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
                          "0x%llx ent=%u instblk=0x%llx(%s)\n",
                          s->chip->name, hclass,
@@ -1082,30 +1108,19 @@ static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
 static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
 {
     *out_sys = false;
-    if (s->chan_inst_block == 0) {
-        return NVKVM_GMMU_FAULT;
-    }
-    /* Read the channel PDB from the instance block (NV_RAMIN_PAGE_DIR_BASE
-     * word128 @ +0x200 = TARGET[1:0]+LO[31:12], word129 @ +0x204 = HI[31:0]). */
-    uint64_t w128, w129;
-    if (s->chan_inst_sys) {
-        uint8_t b[8];
-        PCIDevice *pdev = &s->parent_obj;
-        if (pci_dma_read(pdev, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF,
-                         b, 8) != MEMTX_OK) {
-            return NVKVM_GMMU_FAULT;
+    /* Root the walk at the VAS page-directory base whose VA range contains `va`
+     * (snooped from VASPACE_COPY_SERVER_RESERVED_PDES) — the GSP-managed channel
+     * instance block is empty in our FB so we can't read the PDB from it. */
+    uint64_t tbl = 0;
+    for (int i = 0; i < s->chan_vas_n; i++) {
+        if (s->chan_vas[i].hvas == s->chan_hvaspace) {
+            tbl = s->chan_vas[i].pdb;
+            break;
         }
-        w128 = ldl_le_p(b); w129 = ldl_le_p(b + 4);
-    } else {
-        w128 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, 4);
-        w129 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, 4);
     }
-    uint64_t tbl = (w128 & 0xFFFFF000ull) | (w129 << 32);
-    qemu_log("nvkvm-gpu[%s] M5: chan walk va=0x%llx instblk=0x%llx(%s) "
-             "w128=0x%llx w129=0x%llx PDB=0x%llx\n", s->chip->name,
-             (unsigned long long)va, (unsigned long long)s->chan_inst_block,
-             s->chan_inst_sys ? "sys" : "fb", (unsigned long long)w128,
-             (unsigned long long)w129, (unsigned long long)tbl);
+    qemu_log("nvkvm-gpu[%s] M5: chan walk va=0x%llx hvas=0x%08x -> PDB=0x%llx "
+             "(%d VAS)\n", s->chip->name, (unsigned long long)va,
+             s->chan_hvaspace, (unsigned long long)tbl, s->chan_vas_n);
     if (tbl == 0) {
         return NVKVM_GMMU_FAULT;
     }
