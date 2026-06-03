@@ -1580,26 +1580,30 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
              (unsigned long long)s->chan_gpfifo_va,
              (unsigned long long)s->chan_userd, s->chan_userd_sys ? "sys" : "fb",
              s->chan_gp_get, gp_put, s->chan_gpfifo_ent);
-    /* Read the channel's own PDB from its instance block (RAMIN +0x200/+0x204) —
-     * the HW-authoritative VAS root, correct even for hVASpace=0 channels.  Empty
-     * (GSP-managed) instblk -> 0 -> chan_translate falls back to the snoop list. */
+    /* Pick the channel's VAS by CONTENT, not by handle.  The instance block is
+     * empty (GSP-managed) so it gives no PDB, and hVASpace=0 (device-default)
+     * channels match no snooped VAS handle -> the try-all fallback picks a wrong
+     * VAS that maps gpFifoVA to a stale/zero page.  Instead, among the snooped
+     * VAS PDBs, choose the one under which the pending GPFIFO entry reads
+     * NON-ZERO (a valid pushbuffer pointer) — that is the VAS that actually owns
+     * this channel's ring.  Pin it in chan_pdb so every translate in this walk
+     * (entry/pushbuffer/sema) uses the same correct VAS. */
     s->chan_pdb = 0;
-    if (s->chan_inst_block) {
-        uint64_t w128, w129;
-        if (s->chan_inst_sys) {
-            w128 = nvkvm_phys_rd32(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, true);
-            w129 = nvkvm_phys_rd32(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, true);
-        } else {
-            w128 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, 4);
-            w129 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, 4);
+    if (gp_put < s->chan_gpfifo_ent && gp_put != s->chan_gp_get) {
+        uint64_t eva = s->chan_gpfifo_va + (uint64_t)s->chan_gp_get * 8;
+        for (int i = 0; i < s->chan_vas_n; i++) {
+            bool sy = false;
+            uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, eva, &sy);
+            if (p == NVKVM_GMMU_FAULT) { continue; }
+            if (nvkvm_phys_rd32(s, p, sy) != 0) {   /* valid GP_ENTRY0 (pb low) */
+                s->chan_pdb = s->chan_vas[i].pdb;
+                break;
+            }
         }
-        uint64_t pdb = (w128 & 0xFFFFF000ull) | (w129 << 32);
-        if (pdb != 0) { s->chan_pdb = pdb; }
-        { bool dsys = false; uint64_t dp = nvkvm_chan_translate(s, s->chan_gpfifo_va, &dsys);
-          qemu_log("nvkvm-gpu[%s] M5: chan_exec hvas=0x%08x instblk_pdb=0x%llx "
-                   "gpfifoVA->phys=0x%llx %s\n", s->chip->name, s->chan_hvaspace,
-                   (unsigned long long)s->chan_pdb, (unsigned long long)dp,
-                   dsys ? "SYS" : "FB"); }
+        qemu_log("nvkvm-gpu[%s] M5: chan_exec hvas=0x%08x picked_pdb=0x%llx "
+                 "gpfifoVA=0x%llx\n", s->chip->name, s->chan_hvaspace,
+                 (unsigned long long)s->chan_pdb,
+                 (unsigned long long)s->chan_gpfifo_va);
     }
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
