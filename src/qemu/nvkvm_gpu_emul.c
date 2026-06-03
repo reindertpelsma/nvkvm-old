@@ -94,106 +94,7 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
     .bar3_size     = 32ull  << 20,  /* 32 MiB  */
 };
 
-/* ── Register offsets ──────────────────────────────────────────────────────
- * (full glossary in docs/design/nvidia_gpu_internals.md §1.1) */
-/* M0 — chip identity (dev_boot / nv_ref.h) */
-#define NV_PMC_BOOT_0   0x00000000u
-#define NV_PMC_BOOT_1   0x00000004u
-#define NV_PMC_BOOT_42  0x00000A00u
-
-/* M1 — GFW (GPU firmware) boot completion, spike check #1.
- * PGC6 AON secure-scratch (dev_gc6_island{,_addendum}.h, ga102).  The driver
- * (_gpuIsGfwBootCompleted_TU102) first checks the PLM was lowered, then reads
- * the GFW_BOOT progress and requires COMPLETED (0xFF). */
-#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK 0x00118128u
-#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT      0x00118234u /* GROUP_05(0) */
-#define NV_PGC6_GFW_BOOT_PROGRESS_COMPLETED                 0x000000FFu
-
-/* M2 — VBIOS PROM window.  The GSP RM init (kgspExtractVbiosFromRom_TU102)
- * reads the VBIOS image byte/dword-wise from NV_PROM_DATA(i) = 0x300000 + i in
- * BAR0, validating the PCI ROM signature, IFR header, PCIR struct and the
- * expansion-ROM chain.  We back this window with a real GA106 VBIOS dumped from
- * the host card (matching device id 0x2504), so the driver's parser is exact. */
-#define NV_PROM_DATA_BASE 0x00300000u
-#define NV_PROM_DATA_SIZE 0x00100000u   /* 1 MiB window (dumped image is padded) */
-
-/* M2 — GSP falcon bring-up.  The driver resets/starts the GSP falcon to run
- * FWSEC/Booter, then kflcnWaitForHalt_TU102 spin-polls CPUCTL_HALTED.  In
- * fake-the-boot the falcon never runs, so we report it halted immediately.
- * GSP falcon register block = NV_PGSP base 0x110000; CPUCTL = base + 0x100. */
-#define NV_PGSP_FALCON_CPUCTL        0x00110100u
-#define NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE 0x00000010u  /* bit 4 */
-
-/* GSP falcon HWCFG2 (base+0xf4): kflcnIsRiscvCpuEnabled_TU102 requires
- * _RISCV=ENABLE (bit10); _MEM_SCRUBBING=DONE is value 0 (bit12 clear). So a
- * RISCV-capable, scrubbing-done config = bit10 set only. */
-#define NV_PGSP_FALCON_HWCFG2        0x001100F4u
-#define NV_PFALCON_FALCON_HWCFG2_RISCV_ENABLE_VAL 0x00000400u /* bit 10 */
-
-/* M3 — GSP-RPC. The driver hands the LibOS init-args descriptor GPA via the
- * GSP falcon mailboxes (kgspProgramLibosBootArgsAddr_TU102). We capture it and
- * read the message-queue shared region from guest RAM. See
- * docs/design/mode2_m3_gsp_rpc.md. */
-#define NV_PGSP_FALCON_MAILBOX0      0x00110040u
-#define NV_PGSP_FALCON_MAILBOX1      0x00110044u
-/* LibosMemoryRegionInitArgument: {u64 id8; u64 pa; u64 size; u8 kind; u8 loc;}
- * padded to 8 → 32-byte stride. */
-#define LIBOS_REGION_STRIDE          32u
-#define LIBOS_REGION_LOC_SYSMEM      1u  /* enum: NONE,SYSMEM,FB (loc) */
-
-/* PTIMER — the GPU nanosecond clock.  On GA10x relocated to 0xbb0000:
- * TIME_0 (low) = 0xbb0080, TIME_1 (high) = 0xbb0084 (confirmed by the call
- * chain timeoutSet->tmrGetCurrentTimeEx->tmrGetTimeEx_GM107->_regRead).
- * CRITICAL: must return a real, monotonically increasing counter — every RM
- * timeout loop computes (now - start); a constant value never elapses and the
- * driver spins forever.  Back it with QEMU's virtual clock (ns). */
-#define NV_PTIMER_TIME_0_GA10X       0x00BB0080u
-#define NV_PTIMER_TIME_1_GA10X       0x00BB0084u
-
-/* M3 — Falcon DMA (FWSEC/Booter ucode load).  s_dmaTransfer_GA102 polls
- * DMATRFCMD (falcon+0x118) for FULL==FALSE (queue not full) and IDLE==TRUE
- * (engine idle/done).  We don't run the falcons, so report the DMA always
- * idle+not-full => value 0x2 (IDLE=TRUE bit1, FULL=FALSE bit0).  FWSEC runs on
- * the GSP falcon (0x110000); Booter runs on SEC2 (0x840000).  CPUCTL+0x100
- * HALTED so kflcnWaitForHalt passes for both. */
-#define NV_PFALCON_DMATRFCMD_IDLE_VAL 0x00000002u
-#define NV_PGSP_FALCON_DMATRFCMD     0x00110118u
-#define NV_PSEC_FALCON_DMATRFCMD     0x00840118u
-#define NV_PSEC_FALCON_CPUCTL        0x00840100u
-#define NV_PSEC_FALCON_HWCFG2        0x008400F4u
-
-/* M3 — WPR2 (Write-Protect Region 2 in FB), set up by FWSEC.  After "running"
- * FWSEC the driver reads WPR2_ADDR_HI and requires _VAL (bits 31:4) != 0
- * (_kgspIsWpr2Initialized).  Report a plausible positive region [LO,HI] so the
- * check passes (we don't have real FB; the region is nominal in fake-the-boot).
- * dev_fb.h: WPR2_ADDR_LO=0x1FA824, WPR2_ADDR_HI=0x1FA828, 4KB-aligned. */
-#define NV_PFB_PRI_MMU_WPR2_ADDR_LO  0x001FA824u
-#define NV_PFB_PRI_MMU_WPR2_ADDR_HI  0x001FA828u
-/* The driver checks WPR2_ADDR_LO _VAL (bits 31:4) == frtsOffset >> 12, where
- * frtsOffset is derived from the 12 GiB FB: expected _VAL = 0x002FFE00 (==
- * frtsOffset 0x2FFE00000 >> 12).  Register value = _VAL << 4.  HI just above
- * (frtsSize region); the post-LO HI check refines this if needed. */
-#define NVKVM_WPR2_LO_VAL            0x02FFE000u  /* _VAL=0x2FFE00 = expected LO */
-#define NVKVM_WPR2_HI_VAL            0x02FFF000u  /* _VAL=0x2FFF00 (LO + ~1 MiB) */
-
-/* M3 — usable FB size in MiB.  kmemsysReadUsableFbSize_GA102 reads
- * NV_USABLE_FB_SIZE_IN_MB (= NV_PGC6_AON_SECURE_SCRATCH_GROUP_42 = 0x1183a4),
- * VALUE[31:0] << 20 = bytes.  GFW_BOOT writes it on real HW; we must too, or
- * the GSP WprMeta math (frtsOffset = gspFwWprEnd - frtsSize) degenerates and
- * the WPR2-location check uses a garbage expected value.  RTX 3060 = 12 GiB. */
-#define NV_USABLE_FB_SIZE_IN_MB      0x001183A4u
-#define NVKVM_FB_SIZE_MB             12288u  /* 12 GiB */
-
-/* M3 — GSP RISC-V core active.  kflcnIsRiscvActive_TU102 reads
- * NV_PRISCV_RISCV_CORE_SWITCH_RISCV_STATUS (riscv base NV_FALCON2_GSP_BASE
- * 0x111000 + 0x240) and requires _ACTIVE_STAT (bit0).  After the Booter
- * "starts" the RISC-V (modelled by FWSEC having run), report it active so
- * kgspBootstrap proceeds to the GSP message queue + GSP_INIT_DONE wait. */
-/* GA10x kflcnIsRiscvActive reads RISCV_CPUCTL (riscv base 0x111000 + 0x388),
- * _ACTIVE_STAT bit 7 (confirmed by trace: driver reads 0x111388, not the 0x240
- * CORE_SWITCH variant). */
-#define NV_PGSP_RISCV_CPUCTL                   0x00111388u
-#define NV_PRISCV_RISCV_CPUCTL_ACTIVE_STAT_VAL 0x00000080u  /* bit 7 */
+#include "mode2_regs_ga10x.h"  /* GA10x register offsets + GMMU VER2 format */
 
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
@@ -280,10 +181,7 @@ static const char *nvkvm_reg_name(hwaddr off)
     }
 }
 
-/* ── M6: sparse FB backing + BAR0 PRAMIN window ───────────────────────────── */
-#define NVKVM_PRAMIN_BASE 0x00700000u
-#define NVKVM_PRAMIN_SIZE 0x00100000u      /* 1 MiB window */
-#define NVKVM_BAR0_WINDOW 0x00001700u      /* NV_PBUS_BAR0_WINDOW */
+/* M6: sparse FB backing + BAR0 PRAMIN window (offsets in mode2_regs_ga10x.h) */
 
 /* FB address that PRAMIN+off currently maps to: BASE[23:0]<<16 + window offset. */
 static uint64_t nvkvm_pramin_fb_addr(NvkvmGpuEmul *s, hwaddr off)
@@ -622,8 +520,8 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                  * host printk) = the GSP-chosen BAR2 page-dir base.  The guest
                  * reads this and roots its BAR2 page tables here; use it as our
                  * GMMU walk root + enable VIRTUAL translation. */
-                if (GSPSTATICINFO_GA106_SIZE >= 1672 + 8) {
-                    s->bar2_pdb = ldq_le_p(gspstaticinfo_ga106 + 1672);
+                if (GSPSTATICINFO_GA106_SIZE >= NVKVM_GSPSTATIC_BAR2PDEBASE_OFF + 8) {
+                    s->bar2_pdb = ldq_le_p(gspstaticinfo_ga106 + NVKVM_GSPSTATIC_BAR2PDEBASE_OFF);
                     s->bar2_virtual = (s->bar2_pdb != 0);
                     qemu_log("nvkvm-gpu[%s] M6: BAR2 PDB from GSP static info = "
                              "0x%llx (virtual)\n", s->chip->name,
@@ -800,9 +698,9 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
      * Turing/Ampere VF variant NV_VIRTUAL_FUNCTION_PRIV_BAR2_BLOCK at BAR0
      * 0xB80F48 (NV_VIRTUAL_FUNCTION_FULL_PHYS_OFFSET 0xB80000 + 0xF48).  PTR
      * [27:0]<<12 = instblk FB addr; MODE bit31 = 1 VIRTUAL / 0 PHYSICAL. */
-    if (off == 0x00001714u || off == 0x00B80F48u) {
-        s->bar2_inst_block = (uint64_t)(val & 0x0FFFFFFFu) << 12;
-        s->bar2_virtual    = (val & 0x80000000u) != 0;
+    if (off == NVKVM_PBUS_BAR2_BLOCK || off == NVKVM_VF_BAR2_BLOCK) {
+        s->bar2_inst_block = (uint64_t)(val & 0x0FFFFFFFu) << NVKVM_BAR2_BLOCK_PTR_SHIFT;
+        s->bar2_virtual    = (val & NVKVM_BAR2_BLOCK_MODE_VIRTUAL) != 0;
         qemu_log("nvkvm-gpu[%s] M6: BAR2_BLOCK@0x%llx -> instblk FB 0x%llx mode=%s\n",
                  s->chip->name, (unsigned long long)off,
                  (unsigned long long)s->bar2_inst_block,
@@ -824,7 +722,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
 
     /* M4: cmd-queue doorbell — the driver wrote NV_PGSP_QUEUE_HEAD(0) to notify
      * the GSP of new command(s).  Service the cmd queue (echo NV_OK responses). */
-    if (off == 0x00110c00u && s->q_ready) {
+    if (off == NVKVM_GSP_QUEUE_HEAD0 && s->q_ready) {
         nvkvm_m3_service_cmdq(s);
     }
 
@@ -897,7 +795,6 @@ static const MemoryRegionOps nvkvm_aperture_ops = {
  * VER2 levels (kern_gmmu_fmt_gp10x.c): PD3 VA[48:47], PD2 [46:38], PD1 [37:29],
  * PD0 [28:21] (16B dual PDE), PT_small [20:12] (4 KiB) / PT_big [20:bigShift].
  * Entry addr = field<<shift; PTE/PDE ADDRESS_VID = bits 32:8 (<<12). */
-#define NVKVM_VER2_ADDR_VID(e)  ((((e) >> 8) & ((1ull << 25) - 1)) << 12)
 #define NVKVM_GMMU_FAULT        (~0ull)
 
 static uint64_t nvkvm_fb_rd64(NvkvmGpuEmul *s, uint64_t fb_addr)
@@ -921,8 +818,8 @@ static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
     } else if (s->bar2_inst_block != 0) {
         /* Fallback: read PDB from an instance block (word128 @ +0x200 LO[31:12],
          * word129 @ +0x204 HI[31:0]). */
-        uint64_t w128 = nvkvm_fb_read(s, s->bar2_inst_block + 128 * 4, 4);
-        uint64_t w129 = nvkvm_fb_read(s, s->bar2_inst_block + 129 * 4, 4);
+        uint64_t w128 = nvkvm_fb_read(s, s->bar2_inst_block + NVKVM_RAMIN_PDB_LO_OFF, 4);
+        uint64_t w129 = nvkvm_fb_read(s, s->bar2_inst_block + NVKVM_RAMIN_PDB_HI_OFF, 4);
         tbl = (w128 & 0xFFFFF000ull) | (w129 << 32);
     } else {
         return NVKVM_GMMU_FAULT;
