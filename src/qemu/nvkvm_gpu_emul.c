@@ -181,6 +181,20 @@ struct NvkvmGpuEmul {
     bool     chan_userd_sys;   /* userdMem.addressSpace == ADDR_SYSMEM              */
     uint32_t chan_gp_get;      /* our consumed GPFIFO index (entries [get,put) pend)*/
 
+    /* Multi-channel table.  Init allocates several GPFIFO channels (e.g. the
+     * CeUtils memory scrubber AND its self-verify channel), so a doorbell can
+     * target ANY of them — not just the most-recently allocated one (which the
+     * single chan_* fields above tracked, dropping the scrubber's work -> the
+     * ce_utils.c:349 timeout).  On a doorbell we walk EVERY channel's pending
+     * GPFIFO so we never need to map the doorbell token's chid to a channel. */
+#define NVKVM_MAX_CHANS 32
+    struct nvkvm_chan_entry {
+        uint64_t gpfifo_va, userd;
+        uint32_t gpfifo_ent, gp_get, hvaspace, payload;
+        bool     userd_sys;
+    } chans[NVKVM_MAX_CHANS];
+    int chan_n;
+
     /* M7 — CPU interrupt tree (raise MSI-X on LEAF_TRIGGER; ISR reads TOP/LEAF) */
     uint32_t intr_leaf[NVKVM_VF_INTR_NLEAF];     /* pending per leaf reg */
     uint32_t intr_leaf_en[NVKVM_VF_INTR_NLEAF];  /* enables */
@@ -589,6 +603,23 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 s->chan_userd      = ldq_le_p(cmd + 280);   /* userdMem.base */
                 s->chan_userd_sys  = (ldl_le_p(cmd + 296) == 1u);
                 s->chan_gp_get     = 0;
+                /* Register in the multi-channel table (dedup by gpFifoVA). */
+                if (s->chan_gpfifo_va && s->chan_userd) {
+                    int cslot = -1;
+                    for (int i = 0; i < s->chan_n; i++) {
+                        if (s->chans[i].gpfifo_va == s->chan_gpfifo_va) { cslot = i; break; }
+                    }
+                    if (cslot < 0 && s->chan_n < NVKVM_MAX_CHANS) { cslot = s->chan_n++; }
+                    if (cslot >= 0) {
+                        s->chans[cslot].gpfifo_va  = s->chan_gpfifo_va;
+                        s->chans[cslot].userd      = s->chan_userd;
+                        s->chans[cslot].gpfifo_ent = s->chan_gpfifo_ent;
+                        s->chans[cslot].userd_sys  = s->chan_userd_sys;
+                        s->chans[cslot].hvaspace   = s->chan_hvaspace;
+                        s->chans[cslot].gp_get     = 0;
+                        s->chans[cslot].payload    = 0;
+                    }
+                }
                 qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
                          "0x%llx ent=%u instblk=0x%llx(%s)\n",
                          s->chip->name, hclass,
@@ -978,50 +1009,55 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
      * ce_utils.c:349).  For now, log it so the doorbell offset/token are
      * confirmed against the GA100 HAL. */
     if (off == NVKVM_VF_DOORBELL) {
-        /* Work submitted on the channel.  We don't run the CE; instead we
-         * complete the submission by advancing the channel's finish-payload
-         * semaphore, which is what channelWaitForFinishPayload polls.  Channel
-         * buffer layout [pushbuffer|GPFIFO|hostSema(4)|finishPayload(4)] with
-         * gpFifoOffset = pbGpuVA + channelPbSize, so the finish-payload VA =
-         * gpFifoOffset + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004.  Translate
-         * via the channel PDB and write the incrementing payload (RM submits
-         * payload = lastSubmittedPayload+1 starting at 1). */
-        /* Execute the submitted copy-engine work for real (memset/memcpy) so the
-         * scrubber's CE self-verify (mem_mgr.c:469) sees moved data. */
-        nvkvm_chan_execute(s);
-        /* If the channel's pushbuffer carried an explicit NVC56F SEM_EXECUTE
-         * RELEASE, nvkvm_chan_execute already wrote the real completion
-         * semaphore (golden/watchdog/compute channels do this).  Only fall back
-         * to the implicit finish-payload at gpfifo+0x8004 (the CE scrubber's
-         * layout) when no explicit release was honored. */
-        if (s->chan_sem_released) {
-            return;
-        }
-        uint64_t sema_va = s->chan_gpfifo_va + 0x8004ull;
-        bool is_sys = false;
-        uint64_t phys = s->chan_gpfifo_va
-            ? nvkvm_chan_translate(s, sema_va, &is_sys) : NVKVM_GMMU_FAULT;
-        if (phys != NVKVM_GMMU_FAULT) {
-            uint32_t payload = ++s->chan_payload;
-            if (is_sys) {
-                uint8_t b[4]; stl_le_p(b, payload);
-                pci_dma_write(&s->parent_obj, phys, b, 4);
-            } else {
-                nvkvm_fb_write(s, phys, payload, 4);
+        /* Work submitted on SOME channel.  The doorbell token's chid would name
+         * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
+         * + its self-verify channel + the host/compute channel) and tracking only
+         * the last-allocated one dropped the scrubber's work.  Instead walk EVERY
+         * registered channel's pending GPFIFO: a channel with no new work has
+         * GP_PUT==gp_get so nvkvm_chan_execute() bails harmlessly.  For each that
+         * advanced, honor an explicit CE/NVC56F semaphore release from its
+         * pushbuffer; else fall back to the implicit finish-payload semaphore at
+         * gpFifoVA + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004 with a
+         * per-channel incrementing payload (channelWaitForFinishPayload polls
+         * exactly that). */
+        for (int i = 0; i < s->chan_n; i++) {
+            struct nvkvm_chan_entry *c = &s->chans[i];
+            /* Load this channel into the chan_* working set chan_execute reads. */
+            s->chan_gpfifo_va  = c->gpfifo_va;
+            s->chan_userd      = c->userd;
+            s->chan_gpfifo_ent = c->gpfifo_ent;
+            s->chan_userd_sys  = c->userd_sys;
+            s->chan_hvaspace   = c->hvaspace;
+            s->chan_gp_get     = c->gp_get;
+            uint32_t before = c->gp_get;
+            nvkvm_chan_execute(s);
+            c->gp_get = s->chan_gp_get;          /* save consumed index */
+            if (c->gp_get == before) {
+                continue;                        /* no new work on this channel */
             }
-            qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x rl=%u ch=%u -> "
-                     "completed: semaVA=0x%llx -> %s phys=0x%llx payload=%u\n",
-                     s->chip->name, (uint32_t)val,
-                     NVKVM_DOORBELL_RUNLIST((uint32_t)val),
-                     NVKVM_DOORBELL_CHID((uint32_t)val),
-                     (unsigned long long)sema_va, is_sys ? "SYS" : "FB",
-                     (unsigned long long)phys, payload);
-        } else {
-            qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x -> sema VA 0x%llx "
-                     "FAULTED (no completion); gpfifo=0x%llx instblk=0x%llx\n",
-                     s->chip->name, (uint32_t)val, (unsigned long long)sema_va,
-                     (unsigned long long)s->chan_gpfifo_va,
-                     (unsigned long long)s->chan_inst_block);
+            if (s->chan_sem_released) {
+                continue;                        /* explicit release already done */
+            }
+            /* Fallback: implicit finish-payload semaphore. */
+            uint64_t sema_va = c->gpfifo_va + 0x8004ull;
+            bool is_sys = false;
+            uint64_t phys = nvkvm_chan_translate(s, sema_va, &is_sys);
+            if (phys != NVKVM_GMMU_FAULT) {
+                uint32_t payload = ++c->payload;
+                if (is_sys) { uint8_t b[4]; stl_le_p(b, payload);
+                              pci_dma_write(&s->parent_obj, phys, b, 4); }
+                else        { nvkvm_fb_write(s, phys, payload, 4); }
+                qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> completed: "
+                         "semaVA=0x%llx -> %s phys=0x%llx payload=%u\n",
+                         s->chip->name, (uint32_t)val, i,
+                         (unsigned long long)sema_va, is_sys ? "SYS" : "FB",
+                         (unsigned long long)phys, payload);
+            } else {
+                qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> sema VA "
+                         "0x%llx FAULTED; gpfifo=0x%llx\n", s->chip->name,
+                         (uint32_t)val, i, (unsigned long long)sema_va,
+                         (unsigned long long)c->gpfifo_va);
+            }
         }
         return;
     }
@@ -1421,6 +1457,15 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
      * SEM_EXECUTE.  ADDR is 64-bit: LO bits[31:2] | HI<<32. */
     uint64_t sem_addr = 0;
     uint32_t sem_pay_lo = 0, sem_pay_hi = 0;
+    /* CE-class (NVC8B5/NVB0B5) completion semaphore — the one
+     * channelWaitForFinishPayload() polls (pbGpuVA + finishPayloadOffset); the
+     * CeUtils memory scrubber waits on it (ce_utils.c:349).  Released by
+     * LAUNCH_DMA when SEMAPHORE_TYPE != NONE.  Distinct from the NVC56F host
+     * semaphore (sem_addr) which the same scrub pushbuffer ALSO releases at
+     * semaOffset — honoring only the host one left finishPayload unwritten,
+     * so the scrubber timed out. */
+    uint64_t ce_sem_addr = 0;
+    uint32_t ce_sem_pay = 0;
     s->chan_sem_released = false;
     uint32_t guard = 0;
     for (uint32_t idx = s->chan_gp_get; idx != gp_put &&
@@ -1458,10 +1503,17 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 case 0x260: src_pm = d & 3; break;                                           /* SET_SRC_PHYS_MODE */
                 case 0x264: dst_pm = d & 3; break;                                           /* SET_DST_PHYS_MODE */
                 case 0x700: remapA = d; break;                                               /* SET_REMAP_CONST_A */
+                /* CE-class completion semaphore (NVC8B5_SET_SEMAPHORE_A/B/PAYLOAD).
+                 * A=upper[24:0], B=lower[31:0], PAYLOAD=release value. */
+                case 0x240: ce_sem_addr = (ce_sem_addr & 0xFFFFFFFFull) | ((uint64_t)(d & 0x01FFFFFFu) << 32); break;
+                case 0x244: ce_sem_addr = (ce_sem_addr & ~0xFFFFFFFFull) | d; break;
+                case 0x248: ce_sem_pay = d; break;
                 case 0x300: {                                                                /* LAUNCH_DMA */
                     bool remap    = (d >> 10) & 1;
+                    bool mscrub   = (d >> 23) & 1;   /* MEMORY_SCRUB_ENABLE [23] */
                     bool src_phys = (d >> 12) & 1;   /* SRC_TYPE PHYSICAL */
                     bool dst_phys = (d >> 13) & 1;   /* DST_TYPE PHYSICAL */
+                    uint32_t sem_type = (d >> 3) & 0x3; /* SEMAPHORE_TYPE [4:3], !=0 => release */
                     uint64_t bytes = (uint64_t)llen * lcount;
                     if (bytes > (16u << 20)) bytes = 16u << 20;  /* safety cap */
                     /* Resolve a CE address: PHYSICAL -> the offset IS the phys addr
@@ -1470,7 +1522,12 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                     #define NVKVM_CE_RESOLVE(off, phys, pm, sysv) \
                         ((phys) ? ((sysv) = ((pm) != 0), (off)) \
                                 : nvkvm_chan_translate(s, (off), &(sysv)))
-                    if (remap) {
+                    if (mscrub) {
+                        /* MEMORY_SCRUB: zero the dst region.  Our FB backing is
+                         * sparse-zero (unwritten reads return 0), so the data
+                         * write is a no-op; the completion semaphore below is
+                         * what unblocks the CeUtils scrubber.  No src is set. */
+                    } else if (remap) {
                         for (uint64_t b = 0; b + 4 <= bytes; b += 4) {
                             bool sy; uint64_t p = NVKVM_CE_RESOLVE(off_out + b, dst_phys, dst_pm, sy);
                             if (p == NVKVM_GMMU_FAULT) break;
@@ -1495,9 +1552,31 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                     #undef NVKVM_CE_RESOLVE
                     qemu_log("nvkvm-gpu[%s] M5: CE %s in=0x%llx(%s) out=0x%llx(%s) "
                              "bytes=%llu const=0x%x\n", s->chip->name,
-                             remap ? "MEMSET" : "COPY", (unsigned long long)off_in,
+                             mscrub ? "SCRUB" : remap ? "MEMSET" : "COPY",
+                             (unsigned long long)off_in,
                              src_phys ? "phys" : "virt", (unsigned long long)off_out,
                              dst_phys ? "phys" : "virt", (unsigned long long)bytes, remapA);
+                    /* CE-class completion semaphore release: LAUNCH_DMA with
+                     * SEMAPHORE_TYPE != NONE writes ce_sem_pay to
+                     * (pbGpuVA+finishPayloadOffset).  This is what the CeUtils
+                     * scrubber's channelWaitForFinishPayload polls — the fast-
+                     * scrub pushbuffer ALSO emits an NVC56F SEM_EXECUTE (host
+                     * sema at semaOffset), so honoring only that left this one
+                     * unwritten and the scrubber timed out (ce_utils.c:349). */
+                    if (sem_type != 0 && ce_sem_addr) {
+                        bool sy = false;
+                        uint64_t p = nvkvm_chan_translate(s, ce_sem_addr, &sy);
+                        if (p != NVKVM_GMMU_FAULT) {
+                            if (sy) { uint8_t bb[4]; stl_le_p(bb, ce_sem_pay);
+                                      pci_dma_write(&s->parent_obj, p, bb, 4); }
+                            else    { nvkvm_fb_write(s, p, ce_sem_pay, 4); }
+                            s->chan_sem_released = true;
+                            qemu_log("nvkvm-gpu[%s] M5: CE_SEM_RELEASE addr=0x%llx "
+                                     "-> %s phys=0x%llx payload=%u\n", s->chip->name,
+                                     (unsigned long long)ce_sem_addr, sy ? "SYS" : "FB",
+                                     (unsigned long long)p, ce_sem_pay);
+                        }
+                    }
                     break;
                 }
                 /* NVC56F host-channel semaphore methods. */
