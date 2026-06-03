@@ -38,6 +38,10 @@
 /* PTIMER — GPU ns clock (GA10x relocated to 0xbb0000) */
 #define NV_PTIMER_TIME_0_GA10X       0x00BB0080u
 #define NV_PTIMER_TIME_1_GA10X       0x00BB0084u
+/* PTIMER PRIV_LEVEL_MASK (legacy PRI offset, read directly — NOT relocated).
+ * tmrSetCurrentTime_GV100 asserts unless WRITE_PROTECTION_LEVEL0 (bit4) = ENABLE,
+ * so report all privilege levels granted (fully lowered). */
+#define NV_PTIMER_TIME_PRIV_LEVEL_MASK 0x00009430u
 
 /* M3 — Falcon DMA (FWSEC/Booter ucode load) + SEC2 falcon */
 #define NV_PFALCON_DMATRFCMD_IDLE_VAL 0x00000002u  /* IDLE=TRUE|FULL=FALSE */
@@ -62,6 +66,14 @@
 
 /* M3 — GSP cmd-queue doorbell (NV_PGSP_QUEUE_HEAD(0)) */
 #define NVKVM_GSP_QUEUE_HEAD0        0x00110C00u
+
+/* Display fuse — NV_FUSE_STATUS_OPT_DISPLAY (dev_fuse.h). _DATA bit0: ENABLE=0,
+ * DISABLE=1.  gpuFuseSupportsDisplay_HAL tests _DATA==_ENABLE; reporting bit0=1
+ * (fused-off) makes kdispStatePreInitLocked return NV_ERR_NOT_SUPPORTED, so the
+ * driver cleanly skips ALL display init — we advertise a compute-only displayless
+ * GPU (like A100/H100), which is the right model for Mode-2 compute. */
+#define NV_FUSE_STATUS_OPT_DISPLAY        0x00820C04u
+#define NVKVM_FUSE_OPT_DISPLAY_DISABLED   0x00000001u  /* _DATA=DISABLE */
 
 /* M6 — BAR0 PRAMIN window + BAR2 bind register(s) */
 #define NVKVM_PRAMIN_BASE   0x00700000u

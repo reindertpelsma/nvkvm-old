@@ -96,6 +96,11 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 
 #include "mode2_regs_ga10x.h"  /* GA10x register offsets + GMMU VER2 format */
 
+/* Max bytes for a single GSP RPC response message (header + body + params),
+ * spanning multiple 4 KiB queue elements.  GET_DEVICE_INFO_TABLE is the largest
+ * at paramsSize=24580 (+120 hdr); round up with headroom. */
+#define NVKVM_RESP_MAX 40960u
+
 /* ── Device state (per instance — multi-GPU safe) ──────────────────────────*/
 #define TYPE_NVKVM_GPU_EMUL "nvkvm-gpu-emul"
 OBJECT_DECLARE_SIMPLE_TYPE(NvkvmGpuEmul, NVKVM_GPU_EMUL)
@@ -138,7 +143,8 @@ struct NvkvmGpuEmul {
     uint32_t q_msgcount;     /* entries per queue                                */
     uint32_t q_cmd_entryoff; /* cmd queue entries offset                         */
     uint32_t q_stat_entryoff;/* status queue entries offset                      */
-    uint32_t stat_writeptr;  /* status queue monotonic writePtr == next seqNum   */
+    uint32_t stat_writeptr;  /* status queue monotonic writePtr (in ELEMENTS)    */
+    uint32_t stat_seqnum;    /* per-MESSAGE seqNum (guest rxSeqNum, +1 per reply) */
     uint32_t cmd_readptr;    /* cmd queue messages we've consumed/answered        */
 
     /* M6 — GPU memory: sparse FB backing + BAR0 PRAMIN window.  The driver
@@ -174,6 +180,7 @@ static const char *nvkvm_reg_name(hwaddr off)
     case NV_PGSP_FALCON_HWCFG2:                              return "GSP_HWCFG2";
     case NV_PTIMER_TIME_0_GA10X:                            return "PTIMER_TIME_0";
     case NV_PTIMER_TIME_1_GA10X:                            return "PTIMER_TIME_1";
+    case NV_PTIMER_TIME_PRIV_LEVEL_MASK:                    return "PTIMER_PLM";
     case NV_PGSP_FALCON_DMATRFCMD:                          return "GSP_DMATRFCMD";
     case NV_PSEC_FALCON_DMATRFCMD:                          return "SEC_DMATRFCMD";
     case NV_PSEC_FALCON_CPUCTL:                             return "SEC_CPUCTL";
@@ -268,6 +275,14 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
         return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & 0xFFFFFFE0u;
     case NV_PTIMER_TIME_1_GA10X:
         return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >> 32);
+    /* PTIMER PLM fully lowered: tmrSetCurrentTime_GV100 needs WRITE_PROTECTION
+     * _LEVEL0=ENABLE (bit4) or it NV_ASSERT(0)s (timer_gv100.c:80). */
+    case NV_PTIMER_TIME_PRIV_LEVEL_MASK: return 0xFFFFFFFFu;
+
+    /* Report display fused-off => compute-only displayless GPU.  The driver's
+     * gpuFuseSupportsDisplay_HAL gives NV_ERR_NOT_SUPPORTED in display
+     * StatePreInit, skipping all display engine init (inst-mem/heads/channels). */
+    case NV_FUSE_STATUS_OPT_DISPLAY: return NVKVM_FUSE_OPT_DISPLAY_DISABLED;
 
     /* M3 — Falcon DMA always idle+not-full (FWSEC on GSP, Booter on SEC2). */
     case NV_PGSP_FALCON_DMATRFCMD:
@@ -367,33 +382,58 @@ static void nvkvm_m3_post_status(NvkvmGpuEmul *s, const uint8_t *src,
                                  uint32_t function, uint32_t rpc_result)
 {
     PCIDevice *pdev = &s->parent_obj;
-    uint8_t el[4096];
+    /* A status message may span MULTIPLE queue elements when the rpc payload
+     * (e.g. GET_DEVICE_INFO_TABLE paramsSize=24580) exceeds one element.  The
+     * guest's GspMsgQueueReceiveStatus reads the first element, derives
+     * nElements = ceil((hdrSize48 + rpc.length) / queueElementSizeMin), then
+     * reads that many CONTIGUOUS slots and checksums (48 + rpc.length) bytes.
+     * So we build the full message zero-padded to nElements*msgsize, set
+     * elemCount, fold the checksum over the real message length, and write
+     * each slot, advancing the write pointer by nElements. */
+    static uint8_t el[NVKVM_RESP_MAX]; /* device emu is single-threaded */
+    memset(el, 0, sizeof(el));
     if (src) {
-        memcpy(el, src, sizeof(el));
+        /* copy at most one element's worth of header+body from the seed; the
+         * caller's resp buffer already holds the full payload, so copy it all */
+        uint32_t copylen = 48u + ldl_le_p(src + 56);
+        if (copylen > sizeof(el)) {
+            copylen = sizeof(el);
+        }
+        memcpy(el, src, copylen);
     } else {
-        memset(el, 0, sizeof(el));
         stl_le_p(el + 48, 0x03000000u);  /* header_version MAJOR=3 MINOR=0 */
         stl_le_p(el + 52, 0x43505256u);  /* NV_VGPU_MSG_SIGNATURE_VALID */
         stl_le_p(el + 56, 36u);          /* length = sizeof(rpc_message_header) */
     }
-    stl_le_p(el + 40, 1);                /* elemCount = 1 */
     stl_le_p(el + 60, function);         /* rpc.function */
     stl_le_p(el + 64, rpc_result);       /* rpc.rpc_result */
     stl_le_p(el + 68, rpc_result);       /* rpc.rpc_result_private (RmRpc reads this) */
-    stl_le_p(el + 36, s->stat_writeptr); /* seqNum = current monotonic writePtr */
-    stl_le_p(el + 32, 0);                /* zero checksum field before folding */
-    uint32_t len = 48 + ldl_le_p(el + 56);
+    stl_le_p(el + 36, s->stat_seqnum);   /* per-message seqNum (NOT element ptr) */
+
+    uint32_t msgsize = s->q_msgsize ? s->q_msgsize : 4096u;
+    uint32_t len = 48u + ldl_le_p(el + 56);          /* hdr48 + rpc.length */
     if (len > sizeof(el)) {
         len = sizeof(el);
     }
-    stl_le_p(el + 32, nvkvm_msgq_checksum32(el, len));
+    uint32_t nelems = (len + msgsize - 1u) / msgsize; /* bytesToElements */
+    if (nelems == 0) {
+        nelems = 1;
+    }
+    stl_le_p(el + 40, nelems);           /* elemCount */
+    stl_le_p(el + 32, 0);                /* zero checksum field before folding */
+    /* zero-pad to an 8-byte boundary for the XOR fold (guest does the same) */
+    stl_le_p(el + 32, nvkvm_msgq_checksum32(el, (len + 7u) & ~7u));
 
-    uint32_t slot = s->q_msgcount ? (s->stat_writeptr % s->q_msgcount) : 0;
-    uint64_t gpa = s->q_shmem + s->q_stat_base + s->q_stat_entryoff +
-                   (uint64_t)slot * s->q_msgsize;
-    pci_dma_write(pdev, gpa, el, sizeof(el));
+    for (uint32_t i = 0; i < nelems; i++) {
+        uint32_t slot = s->q_msgcount
+            ? ((s->stat_writeptr + i) % s->q_msgcount) : 0;
+        uint64_t gpa = s->q_shmem + s->q_stat_base + s->q_stat_entryoff +
+                       (uint64_t)slot * msgsize;
+        pci_dma_write(pdev, gpa, el + (uint64_t)i * msgsize, msgsize);
+    }
 
-    s->stat_writeptr++;
+    s->stat_writeptr = (s->stat_writeptr + nelems) % s->q_msgcount; /* modulo ring */
+    s->stat_seqnum++;                    /* per-message seqNum is ABSOLUTE (no wrap) */
     uint8_t wp[4];
     stl_le_p(wp, s->stat_writeptr);
     pci_dma_write(pdev, s->q_shmem + s->q_stat_base + 16, wp, sizeof(wp));
@@ -422,7 +462,17 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         return;
     }
     uint32_t cmd_writeptr = ldl_le_p(wpb);
-    while (s->cmd_readptr != cmd_writeptr) {
+    if (s->trace && s->cmd_readptr != cmd_writeptr) {
+        qemu_log("nvkvm-gpu[%s] M4: cmdq enter cmd_wp=%u cmd_rp=%u (inflight=%d) "
+                 "stat_wp=%u stat_seq=%u\n", s->chip->name, cmd_writeptr,
+                 s->cmd_readptr, (int)(cmd_writeptr - s->cmd_readptr),
+                 s->stat_writeptr, s->stat_seqnum);
+    }
+    /* msgq pointers are MODULO msgCount (msgq.c wraps writePtr/readPtr at
+     * msgCount), not absolute.  Bound the loop by msgCount so a desync can never
+     * spin forever (pending elements < msgCount by construction). */
+    uint32_t guard = 0;
+    while (s->cmd_readptr != cmd_writeptr && guard++ < s->q_msgcount) {
         uint32_t slot = s->cmd_readptr % s->q_msgcount;
         uint8_t cmd[4096];
         uint64_t gpa = s->q_shmem + s->q_cmd_base + s->q_cmd_entryoff +
@@ -449,7 +499,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
              * rpc_gsp_rm_control body), then fill the control response.
              * Body@80: hClient@80, hObject@84, cmd@88, status@92, paramsSize@96,
              * ..., params@120.  RmRpc control reads body.status (@92). */
-            static uint8_t resp[40960];
+            static uint8_t resp[NVKVM_RESP_MAX];
             memset(resp, 0, sizeof(resp));
             memcpy(resp, cmd, 4096);
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
@@ -470,6 +520,21 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      * 24 entries of 16B).  Full struct = 4 + 128*16 = 2052B. */
                     memset(resp + 120, 0, INTRTABLE_GA106_PSIZE);
                     memcpy(resp + 120, intrtable_ga106, sizeof(intrtable_ga106));
+                    /* subtreeMap[7] of NvU64 (per intrInitSubtreeMap_TU102, which
+                     * the GSP mirrors into this control's reply): UVM_OWNED must
+                     * map to subtree 1 (mask 0x2) so it equals the access-counter
+                     * vector's subtree, else intrCacheIntrFields_TU102 asserts.
+                     * idx: 0 DEFAULT, 1 ESCHED(stall subtree3=0x8), 2 ESCHED_NOTIF
+                     * (subtree0=0x1), 3 RUNLIST, 4 RUNLIST_NOTIF, 5 UVM_OWNED
+                     * (subtree1=0x2), 6 UVM_SHARED (subtree2=0x4). */
+                    {
+                        static const uint64_t subtree_map[7] = {
+                            0x0ull, 0x8ull, 0x1ull, 0x0ull, 0x0ull, 0x2ull, 0x4ull
+                        };
+                        for (int k = 0; k < 7; k++)
+                            stq_le_p(resp + 120 + INTRTABLE_GA106_SUBTREEMAP_OFF + k * 8,
+                                     subtree_map[k]);
+                    }
                     stl_le_p(resp + 96, INTRTABLE_GA106_PSIZE);
                     stl_le_p(resp + 56, 32u + 40u + INTRTABLE_GA106_PSIZE);
                 } else if (ctrl == 0x20801112u) {
@@ -487,13 +552,30 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     }
                     stl_le_p(resp + 96, psize);
                     stl_le_p(resp + 56, 32u + 40u + psize);
-                } else if (cr && (32u + 40u + cr->psize) <= (4096u - 48u)) {
+                } else if (ctrl == 0x20800a01u && cr) {
+                    /* INTERNAL_DISPLAY_GET_STATIC_INFO: replay captured 32B but
+                     * SYNTHESIZE numDispChannels (struct off 32, params+120 =>
+                     * resp+152).  Our capture truncated the 36B struct's tail, so
+                     * the field replayed as 0 -> kdispStateInitLocked's
+                     * portMemAllocNonPaged(sizeof*0)=NULL -> "Could not allocate
+                     * clientChannelTable".  Compute-only never allocates a display
+                     * channel, so any value that bounds dispChannelNum works; 128
+                     * comfortably covers GA10x's core/window/cursor channel space
+                     * with a negligible (~3 KiB) table.  (generate-to-satisfy) */
+                    memset(resp + 120, 0, cr->psize);
+                    memcpy(resp + 120, cr->data, cr->dlen);
+                    stl_le_p(resp + 152, 128u); /* numDispChannels */
+                    stl_le_p(resp + 92, cr->status);
+                    stl_le_p(resp + 96, cr->psize);
+                    stl_le_p(resp + 56, 32u + 40u + cr->psize);
+                } else if (cr && (120u + cr->psize) <= NVKVM_RESP_MAX) {
                     /* general replay: captured GA106 init-control response
                      * (ROUTE_TO_PHYSICAL GET controls the echo can't fabricate).
-                     * Single-element only (params <= ~3976B) — the status queue
-                     * tracks elemCount=1 per message.  Larger captured controls
-                     * (0x20800a22/b03/b05, also truncated at 8192B) fall through
-                     * to echo for now; revisit with multi-element + full capture. */
+                     * Multi-element capable now — nvkvm_m3_post_status splits the
+                     * message across queue elements, so large controls (e.g.
+                     * GET_DEVICE_INFO_TABLE 0x20800a40 psize=24580) replay too.
+                     * Any captured tail beyond cr->dlen is zero (fine where the
+                     * meaningful prefix is numEntries + entries). */
                     memset(resp + 120, 0, cr->psize);
                     memcpy(resp + 120, cr->data, cr->dlen);
                     stl_le_p(resp + 92, cr->status);
@@ -572,14 +654,21 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             if (elems == 0) {
                 elems = 1;
             }
-            s->cmd_readptr += elems;
+            s->cmd_readptr = (s->cmd_readptr + elems) % s->q_msgcount; /* wrap */
         }
     }
-    /* ack consumption: we are the RX side of the cmd queue (rx header readPtr
-     * at cmd_base + rxHdrOff(0x20)). */
+    /* ack consumption: advance the cmd-queue read pointer.  The GSP queues are
+     * created with MSGQ_FLAGS_SWAP_RX (message_queue_cpu.c:180), so the readPtr
+     * is SWAPPED into the OTHER queue's backing store: as the cmd-queue consumer
+     * our pReadOutgoing = &pOurRxHdr->readPtr, and pOurRxHdr lives in the queue
+     * WE created (the status queue).  So write the cmd readPtr to the STATUS
+     * queue's rx header (stat_base + rxHdrOff 0x20) — the guest-producer reads
+     * it there via its pReadIncoming.  Writing it to cmd_base+0x20 (no-swap
+     * location) left the guest seeing 0 frees -> "buffer is full" once init
+     * accumulated ~msgCount(63) command elements. */
     uint8_t rp[4];
     stl_le_p(rp, s->cmd_readptr);
-    pci_dma_write(pdev, s->q_shmem + s->q_cmd_base + 0x20, rp, sizeof(rp));
+    pci_dma_write(pdev, s->q_shmem + s->q_stat_base + 0x20, rp, sizeof(rp));
 }
 
 /* M3-step-1: read the LibOS init-args region array from guest RAM at the GPA
@@ -668,6 +757,7 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                             s->q_cmd_entryoff = ldl_le_p(txh + 28);
                             s->q_stat_entryoff= ldl_le_p(txh + 28);
                             s->stat_writeptr  = 0;
+                            s->stat_seqnum    = 0;
                             s->cmd_readptr    = 0;
                             s->q_ready        = true;
                             /* step 2: post GSP_INIT_DONE (seqNum 0) */
@@ -936,6 +1026,7 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     s->fwsec_ran = false;
     s->q_ready = false;
     s->stat_writeptr = 0;
+    s->stat_seqnum = 0;
     s->cmd_readptr = 0;
 
     /* M6: sparse FB backing for the BAR0 PRAMIN window (value = g_malloc0'd 4 KiB). */

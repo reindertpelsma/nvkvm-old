@@ -6,8 +6,14 @@
 #ifndef MODE2_INTRTABLE_GA106_H
 #define MODE2_INTRTABLE_GA106_H
 #define INTRTABLE_GA106_LEN 24
-#define INTRTABLE_GA106_PSIZE 2052
-/* header(tableLen)+24 valid entries; full struct params = 2052 bytes */
+/* Full NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS:
+ *   tableLen@0 (4) + table[128]*16B (2048) @4..2052
+ *   + subtreeMap[NV2080_INTR_CATEGORY_ENUM_COUNT=7] of NvU64, 8-aligned @2056.
+ * subtreeMap is NOT optional: intrInitInterruptTable_KERNEL portMemCopy's it into
+ * pIntr->subtreeMap, and intrCacheIntrFields_TU102 asserts the UVM_OWNED subtree
+ * mask matches the access-counter vector's subtree.  So psize must span it. */
+#define INTRTABLE_GA106_SUBTREEMAP_OFF 2056
+#define INTRTABLE_GA106_PSIZE 2112  /* 2056 + 7*8 */
 static const unsigned char intrtable_ga106[] = {
   0x18,0x00,0x00,0x00,0x3b,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,
   0xff,0xff,0xff,0xff,0x3e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x83,0x00,0x00,0x00,
