@@ -552,6 +552,17 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     }
                     stl_le_p(resp + 96, psize);
                     stl_le_p(resp + 56, 32u + 40u + psize);
+                } else if (ctrl == 0x20802a08u) {
+                    /* CE_GET_FAULT_METHOD_BUFFER_SIZE: { NvU32 size }.  Our
+                     * capture truncated the 4B payload (size replayed as 0) ->
+                     * kchangrpInit_gv100 asserts bufSizeInBytes>0 when CPU-RM
+                     * allocates the CE fault method buffer.  Synthesize one page
+                     * (the buffer lives in sysmem and only our emulated CE uses
+                     * it, so any non-zero page-aligned size satisfies it). */
+                    stl_le_p(resp + 120, 0x1000u); /* size = 4 KiB */
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 96, 4u);
+                    stl_le_p(resp + 56, 32u + 40u + 4u);
                 } else if (ctrl == 0x20800a01u && cr) {
                     /* INTERNAL_DISPLAY_GET_STATIC_INFO: replay captured 32B but
                      * SYNTHESIZE numDispChannels (struct off 32, params+120 =>
