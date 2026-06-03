@@ -185,6 +185,10 @@ struct NvkvmGpuEmul {
     uint32_t chan_class;       /* hClass of the tracked channel                     */
     uint64_t chan_inst_block;  /* instanceMem.base: channel instance block (unused: GSP-managed, empty) */
     bool     chan_inst_sys;    /* instanceMem.addressSpace == ADDR_SYSMEM(1)        */
+    uint64_t chan_pdb;         /* PDB read from the executing channel's instance
+                                * block (RAMIN +0x200): HW-authoritative VAS root.
+                                * 0 if the instblk is empty (GSP-managed) -> fall
+                                * back to the snooped chan_vas[] heuristic.        */
     uint32_t chan_payload;     /* completion payload counter (incr per doorbell)    */
     bool     chan_sem_released; /* set by chan_execute when it honored an explicit
                                   * NVC56F SEM_EXECUTE release from the pushbuffer    */
@@ -1503,6 +1507,13 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
  * (a valid leaf PTE) rather than by the channel's hVASpace handle. */
 static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
 {
+    /* Authoritative: the executing channel's own PDB (from its instance block).
+     * Correct even for hVASpace=0 (device-default) channels that don't match any
+     * snooped VAS handle.  0 = instblk empty -> fall through to the heuristic. */
+    if (s->chan_pdb) {
+        uint64_t p = nvkvm_walk_pdb(s, s->chan_pdb, va, out_sys);
+        if (p != NVKVM_GMMU_FAULT) { return p; }
+    }
     /* Prefer the channel's own hVASpace first (fast path / disambiguation). */
     for (int i = 0; i < s->chan_vas_n; i++) {
         if (s->chan_vas[i].hvas == s->chan_hvaspace) {
@@ -1569,10 +1580,27 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
              (unsigned long long)s->chan_gpfifo_va,
              (unsigned long long)s->chan_userd, s->chan_userd_sys ? "sys" : "fb",
              s->chan_gp_get, gp_put, s->chan_gpfifo_ent);
-    { bool dsys = false; uint64_t dp = nvkvm_chan_translate(s, s->chan_gpfifo_va, &dsys);
-      qemu_log("nvkvm-gpu[%s] M5: chan_exec hvas=0x%08x gpfifoVA->phys=0x%llx %s "
-               "(n_vas=%d)\n", s->chip->name, s->chan_hvaspace,
-               (unsigned long long)dp, dsys ? "SYS" : "FB", s->chan_vas_n); }
+    /* Read the channel's own PDB from its instance block (RAMIN +0x200/+0x204) —
+     * the HW-authoritative VAS root, correct even for hVASpace=0 channels.  Empty
+     * (GSP-managed) instblk -> 0 -> chan_translate falls back to the snoop list. */
+    s->chan_pdb = 0;
+    if (s->chan_inst_block) {
+        uint64_t w128, w129;
+        if (s->chan_inst_sys) {
+            w128 = nvkvm_phys_rd32(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, true);
+            w129 = nvkvm_phys_rd32(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, true);
+        } else {
+            w128 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, 4);
+            w129 = nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, 4);
+        }
+        uint64_t pdb = (w128 & 0xFFFFF000ull) | (w129 << 32);
+        if (pdb != 0) { s->chan_pdb = pdb; }
+        { bool dsys = false; uint64_t dp = nvkvm_chan_translate(s, s->chan_gpfifo_va, &dsys);
+          qemu_log("nvkvm-gpu[%s] M5: chan_exec hvas=0x%08x instblk_pdb=0x%llx "
+                   "gpfifoVA->phys=0x%llx %s\n", s->chip->name, s->chan_hvaspace,
+                   (unsigned long long)s->chan_pdb, (unsigned long long)dp,
+                   dsys ? "SYS" : "FB"); }
+    }
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
     }
