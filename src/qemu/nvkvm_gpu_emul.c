@@ -48,6 +48,7 @@
 #include "mode2_initctrl_ga106.h"  /* captured GA106 init-control responses    */
 #include "mode2_intrtable_ga106.h" /* captured GA106 interrupt table (M5)      */
 #include "mode2_gspstaticinfo_ga106.h" /* captured GA106 GSP static config (M5) */
+#include "mode2_compute_ctrls_ga106.h" /* captured GA106 cuInit compute-cap ctrls */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -667,6 +668,42 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     stl_le_p(resp + 92, 0);
                     stl_le_p(resp + 96, 4u);
                     stl_le_p(resp + 56, 32u + 40u + 4u);
+                } else if (ctrl == 0x20800102u || ctrl == 0x20801303u) {
+                    /* GPU_GET_INFO_V2 / FB_GET_INFO_V2 (Phase-B compute caps):
+                     * inline list {NvU32 count; {NvU32 index, NvU32 value}[]}.
+                     * The guest requests a set of indices; fill each value from
+                     * the captured GA106 map (real RTX 3060 ground truth), default
+                     * 0 for any index we didn't capture.  This is a cuInit=100 fix
+                     * (libcuda reads these for compute-cap/device validation). */
+                    const nvkvm_idxval_t *map = (ctrl == 0x20800102u)
+                        ? gpu_get_info_v2_map : fb_get_info_v2_map;
+                    uint32_t mapn = (ctrl == 0x20800102u)
+                        ? GPU_GET_INFO_V2_MAP_N : FB_GET_INFO_V2_MAP_N;
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    uint32_t cnt = ldl_le_p(resp + 120);
+                    if (cnt > 128) cnt = 128;
+                    for (uint32_t e = 0; e < cnt; e++) {
+                        uint32_t eoff = 124u + e * 8u;
+                        if (eoff + 8u > 120u + ps) break;
+                        uint32_t idx = ldl_le_p(resp + eoff);
+                        uint32_t val = 0;
+                        for (uint32_t k = 0; k < mapn; k++) {
+                            if (map[k].index == idx) { val = map[k].value; break; }
+                        }
+                        stl_le_p(resp + eoff + 4, val);
+                    }
+                    stl_le_p(resp + 92, 0);              /* NV_OK */
+                    stl_le_p(resp + 56, 32u + 40u + ps); /* psize unchanged */
+                } else if (ctrl == 0x20803801u) {
+                    /* GRMGR_GET_GR_FS_INFO: replay captured GA106 floorsweep blob
+                     * (GPC/TPC/PES enable masks).  Capture is a 256B prefix; the
+                     * leading query results are what cuInit reads. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    uint32_t n = GRMGR_GR_FS_INFO_BLOB_N;
+                    if (n > ps) n = ps;
+                    memcpy(resp + 120, grmgr_gr_fs_info_blob, n);
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
                 } else if (ctrl == 0x20800a01u && cr) {
                     /* INTERNAL_DISPLAY_GET_STATIC_INFO: replay captured 32B but
                      * SYNTHESIZE numDispChannels (struct off 32, params+120 =>
@@ -703,6 +740,21 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     stl_le_p(resp + 56, 32u + 40u + 1284u);
                 }
                 /* else: void/SET control — echo with status=NV_OK */
+                /* DIAG(B-compute): log controls we did NOT fill with real data
+                 * (cr==NULL and not special-cased) that REQUEST a non-zero
+                 * response (a GET) — these return NV_OK+zeros and are the
+                 * cuInit=100 compute-cap suspects. */
+                if (!cr && ctrl != 0x20800a5cu && ctrl != 0x20801112u &&
+                    ctrl != 0x20802a08u && ctrl != 0x208001b0u &&
+                    ctrl != 0x20800102u && ctrl != 0x20801303u &&
+                    ctrl != 0x20803801u) {
+                    uint32_t reqpsize = ldl_le_p(resp + 96);
+                    if (reqpsize > 0) {
+                        qemu_log("nvkvm-gpu[%s] CTRL-UNFILLED cmd=0x%08x psize=%u "
+                                 "-> echoed NV_OK+zeros\n",
+                                 s->chip->name, ctrl, reqpsize);
+                    }
+                }
             }
             if (fn == 65) {
                 /* GET_GSP_STATIC_INFO (fn 65): NOT a control — the GSP returns the
