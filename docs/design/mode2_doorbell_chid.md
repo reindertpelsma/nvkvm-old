@@ -215,3 +215,35 @@ full-SRIOV vGPU (where the guest allocs chid itself, line 2603).
   VF doorbell) or emulated VF-partition + trap+translate.
 Universal backstop: trap-all + guest->host chid translation works on ANY arch/posture (slower
 tier), so Blackwell is never blocked — worst case runs trap-all until the posture is sorted.
+
+## 12. CORRECTION (2026-06-05): legacy-vGPU is NOT reachable with the stock OPEN driver
+
+§6 over-claimed. Verified the open driver's virtual-detection:
+- `gpumgrGetGpuHalFactorOfVirtual` (gpu_mgr.c:1003): sets isVirtual=TRUE **only** if
+  NV_PMC_BOOT_1.VGPU == _VF. The _PV value (0x1, para-virtual = legacy) is NOT recognized
+  -> falls through to isVirtual=FALSE (treated as BARE METAL).
+- NV_PMC_BOOT_1_VGPU (nv_ref.h:146) is a 2-bit field: _REAL=0, _PV=1, _VF=2.
+- gpu.c:388 sets bIsVirtualWithSriov = (VGPU==_VF) within the IS_VIRTUAL case; the else
+  (legacy) branch is unreachable because IS_VIRTUAL already requires _VF.
+- gpuDetermineVirtualMode (gpu.c:4552): NV_ASSERT_OR_RETURN(isVirtual == (VGPU==VF),
+  NV_ERR_INVALID_STATE) — release-effective; enforces the coupling.
+=> isVirtual <=> VGPU==VF <=> bIsVirtualWithSriov. There is NO emulated-register state that
+   yields "virtual without SRIOV". The registry key NV_REG_STR_RM_SET_SRIOV_MODE
+   (gpu_registry.c:105) sets the HOST/PF-side bSriovEnabled, NOT the guest virtual-mode.
+   The IS_VIRTUAL_WITHOUT_SRIOV code paths exist (shared w/ the proprietary driver, which
+   supported pre-Ampere para-virtual vGPU) but are DEAD in the open build.
+
+CONSEQUENCE: §6's host-allocates-chid resolution requires a 1-line GUEST-DRIVER PATCH
+(accept _PV in gpumgrGetGpuHalFactorOfVirtual, or force bIsVirtualWithSriov=FALSE at
+gpu.c:388) -> debug/Linux-demo only; breaks the stock-driver (Windows/closed-KMD) thesis.
+
+REVISED production options (Tier model §7 stands; Tier 0 needs a guest patch):
+- Full-SRIOV-VF emulation (present VGPU=_VF): guest allocs chid in its VF partition (line
+  2603); translate vChid->sChid (trap) OR use REAL host SR-IOV so the per-VF doorbell does
+  the offset in HW (zero-trap, but needs SR-IOV unlocked on the host GA106).
+- Bare-metal (current Mode-2): high-range chid steering + per-collision flip to trap-all.
+- Trap-all: universal floor.
+The dig confirmed full-SRIOV-VF is the only stock-driver "vGPU" posture -> real host SR-IOV
+(if unlockable on consumer GA106) is the path that yields HW chid-partition + HW doorbell
+translation for free; otherwise chid translation is a bounded per-channel cost, not the
+original collision nightmare.
