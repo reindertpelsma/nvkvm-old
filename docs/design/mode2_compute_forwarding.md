@@ -87,6 +87,41 @@ real strategic fork with large effort either way — the USER's call, given the
 GSP-internal-map complication makes neither obviously dominant. Control-plane
 forwarding (object tree + channels) is DONE and reusable in both.
 
+## Data-plane double-mmap — code-grounded mechanism (2026-06-04)
+
+Read of the Mode-1 mmap path (nvkvm_mmap_host.c) settles the "how does QEMU map
+the stub's GPU memory" question:
+- `nvkvm_mmap_create(nv, hfd, offset, length, prot, flags, &region)` does
+  `mmap(NULL, length, prot, flags, hfd->fd, offset)` — i.e. QEMU mmaps a **host
+  nvidia fd it holds in its OWN process** at the RM-returned mmap offset, giving a
+  host VA backed by real GPU memory.
+- `nvkvm_mmap_map_to_guest(nv, region)` then `KVM_SET_USER_MEMORY_REGION`s that
+  host VA at a GPA → the guest sees the real GPU memory at that GPA.
+
+Implication for Mode-2: the forwarded channel memory is allocated by the STUB's
+RM client (sandboxed). For QEMU to mmap it, QEMU needs (1) its own host fd to
+/dev/nvidia0, and (2) the memory accessible from QEMU's client — i.e. **DUP the
+stub-allocated object into a QEMU-side RM client** (NV_ESC_RM_DUP_OBJECT), then
+RM_MAP_MEMORY on QEMU's fd to get the offset, then `nvkvm_mmap_create` on QEMU's
+fd. Mode-1 already runs a QEMU-side handle table + the stub; Mode-2 reuses both.
+
+Concrete Mode-2 data-plane build (the remaining work):
+1. QEMU opens its own /dev/nvidia0 (nvkvm_handle_open_nvidia) — for mmap.
+2. For each forwarded memory object the guest will mmap (compute-context buffers,
+   channel USERD/GPFIFO once RM-allocated), DUP it from the stub's client into a
+   QEMU-side client (grant share rights at alloc), RM_MAP_MEMORY on QEMU's fd.
+3. nvkvm_mmap_create QEMU's fd at the offset; back the EMULATED FB BAR's fb_pages
+   at the guest's GPU-phys (or the GPA window) with that host VA — so the guest's
+   BAR1/PRAMIN writes land in real GPU memory and the host GPU reads the guest's
+   data. (Double-mmap: one physical buffer, two views.)
+4. VAS: for the compute channel, the host channel's VAS must map the guest's GPU-VAs
+   (gpFifoOffset etc.); use the channel alloc's gpFifoOffset field (caller-specified,
+   IS in params) + PROMOTE_CTX maps to align them.
+5. Flip the compute-context allocs/controls to AUTHORITATIVE (return host results);
+   keep faking UVM/cuInit.
+This is intricate (cross-process DUP + VAS alignment) and is the focused build that
+remains; the control plane + the mmap mechanism are now both settled.
+
 ## Why (the gate)
 
 cuCtxCreate crashes because the GR/context buffers are never populated by real
