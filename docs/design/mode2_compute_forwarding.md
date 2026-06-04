@@ -559,3 +559,45 @@ So: the GR forward-chain repair (TSG/channel hVASpace) was real and correct, but
 chain ultimately dead-ends at the UVM externally-owned VASpace, which must be solved at
 the UVM layer. Next session: scope the UVM VASpace-registration forwarding (which UVM
 ioctls the guest issues for 0x5c000007; bind a host UVM to the host VASpace+channel).
+
+### M5.3 KEYSTONE (2026-06-04): Mode-2 compute requires reverse-driver page-table xlate
+
+Complete causal chain for Mode-2 cuCtxCreate, now definitively established:
+  cuCtxCreate (Pascal+) builds a UVM-managed primary context
+   → its compute object (0xc7c0) lives on a channel whose primary VASpace is
+     UVM-externally-owned + fault-enabled (flags=0x48)
+   → an externally-owned VASpace's GPU page tables are managed by nvidia-uvm.ko
+     (UVM_REGISTER_GPU_VASPACE ioctls + the in-kernel nvUvmInterface), NOT by RM
+   → in Mode-2 those UVM ops run ENTIRELY IN-GUEST (guest /dev/nvidia-uvm + guest
+     faked RM); they never reach the emulated GPU as forwardable ioctls
+   → so the host RM's forwarded externally-owned VASpace is an unmanaged shell
+     (NULL OBJVASPACE) → ctxshareConstruct pVAS==NULL → INVALID_STATE → cuCtxCreate fails.
+
+There is NO forwardable-ioctl shortcut: the guest UVM↔RM binding is in-guest and
+invisible to the emulated device. The host VASpace can only be made functional by
+RECONSTRUCTING its GPU page tables from the guest's observable GPU-side activity:
+  - PROMOTE_CTX (already snooped → #2 side-table) gives context-buffer VA↔phys.
+  - The guest's GMMU page-table writes are observable via the emulated BAR1 aperture
+    (nvkvm_baraperture_write → walk → FB), and via the GPA-window the guest CPU uses
+    to build page tables.
+  → Translate those guest GPU-VA→guest-phys mappings into host VASpace page-table
+    entries pointing at the host backing (the data-plane primitive, now proven), via
+    a host UVM bound to the host externally-owned VASpace OR direct RM page-table fills.
+
+This is the **reverse-driver page-table translation** — the documented hard core of
+Mode-2 ([[device-sim-verdict]]: "Hardest = guest-PTE↔host DMA xlate"; [[mode2-isolation-cr3-key]]).
+It is THE Mode-2 compute keystone milestone, multi-week, and intersects the UVM
+residency design ([[mode2-uvm-residency]]) + the prior Mode-1 UVM saga
+([[uvm-in-qemu]], [[state-machine-step-e]], [[cuctxcreate-800-pinned]] which hit
+RS_ACCESS_DUP_OBJECT / PAGE_TABLE_NOT_AVAIL on exactly this binding).
+
+What this session SETTLED: the data-plane primitive (QEMU↔host-GPU memory) is proven;
+the cuCtxCreate wall is fully root-caused to the UVM externally-owned VASpace; the GR
+forward-chain handle repairs (TSG/channel hVASpace) are correct and committed; and the
+remaining work is precisely scoped to the page-table-translation keystone. Approach
+candidates for the keystone (next major milestone, likely worth user steer given scale):
+  (1) Host-UVM mirror: stub opens /dev/nvidia-uvm, registers the host externally-owned
+      VASpace, and replays guest GPU-VA mappings into it (observed via BAR1/PROMOTE_CTX).
+  (2) Direct host page-table fill: QEMU/stub writes the host VASpace's PTEs directly
+      from the observed guest mappings (no host UVM), pointing at host backing.
+  (1) reuses real UVM machinery (safer, matches residency design); (2) is lower-level.
