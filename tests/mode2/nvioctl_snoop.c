@@ -57,14 +57,23 @@ int ioctl(int fd, unsigned long req, ...)
 
     unsigned type = _IOC_TYPE(req), nr = _IOC_NR(req), sz = _IOC_SIZE(req);
     int is_evt_alloc = 0; uint32_t e_hClass = 0, e_hRoot = 0, e_hNew = 0;
-    if (type == 'F' && arg) {
-        uint32_t *p = (uint32_t *)arg;
+    void *darg = arg;  /* buffer to DECODE (real call always uses the original arg) */
+    /* NV_ESC_IOCTL_XFER_CMD (211): {cmd@0, size@4, ptr@8} wraps an inner ioctl.
+     * Unwrap so RM_ALLOC/ALLOC_OS_EVENT issued via XFER are still decoded. */
+    if (type == 'F' && nr == 211 && arg) {
+        uint32_t inner_cmd = ((uint32_t *)arg)[0];
+        uint32_t inner_sz  = ((uint32_t *)arg)[1];
+        uint64_t iptr = *(uint64_t *)((char *)arg + 8);
+        if (iptr) { nr = inner_cmd; darg = (void *)(uintptr_t)iptr; sz = inner_sz; }
+    }
+    if (type == 'F' && darg) {
+        uint32_t *p = (uint32_t *)darg;
         if (nr == 0x2B) {                 /* NV_ESC_RM_ALLOC (NVOS21/64) */
             uint32_t hRoot = p[0], hParent = p[1], hNew = p[2], hClass = p[3];
             if (hClass == 0x0079u || hClass == 0x0005u || hClass == 0x007eu) {
                 /* pAllocParms @16 (NvP64) -> NV0005_ALLOC_PARAMETERS
                  * {hParentClient@0, hSrcResource@4, hClass@8, notifyIndex@12, data@16(NvP64)} */
-                uint64_t pAllocParms = *(uint64_t *)((char *)arg + 16);
+                uint64_t pAllocParms = *(uint64_t *)((char *)darg + 16);
                 uint32_t notifyIdx = 0; uint64_t data = 0;
                 if (pAllocParms) {
                     uint32_t *ap = (uint32_t *)(uintptr_t)pAllocParms;
@@ -94,7 +103,7 @@ int ioctl(int fd, unsigned long req, ...)
     }
     int rc = real_ioctl(fd, req, arg);
     if (is_evt_alloc) {                   /* status: NVOS64(48)@40, NVOS21(32)@28 */
-        uint32_t *p = (uint32_t *)arg;
+        uint32_t *p = (uint32_t *)darg;
         uint32_t status = (sz >= 48) ? p[10] : p[7];
         fprintf(stderr, "[SNOOP]  -> EVENT alloc 0x%08x class=0x%04x status=0x%x rc=%d\n",
                 e_hNew, e_hClass, status, rc);
