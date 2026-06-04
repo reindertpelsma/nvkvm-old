@@ -2373,7 +2373,12 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                          (unsigned long long)ldq_le_p(auxbuf + 192),
                          (unsigned long long)ldq_le_p(auxbuf + 216), ldl_le_p(auxbuf + 128));
             }
-            if (hvas == 0u) {
+            /* Only substitute hVASpace for a NON-TSG channel. A TSG channel (has a
+             * context share) MUST leave hVASpace=0 and inherit the TSG's vaspace —
+             * the host RM rejects "TSG channels can't use an explicit vaspace" +
+             * "Both context share and vaspace handles can't be valid" (kernel_channel.c).
+             * The GR channel HAS hContextShare set, so we must NOT touch its hVASpace. */
+            if (hvas == 0u && hctxshare == 0u) {
                 uint32_t sub = 0;
                 for (int i = 0; i < s->m2_devvas_n; i++) {
                     if (s->m2_devvas[i].client == hClient) { sub = s->m2_devvas[i].vas; break; }
