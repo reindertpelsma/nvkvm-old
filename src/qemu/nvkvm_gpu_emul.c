@@ -2241,6 +2241,19 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         psize = sizeof(auxbuf);
     }
     memcpy(auxbuf, cmd + 112, psize);
+    /* M5.3 DIAG: dump KEPLER_CHANNEL_GROUP_A (0xa06c) alloc params as u32s to find
+     * the embedded handle that fails INVALID_OBJECT_HANDLE (0x33) on the host (the
+     * UVM RM-internal 0x5c0000xx channelgroup). NV_CHANNEL_GROUP_ALLOCATION_PARAMS:
+     * hObjectError@0, hObjectEccError@4, hVASpace@8, engineType@12, ... */
+    if (hClass == 0xa06cu && psize >= 4) {
+        char hex[256]; int n = (int)(psize < 48 ? psize : 48); int o = 0;
+        for (int i = 0; i + 4 <= n; i += 4) {
+            o += snprintf(hex + o, sizeof(hex) - o, "%s@%d=0x%08x",
+                          i ? " " : "", i, ldl_le_p(auxbuf + i));
+        }
+        qemu_log("nvkvm-gpu[%s] M5.3 DIAG a06c params(psize=%u) hParent=0x%08x: %s\n",
+                 s->chip->name, psize, hParent, hex);
+    }
     /* M5.1c experiment: for channel classes, drop hObjectError (params+0) — its
      * error-notifier memory object isn't forwarded yet, so RM's notifier lookup
      * fails (kchannelGetNotifierInfo OBJECT_NOT_FOUND). Zeroing it lets the

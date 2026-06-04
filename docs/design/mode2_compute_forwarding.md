@@ -476,3 +476,26 @@ embedded handles per-class in shadow_fwd (channelgroup hVASpace; channel hVASpac
 hContextShare/hObjectError; compute-object none). Once the channelgroup constructs,
 the channel + compute object should follow, the host builds + self-promotes the GR
 context, and we move to mirroring the libcuda-CPU-touched buffers.
+
+### M5.3 ROOT CAUSE CONFIRMED (2026-06-04): GR channelgroup passes hVASpace=0
+
+a06c param dump (NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS: hObjectError@0,
+hObjectEccError@4, hVASpace@8, engineType@12):
+  OK   (libcuda client 0xcaf00000): hVASpace=0xcaf00005 (explicit), engineType=0x9..0xd
+       (= NV2080_ENGINE_TYPE_COPY0..4) — COPY-engine TSGs, all construct.
+  FAIL (UVM client, device 0x5c000002): hVASpace=0x00000000, engineType=0x1
+       (= NV2080_ENGINE_TYPE_GRAPHICS) -> st=0x33 INVALID_OBJECT_HANDLE.
+
+So the GR-engine TSG — the parent the compute object (0xc7c0) needs — relies on the
+device-DEFAULT VASpace (hVASpace=0), which doesn't resolve on the host device as
+forwarded; the COPY TSGs pass an explicit handle and succeed. The guest had allocated
+FERMI_VASPACE_A 0x5c000007 + 0x5c000008 under that same device (SHADOW[46][47], both
+OK on host).
+
+**FIX TO TRY (next tick):** in shadow_fwd, for hClass==0xa06c with hVASpace(@8)==0,
+substitute an explicit VASpace handle forwarded under the same device. Candidate:
+the GR VASpace among 0x5c000007/0x5c000008. Determine which by checking the VASPACE
+alloc params (FERMI_VASPACE_A index/flags) or just try each. If neither works, the
+host device may need its default VASpace established (forward a SET_DEFAULT or alloc
+a device-global VASpace). Once the GR TSG constructs, channel 0x5c000019 + compute
+0x5c00001a should follow → host builds + self-promotes the GR context.
