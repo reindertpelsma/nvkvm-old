@@ -286,6 +286,10 @@ struct NvkvmGpuEmul {
      * 0 (device-default), which doesn't resolve on the forwarded host device. */
     struct { uint32_t client, dev, vas; } m2_devvas[32];
     int      m2_devvas_n;
+    /* M5.3: TSG (0xa06c) handle -> engineType, so a channel that passes engineType=0
+     * (NULL, "inherit") can be given its TSG's engine explicitly on the host. */
+    struct { uint32_t tsg, engine; } m2_tsgeng[32];
+    int      m2_tsgeng_n;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -2309,6 +2313,12 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                      "for client=0x%08x dev=0x%08x\n", s->chip->name, hClient, hParent);
         }
     }
+    /* M5.3: record TSG (0xa06c) handle -> engineType@12 for the channel engineType fix. */
+    if (hClass == 0xa06cu && psize >= 16 && s->m2_tsgeng_n < 32) {
+        s->m2_tsgeng[s->m2_tsgeng_n].tsg    = hObject;
+        s->m2_tsgeng[s->m2_tsgeng_n].engine = ldl_le_p(auxbuf + 12);
+        s->m2_tsgeng_n++;
+    }
     /* M5.3: FERMI_CONTEXT_SHARE_A (0x9067) NV_CTXSHARE_ALLOCATION_PARAMETERS has
      * hVASpace@0. The GR context share (under the GR TSG) leaves it 0 (device
      * default) → NV_ERR_INVALID_STATE (0x40) on the host, and it must match the
@@ -2372,6 +2382,19 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                     stl_le_p(auxbuf + 28, sub);
                     qemu_log("nvkvm-gpu[%s] M5.3 c56f hVASpace 0 -> 0x%08x\n",
                              s->chip->name, sub);
+                }
+            }
+            /* M5.3: NV_CHANNEL_ALLOC_PARAMS engineType@128. The GR channel passes 0
+             * (NULL/inherit); on the host give it the parent TSG's engine explicitly. */
+            if (psize >= 132 && ldl_le_p(auxbuf + 128) == 0u) {
+                for (int i = 0; i < s->m2_tsgeng_n; i++) {
+                    if (s->m2_tsgeng[i].tsg == hParent && s->m2_tsgeng[i].engine != 0) {
+                        stl_le_p(auxbuf + 128, s->m2_tsgeng[i].engine);
+                        qemu_log("nvkvm-gpu[%s] M5.3 c56f engineType 0 -> 0x%x "
+                                 "(from TSG 0x%08x)\n", s->chip->name,
+                                 s->m2_tsgeng[i].engine, hParent);
+                        break;
+                    }
                 }
             }
         }
