@@ -363,3 +363,33 @@ size+order. Option (a) is cleaner — we control the guest's FB-GPA at alloc tim
    (fn=76 0x2080012b) to the host GSP so the host GPU maps the SAME memory.
 4. Re-run cup2: the mapped-but-unbacked context buffers now carry real host GPU
    state → cuCtxCreate should pass the NULL-deref crash.
+
+### M5.3 finding (2026-06-04): host-phys is privileged → pivot to VA-based backing
+
+Empirical (commit 279c523): `NV0041_CTRL_CMD_GET_SURFACE_PHYS_ATTR` returns
+NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b) for the unprivileged stub. Querying a
+surface's GPU-physical address is a privileged op. Since prod QEMU/stub MUST stay
+unprivileged (security model), we **cannot** learn host-phys → the
+"rewrite PROMOTE_CTX guest-phys→host-phys" plan is dead for the unprivileged path.
+
+**Pivot — VA-based backing (unprivileged).** `NV_ESC_RM_MAP_MEMORY_DMA` (NVOS46,
+escape.c:624) is `NV_CTL_DEVICE_ONLY` but **not** privilege-gated. It maps a memory
+object into a VASpace (hDma) at a caller-chosen GPU VA (`dmaOffset` with
+`DMA_OFFSET_FIXED_TRUE`), returning the VA — no phys needed, unprivileged. So:
+
+1. Per guest context buffer (PROMOTE_CTX entry: gpuVirtAddr, size): allocate host
+   vidmem (`nvkvm_m2_host_alloc_map_vidmem`) and `RM_MAP_MEMORY_DMA` it into the
+   forwarded host channel's VAS at dmaOffset = the guest's gpuVirtAddr (FIXED).
+   The host GPU executing that channel then reaches the buffer by the same VA.
+2. Back the guest's CPU/GPU view of that buffer (guest-FB-phys range, via
+   nvkvm_fb_read/write or a memslot) with the same host vidmem mapping (double-mmap).
+3. OPEN QUESTION (needs GR-internals research): does the GR engine context switch
+   require PROMOTE_CTX with true phys, or does VAS mapping suffice? Read
+   open-gpu-kernel-modules kgraphics/GR context-buffer promotion + nouveau before
+   building. If phys is unavoidable, fall back to a privileged helper invoked ONLY
+   at host setup (out of the per-guest unprivileged path) or host-side authoritative
+   context (option A).
+
+Recommended next: confirm the GR-context VA-vs-phys question by source, then wire
+RM_MAP_MEMORY_DMA into the channel VAS for the 6 cup2 context buffers + memslot the
+guest-FB ranges, and re-run cup2.
