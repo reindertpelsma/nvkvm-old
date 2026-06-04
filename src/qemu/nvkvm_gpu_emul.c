@@ -290,6 +290,12 @@ struct NvkvmGpuEmul {
      * (NULL, "inherit") can be given its TSG's engine explicitly on the host. */
     struct { uint32_t tsg, engine; } m2_tsgeng[32];
     int      m2_tsgeng_n;
+    /* M5.3 data-plane: the GR-client subdevice (NV20_SUBDEVICE_0 0x2080) handle, needed
+     * to issue GR_GET_CTX_BUFFER_INFO on the host shadow context after the compute object
+     * is forwarded — the first step of backing the guest's context buffers with real host
+     * GPU state (the proven cuCtxCreate fix). Tracked per GR client. */
+    struct { uint32_t client, subdev; } m2_subdev[64];
+    int      m2_subdev_n;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -793,6 +799,8 @@ static void nvkvm_snoop_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
  * (same function, rpc_result=NV_OK) onto the status queue so _issueRpcAndWait
  * returns.  Init RPCs are mostly SET_* and accept an NV_OK echo. */
 static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn); /* M5.1 fwd-decl */
+static int nvkvm_m2_control1(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hObject,
+                             uint32_t cmd, void *params, uint32_t psize, uint32_t *st); /* M5.3 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -2279,6 +2287,14 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                      s->chip->name, vflags, vflags & ~0x48u);
         }
     }
+    /* M5.3 data-plane: remember the NV20_SUBDEVICE_0 (0x2080) handle per GR client —
+     * GR_GET_CTX_BUFFER_INFO is issued on the subdevice to enumerate the host shadow
+     * context's real buffers (the data to mirror into the guest's BAR-backed buffers). */
+    if (hClass == 0x2080u && s->m2_subdev_n < 64) {
+        s->m2_subdev[s->m2_subdev_n].client = hClient;
+        s->m2_subdev[s->m2_subdev_n].subdev = hObject;
+        s->m2_subdev_n++;
+    }
     /* M5.3: remember each FERMI_VASPACE_A (0x90f1) forwarded under a (client,device)
      * so the GR channelgroup can be given an explicit hVASpace below. */
     if (hClass == 0x90f1u && s->m2_devvas_n < 32) {
@@ -2417,6 +2433,53 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
              "hObj=0x%08x -> rc=%d status=0x%x%s\n", s->chip->name, s->m2_fwd_n,
              hClass, hParent, hObject, rc, p.status,
              (rc == 0 && p.status == 0) ? "  OK" : "  <-- ERR/MISMATCH");
+
+    /* M5.3 DATA-PLANE step 1 (enumerate): once the compute object (AMPERE_COMPUTE_B
+     * 0xc7c0) constructs on the host shadow context, query GR_GET_CTX_BUFFER_INFO on the
+     * subdevice to read the REAL host context-buffer set (size/physAddr/aperture/type).
+     * RESULT (2026-06-04): this control is PRIVILEGED -> returns st=0x1b
+     * (NV_ERR_INSUFFICIENT_PERMISSIONS) for the unprivileged stub, exactly like
+     * GET_SURFACE_PHYS_ATTR. Per the hard security constraint (QEMU stays unprivileged in
+     * prod), the "read/mirror host GR context buffers" data-plane approach is BLOCKED on
+     * the unprivileged path. Kept as a documented probe; the data plane must instead be
+     * solved by forging the guest-side GSP state so libcuda's context buffers are
+     * self-consistent (unprivileged), or via an unprivileged host-content path TBD.
+     * hParent of the compute object IS the channel. */
+    if (hClass == 0xc7c0u && rc == 0 && p.status == 0) {
+        uint32_t subdev = 0;
+        for (int i = 0; i < s->m2_subdev_n; i++) {
+            if (s->m2_subdev[i].client == hClient) { subdev = s->m2_subdev[i].subdev; break; }
+        }
+        if (!subdev) {
+            qemu_log("nvkvm-gpu[%s] M5.3 ctxbuf: no subdevice tracked for client 0x%08x\n",
+                     s->chip->name, hClient);
+        } else {
+            /* params: hUserClient@0, hChannel@4, bufferCount@8, ctxBufferInfo[64]@16
+             * (each 80B: alignment@0,size@8,bufferHandle@16,pageCount@24,physAddr@32,
+             * bufferType@40,aperture@44,kind@48,pageSize@52,flags@56,uuid@60). */
+            static uint8_t cb[16 + 64 * 80];
+            memset(cb, 0, sizeof(cb));
+            stl_le_p(cb + 0, nvkvm_m2_client(s, hClient)); /* hUserClient = host client */
+            stl_le_p(cb + 4, hParent);                     /* hChannel = the GR channel  */
+            uint32_t st = 0xffff;
+            int crc = nvkvm_m2_control1(s, hClient, subdev, 0x20801219u, cb, sizeof(cb), &st);
+            uint32_t cnt = ldl_le_p(cb + 8);
+            qemu_log("nvkvm-gpu[%s] M5.3 GR_GET_CTX_BUFFER_INFO chan=0x%08x sub=0x%08x "
+                     "-> crc=%d st=0x%x bufferCount=%u\n", s->chip->name, hParent, subdev,
+                     crc, st, cnt);
+            if (crc == 0 && st == 0 && cnt <= 64) {
+                for (uint32_t i = 0; i < cnt; i++) {
+                    const uint8_t *e = cb + 16 + (uint64_t)i * 80;
+                    qemu_log("nvkvm-gpu[%s]   ctxbuf[%u] type=%u aperture=%u size=0x%llx "
+                             "physAddr=0x%llx align=0x%llx pageSize=%u\n", s->chip->name, i,
+                             ldl_le_p(e + 40), ldl_le_p(e + 44),
+                             (unsigned long long)ldq_le_p(e + 8),
+                             (unsigned long long)ldq_le_p(e + 32),
+                             (unsigned long long)ldq_le_p(e + 0), ldl_le_p(e + 52));
+                }
+            }
+        }
+    }
 }
 
 /* M5.3 helper: forward one RM_ALLOC (NVOS64) with client remap; returns nvstatus. */

@@ -694,3 +694,27 @@ host subdevice (struct: hUserClient@0,hChannel@4,bufferCount@8,ctxBufferInfo[]@1
 alignment@0,size@8,physAddr@32,bufferType@40,aperture@44), map each, and back the guest FB
 ranges the channel/GR object reference. Tooling: tests/mode2/{gcup2_gdb,gcup2_hal,gcup2_trace,
 ioctl_trace}.* + host-side /tmp/cup2_host (bare-metal reference run).
+
+### M5.3 DATA-PLANE constraint (2026-06-04): GR_GET_CTX_BUFFER_INFO is PRIVILEGED
+
+Implemented step 1 of the data-plane backing: after the compute object (0xc7c0) constructs
+on the host shadow context, issue NV2080_CTRL_CMD_GR_GET_CTX_BUFFER_INFO (0x20801219) on
+the host shadow subdevice (tracked via m2_subdev[], keyed by GR client) to enumerate the
+real host GR context buffers. RESULT: crc=0 but st=0x1b (NV_ERR_INSUFFICIENT_PERMISSIONS),
+bufferCount=0. The control is PRIVILEGED — the unprivileged stub cannot read it (same wall
+as GET_SURFACE_PHYS_ATTR 0x410103).
+
+IMPLICATION (intersects the hard security constraint "QEMU stays unprivileged in prod"):
+the "read host GR context buffers and mirror their contents into the guest" data-plane
+approach is BLOCKED on the unprivileged path. The host GR context buffers are kernel-RM-
+managed (no userspace handles, privileged enumeration), so unprivileged QEMU cannot read
+them directly. The data-plane keystone must therefore be solved one of:
+  (A) FORGE the guest-side GSP state so the guest kernel populates libcuda's context
+      buffers self-consistently (unprivileged; canonical fake-the-boot). Needs the correct
+      values — find via host-vs-guest CONTROL-RESPONSE byte-compare (the tracer captures
+      both in+out, unprivileged), since libcuda crashes on a value it stored from an
+      earlier control/mapped read.
+  (B) An unprivileged host-content path (TBD) — e.g. map host buffers via handles libcuda
+      itself creates, not RM-internal GR buffers.
+  (C) Privileged helper (rejected by the security constraint except for debugging).
+NEXT: host-vs-guest control-response diff to find the divergent forgeable value (approach A).
