@@ -188,3 +188,30 @@ Confirmed from source:
   Different pages by privilege => the per-page trap/passthrough split is native, not engineered.
 This RESOLVES §8 verify-item #2 and strengthens §6: legacy-vGPU gives both host-authoritative
 chid/instmem AND a clean control(0x2200)/data(0x90) doorbell separation.
+
+## 11. Blackwell forward-look (2026-06-05): doorbell split survives; real risk is legacy-vGPU support
+
+Verified from gb100/dev_vm.h + shared vgpu rpc:
+- Blackwell KEEPS the separate privileged doorbell: NV_VIRTUAL_FUNCTION_PRIV_DOORBELL @
+  0x2200 (PRIV region), field renamed to CPU_NOTIFICATION[31]+VECTOR[11:0]. The vGPU RPC
+  path is shared (only vgpu/arch/ampere/rpcga102.c exists; rings PRIV_DOORBELL). So a
+  Blackwell vGPU guest still signals control-plane RPC via 0x2200 (separate page) — same
+  as Ampere.
+- The userspace doorbell (0x30090) ADDS GSP_DOORBELL[31] (vs Ampere has none). But channel
+  submit (gb202 kfifo) sets RUNLIST_DOORBELL, not GSP. GSP_DOORBELL is a BARE-METAL
+  GSP-client optimization (ring GSP directly from the userspace doorbell instead of the
+  0x110c00 queue head), NOT the vGPU control path.
+=> In vGPU posture the control/data page split SURVIVES on Blackwell: control=PRIV_DOORBELL
+   0x2200 (trap), data=userspace doorbell 0x30090 (passthrough). GSP_DOORBELL[31] only bites
+   if we present BARE-METAL GSP-client posture; staying in vGPU posture keeps the userspace
+   doorbell channel-only. (Confirm at bring-up: no vGPU-mode path sets GSP_DOORBELL on 0x30090.)
+
+The REAL Blackwell question is chid allocation, not the doorbell: verify whether
+IS_VIRTUAL_WITHOUT_SRIOV (legacy vGPU) is still supported on Blackwell, or whether it forces
+full-SRIOV vGPU (where the guest allocs chid itself, line 2603).
+- legacy-vGPU survives -> identical to Ampere (host-allocates chid).
+- full-SRIOV mandated -> chid guest-side but in a HW-partitioned VF chram slice (chidOffset,
+  vChid->sChid). Passthrough then needs either real host SR-IOV (HW does the offset in the
+  VF doorbell) or emulated VF-partition + trap+translate.
+Universal backstop: trap-all + guest->host chid translation works on ANY arch/posture (slower
+tier), so Blackwell is never blocked — worst case runs trap-all until the posture is sorted.
