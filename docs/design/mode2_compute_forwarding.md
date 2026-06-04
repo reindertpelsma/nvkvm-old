@@ -911,3 +911,34 @@ alloc's FB range (add FB-base tracking to forwarded 0x0040/0x003e allocs). Optio
 most decisive (the guest kernel knows what it's polling). THEN decide the execution-path
 backing. KEEP the confirmed wins: GR USERD double-mmap (step 1, committed, no regression)
 and the CRASHWIN/GPU-VA probes.
+
+### M5.4 channel-execution scoping (2026-06-04 tick 3): faking completes some, not 0x2efbaf000
+
+Doorbell + chan_execute correlation run (committed build, m2fwd=on):
+- The emulator's faking path DOES "complete" several channels — DOORBELL handler writes
+  their semaphores: ch[2] semaVA=0x120008404->SYS, ch[3..6] semaVA=0x121018004/48004/
+  78004/a8004 -> FB 0x1018004... (the libcuda COPY channels, low-FB pattern), and
+  CE_SEM_RELEASE addr=0x42006c004->SYS payload=1/2 is parsed from resolved pushbuffers.
+- chan_exec pushbuffer resolution: 8192 FAULT vs 40 OK. Many channels show
+  picked_pdb=0x0 (the emulator cannot determine the channel's page-directory base from
+  its instance block) -> their GPFIFO/pushbuffer VAs don't walk -> FAULT -> their work
+  (and any SEM_RELEASE) is never processed.
+- The dominant wait 0x2efbaf000 is HIGH-FB (the GR/UVM region), NOT the low-FB
+  0x1xxx004 pattern of the completed COPY channels, and is NOT written by the faking
+  path. So it belongs to a channel whose pushbuffers FAULT (PDB unresolved) OR is a
+  GSP/UVM-written value the faking path never produces.
+
+ROOT (consistent across all angles): channels can't RUN because the instance block
+(RAMIN: PAGE_DIR_BASE/RAMFC) that GSP normally populates is not populated in our
+fake-GSP, so the emulator (and a host channel) can't resolve the channel VAS to walk
+GPFIFO/pushbuffers. cuCtxCreate's init work (whatever writes 0x2efbaf000) is on such a
+channel. NOTE: making the faking chan_execute resolve more PDBs would let it FAKE more
+completions — explicitly NOT the goal (user: forward real GPU work, don't fake). The
+legit fix is the channel-execution FORWARD path: populate/forward the instance block +
+double-mmap the channel working set (GPFIFO/pushbuffer/USERD/semaphore) into the host
+channel's VAS at the guest's GPU VAs + forward the doorbell kick, so the host GPU runs
+the guest's pushbuffers and writes 0x2efbaf000 for real. This is the multi-week keystone,
+now scoped from every angle. Tooling constraint discovered: the open driver's RM core is
+a PRECOMPILED BLOB in the DKMS build (nv-kernel.o_binary) — only nv.c (kernel interface)
+is patchable, so RM-internal printk instrumentation is NOT available; QEMU-side
+diagnosis + nv.c shims are the only instrumentation surface.
