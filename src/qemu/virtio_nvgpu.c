@@ -714,6 +714,58 @@ static void nvkvm_enter_loop_work_done(void *opaque, int ret)
 	g_free(w);
 }
 
+/* ── #127 async os-event delivery: host fd ready → VQ_EVT → guest poll_wq ─────
+ * The stub background-polls registered host os-event fds and, on readiness,
+ * sends ISOLATE_RESP_POLL_EVENT on its reader socket.  The isolate reader thread
+ * calls nvkvm_virtio_push_evt(), which hops onto the device AioContext (BQL held)
+ * via a one-shot BH so the vq_evt push is serialized with the rest of the device
+ * — the reader thread must never touch a VirtQueue directly.  The guest's
+ * vq_evt callback (nvkvm_evt_callback → nvkvm_evt_deliver) matches the buffer's
+ * (isolate_id, handle_id) to the waiting fd's poll_wq and wakes it.  Without this
+ * libnvidia falls back to an ~18 ms poll-timeout-recheck per blocking-sync wait. */
+struct nvkvm_evt_push {
+	VirtIONvgpu *nv;
+	uint32_t     isolate_id;
+	uint32_t     handle_id;
+	uint32_t     revents;
+};
+
+static void nvkvm_evt_push_bh(void *opaque)
+{
+	struct nvkvm_evt_push *p = opaque;
+	VirtQueueElement *elem = virtqueue_pop(p->nv->vq_evt, sizeof(*elem));
+	if (elem) {
+		struct nvkvm_evt_poll msg = {
+			.isolate_id = cpu_to_le32(p->isolate_id),
+			.handle_id  = cpu_to_le32(p->handle_id),
+			.events     = cpu_to_le32(p->revents),
+			.reserved   = 0,
+		};
+		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
+		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
+		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
+		g_free(elem);
+	} else {
+		/* No pre-posted evt buffer free right now.  The guest re-arms its
+		 * poll and the still-readable host fd re-fires, so this is
+		 * recoverable (one missed wake, not a lost completion). */
+		NVKVM_DBG("nvkvm: vq_evt full, dropped poll-event iso=%u h=%u\n",
+			  p->isolate_id, p->handle_id);
+	}
+	g_free(p);
+}
+
+void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
+			   uint32_t handle_id, uint32_t revents)
+{
+	struct nvkvm_evt_push *p = g_malloc(sizeof(*p));
+	p->nv = nv;
+	p->isolate_id = isolate_id;
+	p->handle_id  = handle_id;
+	p->revents    = revents;
+	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_evt_push_bh, p);
+}
+
 static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);

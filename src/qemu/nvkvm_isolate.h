@@ -43,6 +43,8 @@ struct nvkvm_isolate {
 	int         sock_fd;
 	bool        alive;
 	bool        in_use;
+	void       *nv;       /* #127: owning VirtIONvgpu, so the reader thread can
+	                       * push os-event wakeups (vq_evt). Copied from table->nv. */
 
 	/*
 	 * lock: protects alive, in_use, pending_head, next_txn_id.

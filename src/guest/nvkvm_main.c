@@ -625,6 +625,9 @@ void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events)
 		if (ctx->handle_id == handle_id && ctx->session &&
 		    ctx->session->isolate_id == isolate_id) {
 			atomic_or((int)events, &ctx->poll_events);
+			/* #127: the host's one-shot arm fired; let the next
+			 * wait re-arm. */
+			atomic_set(&ctx->poll_armed, 0);
 			wake_up_interruptible(&ctx->poll_wq);
 		}
 	}
@@ -651,6 +654,7 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 	}
 	init_waitqueue_head(&ctx->poll_wq);
 	atomic_set(&ctx->poll_events, 0);
+	atomic_set(&ctx->poll_armed, 0);   /* #127 */
 	spin_lock_init(&ctx->mmap_lock);
 	INIT_LIST_HEAD(&ctx->mmap_regions);
 	mutex_init(&ctx->cpu_pages_lock);
@@ -2343,6 +2347,19 @@ static __poll_t nvkvm_poll(struct file *filp, poll_table *wait)
 
 	poll_wait(filp, &ctx->poll_wq, wait);
 	events = atomic_xchg(&ctx->poll_events, 0);
+
+	/* #127: about to block with nothing pending — ask the host to relay this
+	 * os-event fd's readiness over VQ_EVT, so a CUDA blocking-sync wait
+	 * (CU_CTX_SCHED_BLOCKING_SYNC, blocking cuEventSynchronize, NCCL) wakes
+	 * promptly instead of eating libnvidia's ~18ms poll-timeout fallback.
+	 * One-shot: the stub disarms after firing and nvkvm_evt_deliver clears
+	 * poll_armed, so the next wait re-arms.  The arm is a fast control-plane
+	 * round-trip done at most once per wait. */
+	if (!events && ctx->handle_id && ctx->session &&
+	    ctx->session->isolate_id &&
+	    atomic_cmpxchg(&ctx->poll_armed, 0, 1) == 0)
+		nvkvm_virtio_poll_arm(ctx->session->isolate_id,
+				      ctx->handle_id, 1);
 	return events;
 }
 

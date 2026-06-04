@@ -209,6 +209,11 @@ struct nvkvm_fd_ctx {
 	/* poll support */
 	wait_queue_head_t      poll_wq;
 	atomic_t               poll_events; /* cached POLL* bits from host         */
+	atomic_t               poll_armed;  /* #127: 1 while the host is asked to
+					     * relay this fd's readiness (one-shot;
+					     * cleared on delivery so the next wait
+					     * re-arms). Avoids the ~18ms blocking-
+					     * sync poll-timeout fallback.            */
 	struct list_head       evt_node;    /* #101: node in the async-event registry,
 					     * keyed by (isolate_id, handle_id), so a
 					     * VQ_EVT notification can find + wake us  */
@@ -377,6 +382,9 @@ int  nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_create_isolate(unsigned int session_id,
 				 __u32 *isolate_id_out);
+/* #127: ask the host to relay an os-event fd's readiness (POLLIN) over VQ_EVT.
+ * arm!=0 starts polling; arm==0 stops. Control-plane (does not block on GPU). */
+int  nvkvm_virtio_poll_arm(__u32 isolate_id, __u32 handle_id, int arm);
 int  nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
 			     u32 *ring_bytes_out);
 int  nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us,

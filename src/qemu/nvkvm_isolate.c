@@ -551,7 +551,13 @@ static void *isolate_reader_fn(void *arg)
 		}
 
 		case ISOLATE_RESP_POLL_EVENT:
-			/* TODO: forward to virtio EVT queue */
+			/* #127: a registered host os-event fd became ready in the
+			 * stub. Wake the matching guest fd via vq_evt (push is
+			 * marshalled onto the device AioContext internally). */
+			if (iso->nv)
+				nvkvm_virtio_push_evt((VirtIONvgpu *)iso->nv, iso->id,
+						      u.poll_event.handle_id,
+						      u.poll_event.revents);
 			break;
 
 		case ISOLATE_RESP_REALIZE_UVM: {
@@ -726,6 +732,7 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->sock_fd      = -1;
 			iso->pending_head = NULL;
 			iso->next_txn_id  = 1;
+			iso->nv           = t->nv;  /* #127: owning device for vq_evt push */
 			/* F-5 (security_audit_2026_06_01): do NOT reset sync_done here.
 			 * Every sync op resets it under sync_lock before its own wait;
 			 * resetting it here under iso->lock is a cross-lock data race that
