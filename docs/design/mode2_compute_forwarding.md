@@ -289,3 +289,44 @@ before coding M5.1.
   RPC or a trapped MMIO that pings the host channel.
 - cuCtxCreate's first forwarded alloc that previously crashed (object 0x5c00001a)
   — confirm it now succeeds with real backing.
+
+---
+
+## M5.3 status update (2026-06-04): data-plane primitive PROVEN
+
+Commit 651d860. The host-side half of the double-mmap is validated end-to-end:
+QEMU allocs real GA106 vidmem (client/device/subdevice/memory all NV_OK), maps it
+(`RM_MAP_MEMORY` on **/dev/nvidiactl** — it is `NV_CTL_DEVICE_ONLY`, escape.c:521 —
+with the NVOS33 `fd` field naming the device fd), and `mmap`s the SCM_RIGHTS fd
+into QEMU's address space at **offset 0** (nvidia device mmap requires
+`vm_pgoff==0`, nv-mmap.c:533; the kernel uses the per-fd `mmap_context`
+`rm_create_mmap_context` registered). Wrote/read `0xc0ffee01/0xdeadbeef` through
+host BAR1 — byte-exact PASS. See [[mode2-map-memory-control-device]]. Reusable
+sequence lives in `nvkvm_m2_memtest()` (gated by `m2fwd`, realize-time).
+
+### The integration that remains (the real M5.3)
+
+The emulated GPU's FB is a **sparse malloc-backed emulation** (`fb_pages`
+GHashTable of 4 KB pages, reached via the BAR0 PRAMIN window). The guest's
+cuCtxCreate context buffers live at guest-FB-GPAs that the guest's faked RM PMA
+assigns; libcuda then CPU-mmaps them (seen in strace at guest VA 0x200xxxxxxx via
+nvidia-uvm). Today those pages are malloc'd and **never populated** with real GPU
+state → libcuda dereferences garbage → SIGSEGV. To fix:
+
+1. **Reconcile** each guest context buffer (known guest-GPU-phys + size from the
+   PROMOTE_CTX side-table, `nvkvm_record_va_map`) with the corresponding **host**
+   context buffer the forwarded cuCtxCreate allocated on the real GA106. This
+   guest-FB-GPA ↔ host-GPU-mem matching is the hard kernel (two independent RMs
+   pick independent physical addresses).
+2. **Map** the host context buffer into QEMU via the proven primitive → QEMU VA.
+3. **Back** the guest-FB-GPA range with that QEMU VA via a KVM memslot (replace the
+   malloc'd `fb_pages` for that range). Then guest-CPU mmaps AND guest-GPU-PTE
+   walks that resolve to those FB pages hit real host GPU memory; the host GPU's
+   writes during real execution become visible to the guest. This mirrors Mode-1's
+   sparse GPA window (nvkvm_isolate_handlers.c:1818) but driven by the emulated
+   GPU's FB allocation instead of forwarded guest mmaps.
+
+Reconciliation options to evaluate next: (a) intercept the context-buffer
+GSP_RM_ALLOC, force the guest's GPU-phys assignment into a dedicated host-backed
+FB window whose GPAs we memslot to the host mappings; (b) post-hoc match by
+size+order. Option (a) is cleaner — we control the guest's FB-GPA at alloc time.
