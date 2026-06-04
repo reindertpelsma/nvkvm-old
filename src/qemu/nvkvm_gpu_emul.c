@@ -314,7 +314,7 @@ struct NvkvmGpuEmul {
      * it from host_qva instead of the local g_malloc0 FB page — so the guest sees real
      * GPU-initialized state (the proven cuCtxCreate fix). Inert until populated. The
      * bring-up mechanism; KVM-memslot backing is the perf endpoint (see design doc). */
-    struct { uint64_t fb_base, size; void *host_qva; } m2_fbback[32];
+    struct { uint64_t fb_base, size; void *host_qva; } m2_fbback[64];
     int      m2_fbback_n;
     /* M5.3 DIAG: crash-window FB-read probe. Set true the moment the GR compute
      * object (0xc7c0) alloc returns OK — libcuda then reads GR-context GPU memory
@@ -333,9 +333,12 @@ struct NvkvmGpuEmul {
      * USERD IS the guest's USERD view (double-mmap): guest GP_PUT lands in host USERD and
      * the host GPU advances GP_GET there for the guest's poll to see. */
     struct { uint32_t client, chan; uint32_t h_userd; void *qva; uint64_t fb_base, size; }
-             m2_chanbuf[16];
+             m2_chanbuf[32];
     int      m2_chanbuf_n;
     uint32_t m2_databuf_next;   /* unique host handle allocator for data-plane objects */
+    uint64_t m2_cur_gva;        /* BAR1 GPU VA of the in-flight aperture access (~0=none),
+                                 * so the CRASHWIN probe can report the guest GPU VA that
+                                 * maps to a polled FB address (correlate 0x2efbaf000) */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -415,8 +418,8 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
         if (s->m2_crashwin && !s->m2_in_walk && s->m2_crashwin_reads < 100000) {
             s->m2_crashwin_reads++;
             qemu_log("nvkvm-gpu[GA106] CRASHWIN RD fb=0x%llx sz=%u = 0x%llx "
-                     "(HOST-BACKED)\n", (unsigned long long)fb_addr, size,
-                     (unsigned long long)v);
+                     "(HOST-BACKED) gva=0x%llx\n", (unsigned long long)fb_addr, size,
+                     (unsigned long long)v, (unsigned long long)s->m2_cur_gva);
         }
         return v;
     }
@@ -439,9 +442,9 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
      * that corrupts libcuda's frame; its fb_addr identifies the buffer to back. */
     if (s->m2_crashwin && !s->m2_in_walk && s->m2_crashwin_reads < 100000) {
         s->m2_crashwin_reads++;
-        qemu_log("nvkvm-gpu[GA106] CRASHWIN RD fb=0x%llx sz=%u = 0x%llx%s\n",
+        qemu_log("nvkvm-gpu[GA106] CRASHWIN RD fb=0x%llx sz=%u = 0x%llx%s gva=0x%llx\n",
                  (unsigned long long)fb_addr, size, (unsigned long long)v,
-                 p ? "" : " (UNBACKED-ZERO)");
+                 p ? "" : " (UNBACKED-ZERO)", (unsigned long long)s->m2_cur_gva);
     }
     return v;
 }
@@ -1860,7 +1863,9 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
         if (pci_dma_read(&s->parent_obj, pa, b, size) != MEMTX_OK) return 0;
         rv = ldn_le_p(b, size);
     } else {
+        s->m2_cur_gva = off ? off : 0;       /* CRASHWIN: report the guest GPU VA */
         rv = nvkvm_fb_read(s, pa, size);
+        s->m2_cur_gva = 0;
     }
     /* DIAG: BAR1 reads landing in the low-FB region (where the UVM channel's
      * GPFIFO/USERD/semaphore live) — a poll spin shows up as repeated reads of
@@ -2698,6 +2703,15 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
          * hUserdMemory[0]=0 (host RM allocates) until they're backed too. */
         if (psize >= 36) {
             stl_le_p(auxbuf + 32, 0u);               /* default: host RM allocates USERD */
+            /* M5.4: back the GR channel's USERD with real host GPU memory (double-mmap).
+             * Identify it by parent TSG engine (GRAPHICS=1). Backing ALL channels was
+             * tried (incl. sentinel-handle probe channels 0xbaba0045/0x31415900) and
+             * introduced status=0x51/0x33 errors on those probe channels, so restrict to
+             * the GR channel (the cuCtxCreate context) — proven clean. The libcuda COPY
+             * channels keep RM-allocated USERD. NOTE: USERD-backing alone does NOT clear
+             * the cuCtxCreate hang — the dominant wait (CRASHWIN fb=0x2efbaf000, 331x,
+             * PRAMIN-accessed gva=0) is a non-USERD FB semaphore the host channel must
+             * EXECUTE to write (M5.4 steps 2-3: GPFIFO+pushbuffer double-mmap + doorbell). */
             bool is_gr = false;
             for (int i = 0; i < s->m2_tsgeng_n; i++) {
                 if (s->m2_tsgeng[i].tsg == hParent && s->m2_tsgeng[i].engine == 1u) {
@@ -2994,7 +3008,7 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
     if (ubase == 0) {
         return;                              /* guest didn't place USERD — let RM alloc */
     }
-    if (s->m2_chanbuf_n >= 16) {
+    if (s->m2_chanbuf_n >= 32 || s->m2_fbback_n >= 64) {
         return;
     }
     /* Find the channel's device (VASpace parent) tracked for this client. */
