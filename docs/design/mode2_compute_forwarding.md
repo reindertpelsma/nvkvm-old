@@ -797,3 +797,55 @@ fake-GSP page-table ownership) awaiting user steer. The FB->host overlay foundat
 (committed, inert) is the mechanism; populating it correctly needs the GR-context buffers'
 guest-FB<->host mapping, which is exactly what the address-virt #2 side-table + a guest
 report provide.
+
+## M5.3 CRASHWIN result (2026-06-04, commit 903ffff): mechanism PINNED, access-path RESOLVED
+
+A crash-window FB-read probe (arms when the 0xc7c0 AMPERE_COMPUTE_B alloc returns
+OK; an `m2_in_walk` flag excludes the emulator's own GMMU page-walk PTE reads so
+only LEAF data reads libcuda *consumes* are logged) finally pins the cuCtxCreate
+hang on the live GA106, ending the "RE exhausted" impasse:
+
+- Full GR ctx constructs on host (TSG 0xa06c -> ctxshare 0x9067 -> chan 0xc56f ->
+  compute 0xc7c0, all status=0), THEN cuCtxCreate SPINS polling UNBACKED (zero) FB:
+  - **fb=0x420208c (70x)** = GR channel USERD (0x4202000) + 0x8c — GP_GET/completion.
+  - fb=0x2efbaf000 (331x); fb=0x2eb6e008c (41x, a 2nd channel's USERD+0x8c); plus a
+    page-table chain ending at an unpopulated PTE (0x2efbc5000 = 0). Then rbp=0 SIGSEGV.
+- ROOT: the guest submits work to its EMULATED USERD/GPFIFO and polls a completion
+  that never arrives — its USERD (0x4202000) is not the host channel's real USERD, so
+  the host GPU never runs the work and GP_GET stays 0 -> spin -> crash.
+
+ACCESS-PATH RESOLVED (the question flagged "next build's first trace target"): these
+reads reach FB via the **BAR aperture** (nvkvm_baraperture_read -> nvkvm_walk_pdb ->
+nvkvm_fb_read), NOT via a guest-RAM UVM mmap. => the **m2_fbback FB-overlay double-mmap
+IS the correct, sufficient backing mechanism** for them; no KVM-memslot-on-guest-RAM
+needed. This collapses the earlier A/B/C fork toward double-mmap.
+
+### The execution-path data-plane build (the keystone, now concretely scoped)
+
+To make cuCtxCreate's channel-init/scrubber work actually complete, the GR channel's
+work-submission + completion path must be REAL host GPU memory (double-mmap), so the
+host GPU runs the guest's own pushbuffers and advances GP_GET. From the GR channel
+0x5c000019 memdescs (guest-FB, addrSpace=2): inst.base=0x32d0000, userd.base=0x4202000,
+ramfc.base=0x32d0000, gpFifoOff=0x200200000 (a GPU VA).
+
+Build order (each gated behind m2fwd, each testable via the CRASHWIN probe shrinking):
+1. **USERD double-mmap.** In shadow_fwd's c56f handler, instead of zeroing
+   hUserdMemory[0] (@auxbuf+32), allocate a host USERD vidmem object under the
+   remapped GR (client,device) via nvkvm_m2_host_alloc_map_vidmem, set hUserdMemory[0]
+   to its handle, and register m2_fbback[guest userd.base=0x4202000 -> host qva, sz].
+   GATE + verify SHADOW[85] c56f stays status=0 (providing USERD may change construct).
+   Effect alone: USERD becomes real+consistent, but GP_GET only advances once the host
+   channel RUNS — so expect the poll to persist until step 3.
+2. **GPFIFO double-mmap** at gpFifoOff=0x200200000: back the guest's GPFIFO ring with
+   host memory mapped into the host channel's VAS at the same GPU VA, so host GP_PUT
+   reads the entries the guest wrote.
+3. **Pushbuffer double-mmap + VAS reconcile + doorbell**: the GPFIFO entries reference
+   pushbuffer GPU VAs in the guest VAS; the host channel's VAS must resolve them to the
+   same host memory (RM_MAP_MEMORY_DMA at the guest VA, DMA_OFFSET_FIXED — unprivileged,
+   per the M5.3 finding). Forward/emulate the doorbell as a host channel kick. Then the
+   host GPU executes the guest's submitted init work and writes GP_GET/semaphores ->
+   the guest's poll clears -> cuCtxCreate proceeds.
+
+Risk/scale: this is the documented multi-week keystone, but now with concrete targets
+(exact guest-FB addrs + the proven unprivileged primitives) and a tight test loop (the
+CRASHWIN probe + serial cup2). Begin with step 1 in a fresh-focus session.
