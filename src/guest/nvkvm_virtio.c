@@ -22,6 +22,7 @@
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/sched/mm.h>
+#include <linux/poll.h>          /* POLLIN for the #127 os-event poll arm */
 
 #include "nvkvm.h"
 
@@ -809,6 +810,26 @@ int nvkvm_virtio_create_isolate(unsigned int session_id, __u32 *isolate_id_out)
 	if (ret == 0 && isolate_id_out)
 		*isolate_id_out = (__u32)retval;
 	return ret;
+}
+
+/* #127: arm/disarm host-side polling of an os-event fd. The stub ppoll()s the
+ * host fd and pushes a VQ_EVT (→ nvkvm_evt_deliver) when it fires, so a
+ * blocking-sync waiter wakes promptly instead of eating the ~18ms poll-timeout
+ * fallback. Control-plane (isolate_id stays 0 in the inflight → fast response). */
+int nvkvm_virtio_poll_arm(__u32 isolate_id, __u32 handle_id, int arm)
+{
+	struct {
+		struct nvkvm_hdr                 hdr;
+		struct nvkvm_req_poll_on_isolate req;
+	} msg = {};
+	__u64 retval = 0;
+
+	msg.req.isolate_id = cpu_to_le32(isolate_id);
+	msg.req.handle_id  = cpu_to_le32(handle_id);
+	msg.req.events     = cpu_to_le32(POLLIN);
+	return simple_req(arm ? NVKVM_REQ_POLL_ON_ISOLATE
+			      : NVKVM_REQ_UNPOLL_ON_ISOLATE,
+			  &msg, sizeof(msg), &retval);
 }
 
 /*

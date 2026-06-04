@@ -298,6 +298,24 @@ static long stub_sendmsg(int fd, const struct msghdr *m, int fl)
 	return sc3(__NR_sendmsg, fd, (long)m, fl);
 }
 
+/* #127 — minimal freestanding poll(2) for the os-event relay. */
+struct stub_pollfd {
+	int   fd;
+	short events;
+	short revents;
+};
+#define STUB_POLLIN   0x0001
+#define STUB_POLLERR  0x0008
+#define STUB_POLLHUP  0x0010
+/* ppoll(fds, nfds, NULL timeout, NULL sigmask, 0) — blocks until an fd is ready
+ * or a signal arrives (returns -EINTR). */
+static long stub_ppoll(struct stub_pollfd *fds, unsigned long nfds)
+{
+	/* ppoll(fds, nfds, tmo=NULL, sigmask=NULL, sigsetsize=0); sc6 is a
+	 * 6-arg syscall wrapper, so pad the unused 6th slot. */
+	return sc6(__NR_ppoll, (long)fds, (long)nfds, 0, 0, 0, 0);
+}
+
 static long stub_openat(int dfd, const char *path, int flags)
 {
 	return sc3(__NR_openat, dfd, (long)path, flags);
@@ -492,9 +510,50 @@ static void handle_store(uint32_t id, int fd)
 	if (id < MAX_HANDLES) handle_fds[id] = fd;
 }
 
+/* ── #127 os-event poll set ──────────────────────────────────────────────────
+ * The guest arms a poll on an os-event fd via ISOLATE_CMD_POLL; the main reader
+ * loop ppoll()s the host fd alongside the control socket and sends
+ * ISOLATE_RESP_POLL_EVENT when it fires (one-shot — the guest re-arms on its
+ * next poll()).  ISOLATE_CMD_POLL/UNPOLL may be dispatched from the reader loop
+ * or the ring drain-edge, so guard the table with poll_lock. */
+#define NVKVM_POLL_MAX 256
+static struct fs_mutex poll_lock = FS_MUTEX_INIT;
+static int      poll_fds[NVKVM_POLL_MAX];
+static uint32_t poll_handles[NVKVM_POLL_MAX];
+static int      poll_n;
+
+static void poll_arm(uint32_t handle_id)
+{
+	int fd = handle_lookup(handle_id);
+	if (fd < 0) return;
+	fs_mutex_lock(&poll_lock);
+	for (int i = 0; i < poll_n; i++)
+		if (poll_handles[i] == handle_id) { fs_mutex_unlock(&poll_lock); return; }
+	if (poll_n < NVKVM_POLL_MAX) {
+		poll_fds[poll_n]     = fd;
+		poll_handles[poll_n] = handle_id;
+		poll_n++;
+	}
+	fs_mutex_unlock(&poll_lock);
+}
+
+static void poll_disarm(uint32_t handle_id)
+{
+	fs_mutex_lock(&poll_lock);
+	for (int i = 0; i < poll_n; i++)
+		if (poll_handles[i] == handle_id) {
+			poll_fds[i]     = poll_fds[poll_n - 1];
+			poll_handles[i] = poll_handles[poll_n - 1];
+			poll_n--;
+			break;
+		}
+	fs_mutex_unlock(&poll_lock);
+}
+
 static void handle_remove(uint32_t id)
 {
 	if (id < MAX_HANDLES) {
+		poll_disarm(id);   /* #127: drop a closed os-event fd from the poll set */
 		if (handle_fds[id] >= 0) stub_close(handle_fds[id]);
 		handle_fds[id] = -1;
 	}
@@ -2384,11 +2443,13 @@ static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
 		handle_munmap_cmd(&c->munmap_cmd);
 		return 0;
 	case ISOLATE_CMD_POLL:
-		(void)c->poll_cmd;
-		send_ok();   /* TODO: background poll */
+		/* #127: arm the host os-event fd; the reader loop ppoll()s it and
+		 * sends ISOLATE_RESP_POLL_EVENT when it fires. */
+		poll_arm(c->poll_cmd.handle_id);
+		send_ok();
 		return 0;
 	case ISOLATE_CMD_UNPOLL:
-		(void)c->unpoll_cmd;
+		poll_disarm(c->unpoll_cmd.handle_id);
 		send_ok();
 		return 0;
 	case ISOLATE_CMD_OPEN_DEVICE:
@@ -2706,6 +2767,52 @@ int main(void)
 	for (;;) {
 		union stub_cmd cmd;
 		char cmsg_buf[CMSG_SPACE(sizeof(int))];
+
+		/* #127: if any os-event fds are armed, wait on them alongside the
+		 * control socket and relay the ones that fire, then read a command
+		 * only if the socket is ready.  When nothing is armed (the common
+		 * case) this is skipped and we block in recvmsg exactly as before —
+		 * zero behaviour change for the existing fast path. */
+		fs_mutex_lock(&poll_lock);
+		int armed = poll_n;
+		fs_mutex_unlock(&poll_lock);
+		if (armed > 0) {
+			struct stub_pollfd pfds[1 + NVKVM_POLL_MAX];
+			pfds[0].fd = SOCK_FD; pfds[0].events = STUB_POLLIN; pfds[0].revents = 0;
+			int nf = 1;
+			fs_mutex_lock(&poll_lock);
+			for (int i = 0; i < poll_n && nf <= NVKVM_POLL_MAX; i++) {
+				pfds[nf].fd = poll_fds[i];
+				pfds[nf].events = STUB_POLLIN;
+				pfds[nf].revents = 0;
+				nf++;
+			}
+			fs_mutex_unlock(&poll_lock);
+			long pr = stub_ppoll(pfds, (unsigned long)nf);
+			if (pr < 0) {
+				if (pr == -EINTR) continue;
+				break;
+			}
+			for (int i = 1; i < nf; i++) {
+				if (!pfds[i].revents) continue;
+				uint32_t h = 0;
+				fs_mutex_lock(&poll_lock);
+				for (int j = 0; j < poll_n; j++)
+					if (poll_fds[j] == pfds[i].fd) { h = poll_handles[j]; break; }
+				fs_mutex_unlock(&poll_lock);
+				if (h) {
+					struct isolate_resp_poll_event ev;
+					ev.type      = ISOLATE_RESP_POLL_EVENT;
+					ev.handle_id = h;
+					ev.revents   = (uint32_t)(unsigned short)pfds[i].revents;
+					ev.reserved  = 0;
+					locked_send(&ev, sizeof(ev));
+					poll_disarm(h);   /* one-shot; guest re-arms on next poll() */
+				}
+			}
+			if (!(pfds[0].revents & STUB_POLLIN))
+				continue;   /* only os-events fired; no command to read yet */
+		}
 
 		struct iovec iov = { &cmd, sizeof(cmd) };
 		struct msghdr msg_hdr = {

@@ -356,6 +356,10 @@ struct nvkvm_req_ctx {
 /* virtio_nvgpu.c */
 void virtio_nvgpu_init(VirtIONvgpu *nv);
 void virtio_nvgpu_fini(VirtIONvgpu *nv);
+/* #127: async os-event delivery — isolate reader thread → vq_evt → guest poll_wq.
+ * Safe to call from any thread; hops onto the device AioContext internally. */
+void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
+			   uint32_t handle_id, uint32_t revents);
 
 /* nvkvm_dispatch.c */
 int  nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx,

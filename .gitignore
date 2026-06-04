@@ -13,26 +13,21 @@ modules.order
 
 # Go test artifacts
 tests/abi_parity/vendor/
-
 # QEMU build artifacts
 *.so
-
 # Editor / IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
 # Python
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
 # gVisor reference (large, fetched separately)
 gvisor/
-
 # VM images
 *.qcow2
 *.iso
@@ -40,7 +35,6 @@ gvisor/
 tools/diag/nvioctl_trace
 src/stub/nvkvm_stub
 src/stub/nvkvm_stub_bin.h
-
 # guest kernel-module build artifacts
 src/guest/.*.cmd
 src/guest/.*.o.d
@@ -49,7 +43,6 @@ src/guest/*.ko
 src/guest/*.mod*
 src/guest/Module.symvers
 src/guest/modules.order
-
 # Claude Code session/memory (never commit — may hold secrets)
 .claude/
 host-libs-*/
