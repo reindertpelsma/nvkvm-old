@@ -38,14 +38,23 @@ RM↔GSP RPC boundary (Mode-2) — reusing the same stub/isolate/mmap stack.
   paramsSize}. Forward params as aux.
 - `FREE`(10) → `NV_ESC_RM_FREE`.
 
-### Verbatim handles — no handle translation needed
-RM_ALLOC is caller-chooses-handle (the caller supplies hObjectNew). The per-guest
-isolate is DEDICATED to one guest, so the guest's handle namespace (hClient
-0xc1d…/0xc1e…, objects 0x5c…/0xcaf…) can be used **as-is** on the host RM. Forward
-the guest's chosen handles verbatim → the host builds the identical object tree
-with identical handles → guest↔host handle spaces coincide → zero translation.
-(Distinct from Mode-1, which translated; Mode-2's dedicated-isolate-per-guest lets
-us skip it. Re-verify no collision with stub-internal handles.)
+### Handles — objects verbatim, CLIENTS need a map (M5.1a finding)
+CORRECTED by the M5.1a shadow-forward test (2026-06-04): RM_ALLOC is
+caller-chooses-handle for OBJECTS under a client (device/subdevice/vaspace/channel:
+0xcaf…/0x5c… — these are scoped to their client's handle space and forward
+verbatim fine). But CLIENT handles do NOT: forwarding the guest's client handles
+(0xc1e00004 …) verbatim mostly fails with **NV_ERR_INSERT_DUPLICATE_NAME (0x19)** —
+they collide with PRE-EXISTING host RM clients (persistenced/desktop live in the
+same global 0xc1xxxxxx namespace), and every object under a failed client then
+cascades to NV_ERR_INVALID_CLIENT (0x23). (A few guest client handles that happen
+to be free on the host succeed — confirming it's a collision, not a format bug.)
+So the reconciliation layer is: **let the host RM ASSIGN the client handle**
+(NV01_ROOT/NV01_ROOT_CLIENT, pass hObjectNew=0, capture the returned handle), keep
+a guest-client → host-client map, and translate the client refs (hRoot in NVOS64,
+hClient in NVOS54, and any hParent that names a client) on every forwarded op.
+Object handles within a client stay verbatim. GPU-phys reconciliation (channel
+instanceMem.base etc.) is the NEXT layer after this — the M5.1a run couldn't reach
+it because the client allocs failed first.
 
 ### Memory backing = double-mmap; channel structures then run NATIVELY
 When the guest allocates GPU memory (NV01_MEMORY_LOCAL_USER vidmem / sysmem /

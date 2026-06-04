@@ -264,6 +264,11 @@ struct NvkvmGpuEmul {
      * smoke test validates the Mode-2-process -> host-GPU path at realize(). */
     bool     m2fwd;                      /* device prop: enable forwarding (default off) */
     struct nvkvm_isolate_table m2_iso;   /* per-Mode-2 isolate table (own host stub) */
+    bool     m2_iso_ready;               /* lazy: isolate created + devices opened   */
+    uint32_t m2_iso_id;                  /* the per-guest host isolate id            */
+    uint32_t m2_ctl_h;                   /* handle for /dev/nvidiactl in the isolate */
+    uint32_t m2_gpu_h;                   /* handle for /dev/nvidia0                   */
+    uint32_t m2_fwd_n;                   /* count of forwarded RPCs (diag)           */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -766,6 +771,8 @@ static void nvkvm_snoop_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
  * QUEUE_HEAD doorbell (0x110c00).  For each new command, echo a response
  * (same function, rpc_result=NV_OK) onto the status queue so _issueRpcAndWait
  * returns.  Init RPCs are mostly SET_* and accept an NV_OK echo. */
+static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn); /* M5.1 fwd-decl */
+
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
     PCIDevice *pdev = &s->parent_obj;
@@ -813,6 +820,11 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * without leaf PTEs in our FB. */
         if (fn == 76 && ldl_le_p(cmd + 88) == 0x2080012bu) {
             nvkvm_snoop_promote_ctx(s, cmd);
+        }
+        /* M5.1a: shadow-forward the guest's actual RM alloc stream to the real
+         * host GPU (gated; non-disruptive — guest still uses the faked response). */
+        if (s->m2fwd) {
+            nvkvm_m2_shadow_fwd(s, cmd, fn);
         }
         /* fn=47 UNLOADING_GUEST_DRIVER: the guest is tearing down.  On real HW the
          * teardown runs Booter Unload, which brings WPR2 back DOWN.  We don't run
@@ -2112,64 +2124,78 @@ static const MemoryRegionOps nvkvm_bar2_ops = {
 
 /* ── realize / unrealize ───────────────────────────────────────────────────*/
 
-/* M5.0 smoke test (docs/design/mode2_compute_forwarding.md): validate that the
- * Mode-2 QEMU process can stand up a sandboxed host isolate, open the real host
- * GPU, and forward one RM_ALLOC — i.e. that the emulated-GPU process can reach
- * real silicon via the reused Mode-1 stub/isolate stack. Runs once at realize()
- * (not on a vCPU thread), gated behind the m2fwd property. Forward-only: passes
- * nv=NULL (the GPA-window paths that deref it are unused here). A transport
- * rc==0 (any nvstatus) proves the path; nvstatus==0 proves the alloc too. */
-static void nvkvm_m2_smoke(NvkvmGpuEmul *s)
+/* M5.1: lazily stand up the per-guest host isolate + open the real GPU control
+ * and device nodes. Persists for the guest's lifetime (the host-side context the
+ * forwarded RM stream builds on). Returns true once ready; on failure disables
+ * forwarding cleanly so the guest keeps running on the faked path. */
+static bool nvkvm_m2_iso_ensure(NvkvmGpuEmul *s)
 {
+    if (s->m2_iso_ready) {
+        return true;
+    }
     nvkvm_isolate_table_init(&s->m2_iso);
     s->m2_iso.abi_profile = NVKVM_ABI_580;   /* host is 580.159.04 */
+    uint32_t id = 0;
+    if (nvkvm_isolate_create(&s->m2_iso, 1 /*session*/, NULL, &id) != 0 || id == 0) {
+        qemu_log("nvkvm-gpu[%s] M5.1: isolate_create FAILED — forwarding OFF\n",
+                 s->chip->name);
+        s->m2fwd = false;
+        return false;
+    }
+    int fd = -1;
+    int r1 = nvkvm_isolate_open_device(&s->m2_iso, id, 1, NVKVM_DEV_CTL,    O_RDWR, &fd);
+    int r2 = nvkvm_isolate_open_device(&s->m2_iso, id, 2, NVKVM_DEV_GPU(0), O_RDWR, &fd);
+    if (r1 != 0 || r2 != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.1: open ctl/gpu FAILED r1=%d r2=%d — forwarding OFF\n",
+                 s->chip->name, r1, r2);
+        nvkvm_isolate_kill(&s->m2_iso, id);
+        s->m2fwd = false;
+        return false;
+    }
+    s->m2_iso_id = id; s->m2_ctl_h = 1; s->m2_gpu_h = 2; s->m2_iso_ready = true;
+    qemu_log("nvkvm-gpu[%s] M5.1: host isolate %u ready (pid=%d, ctl+gpu0 open)\n",
+             s->chip->name, id, (int)nvkvm_isolate_host_pid(&s->m2_iso, id));
+    return true;
+}
 
-    uint32_t iso_id = 0;
-    int rc = nvkvm_isolate_create(&s->m2_iso, 1 /*session*/, NULL, &iso_id);
-    if (rc != 0 || iso_id == 0) {
-        qemu_log("nvkvm-gpu[%s] M5.0: isolate_create FAILED rc=%d "
-                 "(no host stub? check /usr/lib/nvkvm/nvkvm_stub)\n",
-                 s->chip->name, rc);
+/* M5.1a SHADOW-forward: replay the guest's RM alloc on the real host GPU in
+ * PARALLEL — the guest still proceeds on the faked GSP response, so this is
+ * non-disruptive. It validates the real alloc stream forwards and reveals where
+ * the two-RM GPU-phys reconciliation first breaks (expected at the channel alloc,
+ * whose instanceMem.base is the guest CPU-RM PMA's FB offset, meaningless to the
+ * host RM's PMA). GSP_RM_ALLOC body @cmd: hClient@80,hParent@84,hObject@88,
+ * hClass@92,paramsSize@100,params@112. -> NV_ESC_RM_ALLOC (NVOS64), params as aux. */
+static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn)
+{
+    if (fn != 103) {
+        return;                          /* M5.1a: allocs only */
+    }
+    if (!nvkvm_m2_iso_ensure(s)) {
         return;
     }
-    qemu_log("nvkvm-gpu[%s] M5.0: isolate %u up (host stub spawned, pid=%d)\n",
-             s->chip->name, iso_id,
-             (int)nvkvm_isolate_host_pid(&s->m2_iso, iso_id));
-
-    int ctlfd = -1;
-    rc = nvkvm_isolate_open_device(&s->m2_iso, iso_id, 1 /*handle_id*/,
-                                   NVKVM_DEV_CTL, O_RDWR, &ctlfd);
-    if (rc != 0) {
-        qemu_log("nvkvm-gpu[%s] M5.0: open /dev/nvidiactl FAILED rc=%d "
-                 "(host GPU busy/absent?)\n", s->chip->name, rc);
-        nvkvm_isolate_kill(&s->m2_iso, iso_id);
-        return;
+    static uint8_t auxbuf[16384];
+    uint32_t hClient = ldl_le_p(cmd + 80), hParent = ldl_le_p(cmd + 84);
+    uint32_t hObject = ldl_le_p(cmd + 88), hClass = ldl_le_p(cmd + 92);
+    uint32_t psize   = ldl_le_p(cmd + 100);
+    if (psize > sizeof(auxbuf)) {
+        psize = sizeof(auxbuf);
     }
-    qemu_log("nvkvm-gpu[%s] M5.0: /dev/nvidiactl open OK (handle 1)\n",
-             s->chip->name);
-
-    /* Forward a root-client alloc (NVOS21): h_class=NV01_ROOT_CLIENT; the stub
-     * substitutes the host VA for p_alloc_parms from the aux blob (the new client
-     * handle is written back there). */
-    struct nvos21_parameters p;
+    memcpy(auxbuf, cmd + 112, psize);
+    struct nvos64_parameters p;
     memset(&p, 0, sizeof(p));
-    p.h_object_new = 0xcafe0001u;
-    p.h_class      = NV01_ROOT_CLIENT;
-    uint32_t aux = 0xcafe0001u;        /* NV0000 alloc params: hClient */
-    unsigned int cmd = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
-                       ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC;
+    p.h_root = hClient; p.h_object_parent = hParent; p.h_object_new = hObject;
+    p.h_class = hClass; p.alloc_parms_size = psize;
+    unsigned int ic = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC;
     uint32_t nvstatus = 0xdeadbeefu;
     uint64_t fault = 0;
-    rc = nvkvm_isolate_ioctl(&s->m2_iso, iso_id, 1 /*handle_id*/, cmd,
-                             &p, sizeof(p), &aux, sizeof(aux), 0,
-                             &nvstatus, &fault);
-    qemu_log("nvkvm-gpu[%s] M5.0: ROOT_CLIENT alloc -> rc=%d ioctl.status=0x%x "
-             "nvstatus=0x%x newClient=0x%x  PATH=%s\n", s->chip->name, rc,
-             p.status, nvstatus, aux,
-             (rc == 0) ? "REACHES-HOST-GPU" : "transport-fail");
-    /* Leave the isolate alive (a real M5 would keep it as the guest's host
-     * context); for the smoke test, tear it down to avoid leaking the stub. */
-    nvkvm_isolate_kill(&s->m2_iso, iso_id);
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, ic,
+                                 &p, sizeof(p), auxbuf, psize, 0, &nvstatus, &fault);
+    s->m2_fwd_n++;
+    qemu_log("nvkvm-gpu[%s] M5.1 SHADOW[%u] alloc class=0x%04x hParent=0x%08x "
+             "hObj=0x%08x -> rc=%d status=0x%x%s\n", s->chip->name, s->m2_fwd_n,
+             hClass, hParent, hObject, rc, p.status,
+             (rc == 0 && p.status == 0) ? "  OK" : "  <-- ERR/MISMATCH");
 }
 
 static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
@@ -2298,10 +2324,8 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
         pci_set_word(cfg + exp + PCI_EXP_LNKSTA, (uint16_t)(4u | (16u << 4)));
     }
 
-    /* M5.0: one-shot forwarding smoke test (gated; default off). */
-    if (s->m2fwd) {
-        nvkvm_m2_smoke(s);
-    }
+    /* M5.1: forwarding (m2fwd) is lazy — the per-guest host isolate is created on
+     * the first forwarded alloc in the cmdq path (nvkvm_m2_shadow_fwd). */
 }
 
 static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
