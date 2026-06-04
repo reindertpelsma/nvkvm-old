@@ -421,3 +421,30 @@ host RM logs its own context-buffer alloc+promote; then identify which PROMOTE_C
 bufferIds libcuda CPU-maps (the 0x200xxxxxxx mmaps) and double-mmap only those host
 buffers (RM_MAP_MEMORY_DMA into the channel VAS for GPU side + memslot/fb-redirect
 for the guest CPU side). This is far smaller than backing all 6 buffers.
+
+### M5.3 decisive test (2026-06-04): m2fwd cup2 — exact forwarding gaps found
+
+Ran cup2 with m2fwd=on (new /tmp/m2_cup2_fwd.sh → /tmp/run_mode2_m2fwd.sh).
+cuInit ok, devices=1; cuCtxCreate still SIGSEGVs (NULL-0x38). Forwarded-alloc class
+status breakdown (host RM):
+  OK:  0x0000 client, 0x0080 device, 0x2080 subdev, 0x2081, 0x402c, 0x90f1 VASPACE,
+       0xa06c channelgroup (5 ok/1 err), 0xc56f channel (10 ok/4 err),
+       0xc7b5 AMPERE_DMA_COPY_B (8 ok/4 err)
+  ERR: 0xc7c0 AMPERE_COMPUTE_B  status=0x57 NV_ERR_OBJECT_NOT_FOUND (parent chan 0x5c000019)
+       0xc797 AMPERE_B graphics  status=0x57 OBJECT_NOT_FOUND
+       0xc076 (profiler/perf)   status=0x1b INSUFFICIENT_PERMISSIONS ×7 (privileged → likely optional)
+       0x007e ×3, 0x902d, 0x9067 ERR
+
+**Root:** the compute GR object (0xc7c0) — the one whose construction triggers the
+host kernel's self-promotion — fails OBJECT_NOT_FOUND because its parent channel
+chain has gaps (some 0xc56f channels / 0xa06c channelgroups fail). Child objects
+(compute, DMA-copy, graphics) cascade. So the host never builds the GR context →
+never self-promotes → guest reads unpopulated buffers → cuCtxCreate NULL-deref.
+
+**Next (object-tree chain, in dependency order):** debug why specific 0xa06c
+channelgroup + 0xc56f channel allocs ERR on the host (likely a missing parent
+handle remap, the channelgroup's VASpace handle, or USERD/instmem the M5.3a forge
+zeroed). Once channels construct cleanly, 0xc7c0 should find its parent and
+construct → host self-promotes. The 0xc076 privileged profiler objects are a
+separate concern (probably skip/forge — not needed for compute). Then revisit the
+content-mirroring (double-mmap by bufferId) for libcuda-CPU-touched buffers.
