@@ -1124,6 +1124,35 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     memcpy(resp + 120, grmgr_gr_fs_info_blob, n);
                     stl_le_p(resp + 92, 0);
                     stl_le_p(resp + 56, 32u + 40u + ps);
+                } else if (ctrl == 0x20803601u) {
+                    /* M5.3 forge gap (host-vs-guest control diff): version-ish struct
+                     * {u32@0=1; u8@4=1; u8@5=1; char ver[]@6}. libcuda reads the
+                     * driver/GSP version; an all-zero reply (CTRL-UNFILLED) may steer it
+                     * into a bad path during cuCtxCreate. Replay the host 580.159.04. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    memset(resp + 120, 0, ps);
+                    if (ps >= 6) { stl_le_p(resp + 120, 1u); resp[124] = 1u; resp[125] = 1u; }
+                    if (ps >= 16) { memcpy(resp + 126, "580.159.04", 10); }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
+                } else if (ctrl == 0x20802a0au) {
+                    /* M5.3 forge gap: host returns four u16 {0x3e3,0x3e3,0x3e2,0x3e2}@0
+                     * and 0x0f@128 (looks like per-unit caps/clocks). Replay. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    memset(resp + 120, 0, ps);
+                    if (ps >= 8) {
+                        stw_le_p(resp + 120, 0x03e3); stw_le_p(resp + 122, 0x03e3);
+                        stw_le_p(resp + 124, 0x03e2); stw_le_p(resp + 126, 0x03e2);
+                    }
+                    if (ps >= 129) { resp[120 + 128] = 0x0f; }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
+                } else if (ctrl == 0x20808162u) {
+                    /* M5.3 forge gap: host returns bool=1. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    if (ps >= 1) { resp[120] = 1u; }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
                 } else if (ctrl == 0x20800a01u && cr) {
                     /* INTERNAL_DISPLAY_GET_STATIC_INFO: replay captured 32B but
                      * SYNTHESIZE numDispChannels (struct off 32, params+120 =>
