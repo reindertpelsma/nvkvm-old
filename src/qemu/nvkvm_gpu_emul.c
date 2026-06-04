@@ -316,6 +316,17 @@ struct NvkvmGpuEmul {
      * bring-up mechanism; KVM-memslot backing is the perf endpoint (see design doc). */
     struct { uint64_t fb_base, size; void *host_qva; } m2_fbback[32];
     int      m2_fbback_n;
+    /* M5.3 DIAG: crash-window FB-read probe. Set true the moment the GR compute
+     * object (0xc7c0) alloc returns OK — libcuda then reads GR-context GPU memory
+     * (no further ioctl per the trace) and crashes (rbp=0). Logging every FB read
+     * after this flag pins the EXACT buffer (fb_addr+value+backed?) and its access
+     * path: appears here => served via FB/BAR1 (FB-overlay backing applies); window
+     * empty => libcuda reads it via the UVM mmap to guest-RAM (needs memslot). */
+    bool     m2_crashwin;
+    uint32_t m2_crashwin_reads;
+    bool     m2_in_walk;     /* true while reading a GMMU PDE/PTE — excludes page-walk
+                              * noise from the CRASHWIN probe so only LEAF data reads
+                              * (the buffer values libcuda actually consumes) are logged */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -384,26 +395,46 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 {
     uint8_t *hp = (s->m2_fbback_n ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: served from real host GPU memory */
+        uint64_t v;
         switch (size) {
-        case 1: return *hp;
-        case 2: return lduw_le_p(hp);
-        case 4: return ldl_le_p(hp);
-        case 8: return ldq_le_p(hp);
-        default: return 0;
+        case 1: v = *hp; break;
+        case 2: v = lduw_le_p(hp); break;
+        case 4: v = ldl_le_p(hp); break;
+        case 8: v = ldq_le_p(hp); break;
+        default: v = 0; break;
         }
+        if (s->m2_crashwin && !s->m2_in_walk && s->m2_crashwin_reads < 100000) {
+            s->m2_crashwin_reads++;
+            qemu_log("nvkvm-gpu[GA106] CRASHWIN RD fb=0x%llx sz=%u = 0x%llx "
+                     "(HOST-BACKED)\n", (unsigned long long)fb_addr, size,
+                     (unsigned long long)v);
+        }
+        return v;
     }
     uint8_t *p = nvkvm_fb_page(s, fb_addr, false);
     uint32_t o = fb_addr & 0xfffu;
+    uint64_t v;
     if (!p) {
-        return 0;
+        v = 0;
+    } else {
+        switch (size) {
+        case 1: v = p[o]; break;
+        case 2: v = lduw_le_p(p + o); break;
+        case 4: v = ldl_le_p(p + o); break;
+        case 8: v = ldq_le_p(p + o); break;
+        default: v = 0; break;
+        }
     }
-    switch (size) {
-    case 1: return p[o];
-    case 2: return lduw_le_p(p + o);
-    case 4: return ldl_le_p(p + o);
-    case 8: return ldq_le_p(p + o);
-    default: return 0;
+    /* M5.3 DIAG: crash-window probe — log FB reads after the 0xc7c0 alloc. A read
+     * returning 0 from an UN-backed page (p==NULL) is a prime suspect for the value
+     * that corrupts libcuda's frame; its fb_addr identifies the buffer to back. */
+    if (s->m2_crashwin && !s->m2_in_walk && s->m2_crashwin_reads < 100000) {
+        s->m2_crashwin_reads++;
+        qemu_log("nvkvm-gpu[GA106] CRASHWIN RD fb=0x%llx sz=%u = 0x%llx%s\n",
+                 (unsigned long long)fb_addr, size, (unsigned long long)v,
+                 p ? "" : " (UNBACKED-ZERO)");
     }
+    return v;
 }
 
 static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
@@ -1960,7 +1991,10 @@ static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
         if (pci_dma_read(&s->parent_obj, addr, b, 8) != MEMTX_OK) return 0;
         return ldq_le_p(b);
     }
-    return nvkvm_fb_rd64(s, addr);
+    s->m2_in_walk = true;                /* exclude this PTE read from the CRASHWIN probe */
+    uint64_t v = nvkvm_fb_rd64(s, addr);
+    s->m2_in_walk = false;
+    return v;
 }
 
 /* M5 — translate a CHANNEL GPU VA to a physical address, rooted at the channel's
@@ -2731,6 +2765,13 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
      * self-consistent (unprivileged), or via an unprivileged host-content path TBD.
      * hParent of the compute object IS the channel. */
     if (hClass == 0xc7c0u && rc == 0 && p.status == 0) {
+        /* M5.3 DIAG: arm the crash-window FB-read probe. libcuda now reads GR-context
+         * GPU memory and crashes (rbp=0); the reads logged from here pin the buffer. */
+        if (!s->m2_crashwin) {
+            s->m2_crashwin = true;
+            qemu_log("nvkvm-gpu[GA106] CRASHWIN ARMED (after 0xc7c0 compute obj "
+                     "0x%08x) — logging subsequent FB reads\n", hObject);
+        }
         uint32_t subdev = 0;
         for (int i = 0; i < s->m2_subdev_n; i++) {
             if (s->m2_subdev[i].client == hClient) { subdev = s->m2_subdev[i].subdev; break; }
