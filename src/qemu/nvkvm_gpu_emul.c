@@ -2240,7 +2240,14 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
      * fails (kchannelGetNotifierInfo OBJECT_NOT_FOUND). Zeroing it lets the
      * channel construct without a notifier; revisit when memory objects forward. */
     if ((hClass == 0xc56fu || hClass == 0xc36fu) && psize >= 4) {
-        stl_le_p(auxbuf, 0u);
+        stl_le_p(auxbuf, 0u);                        /* hObjectError = 0 */
+        /* hUserdMemory[0] @ params+32: "ignored if 0" -> the host CPU-RM allocates
+         * USERD itself (kernel_channel.c:309); instance memory is RM-allocated on
+         * the normal host-RM path too. So zeroing the client-USERD handle lets the
+         * channel fully construct with RM-managed memory (M5.3a). */
+        if (psize >= 36) {
+            stl_le_p(auxbuf + 32, 0u);               /* hUserdMemory[0] = 0 */
+        }
     }
     struct nvos64_parameters p;
     memset(&p, 0, sizeof(p));
