@@ -622,3 +622,36 @@ RM-managed GR context (VASpace+TSG+ctxshare all OK), SIDESTEPPING the multi-week
 keystone for host-side context construction. Remaining for cuCtxCreate-on-host: channel
 0x1f -> compute object, then back the guest's CPU-touched context buffers via the data
 plane. The guest keeps its UVM view; host uses RM-managed; reconcile at buffer level.
+
+### M5.3 LANDMARK (2026-06-04, commit a1f3edb): full GR compute context constructs on host
+
+The channel 0x1f was MY OWN c56f hVASpace substitution (host dmesg: "TSG channels
+can't use an explicit vaspace" + "Both context share and vaspace handles can't be
+valid"). REMOVED it (TSG channels inherit the TSG vaspace; never set explicit hVASpace).
+Result: the full UVM RM-internal GR compute chain constructs st=0x0 on the real GA106
+via Mode-2 forwarding:
+  VASpace 0x90f1 -> TSG 0xa06c -> ctxshare 0x9067 -> channel 0xc56f -> AMPERE_COMPUTE_B 0xc7c0
+No regression (libcuda COPY channels 0xc56f back to 11 OK, 0xc7b5 8 OK). So with
+(a) the EXTERNALLY_OWNED strip and (b) leaving TSG channels' vaspace implicit, the host
+RM builds a COMPLETE real shadow GR compute context — the kernel-self-promotion trigger —
+WITHOUT the UVM keystone. This validates the SIDESTEP: the host doesn't need the guest's
+UVM to manage the GR VASpace; it builds an RM-managed shadow context; reconcile at the
+buffer-content level.
+
+### M5.3 NEXT: data-plane backing — reframe of the cuCtxCreate crash
+
+REFRAME: the cuCtxCreate guest crash (NULL deref) is the GUEST reading back its own GR
+context buffers that a REAL GPU's GSP/RM would have populated during GR-context init.
+Our emulated GPU never runs GR init, so those buffers are zero -> guest derefs NULL.
+This is NOT (yet) about forwarding compute *execution*; it's about populating the guest's
+context-buffer view with real state. The host shadow context (just constructed) HAS real
+context buffers. So the milestone = mirror the host's context-buffer state into the guest's
+view (FB pages / sysmem the guest CPU reads), via the proven host-alloc-map primitive.
+
+Concrete sub-steps (this session):
+  (a) PINPOINT the exact guest read that returns NULL and crashes cuCtxCreate (faulting VA
+      + libcuda backtrace via gdb). Determine if that VA is an FB-backed context buffer
+      (observable/interceptable in QEMU via BAR1/PRAMIN) or guest sysmem.
+  (b) Read the host self-promoted context-buffer addresses/contents
+      (NV2080_CTRL_CMD_GR_GET_CTX_BUFFER_INFO 0x20801219 / GET_CTX_BUFFER_SIZE 0x20801218).
+  (c) Mirror host buffer contents into the guest's view so the guest reads real state.
