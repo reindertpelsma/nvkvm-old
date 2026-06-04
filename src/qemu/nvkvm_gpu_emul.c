@@ -2207,6 +2207,16 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
      * so the scrubber timed out. */
     uint64_t ce_sem_addr = 0;
     uint32_t ce_sem_pay = 0;
+    /* COMPUTE/3D-class (NVC7C0 AMPERE_COMPUTE_B etc) report-semaphore release.
+     * cuCtxCreate's compute init work releases a dedicated completion semaphore
+     * via SET_REPORT_SEMAPHORE_A/B(addr)+C(payload)+D(trigger,OPERATION=RELEASE);
+     * libcuda's blocking-sync poll spins on THAT semaphore.  The parser
+     * previously only honored CE + NVC56F host releases, so the compute
+     * completion sema was never written and the wait hung (the dataless os-event
+     * wake fired but the decisive bit stayed 0).  ADDR_UPPER[7:0]@0x1b00,
+     * ADDR_LOWER[31:0]@0x1b04, PAYLOAD@0x1b08, D@0x1b0c. */
+    uint64_t cr_sem_addr = 0;
+    uint32_t cr_sem_pay = 0;
     s->chan_sem_released = false;
     uint32_t guard = 0;
     for (uint32_t idx = s->chan_gp_get; idx != gp_put &&
@@ -2354,6 +2364,35 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                                      "phys=0x%llx payload=%u\n", s->chip->name,
                                      (unsigned long long)sem_addr, sy ? "SYS" : "FB",
                                      (unsigned long long)p, sem_pay_lo);
+                        }
+                    }
+                    break;
+                }
+                /* COMPUTE/3D-class (NVC7C0+) report-semaphore release. */
+                case 0x1b00: cr_sem_addr = (cr_sem_addr & 0xFFFFFFFFull) | ((uint64_t)(d & 0xFFu) << 32); break; /* ADDR_UPPER */
+                case 0x1b04: cr_sem_addr = (cr_sem_addr & ~0xFFFFFFFFull) | d; break;                          /* ADDR_LOWER */
+                case 0x1b08: cr_sem_pay = d; break;                                                            /* PAYLOAD */
+                case 0x1b0c: {                                                                                 /* D: trigger */
+                    if ((d & 0x3u) == 0x0u && cr_sem_addr) {   /* OPERATION == RELEASE */
+                        bool sy = false;
+                        uint64_t p = nvkvm_chan_translate(s, cr_sem_addr, &sy);
+                        if (p != NVKVM_GMMU_FAULT) {
+                            bool one_word = (d >> 28) & 1;     /* STRUCTURE_SIZE: 1=ONE_WORD(4B), 0=FOUR_WORDS(16B w/ ts) */
+                            if (sy) { uint8_t b[4]; stl_le_p(b, cr_sem_pay);
+                                      pci_dma_write(&s->parent_obj, p, b, 4); }
+                            else    { nvkvm_fb_write(s, p, cr_sem_pay, 4); }
+                            if (!one_word) {                   /* 4-word: also zero the timestamp dwords */
+                                if (sy) { uint8_t z[12] = {0};
+                                          pci_dma_write(&s->parent_obj, p + 4, z, 12); }
+                                else    { nvkvm_fb_write(s, p + 4, 0, 4);
+                                          nvkvm_fb_write(s, p + 8, 0, 4);
+                                          nvkvm_fb_write(s, p + 12, 0, 4); }
+                            }
+                            s->chan_sem_released = true;
+                            qemu_log("nvkvm-gpu[%s] M5: COMPUTE_REPORT_SEM addr=0x%llx -> %s "
+                                     "phys=0x%llx payload=%u awaken=%d\n", s->chip->name,
+                                     (unsigned long long)cr_sem_addr, sy ? "SYS" : "FB",
+                                     (unsigned long long)p, cr_sem_pay, (int)((d >> 20) & 1));
                         }
                     }
                     break;
