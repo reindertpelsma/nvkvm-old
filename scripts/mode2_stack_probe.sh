@@ -65,6 +65,20 @@ except Exception as e:
 print(f"tid {tid}: poll nfds={nfds} -> {' '.join(fds)}")
 PYEOF
 done
+echo "=== kcmp dup test: are polled nvidia0 fds dups of os-event fds? ==="
+python3 - "$CPID" <<'PYEOF'
+import sys,ctypes,os
+pid=int(sys.argv[1])
+libc=ctypes.CDLL("libc.so.6",use_errno=True)
+KCMP_FILE=0
+def same(a,b):
+    r=libc.syscall(312,pid,pid,KCMP_FILE,a,b)  # kcmp(pid,pid,KCMP_FILE,fd_a,fd_b)
+    if r<0: return f"err({os.strerror(ctypes.get_errno())})"
+    return "SAME-FILE(dup)" if r==0 else "diff"
+# compare each os-event fd (17,19,21) with the adjacent polled fd (+1) and a few others
+for a,b in [(17,18),(19,20),(21,22),(14,15),(17,17)]:
+    print(f"  fd{a} vs fd{b}: {same(a,b)}")
+PYEOF
 echo "=== fd links for ALL cup2 fds (identify RM/UVM/eventfd) ==="
 for f in $(ls /proc/$CPID/fd 2>/dev/null); do
     l=$(readlink /proc/$CPID/fd/$f 2>/dev/null)
