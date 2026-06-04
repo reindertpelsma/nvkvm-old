@@ -2203,10 +2203,28 @@ static bool nvkvm_m2_client_known(NvkvmGpuEmul *s, uint32_t g)
  * hClass@92,paramsSize@100,params@112. -> NV_ESC_RM_ALLOC (NVOS64), params as aux. */
 static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn)
 {
-    if (fn != 103) {
-        return;                          /* M5.1a: allocs only */
+    if (fn != 103 && fn != 10) {
+        return;                          /* allocs (103) + frees (10) */
     }
     if (!nvkvm_m2_iso_ensure(s)) {
+        return;
+    }
+    /* M5.1c: forward FREE so host objects/channels don't accumulate (the
+     * un-freed channels exhausted the host's channel-ID heap). */
+    if (fn == 10) {
+        uint32_t fClient = ldl_le_p(cmd + 80), fParent = ldl_le_p(cmd + 84);
+        uint32_t fObj = ldl_le_p(cmd + 88);
+        struct nvos00_parameters f;
+        memset(&f, 0, sizeof(f));
+        f.h_root = nvkvm_m2_client(s, fClient);
+        f.h_object_parent = nvkvm_m2_client_known(s, fParent) ? nvkvm_m2_client(s, fParent)
+                                                              : fParent;
+        f.h_object_old = nvkvm_m2_client_known(s, fObj) ? nvkvm_m2_client(s, fObj) : fObj;
+        unsigned int fc = (3u << 30) | ((unsigned int)sizeof(f) << 16) |
+                          ((unsigned int)'F' << 8) | NV_ESC_RM_FREE;
+        uint32_t fst = 0; uint64_t ff = 0;
+        nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, fc,
+                            &f, sizeof(f), NULL, 0, 0, &fst, &ff);
         return;
     }
     static uint8_t auxbuf[16384];
@@ -2217,6 +2235,13 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         psize = sizeof(auxbuf);
     }
     memcpy(auxbuf, cmd + 112, psize);
+    /* M5.1c experiment: for channel classes, drop hObjectError (params+0) — its
+     * error-notifier memory object isn't forwarded yet, so RM's notifier lookup
+     * fails (kchannelGetNotifierInfo OBJECT_NOT_FOUND). Zeroing it lets the
+     * channel construct without a notifier; revisit when memory objects forward. */
+    if ((hClass == 0xc56fu || hClass == 0xc36fu) && psize >= 4) {
+        stl_le_p(auxbuf, 0u);
+    }
     struct nvos64_parameters p;
     memset(&p, 0, sizeof(p));
     /* M5.1b: translate client refs. h_root is always the owning client; register
