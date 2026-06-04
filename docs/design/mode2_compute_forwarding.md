@@ -655,3 +655,42 @@ Concrete sub-steps (this session):
   (b) Read the host self-promoted context-buffer addresses/contents
       (NV2080_CTRL_CMD_GR_GET_CTX_BUFFER_INFO 0x20801219 / GET_CTX_BUFFER_SIZE 0x20801218).
   (c) Mirror host buffer contents into the guest's view so the guest reads real state.
+
+### M5.3 ROOT CAUSE PROVEN (2026-06-04): host-vs-guest byte-compare → data-plane backing
+
+Method: ran the SAME cup2 on the bare-metal host (PASSES: CTX OK, CE PASS) and the guest
+(crashes), both under an LD_PRELOAD ioctl tracer (tests/mode2/ioctl_trace.c) decoding
+RM_CONTROL/RM_ALLOC in+out. Findings:
+
+1. Class-alloc sequence is IDENTICAL up to the first compute object:
+     0x90f1 0x90f1 0x50a0 0x0040x4 0xa06c 0x9067 0x0040 0x003e 0x003e 0xc56f 0xc7c0
+   HOST then continues: 0xc7b5 0x003e 0xc56f 0xc7c0 0xc7b5 ... (8 compute+copy channel
+   groups) and finishes cuCtxCreate. GUEST crashes right after the FIRST 0xc7c0.
+2. The 0xc7c0 RM_ALLOC NVOS64 writeback is BYTE-IDENTICAL host vs guest except the client
+   id (0xc1d00277 vs 0xc1d00003) and a stack pointer: status=0 (NV_OK), paramsSize=0,
+   tail all zeros. So the ioctl writeback is NOT the bug.
+3. NO ioctl occurs between the 0xc7c0 alloc and the SIGSEGV (verified by the tracer) —
+   libcuda crashes processing IN-MEMORY state.
+4. gdb: crash is a STACK SMASH — in 0x4664c0 -> 0x47acc0 -> 0x497b50 (the chain that
+   issues the 0xc7c0 RM_ALLOC), the saved rbp of 0x47acc0's frame is overwritten, so
+   on return rbp=0 and the next deref (mov -0x38(%rbp)) faults at 0x466560. The HAL
+   dispatch target (*(global+0x48))->[0x560] = 0x47acc0 is a VALID, well-behaved function.
+   Full bt: cuCtxCreate_v2 -> 0x2578390 -> 0x25931c5 -> 0x246f533/164/cd32 ->
+   0x24299f4 -> 0x2426fbd -> 0x266d49f -> 0x4664c0 -> 0x47acc0 -> 0x497b50.
+
+CONCLUSION (proven): cuCtxCreate-on-Mode-2 crashes because libcuda reads the channel/GR
+compute context's MAPPED GPU memory (instance block / USERD / GR "golden" context buffer
+— BAR-backed in our emulated FB at e.g. inst.base=0x3330000, userd.base=0x4202000) which
+on a real GPU is initialized by RM/GSP during channel+GR-object construction, but on our
+faked GPU contains zeros/inconsistent data. libcuda derives a bad size/count from it and
+smashes its stack. The host shadow context (real GA106, forwarded) HAS this real state.
+
+=> THE FIX IS THE DATA-PLANE BACKING: mirror the host shadow context's real context-buffer
+contents into the guest's BAR-backed context buffers (the proven nvkvm_m2_host_alloc_map_
+vidmem primitive + double-mmap), so the guest reads real GPU-initialized state. This is the
+multi-week keystone (task #126 "hard part"). NEXT IMPLEMENTATION STEP: enumerate the host
+shadow context's buffers via NV2080_CTRL_CMD_GR_GET_CTX_BUFFER_INFO (0x20801219) on the
+host subdevice (struct: hUserClient@0,hChannel@4,bufferCount@8,ctxBufferInfo[]@16 each 80B:
+alignment@0,size@8,physAddr@32,bufferType@40,aperture@44), map each, and back the guest FB
+ranges the channel/GR object reference. Tooling: tests/mode2/{gcup2_gdb,gcup2_hal,gcup2_trace,
+ioctl_trace}.* + host-side /tmp/cup2_host (bare-metal reference run).
