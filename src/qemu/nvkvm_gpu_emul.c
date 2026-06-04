@@ -2298,6 +2298,47 @@ static int nvkvm_m2_alloc1(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hParent,
     return rc;
 }
 
+/* M5.3 helper: forward one RM_CONTROL (NVOS54) with client remap; params marshalled
+ * as aux (the stub relocates the params@16 pointer). h_object is an object handle,
+ * not a client, so it is passed verbatim unless it names a known client. */
+static int nvkvm_m2_control1(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hObject,
+                             uint32_t cmd, void *params, uint32_t psize, uint32_t *st)
+{
+    struct nvos54_parameters p;
+    memset(&p, 0, sizeof(p));
+    p.h_client = nvkvm_m2_client(s, hClient);
+    p.h_object = nvkvm_m2_client_known(s, hObject) ? nvkvm_m2_client(s, hObject) : hObject;
+    p.cmd = cmd; p.params_size = psize;
+    unsigned int ic = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_CONTROL;
+    uint32_t nv = 0; uint64_t f = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, ic,
+                                 &p, sizeof(p), params, psize, 0, &nv, &f);
+    if (st) { *st = p.status; }
+    return rc;
+}
+
+/* M5.3: query the host GPU-physical (FB) address of a vidmem object via
+ * NV0041_CTRL_CMD_GET_SURFACE_PHYS_ATTR (0x410103). Returns the FB phys offset in
+ * *phys (the value PROMOTE_CTX needs to point the host GPU at this buffer). The
+ * 48B params: memOffset@0 (in: offset, out: phys), memAperture@20 (0=VIDMEM). */
+static bool nvkvm_m2_host_phys(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hMem,
+                               uint64_t *phys, uint32_t *aperture)
+{
+    uint8_t pa[48];
+    memset(pa, 0, sizeof(pa));
+    uint32_t st = 0xffff;
+    int rc = nvkvm_m2_control1(s, hClient, hMem, 0x410103u, pa, sizeof(pa), &st);
+    if (rc != 0 || st != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.3: GET_SURFACE_PHYS_ATTR 0x%x rc=%d st=0x%x\n",
+                 s->chip->name, hMem, rc, st);
+        return false;
+    }
+    if (phys)     { *phys = ldq_le_p(pa); }
+    if (aperture) { *aperture = ldl_le_p(pa + 20); }
+    return true;
+}
+
 /* Result of the M5.3 data-plane primitive: real host GPU memory mapped into QEMU. */
 struct nvkvm_host_map {
     void    *qva;       /* QEMU VA of the host GPU memory (NULL on failure)    */
@@ -2412,6 +2453,15 @@ static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
     qemu_log("nvkvm-gpu[%s] MEMTEST: *** mmap OK hva=%p  wrote/read 0x%08x 0x%08x "
              "-> %s ***  DATA PLANE PRIMITIVE WORKS\n", s->chip->name, hm.qva, r0, r1,
              (r0 == 0xc0ffee01u && r1 == 0xdeadbeefu) ? "PASS" : "MISMATCH");
+    /* M5.3: query the host GPU-phys of this buffer — the value PROMOTE_CTX rewrite
+     * will point the host GPU at, so the host GPU operates on the SAME memory the
+     * guest sees through the (future) memslot backing. */
+    uint64_t hphys = 0; uint32_t aper = 0xff;
+    if (nvkvm_m2_host_phys(s, C, MEM, &hphys, &aper)) {
+        qemu_log("nvkvm-gpu[%s] MEMTEST: host GPU-phys=0x%llx aperture=%u (0=VIDMEM)"
+                 "  <- PROMOTE_CTX target\n", s->chip->name,
+                 (unsigned long long)hphys, aper);
+    }
     munmap(hm.qva, hm.size);
 }
 
