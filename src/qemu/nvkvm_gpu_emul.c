@@ -269,6 +269,13 @@ struct NvkvmGpuEmul {
     uint32_t m2_ctl_h;                   /* handle for /dev/nvidiactl in the isolate */
     uint32_t m2_gpu_h;                   /* handle for /dev/nvidia0                   */
     uint32_t m2_fwd_n;                   /* count of forwarded RPCs (diag)           */
+    /* M5.1b: guest RM client handle -> host (synthetic, non-colliding) client.
+     * Guest client handles live in the global 0xc1xxxxxx namespace and collide
+     * with pre-existing host clients (NV_ERR_INSERT_DUPLICATE_NAME), so we remap
+     * each to a 0xdeadNNNN handle the host RM accepts, and translate client refs
+     * (h_root, and h_object_parent when it names a client). Objects stay verbatim. */
+    struct { uint32_t g, h; } m2_cmap[128];
+    int      m2_cmap_n;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -2158,6 +2165,35 @@ static bool nvkvm_m2_iso_ensure(NvkvmGpuEmul *s)
     return true;
 }
 
+/* M5.1b: map a guest RM client handle -> a host (synthetic, non-colliding)
+ * handle, minting a fresh 0xdeadNNNN on first sight. Host clients live in
+ * 0xc1xxxxxx, so 0xdeadNNNN never collides. */
+static uint32_t nvkvm_m2_client(NvkvmGpuEmul *s, uint32_t g)
+{
+    for (int i = 0; i < s->m2_cmap_n; i++) {
+        if (s->m2_cmap[i].g == g) {
+            return s->m2_cmap[i].h;
+        }
+    }
+    if (s->m2_cmap_n >= (int)(sizeof(s->m2_cmap) / sizeof(s->m2_cmap[0]))) {
+        return g;                        /* table full -> verbatim (may collide) */
+    }
+    uint32_t h = 0xdead0001u + (uint32_t)s->m2_cmap_n;
+    s->m2_cmap[s->m2_cmap_n].g = g;
+    s->m2_cmap[s->m2_cmap_n].h = h;
+    s->m2_cmap_n++;
+    return h;
+}
+static bool nvkvm_m2_client_known(NvkvmGpuEmul *s, uint32_t g)
+{
+    for (int i = 0; i < s->m2_cmap_n; i++) {
+        if (s->m2_cmap[i].g == g) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* M5.1a SHADOW-forward: replay the guest's RM alloc on the real host GPU in
  * PARALLEL — the guest still proceeds on the faked GSP response, so this is
  * non-disruptive. It validates the real alloc stream forwards and reveals where
@@ -2183,7 +2219,13 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
     memcpy(auxbuf, cmd + 112, psize);
     struct nvos64_parameters p;
     memset(&p, 0, sizeof(p));
-    p.h_root = hClient; p.h_object_parent = hParent; p.h_object_new = hObject;
+    /* M5.1b: translate client refs. h_root is always the owning client; register
+     * + remap it. h_object_parent is a client for device allocs (== hClient) but
+     * an object for deeper allocs — translate only if it's a known client. */
+    uint32_t h_root = nvkvm_m2_client(s, hClient);
+    uint32_t h_parent = nvkvm_m2_client_known(s, hParent) ? nvkvm_m2_client(s, hParent)
+                                                          : hParent;
+    p.h_root = h_root; p.h_object_parent = h_parent; p.h_object_new = hObject;
     p.h_class = hClass; p.alloc_parms_size = psize;
     unsigned int ic = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
                       ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC;
