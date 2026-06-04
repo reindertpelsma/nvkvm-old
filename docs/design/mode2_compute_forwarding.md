@@ -499,3 +499,35 @@ alloc params (FERMI_VASPACE_A index/flags) or just try each. If neither works, t
 host device may need its default VASpace established (forward a SET_DEFAULT or alloc
 a device-global VASpace). Once the GR TSG constructs, channel 0x5c000019 + compute
 0x5c00001a should follow → host builds + self-promotes the GR context.
+
+### M5.3 chain progress (2026-06-04): TSG fixed, channel advanced, ctxshare wall
+
+Iterative forward-chain repair of the GR context (0x5c0000xx, UVM client 0xc1d00003):
+  0xa06c TSG       0x5c000012:  0x33 -> 0x0   FIXED (substitute hVASpace 0 -> 0x5c000007)
+  0x9067 ctxshare  0x5c000013:  0x40 INVALID_STATE  <-- CURRENT WALL
+  0xc56f channel   0x5c000019:  0x57 -> 0x1f  (downstream of ctxshare; references it)
+  0xc7c0 compute   0x5c00001a:  0x57          (downstream of channel)
+
+The FERMI_CONTEXT_SHARE_A (0x9067, psize=12: hVASpace@0,flags@4,subctxId@8) already
+carries a NON-zero hVASpace (our hVASpace=0 substitution did NOT fire), so 0x40
+NV_ERR_INVALID_STATE is NOT a handle problem — it's a stateful GR-subcontext failure.
+ctxshareConstruct allocates a subcontext within the TSG's GR engine context; on the
+host that state isn't established because we forward the guest's RM-internal GR
+objects out of their original kernel construction sequence (golden ctx / subcontext
+pool / GR engine state are GSP/RM-internal and not replicated by forwarding individual
+allocs).
+
+**Architectural question for next session:** forwarding the guest's RM-INTERNAL GR
+objects (TSG/ctxshare/channel/compute under 0x5c0000xx) is fighting their stateful
+interdependencies. Two directions:
+  (A) Make the host device establish a proper default VASpace + GR engine state so
+      hVASpace=0 resolves naturally and ctxshare subcontext alloc finds valid state
+      (investigate the NV0080 device alloc params + whether a default-VAS / GR
+      bootstrap control must be forwarded first).
+  (B) DON'T forward the guest's RM-internal GR objects; instead let the HOST RM build
+      its own GR context when libcuda's compute object is allocated against a
+      host-constructed channel — i.e. forward only libcuda's userspace-visible
+      objects and let host kgrctx self-manage (ties to the kernel-self-promotion
+      insight). Needs the compute object reparented to a host-built channel.
+Dump the 0x9067 params (hVASpace/flags/subctxId values) + the subdevice GR-init
+control sequence to decide. INVALID_STATE is a state-ordering problem, not a handle.

@@ -2280,6 +2280,21 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                      "for client=0x%08x dev=0x%08x\n", s->chip->name, hClient, hParent);
         }
     }
+    /* M5.3: FERMI_CONTEXT_SHARE_A (0x9067) NV_CTXSHARE_ALLOCATION_PARAMETERS has
+     * hVASpace@0. The GR context share (under the GR TSG) leaves it 0 (device
+     * default) → NV_ERR_INVALID_STATE (0x40) on the host, and it must match the
+     * TSG/channel VASpace. Substitute the same first-VASpace-for-client. */
+    if (hClass == 0x9067u && psize >= 4 && ldl_le_p(auxbuf) == 0u) {
+        uint32_t sub = 0;
+        for (int i = 0; i < s->m2_devvas_n; i++) {
+            if (s->m2_devvas[i].client == hClient) { sub = s->m2_devvas[i].vas; break; }
+        }
+        if (sub) {
+            stl_le_p(auxbuf, sub);
+            qemu_log("nvkvm-gpu[%s] M5.3 9067 ctxshare hVASpace 0 -> 0x%08x\n",
+                     s->chip->name, sub);
+        }
+    }
     /* M5.1c experiment: for channel classes, drop hObjectError (params+0) — its
      * error-notifier memory object isn't forwarded yet, so RM's notifier lookup
      * fails (kchannelGetNotifierInfo OBJECT_NOT_FOUND). Zeroing it lets the
@@ -2292,6 +2307,31 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
          * channel fully construct with RM-managed memory (M5.3a). */
         if (psize >= 36) {
             stl_le_p(auxbuf + 32, 0u);               /* hUserdMemory[0] = 0 */
+        }
+        /* M5.3: NV_CHANNEL_ALLOC_PARAMS hVASpace@28 (alloc_channel.h). Like the GR
+         * channelgroup, the GR channel leaves it 0 (device default) which won't
+         * resolve on the forwarded host device -> OBJECT_NOT_FOUND. Substitute the
+         * VASpace forwarded under the same (client,device-of-the-channelgroup). The
+         * channel's hParent is the TSG, so look up by the TSG's device — track via
+         * the a06c we already saw. Simplest: substitute the first VASpace tracked for
+         * this client (the GR VAS). Also dump for diagnosis. */
+        if (psize >= 64) {
+            uint32_t hctxshare = ldl_le_p(auxbuf + 24);
+            uint32_t hvas      = ldl_le_p(auxbuf + 28);
+            qemu_log("nvkvm-gpu[%s] M5.3 DIAG c56f obj=0x%08x hParent=0x%08x "
+                     "hContextShare@24=0x%08x hVASpace@28=0x%08x\n",
+                     s->chip->name, hObject, hParent, hctxshare, hvas);
+            if (hvas == 0u) {
+                uint32_t sub = 0;
+                for (int i = 0; i < s->m2_devvas_n; i++) {
+                    if (s->m2_devvas[i].client == hClient) { sub = s->m2_devvas[i].vas; break; }
+                }
+                if (sub) {
+                    stl_le_p(auxbuf + 28, sub);
+                    qemu_log("nvkvm-gpu[%s] M5.3 c56f hVASpace 0 -> 0x%08x\n",
+                             s->chip->name, sub);
+                }
+            }
         }
     }
     struct nvos64_parameters p;
