@@ -2324,10 +2324,10 @@ static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
     memset(&mp, 0, sizeof(mp));
     mp.owner = C;
     mp.type  = 0;                            /* NVOS32_TYPE_IMAGE */
-    mp.attr  = (2u << 27) | (1u << 25);      /* CONTIGUOUS | LOCATION_PCI (sysmem, CPU-mappable) */
+    mp.attr  = (2u << 27) | (0u << 25);      /* CONTIGUOUS | LOCATION_VIDMEM (BAR1-mappable) */
     mp.size  = 0x10000;                      /* 64 KiB */
     mp.alignment = 0x10000;
-    nvkvm_m2_alloc1(s, C, DEV, MEM, 0x003eu, &mp, sizeof(mp), &st);  /* NV01_MEMORY_SYSTEM */
+    nvkvm_m2_alloc1(s, C, DEV, MEM, 0x0040u, &mp, sizeof(mp), &st);  /* NV01_MEMORY_LOCAL_USER */
     qemu_log("nvkvm-gpu[%s] MEMTEST vidmem    -> 0x%x size=0x%llx\n", s->chip->name,
              st, (unsigned long long)mp.size);
     if (st != 0) {
@@ -2353,7 +2353,10 @@ static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
     unsigned int mc = (3u << 30) | ((unsigned int)sizeof(mm) << 16) |
                       ((unsigned int)'F' << 8) | NV_ESC_RM_MAP_MEMORY;
     uint32_t mnv = 0; uint64_t mf = 0;
-    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, 3 /*the fresh map fd*/, mc,
+    /* RM_MAP_MEMORY is NV_CTL_DEVICE_ONLY (escape.c:521) — it MUST be issued on
+     * /dev/nvidiactl, with pApi->fd naming the /dev/nvidia0 fd to mmap. Issuing
+     * it on the device fd returns syscall -EINVAL before RM (no dmesg). */
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, mc,
                                  &mm, sizeof(mm), NULL, 0, 0, &mnv, &mf);
     qemu_log("nvkvm-gpu[%s] MEMTEST map -> rc=%d status=0x%x offset=0x%llx fd=%d\n",
              s->chip->name, rc, mm.status,
@@ -2363,8 +2366,10 @@ static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
                  s->chip->name, rc, mm.status, mapfd);
         return;
     }
-    /* mmap QEMU's copy of the fresh mapping fd at the RM offset (fd-based: 0). */
-    off_t moff = (off_t)(uintptr_t)mm.p_linear_address;
+    /* nvidia device mmap requires vm_pgoff==0 (nv-mmap.c:533): the kernel uses the
+     * per-fd mmap_context that rm_create_mmap_context just registered. The fresh fd
+     * carries exactly one mapping, so offset is always 0. */
+    off_t moff = 0;
     void *hva = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED,
                      mapfd, moff);
     if (hva == MAP_FAILED) {
