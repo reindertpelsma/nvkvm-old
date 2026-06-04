@@ -2259,6 +2259,22 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         qemu_log("nvkvm-gpu[%s] M5.3 DIAG 90f1 VAS obj=0x%08x client=0x%08x "
                  "psize=%u: %s\n", s->chip->name, hObject, hClient, psize, hex);
     }
+    /* M5.3 EXPERIMENT: the UVM GR VASpace is forwarded with flags IS_EXTERNALLY_OWNED
+     * (BIT3) | ENABLE_PAGE_FAULTING (BIT6) = 0x48, whose page tables the guest UVM
+     * manages — unforwardable, so the host gets an unmanaged shell (NULL OBJVASPACE)
+     * -> ctxshare INVALID_STATE. Hypothesis: the host doesn't need UVM management of
+     * THIS vaspace; it only needs a functional RM-managed VASpace to build its shadow
+     * GR context (buffer CONTENTS are matched later via the data plane). So strip
+     * EXTERNALLY_OWNED + PAGE_FAULTING (0x48) on the host copy → host RM owns the page
+     * tables → real OBJVASPACE → ctxshare/channel/compute can construct. */
+    if (hClass == 0x90f1u && psize >= 8) {
+        uint32_t vflags = ldl_le_p(auxbuf + 4);
+        if (vflags & 0x48u) {
+            stl_le_p(auxbuf + 4, vflags & ~0x48u);
+            qemu_log("nvkvm-gpu[%s] M5.3 90f1 strip EXT_OWNED|PAGE_FAULT flags 0x%x->0x%x\n",
+                     s->chip->name, vflags, vflags & ~0x48u);
+        }
+    }
     /* M5.3: remember each FERMI_VASPACE_A (0x90f1) forwarded under a (client,device)
      * so the GR channelgroup can be given an explicit hVASpace below. */
     if (hClass == 0x90f1u && s->m2_devvas_n < 32) {
