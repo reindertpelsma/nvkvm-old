@@ -746,3 +746,28 @@ PLAN (incremental, each step testable):
    the hot buffers (doorbell/USERD/data) so the data plane is zero-copy/no-trap = host parity
    (per [[mode2-dataplane-decision]] perf analysis). The FB-redirect of step 1-2 is the
    bring-up mechanism; memslot is the perf endpoint.
+
+### M5.3 ALIGNMENT (2026-06-04, user steer): RM data-plane = UVM-residency + address-virt design
+
+User pointed out the UVM docs already describe the implementation and it applies to RM. Confirmed:
+- mode2_uvm_residency.md + mode2_address_virtualization.md ARE the canonical design. The
+  double-mmap FB->host overlay I just built == address-virt category-6 "assigned" state
+  (real host-context mmap installed at the guest PCIe GPA). Step 4 of that doc's impl order.
+- The privilege wall (GR_GET_CTX_BUFFER_INFO 0x1b) and GSP-internal unobservability are both
+  bypassed by the doc's PROVEN guest-instrumentation technique: the UVM wall (cuInit) was
+  unblocked by a guest nvidia-uvm printk/BAR0-backdoor reporting the semaphore GPA+payload
+  (docs/kernel_patches/mode2_uvm_complete_proof.patch). Apply the SAME to the RM/GR path: a
+  guest nvidia.ko report of the GR context-buffer GPU-VA<->GPA so QEMU backs it (the
+  "(2) reverse-driver guest module reporting GPU-phys<->GPA bookkeeping" path). Unprivileged;
+  the guest kernel knows what GSP hides from QEMU.
+- New finding (value probe, correct offsets): at the cuCtxCreate crash the values libcuda
+  reads are VALID (channel class 0xc56f, channel handle 0x5c000019) — NOT a wrong heap read.
+  rbp=0 corruption is not a stack smash and not a wrong-read; consistent with un-backed
+  *mapped* channel/USERD/context state (category-6 backing target), not a forge-value gap.
+
+NEXT (aligned with the docs, two tracks):
+  (a) double-mmap backing: populate the FB->host overlay for handle-bearing GR-context vidmem
+      objects (0x0040/0x003e forwarded under the GR client) — map host copy + register guest-FB
+      range. Test if cuCtxCreate clears.
+  (b) if GSP-internal mappings block it: guest nvidia.ko instrumentation (BAR0-backdoor report
+      of GR context-buffer GPU-VA<->GPA), mirroring mode2_uvm_complete_proof.patch.

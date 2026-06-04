@@ -24,20 +24,28 @@ break cuCtxCreate_v2
 commands
   silent
   set $b = (unsigned long)&cuVDPAUCtxCreate
-  break *($b + 0xc0e60) if $rdi != 0 && *(unsigned long*)$rdi != 0
+  break *($b + 0xc0e60) if $rdi == 0x7ffff007e010
   commands
     silent
-    set $a0 = $rdi
-    set $p1 = *(unsigned long*)($a0 + 8)
-    printf "FN-ENTRY a0=%p a0[8]=%p", $a0, $p1
-    if $p1 > 0x1000
-      set $saved = *(unsigned long*)($p1 + 0x40)
-      printf " a0[8][0x40]=%p", $saved
-      if $saved > 0x1000
-        printf " *(saved+0xd78)=%p", *(unsigned int*)($saved + 0xd78)
+    set $o = *(unsigned long*)$rdi
+    printf "INV *(rdi)=%p", $o
+    if $o > 0x10000
+      set $y = *(unsigned long*)($o + 8)
+      printf " [+8]=%p", $y
+      if $y > 0x10000
+        set $sv = *(unsigned long*)($y + 0x40)
+        printf " [+0x40]=%p", $sv
+        if $sv > 0x10000
+          printf " *(sv+0xd78)=0x%x", *(unsigned int*)($sv + 0xd78)
+        end
       end
     end
-    printf " rbx=%p rbx[0x9488]=%p\n", $rbx, *(unsigned long*)($rbx + 0x9488)
+    set $q = *(unsigned long*)($rdi + 0x9488)
+    printf " rdi[0x9488]=%p", $q
+    if $q > 0x10000
+      printf " *q=0x%x", *(unsigned int*)$q
+    end
+    printf "\n"
     continue
   end
   continue
@@ -46,8 +54,6 @@ handle SIGSEGV stop nopass
 run
 echo \n==CRASH==\n
 printf "pc=%p rbp=%p\n", $pc, $rbp
-echo "-- which mapping is rbx, and the saved ptr? check /proc/PID/maps offsets --"
-info proc mappings
 GDB
 echo "=== gdb HAL inspect ==="
 sudo timeout 90 gdb -batch -nx -x /tmp/hal.gdb /tmp/cup2 2>&1 | grep -vE "Reading symbols|no debugging symbols|Thread|New Thread|^\[" | head -80
