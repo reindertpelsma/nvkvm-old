@@ -2246,6 +2246,19 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         psize = sizeof(auxbuf);
     }
     memcpy(auxbuf, cmd + 112, psize);
+    /* M5.3 DIAG: compare libcuda's working VASpace (0xcaf00005) vs the UVM RM-internal
+     * one (0x5c000007) that resolves to a NULL OBJVASPACE on the host. NV_VASPACE_
+     * ALLOCATION_PARAMETERS: index@0, flags@4, vaSize@8(u64), vaStartInternal@16(u64),
+     * vaLimitInternal@24(u64), bigPageSize@32, vaBase@40(u64). */
+    if (hClass == 0x90f1u && psize >= 4) {
+        char hex[256]; int n = (int)(psize < 48 ? psize : 48); int o = 0;
+        for (int i = 0; i + 4 <= n; i += 4) {
+            o += snprintf(hex + o, sizeof(hex) - o, "%s@%d=0x%08x",
+                          i ? " " : "", i, ldl_le_p(auxbuf + i));
+        }
+        qemu_log("nvkvm-gpu[%s] M5.3 DIAG 90f1 VAS obj=0x%08x client=0x%08x "
+                 "psize=%u: %s\n", s->chip->name, hObject, hClient, psize, hex);
+    }
     /* M5.3: remember each FERMI_VASPACE_A (0x90f1) forwarded under a (client,device)
      * so the GR channelgroup can be given an explicit hVASpace below. */
     if (hClass == 0x90f1u && s->m2_devvas_n < 32) {

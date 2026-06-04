@@ -531,3 +531,31 @@ interdependencies. Two directions:
       insight). Needs the compute object reparented to a host-built channel.
 Dump the 0x9067 params (hVASpace/flags/subctxId values) + the subdevice GR-init
 control sequence to decide. INVALID_STATE is a state-ordering problem, not a handle.
+
+### M5.3 ROOT CAUSE — DEFINITIVE (2026-06-04): GR context = UVM externally-owned VASpace
+
+VASpace alloc-param comparison (NV_VASPACE_ALLOCATION_PARAMETERS flags@4):
+  libcuda VAS 0xcaf00005 (WORKS):     flags=0x4  = SHARED_MANAGEMENT (normal RM-managed)
+  UVM GR VAS 0x5c000007 (SHELL/fail): flags=0x48 = IS_EXTERNALLY_OWNED(BIT3) |
+                                                    ENABLE_PAGE_FAULTING(BIT6)
+
+The cuCtxCreate compute context's primary VASpace is a UVM-externally-owned,
+fault-enabled VASpace: its page tables are managed by nvidia-uvm.ko, NOT RM. Forwarded
+verbatim, the host RM creates the VASpace resource but with an empty/NULL OBJVASPACE
+(pVAS) because the external owner — the GUEST UVM — never registers or manages the
+HOST RM's VASpace. Hence kernel_ctxshare.c:133 NV_ERR_INVALID_STATE (pVAS==NULL), and
+the channel/compute cascade. Handle substitution can't fix this; it's structural.
+
+**This is the UVM-externally-owned-VASpace problem** — the documented hard part of
+Mode-2, tied to [[mode2-uvm-residency]]. The path to Mode-2 cuCtxCreate REQUIRES making
+the host RM's externally-owned VASpace actually managed: forward the guest's UVM
+VASpace-registration operations (UvmRegisterGpuVaSpace / the UVM ioctls that populate
+GPU page tables) to a HOST UVM bound to the host's externally-owned VASpace + the host
+channel, so the host VASpace gets real page tables. This is exactly the Mode-1 UVM
+forwarding ([[uvm-in-qemu]]) but for a Mode-2-guest-driven, host-owned VASpace, and it
+intersects the UVM residency design. NOT a quick handle fix — it's the UVM milestone.
+
+So: the GR forward-chain repair (TSG/channel hVASpace) was real and correct, but the
+chain ultimately dead-ends at the UVM externally-owned VASpace, which must be solved at
+the UVM layer. Next session: scope the UVM VASpace-registration forwarding (which UVM
+ioctls the guest issues for 0x5c000007; bind a host UVM to the host VASpace+channel).
