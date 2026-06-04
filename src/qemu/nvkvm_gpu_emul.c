@@ -2373,22 +2373,14 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                          (unsigned long long)ldq_le_p(auxbuf + 192),
                          (unsigned long long)ldq_le_p(auxbuf + 216), ldl_le_p(auxbuf + 128));
             }
-            /* Only substitute hVASpace for a NON-TSG channel. A TSG channel (has a
-             * context share) MUST leave hVASpace=0 and inherit the TSG's vaspace —
-             * the host RM rejects "TSG channels can't use an explicit vaspace" +
-             * "Both context share and vaspace handles can't be valid" (kernel_channel.c).
-             * The GR channel HAS hContextShare set, so we must NOT touch its hVASpace. */
-            if (hvas == 0u && hctxshare == 0u) {
-                uint32_t sub = 0;
-                for (int i = 0; i < s->m2_devvas_n; i++) {
-                    if (s->m2_devvas[i].client == hClient) { sub = s->m2_devvas[i].vas; break; }
-                }
-                if (sub) {
-                    stl_le_p(auxbuf + 28, sub);
-                    qemu_log("nvkvm-gpu[%s] M5.3 c56f hVASpace 0 -> 0x%08x\n",
-                             s->chip->name, sub);
-                }
-            }
+            /* NOTE: do NOT substitute the channel's hVASpace. ALL these channels are
+             * TSG channels (parented to a 0xa06c group); the host RM rejects any
+             * explicit vaspace on a TSG channel ("TSG channels can't use an explicit
+             * vaspace", kernel_channel.c) — they inherit the TSG's vaspace. The earlier
+             * substitution was a red herring that broke the libcuda COPY channels; the
+             * GR channel only needed its ctxshare to exist (the EXTERNALLY_OWNED strip).
+             * hVASpace stays 0 here. (void to silence unused.) */
+            (void)hctxshare;
             /* M5.3: NV_CHANNEL_ALLOC_PARAMS engineType@128. The GR channel passes 0
              * (NULL/inherit); on the host give it the parent TSG's engine explicitly. */
             if (psize >= 132 && ldl_le_p(auxbuf + 128) == 0u) {
