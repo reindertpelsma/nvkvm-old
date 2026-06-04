@@ -109,6 +109,44 @@ any KVM box.
 M0–M3 = "does fake-the-boot actually work against a stock driver" (the risk).
 M4–M5 = the large, known RPC/forwarding long-tail. M6 = the display win.
 
+### M5 detailed plan (2026-06-04 — after cuInit+enum landed)
+
+STATUS: M4 done. cuInit + full device enumeration PASS on GA106+open-580
+(devices=1, RTX 3060, compute 8.6, 11909 MiB) via two mechanisms now committed:
+- the **#2 address-virtualization side-table** from `NV2080_CTRL_CMD_GPU_PROMOTE_CTX`
+  (0x2080012b) — resolves GR/compute channel GPU-VA→phys without page-table walks
+  ([[mode2-address-virtualization]], [[mode2-promote-ctx-and-uvm-wall]]);
+- the **UVM-completion forge** (debug backdoor: guest reports the CE tracking-sema
+  GPA, QEMU writes the payload) — breaks the UVM_REGISTER_GPU busy-poll wall.
+
+M5 GATE = **cuCtxCreate**. It currently segfaults *inside libcuda*: the per-context
+GPU-ops vtable (`call *0x560([global+0x48])`) has a NULL/garbage method because the
+context state was never really initialized — **forging completion ≠ doing the
+work.** strace confirms every ioctl/mmap succeeds; the NULL deref is libcuda
+reading an un-populated, GPU-owned context buffer. So M5 must execute/forward the
+REAL GPU work, not fake it. Sub-steps (each commit-and-test):
+
+- **M5.1 — unprivileged host context.** Stand up a real host-GPU context via the
+  Mode-1 stub/isolate (one per guest userspace process, [[isolate-architecture]]),
+  unprivileged-ioctl-only ([[access-model-split]]). No new host privilege.
+- **M5.2 — forward the compute channel.** CUDA's client DOES use PROMOTE_CTX, so
+  its GPFIFO/pushbuffer are already side-table-resolvable. Replace the forge for
+  these channels with real submission: on the doorbell, translate the resolved
+  pushbuffer → submit on the host channel (reuse Mode-1 chan forwarding).
+- **M5.3 — context-buffer backing (chain #2).** Back the guest's GPU buffers (the
+  0x200xxxxxxx UVM mmaps libcuda dereferences) with REAL host-GPU memory installed
+  at the guest GPA window — the double-mmap ([[gpa-window-design]],
+  [[realize-kvm-slot-regression]], [[uvm-in-qemu]]). This populates the context
+  state libcuda reads → fixes the cuCtxCreate vtable crash.
+- **M5.4 — UVM-internal channels.** Productionize the proof backdoor into a
+  *validated* guest→VMM mapping-report (guest reports GPU-VA→GPA bounded to its own
+  RAM; QEMU records in the side-table; real chan_exec runs the work). Replaces the
+  write-anywhere debug forge.
+
+Reuse the Mode-1 hardened dispatch/sanitizer for all host-side forwarded ioctls.
+The cuCtxCreate libcuda RE (guest globals 0x7ffff7dd7bc8/+0x48) is superseded by
+M5.3 — don't chase it; provide real backing instead.
+
 ## Isolation model (carried over from Mode-1, with a Mode-2 process key)
 
 Mode-1's host security boundary is **one sandboxed isolate per guest userspace
