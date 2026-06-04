@@ -49,6 +49,7 @@
 #include "mode2_intrtable_ga106.h" /* captured GA106 interrupt table (M5)      */
 #include "mode2_gspstaticinfo_ga106.h" /* captured GA106 GSP static config (M5) */
 #include "mode2_compute_ctrls_ga106.h" /* captured GA106 cuInit compute-cap ctrls */
+#include "virtio_nvgpu.h"   /* M5: Mode-1 forwarding stack (isolate API + NVOS structs) */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -256,6 +257,13 @@ struct NvkvmGpuEmul {
      * a bring-up PROOF that forging the completion unblocks cuInit; production
      * needs a validated guest<->VMM mapping-report channel (untrusted guest). */
     uint32_t dbg_gpa_lo, dbg_gpa_hi;
+
+    /* M5 compute forwarding (docs/design/mode2_compute_forwarding.md). The
+     * emulated GPU hosts its own forwarding backend (separate QEMU process from
+     * any Mode-1 instance, so this is additive and cannot disturb Mode-1). M5.0
+     * smoke test validates the Mode-2-process -> host-GPU path at realize(). */
+    bool     m2fwd;                      /* device prop: enable forwarding (default off) */
+    struct nvkvm_isolate_table m2_iso;   /* per-Mode-2 isolate table (own host stub) */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -2104,6 +2112,66 @@ static const MemoryRegionOps nvkvm_bar2_ops = {
 
 /* ── realize / unrealize ───────────────────────────────────────────────────*/
 
+/* M5.0 smoke test (docs/design/mode2_compute_forwarding.md): validate that the
+ * Mode-2 QEMU process can stand up a sandboxed host isolate, open the real host
+ * GPU, and forward one RM_ALLOC — i.e. that the emulated-GPU process can reach
+ * real silicon via the reused Mode-1 stub/isolate stack. Runs once at realize()
+ * (not on a vCPU thread), gated behind the m2fwd property. Forward-only: passes
+ * nv=NULL (the GPA-window paths that deref it are unused here). A transport
+ * rc==0 (any nvstatus) proves the path; nvstatus==0 proves the alloc too. */
+static void nvkvm_m2_smoke(NvkvmGpuEmul *s)
+{
+    nvkvm_isolate_table_init(&s->m2_iso);
+    s->m2_iso.abi_profile = NVKVM_ABI_580;   /* host is 580.159.04 */
+
+    uint32_t iso_id = 0;
+    int rc = nvkvm_isolate_create(&s->m2_iso, 1 /*session*/, NULL, &iso_id);
+    if (rc != 0 || iso_id == 0) {
+        qemu_log("nvkvm-gpu[%s] M5.0: isolate_create FAILED rc=%d "
+                 "(no host stub? check /usr/lib/nvkvm/nvkvm_stub)\n",
+                 s->chip->name, rc);
+        return;
+    }
+    qemu_log("nvkvm-gpu[%s] M5.0: isolate %u up (host stub spawned, pid=%d)\n",
+             s->chip->name, iso_id,
+             (int)nvkvm_isolate_host_pid(&s->m2_iso, iso_id));
+
+    int ctlfd = -1;
+    rc = nvkvm_isolate_open_device(&s->m2_iso, iso_id, 1 /*handle_id*/,
+                                   NVKVM_DEV_CTL, O_RDWR, &ctlfd);
+    if (rc != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.0: open /dev/nvidiactl FAILED rc=%d "
+                 "(host GPU busy/absent?)\n", s->chip->name, rc);
+        nvkvm_isolate_kill(&s->m2_iso, iso_id);
+        return;
+    }
+    qemu_log("nvkvm-gpu[%s] M5.0: /dev/nvidiactl open OK (handle 1)\n",
+             s->chip->name);
+
+    /* Forward a root-client alloc (NVOS21): h_class=NV01_ROOT_CLIENT; the stub
+     * substitutes the host VA for p_alloc_parms from the aux blob (the new client
+     * handle is written back there). */
+    struct nvos21_parameters p;
+    memset(&p, 0, sizeof(p));
+    p.h_object_new = 0xcafe0001u;
+    p.h_class      = NV01_ROOT_CLIENT;
+    uint32_t aux = 0xcafe0001u;        /* NV0000 alloc params: hClient */
+    unsigned int cmd = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
+                       ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC;
+    uint32_t nvstatus = 0xdeadbeefu;
+    uint64_t fault = 0;
+    rc = nvkvm_isolate_ioctl(&s->m2_iso, iso_id, 1 /*handle_id*/, cmd,
+                             &p, sizeof(p), &aux, sizeof(aux), 0,
+                             &nvstatus, &fault);
+    qemu_log("nvkvm-gpu[%s] M5.0: ROOT_CLIENT alloc -> rc=%d ioctl.status=0x%x "
+             "nvstatus=0x%x newClient=0x%x  PATH=%s\n", s->chip->name, rc,
+             p.status, nvstatus, aux,
+             (rc == 0) ? "REACHES-HOST-GPU" : "transport-fail");
+    /* Leave the isolate alive (a real M5 would keep it as the guest's host
+     * context); for the smoke test, tear it down to avoid leaking the stub. */
+    nvkvm_isolate_kill(&s->m2_iso, iso_id);
+}
+
 static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 {
     NvkvmGpuEmul *s = NVKVM_GPU_EMUL(pci_dev);
@@ -2229,6 +2297,11 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
          * CURRENT_LINK_SPEED[19:16]=4, NEG_LINK_WIDTH[25:20]=16. */
         pci_set_word(cfg + exp + PCI_EXP_LNKSTA, (uint16_t)(4u | (16u << 4)));
     }
+
+    /* M5.0: one-shot forwarding smoke test (gated; default off). */
+    if (s->m2fwd) {
+        nvkvm_m2_smoke(s);
+    }
 }
 
 static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
@@ -2246,6 +2319,7 @@ static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
 
 static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("trace", NvkvmGpuEmul, trace, true),
+    DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, false), /* M5: enable host-GPU forwarding */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
     DEFINE_PROP_END_OF_LIST(),
 };
