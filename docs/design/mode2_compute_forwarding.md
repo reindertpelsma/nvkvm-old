@@ -849,3 +849,39 @@ Build order (each gated behind m2fwd, each testable via the CRASHWIN probe shrin
 Risk/scale: this is the documented multi-week keystone, but now with concrete targets
 (exact guest-FB addrs + the proven unprivileged primitives) and a tight test loop (the
 CRASHWIN probe + serial cup2). Begin with step 1 in a fresh-focus session.
+
+## M5.4 root cause from source (2026-06-04): 0x2efbaf000 = CE scrubber finishPayload
+
+Confirmed via research_clones/ogkm src/nvidia/src/kernel/gpu/mem_mgr/{ce_utils.c,
+channel_utils.c}: the CE memcopy/scrub utility (ce_utils) uses ONE contiguous channel
+buffer laid out as [pushbuffer @0 | GPFIFO @channelPbSize | semaphore @semaOffset |
+finishPayload @finishPayloadOffset] (channel_utils.c:249-250). _ceutilsSubmitPushBuffer
+writes a CE pushbuffer ending in NV*B5 SET_SEMAPHORE_A/B = pbGpuVA+finishPayloadOffset +
+a release of `payload`, bumps GP_PUT, kicks the doorbell, then RM busy-polls
+channelWaitForFinishPayload -> MEM_RD32(pbCpuVA + finishPayloadOffset) until it sees
+`payload`.
+
+=> The CRASHWIN dominant wait fb=0x2efbaf000 (331x, gva=0/PRAMIN = guest RM kernel poll)
+is a CE-scrubber-class channel's finishPayload semaphore. cuCtxCreate scrubs the GR
+context buffers (or copies the golden image) via this CE channel and waits; in Mode-2 the
+host CE channel never runs the guest's submitted scrub, so the semaphore stays 0 -> hang.
+This is SIMPLER than the GR golden-context path feared earlier: a CE memset + semaphore
+release on ONE contiguous channel buffer.
+
+### Execution-path build for the CE scrubber (the concrete keystone, simplest channel)
+To make the host GPU run the guest's scrub and release the semaphore (NO faking — the GPU
+writes it, per the reverse-driver model):
+1. Identify the scrubber channel + its single channel buffer memory object (the FB alloc
+   containing pushbuffer/GPFIFO/semaphores; finishPayload lands at ~0x2efbaf000). It's
+   allocated by the guest RM and forwarded; find its handle + pbGpuVA + guest-FB base.
+2. Double-mmap that ONE channel buffer (host memory <-> guest-FB range) so the guest's
+   pushbuffer+GPFIFO+semaphore writes land in host GPU memory and the host GPU's semaphore
+   release is visible to the guest's PRAMIN poll (m2_fbback overlay, already covers PRAMIN).
+3. Map the channel buffer into the host (forwarded) CE channel's VAS at pbGpuVA via
+   RM_MAP_MEMORY_DMA(DMA_OFFSET_FIXED) [unprivileged]. USERD already double-mmapped (step 1).
+4. Forward/emulate the doorbell: when the guest rings the scrubber channel's doorbell,
+   kick the host channel (schedule + ring host doorbell) so the host GPU consumes GP_PUT.
+Then the host CE engine runs the memset and releases finishPayload -> guest poll clears ->
+cuCtxCreate proceeds to the next step. This is the M5.4 execution path; the CE scrubber is
+the right FIRST channel to forward (single buffer, no GR ctx). The GR compute channel
+follows the same recipe.
