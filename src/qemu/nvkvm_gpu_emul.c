@@ -240,6 +240,18 @@ struct NvkvmGpuEmul {
     uint32_t intr_leaf_en[NVKVM_VF_INTR_NLEAF];  /* enables */
     uint32_t intr_top;                           /* pending subtree bitmask (TOP(0)) */
     uint32_t intr_top_en;
+
+    /* M5/M7 — GSP os-event delivery.  cuCtxCreate's blocking-sync wait parks
+     * libcuda in poll() on an os-event fd; the channel completes (semaphore
+     * released) but no completion interrupt is delivered, so poll() never wakes
+     * (lost wakeup).  We record every NV01_EVENT_OS_EVENT (0x0079) alloc, and on
+     * a doorbell-completed channel post a GSP NV_VGPU_MSG_EVENT_POST_EVENT
+     * (0x1003) for each + raise the GSP falcon SWGEN0 interrupt (vector 155 =
+     * MC_ENGINE_IDX_GSP stall) so kgspService drains the queue -> _kgspRpcPostEvent
+     * -> osNotifyEvent -> nv_post_event wakes the poll.  Mirrors Mode-1 #127. */
+    struct { uint32_t hclient, hevent, notify_index; } osevents[64];
+    int      osevent_n;
+    bool     gsp_swgen0_pending;                 /* GSP falcon IRQSTAT SWGEN0 latched */
     /* VAS root page-dir bases snooped from VASPACE_COPY_SERVER_RESERVED_PDES
      * (0x90f10106): levels[0].physAddress roots the WHOLE VAS (the params' VA
      * range is only the reserved window, not the VAS extent), keyed by the
@@ -503,6 +515,19 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
      * the UNLOADING RPC arrived so close() doesn't hang 4s. */
     case NV_PGSP_FALCON_MAILBOX0: return s->gsp_suspended ? 0x80000000u : 0;
 
+    /* M5/M7 — GSP falcon interrupt registers for os-event delivery.
+     * kgspService_TU102 calls kflcnGetPendingHostInterrupts = IRQSTAT & IRQMASK
+     * & IRQDEST (legacy) or IRQSTAT & RISCV_IRQMASK & RISCV_IRQDEST (riscv).  We
+     * advertise SWGEN0 (bit6) enabled in all mask/dest regs and latch it in
+     * IRQSTAT when an event is pending; cleared via IRQSCLR write.  Offsets:
+     * NV_PGSP base 0x110000; FALCON IRQSTAT +0x08, IRQMASK +0x18, IRQDEST +0x1c;
+     * RISCV base 0x111000; RISCV_IRQMASK +0x528, RISCV_IRQDEST +0x52c. */
+    case 0x00110008u: return s->gsp_swgen0_pending ? (1u << 6) : 0; /* FALCON IRQSTAT */
+    case 0x00110018u: return (1u << 6);                             /* FALCON IRQMASK */
+    case 0x0011001cu: return (1u << 6);                             /* FALCON IRQDEST */
+    case 0x00111528u: return (1u << 6);                             /* RISCV  IRQMASK */
+    case 0x0011152cu: return (1u << 6);                             /* RISCV  IRQDEST */
+
     /* NV_VIRTUAL_FUNCTION_PRIV_ACCESS_COUNTER_NOTIFY_BUFFER_SIZE (VF 0xB80000 +
      * 0x3110): UVM_REGISTER_GPU's uvmGetAccessCounterBufferSize reads this and
      * multiplies by 32 for the notify-buffer byte size; 0 => memdescCreate(0) =>
@@ -665,6 +690,82 @@ static void nvkvm_m3_post_init_done(NvkvmGpuEmul *s)
     nvkvm_m3_post_status(s, NULL, 0x1001u /* GSP_INIT_DONE */, 0 /* NV_OK */);
     qemu_log("nvkvm-gpu[%s] M3: posted GSP_INIT_DONE (seqNum 0) -> "
              "RmInitAdapter should pass kgspWaitForRmInitDone\n", s->chip->name);
+}
+
+/* M5/M7 — post a GSP NV_VGPU_MSG_EVENT_POST_EVENT (0x1003).  The body is
+ * rpc_post_event_v17_00 {NvHandle hClient@0; NvHandle hEvent@4; NvU32
+ * notifyIndex@8; NvU32 data@12; NvU16 info16@16; NvU32 status@20; NvU32
+ * eventDataSize@24; NvBool bNotifyList@28; NvU8 eventData[]@29} placed at the
+ * rpc params offset.  The GSP message element is {48-byte element header,
+ * 32-byte rpc_message_header, params...}, so params (rpc_message_data) live at
+ * el+48+32 = el+80 — the SAME base the working GSP_RM_CONTROL reply uses
+ * (rpc.length = 32 + 40-byte gsp_rm_control header + psize -> control params at
+ * el+120).  bNotifyList=0 => _kgspRpcPostEvent does CliGetEventInfo(hClient,
+ * hEvent) then osNotifyEvent on the matching event (wakes the os-event fd). */
+static void nvkvm_m3_post_event(NvkvmGpuEmul *s, uint32_t hclient,
+                                uint32_t hevent, uint32_t notify_index,
+                                uint32_t data)
+{
+    static uint8_t el[256];               /* device emu is single-threaded */
+    memset(el, 0, sizeof(el));
+    stl_le_p(el + 48, 0x03000000u);       /* rpc header_version MAJOR=3 */
+    stl_le_p(el + 52, 0x43505256u);       /* NV_VGPU_MSG_SIGNATURE_VALID */
+    stl_le_p(el + 80 +  0, hclient);      /* hClient */
+    stl_le_p(el + 80 +  4, hevent);       /* hEvent  */
+    stl_le_p(el + 80 +  8, notify_index); /* notifyIndex */
+    stl_le_p(el + 80 + 12, data);         /* data */
+    /* info16@16, status@20, eventDataSize@24=0, bNotifyList@28=0 stay zero */
+    stl_le_p(el + 56, 32u + 32u);         /* rpc.length = hdr(32) + body(32) */
+    nvkvm_m3_post_status(s, el, 0x1003u /* NV_VGPU_MSG_EVENT_POST_EVENT */, 0);
+}
+
+/* M5/M7 — latch the GSP falcon SWGEN0 interrupt and raise the GSP engine's
+ * stall vector (155 = 0x9b for MC_ENGINE_IDX_GSP=50 on GA106, from the captured
+ * INTERNAL_INTR_GET_KERNEL_TABLE).  Mirrors the INTR_LEAF_TRIGGER path: set the
+ * leaf+top pending bits and notify MSI-X so the guest ISR -> kgspServiceInterrupt
+ * -> kgspService reads SWGEN0 and drains the GSP message queue. */
+static void nvkvm_gsp_raise_swgen0(NvkvmGpuEmul *s)
+{
+    s->gsp_swgen0_pending = true;
+    uint32_t vec = 155u, leaf = vec / 32u, bit = vec % 32u, subtree = leaf / 2u;
+    if (leaf < NVKVM_VF_INTR_NLEAF) {
+        s->intr_leaf[leaf] |= (1u << bit);
+        s->intr_top        |= (1u << subtree);
+        PCIDevice *pd = &s->parent_obj;
+        if (msix_enabled(pd)) {
+            msix_notify(pd, 0);
+        } else {
+            pci_set_irq(pd, 1);
+        }
+    }
+}
+
+/* M5/M7 — deliver completion to every registered os-event, then raise SWGEN0
+ * once (the guest drains all queued POST_EVENTs in one service pass). */
+static void nvkvm_gsp_deliver_events(NvkvmGpuEmul *s)
+{
+    if (s->osevent_n <= 0) {
+        return;
+    }
+    /* CRITICAL: the status queue is SHARED with RPC responses and has strictly
+     * monotonic per-message seqNums in a small ring.  Posting an event batch on
+     * every doorbell (hundreds of times) overflows the ring before the guest
+     * drains it -> the guest's rpcRecvPoll sees a seqNum gap ("Bad sequence
+     * number") and the whole RPC path breaks.  Gate on the previous batch being
+     * drained: only post when SWGEN0 was already cleared by the guest's
+     * kgspService (IRQSCLR write), bounding outstanding messages to one batch. */
+    if (s->gsp_swgen0_pending) {
+        return;
+    }
+    for (int i = 0; i < s->osevent_n; i++) {
+        nvkvm_m3_post_event(s, s->osevents[i].hclient, s->osevents[i].hevent,
+                            s->osevents[i].notify_index, 0);
+    }
+    nvkvm_gsp_raise_swgen0(s);
+    if (s->trace) {
+        qemu_log("nvkvm-gpu[%s] M7: delivered %d os-event(s) + raised GSP SWGEN0 "
+                 "(vec 155)\n", s->chip->name, s->osevent_n);
+    }
 }
 
 /* ── DIAG (address-virtualization bring-up, removable) ──────────────────────
@@ -936,6 +1037,34 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         }
         if (fn == 103) {
             uint32_t hclass = ldl_le_p(cmd + 92);
+            /* M5/M7 — record NV01_EVENT_OS_EVENT (0x0079) allocations so we can
+             * post a GSP POST_EVENT on channel completion (the blocking-sync
+             * wakeup).  GSP_RM_ALLOC body: hClient@80, hObject@88(=hEvent),
+             * hClass@92, params@112 = NV0005_ALLOC_PARAMETERS {hParentClient@0,
+             * hSrcResource@4, hClass@8, notifyIndex@12, data@16}.  _kgspRpcPostEvent
+             * matches by (hClient,hEvent), so those are the load-bearing fields. */
+            if (hclass == 0x0079u &&
+                s->osevent_n < (int)ARRAY_SIZE(s->osevents)) {
+                uint32_t hcli = ldl_le_p(cmd + 80);
+                uint32_t hev  = ldl_le_p(cmd + 88);
+                /* de-dup (the same event may be re-seen on replay) */
+                bool seen = false;
+                for (int i = 0; i < s->osevent_n; i++) {
+                    if (s->osevents[i].hclient == hcli &&
+                        s->osevents[i].hevent  == hev) { seen = true; break; }
+                }
+                if (!seen) {
+                    s->osevents[s->osevent_n].hclient      = hcli;
+                    s->osevents[s->osevent_n].hevent       = hev;
+                    s->osevents[s->osevent_n].notify_index = ldl_le_p(cmd + 124);
+                    s->osevent_n++;
+                    if (s->trace) {
+                        qemu_log("nvkvm-gpu[%s] M7: recorded os-event hClient=0x%08x "
+                                 "hEvent=0x%08x notifyIndex=%u (#%d)\n", s->chip->name,
+                                 hcli, hev, ldl_le_p(cmd + 124), s->osevent_n);
+                    }
+                }
+            }
             if ((hclass & 0xFFFFu) >= 0xC06Fu && (hclass & 0xFFu) == 0x6Fu &&
                 (hclass & 0xF000u) == 0xC000u) {
                 s->chan_class      = hclass;
@@ -1495,6 +1624,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * gpFifoVA + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004 with a
          * per-channel incrementing payload (channelWaitForFinishPayload polls
          * exactly that). */
+        bool any_completed = false;
         for (int i = 0; i < s->chan_n; i++) {
             struct nvkvm_chan_entry *c = &s->chans[i];
             /* Load this channel into the chan_* working set chan_execute reads. */
@@ -1511,6 +1641,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (c->gp_get == before) {
                 continue;                        /* no new work on this channel */
             }
+            any_completed = true;
             if (s->chan_sem_released) {
                 continue;                        /* explicit release already done */
             }
@@ -1534,6 +1665,14 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                          (uint32_t)val, i, (unsigned long long)sema_va,
                          (unsigned long long)c->gpfifo_va);
             }
+        }
+        /* M5/M7 — a channel finished: deliver the os-event completion so
+         * libcuda's blocking-sync poll() wakes (write sema THEN signal, so the
+         * payload is already visible when the guest re-checks).  Posting per
+         * completed-doorbell is bounded by the queue ring; the guest drains all
+         * queued POST_EVENTs in one SWGEN0 service. */
+        if (any_completed) {
+            nvkvm_gsp_deliver_events(s);
         }
         return;
     }
@@ -1593,6 +1732,15 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                  s->chip->name, (unsigned long long)off,
                  (unsigned long long)s->bar2_inst_block,
                  s->bar2_virtual ? "VIRTUAL" : "PHYSICAL");
+        return;
+    }
+
+    /* M5/M7 — GSP falcon IRQSCLR (0x110004): write-1-to-clear SWGEN0 (bit6).
+     * kgspService clears the edge before draining the queue. */
+    if (off == 0x00110004u) {
+        if (val & (1u << 6)) {
+            s->gsp_swgen0_pending = false;
+        }
         return;
     }
 
