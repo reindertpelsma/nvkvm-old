@@ -327,6 +327,15 @@ struct NvkvmGpuEmul {
     bool     m2_in_walk;     /* true while reading a GMMU PDE/PTE — excludes page-walk
                               * noise from the CRASHWIN probe so only LEAF data reads
                               * (the buffer values libcuda actually consumes) are logged */
+    /* M5.4 data-plane: per forwarded channel, the host-allocated USERD we provide as
+     * hUserdMemory[0] (handle-bearing -> mappable, unlike RM's own USERD) and mmap into
+     * QEMU, registered in m2_fbback at the guest's userd.base. So the host channel's real
+     * USERD IS the guest's USERD view (double-mmap): guest GP_PUT lands in host USERD and
+     * the host GPU advances GP_GET there for the guest's poll to see. */
+    struct { uint32_t client, chan; uint32_t h_userd; void *qva; uint64_t fb_base, size; }
+             m2_chanbuf[16];
+    int      m2_chanbuf_n;
+    uint32_t m2_databuf_next;   /* unique host handle allocator for data-plane objects */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -977,6 +986,9 @@ static void nvkvm_snoop_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
 static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn); /* M5.1 fwd-decl */
 static int nvkvm_m2_control1(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hObject,
                              uint32_t cmd, void *params, uint32_t psize, uint32_t *st); /* M5.3 fwd-decl */
+static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
+                                        uint32_t chanObj, uint8_t *auxbuf,
+                                        uint32_t psize); /* M5.4 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -2678,9 +2690,23 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         /* hUserdMemory[0] @ params+32: "ignored if 0" -> the host CPU-RM allocates
          * USERD itself (kernel_channel.c:309); instance memory is RM-allocated on
          * the normal host-RM path too. So zeroing the client-USERD handle lets the
-         * channel fully construct with RM-managed memory (M5.3a). */
+         * channel fully construct with RM-managed memory (M5.3a).
+         * M5.4: for the GR channel (the one whose completion poll hangs cuCtxCreate,
+         * CRASHWIN fb=0x420208c), instead BACK its USERD with real host GPU memory
+         * (double-mmap) so the host GPU's GP_GET is visible to the guest's poll.
+         * Identify it by its parent TSG's engine (GRAPHICS=1). Other channels keep
+         * hUserdMemory[0]=0 (host RM allocates) until they're backed too. */
         if (psize >= 36) {
-            stl_le_p(auxbuf + 32, 0u);               /* hUserdMemory[0] = 0 */
+            stl_le_p(auxbuf + 32, 0u);               /* default: host RM allocates USERD */
+            bool is_gr = false;
+            for (int i = 0; i < s->m2_tsgeng_n; i++) {
+                if (s->m2_tsgeng[i].tsg == hParent && s->m2_tsgeng[i].engine == 1u) {
+                    is_gr = true; break;
+                }
+            }
+            if (is_gr) {
+                nvkvm_m2_back_channel_userd(s, hClient, hObject, auxbuf, psize);
+            }
         }
         /* M5.3: NV_CHANNEL_ALLOC_PARAMS hVASpace@28 (alloc_channel.h). Like the GR
          * channelgroup, the GR channel leaves it 0 (device default) which won't
@@ -2944,6 +2970,68 @@ static bool nvkvm_m2_host_alloc_map_vidmem(NvkvmGpuEmul *s, uint32_t hClient,
     out->qva = qva; out->mapfd = mapfd; out->h_mem = hMem; out->maph = maph;
     out->size = size;
     return true;
+}
+
+/* M5.4 DATA-PLANE: back a forwarded channel's USERD with REAL host GPU memory.
+ * The guest's NV_CHANNEL_ALLOC_PARAMS carries a userd memdesc (base@168, size@176,
+ * addressSpace@184) naming a guest-FB address where the guest driver maps USERD via
+ * BAR1. We allocate a host vidmem object, hand it to the host channel as
+ * hUserdMemory[0] (@auxbuf+32) so the host channel USES it, mmap it into QEMU, and
+ * register the guest-FB userd.base range in m2_fbback. Then guest reads/writes of its
+ * USERD (GP_PUT/GP_GET) go through the BAR-aperture->FB path to the SAME host memory
+ * the host GPU uses — the double-mmap that makes GP_GET observable to the guest poll.
+ * Defensive: skips (leaving hUserdMemory[0] for the caller to zero) on any anomaly. */
+static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
+                                        uint32_t chanObj, uint8_t *auxbuf,
+                                        uint32_t psize)
+{
+    if (psize < 192) {
+        return;                              /* no userd memdesc present */
+    }
+    uint64_t ubase = ldq_le_p(auxbuf + 168);
+    uint64_t usize = ldq_le_p(auxbuf + 176);
+    uint32_t uas   = ldl_le_p(auxbuf + 184); /* addressSpace: 2=FBMEM, 1=SYSMEM */
+    if (ubase == 0) {
+        return;                              /* guest didn't place USERD — let RM alloc */
+    }
+    if (s->m2_chanbuf_n >= 16) {
+        return;
+    }
+    /* Find the channel's device (VASpace parent) tracked for this client. */
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == hClient) { hDev = s->m2_devvas[i].dev; break; }
+    }
+    if (!hDev) {
+        qemu_log("nvkvm-gpu[%s] M5.4 USERD-back: no device for client 0x%08x — skip\n",
+                 s->chip->name, hClient);
+        return;
+    }
+    uint64_t asize = usize ? ((usize + 0xfff) & ~0xfffull) : 0x1000;
+    uint32_t hUserd = 0xda000000u | (s->m2_databuf_next++ & 0xffffu);
+    struct nvkvm_host_map hm;
+    if (!nvkvm_m2_host_alloc_map_vidmem(s, hClient, hDev, hUserd, asize, &hm)) {
+        qemu_log("nvkvm-gpu[%s] M5.4 USERD-back: host alloc failed (chan 0x%08x) — skip\n",
+                 s->chip->name, chanObj);
+        return;
+    }
+    stl_le_p(auxbuf + 32, hUserd);           /* hUserdMemory[0] = host USERD handle */
+    s->m2_fbback[s->m2_fbback_n].fb_base = ubase;
+    s->m2_fbback[s->m2_fbback_n].size    = asize;
+    s->m2_fbback[s->m2_fbback_n].host_qva = hm.qva;
+    s->m2_fbback_n++;
+    s->m2_chanbuf[s->m2_chanbuf_n].client = hClient;
+    s->m2_chanbuf[s->m2_chanbuf_n].chan   = chanObj;
+    s->m2_chanbuf[s->m2_chanbuf_n].h_userd = hUserd;
+    s->m2_chanbuf[s->m2_chanbuf_n].qva    = hm.qva;
+    s->m2_chanbuf[s->m2_chanbuf_n].fb_base = ubase;
+    s->m2_chanbuf[s->m2_chanbuf_n].size   = asize;
+    s->m2_chanbuf_n++;
+    qemu_log("nvkvm-gpu[%s] M5.4 USERD-back: chan 0x%08x USERD guest-FB 0x%llx "
+             "(memdesc sz=0x%llx as=%u) -> host hUserd=0x%08x qva=%p asize=0x%llx "
+             "[DOUBLE-MMAP]\n", s->chip->name, chanObj, (unsigned long long)ubase,
+             (unsigned long long)usize, uas, hUserd, hm.qva,
+             (unsigned long long)asize);
 }
 
 /* M5.3 DATA-PLANE PROOF: validate that QEMU can put REAL host GPU memory into its
