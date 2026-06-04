@@ -330,3 +330,36 @@ Reconciliation options to evaluate next: (a) intercept the context-buffer
 GSP_RM_ALLOC, force the guest's GPU-phys assignment into a dedicated host-backed
 FB window whose GPAs we memslot to the host mappings; (b) post-hoc match by
 size+order. Option (a) is cleaner — we control the guest's FB-GPA at alloc time.
+
+### M5.3 progress (2026-06-04, cont'd): primitive is reusable; integration mapped
+
+- `nvkvm_m2_host_alloc_map_vidmem()` (commit e124deb) is the reusable on-demand
+  primitive: alloc host vidmem of size N → QEMU VA. memtest regression PASS.
+- **Forwarding state today:** `nvkvm_m2_shadow_fwd` forwards GSP_RM_ALLOC (fn=103)
+  and FREE (fn=10) to the host. **GSP_RM_CONTROL (fn=76) is NOT forwarded** — so
+  PROMOTE_CTX never reaches the host GSP, and the host context buffers are never
+  mapped into the GR VAS.
+- **cup2 context-buffer trace** (PROMOTE_CTX side-table, guest-FB-phys):
+  client 0xc1e00009: va 0x120020000→FB 0x2ef946000 sz 0xea000 (MAIN);
+  0x12010a000→FB 0x2efa41000 sz 0x4000; 0x120010000→SYS 0x149140000 sz 0x10000;
+  0x120110000→FB 0x2eed80000 sz 0x80000. client 0xc1d0000a (UVM): two more FB bufs.
+  These guest-FB-phys are picked by the guest's faked PMA; the host has no matching
+  allocation for them.
+- **Guest CPU access to vidmem** goes through the emulated BAR1 aperture
+  (nvkvm_baraperture_read/write → nvkvm_walk_pdb(bar1_pdb) → fb_pages malloc'd) OR
+  via the guest UVM mmap (libcuda derefs 0x200xxxxxxx, fd=nvidia-uvm). The exact
+  resolution of the UVM-mapped deref (BAR1 MMIO vs guest RAM vs fault) is the next
+  build's first trace target — it determines where the KVM memslot must go.
+
+### Next build (the real M5.3, in order)
+
+1. Trace where libcuda's UVM-mapped context-buffer deref resolves in the emulated
+   GPU (add a targeted log / gdb the guest at the SIGSEGV si_addr).
+2. Per FB context buffer (from PROMOTE_CTX): `nvkvm_m2_host_alloc_map_vidmem(size)`
+   → host VA. Install a KVM memslot over the guest-FB-GPA range backed by that VA
+   (Mode-1 GPA-window style; replaces the malloc'd fb_pages for that range).
+3. Query host GPU-phys of each (NV0041_CTRL_CMD_GET_SURFACE_PHYS_ATTR forwarded),
+   rewrite the PROMOTE_CTX entries guest-phys→host-phys, and forward PROMOTE_CTX
+   (fn=76 0x2080012b) to the host GSP so the host GPU maps the SAME memory.
+4. Re-run cup2: the mapped-but-unbacked context buffers now carry real host GPU
+   state → cuCtxCreate should pass the NULL-deref crash.
