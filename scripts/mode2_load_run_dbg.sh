@@ -10,7 +10,7 @@
 # allocator lib), so we LD_PRELOAD the real one explicitly.  [[guest_lib_version_staging]]
 set -u
 NVVER=580.159.04
-DBG=/home/ubuntu/nvmods-dbg
+DBG=${DBG:-/home/ubuntu/nvmods-dbg}
 GUESTLIB=/usr/local/nvidia-guest/lib
 LIBCUDA="$GUESTLIB/libcuda.so.$NVVER"
 
