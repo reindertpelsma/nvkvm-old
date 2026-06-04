@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <poll.h>
 #include <dlfcn.h>
 #include <sys/ioctl.h>
 
@@ -22,6 +23,31 @@
 #endif
 
 static int (*real_ioctl)(int, unsigned long, ...);
+static int (*real_poll)(struct pollfd *, nfds_t, int);
+
+/* track os-event fds returned by NV_ESC_ALLOC_OS_EVENT */
+static int osevent_fds[64]; static int osevent_n;
+static int is_osevent_fd(int fd){ for(int i=0;i<osevent_n;i++) if(osevent_fds[i]==fd) return 1; return 0; }
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    if (!real_poll) real_poll = dlsym(RTLD_NEXT, "poll");
+    /* log blocking polls that wait on a nvidia os-event fd */
+    if (fds && (timeout < 0 || timeout > 50)) {
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (is_osevent_fd(fds[i].fd)) {
+                char buf[256]; int o = 0;
+                o += snprintf(buf+o, sizeof(buf)-o, "[SNOOP] POLL(timeout=%d) os-event fds:", timeout);
+                for (nfds_t j = 0; j < nfds && o < 200; j++)
+                    o += snprintf(buf+o, sizeof(buf)-o, " fd%d%s", fds[j].fd,
+                                  is_osevent_fd(fds[j].fd) ? "*" : "");
+                fprintf(stderr, "%s\n", buf); fflush(stderr);
+                break;
+            }
+        }
+    }
+    return real_poll(fds, nfds, timeout);
+}
 
 int ioctl(int fd, unsigned long req, ...)
 {
@@ -36,14 +62,24 @@ int ioctl(int fd, unsigned long req, ...)
         if (nr == 0x2B) {                 /* NV_ESC_RM_ALLOC (NVOS21/64) */
             uint32_t hRoot = p[0], hParent = p[1], hNew = p[2], hClass = p[3];
             if (hClass == 0x0079u || hClass == 0x0005u || hClass == 0x007eu) {
+                /* pAllocParms @16 (NvP64) -> NV0005_ALLOC_PARAMETERS
+                 * {hParentClient@0, hSrcResource@4, hClass@8, notifyIndex@12, data@16(NvP64)} */
+                uint64_t pAllocParms = *(uint64_t *)((char *)arg + 16);
+                uint32_t notifyIdx = 0; uint64_t data = 0;
+                if (pAllocParms) {
+                    uint32_t *ap = (uint32_t *)(uintptr_t)pAllocParms;
+                    notifyIdx = ap[3];
+                    data = *(uint64_t *)((char *)ap + 16);
+                }
                 fprintf(stderr, "[SNOOP] RM_ALLOC EVENT hClass=0x%04x hRoot(client)=0x%08x "
-                        "hParent=0x%08x hObjectNew(event)=0x%08x sz=%u\n",
-                        hClass, hRoot, hParent, hNew, sz);
+                        "hParent=0x%08x event=0x%08x notifyIdx=0x%x data(osevent)=0x%llx\n",
+                        hClass, hRoot, hParent, hNew, notifyIdx, (unsigned long long)data);
                 is_evt_alloc = 1; e_hClass = hClass; e_hRoot = hRoot; e_hNew = hNew;
             }
         } else if (nr == 206) {           /* NV_ESC_ALLOC_OS_EVENT */
             fprintf(stderr, "[SNOOP] ALLOC_OS_EVENT hClient=0x%08x hDevice=0x%08x fd=%d\n",
                     p[0], p[1], (int)p[2]);
+            if (osevent_n < 64) osevent_fds[osevent_n++] = (int)p[2];
         } else if (nr == 0x29) {          /* NV_ESC_RM_FREE (NVOS00) */
             fprintf(stderr, "[SNOOP] RM_FREE hRoot=0x%08x hParent=0x%08x hObjectOld=0x%08x\n",
                     p[0], p[1], p[2]);

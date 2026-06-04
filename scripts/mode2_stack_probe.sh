@@ -7,7 +7,11 @@ GUESTLIB=/usr/local/nvidia-guest/lib
 LIBCUDA="$GUESTLIB/libcuda.so.$NVVER"
 
 dmesg -C 2>/dev/null || true
-LD_PRELOAD="$LIBCUDA" LD_LIBRARY_PATH="$GUESTLIB" /tmp/cup2 >/tmp/cup2.out 2>&1 &
+# preload the ioctl snoop too (if built) so os-event fds are logged in the SAME
+# run we decode the pollset of -> lets us correlate os-event fds <-> poll fds.
+SNOOP=""
+[ -f /tmp/nvioctl_snoop.so ] && SNOOP="/tmp/nvioctl_snoop.so "
+LD_PRELOAD="${SNOOP}$LIBCUDA" LD_LIBRARY_PATH="$GUESTLIB" /tmp/cup2 >/tmp/cup2.out 2>/tmp/snoop.err &
 CPID=$!
 echo "cup2 pid=$CPID"
 # wait until it has printed past totalMem (i.e. entered cuCtxCreate)
@@ -31,5 +35,42 @@ for t in /proc/$CPID/task/*; do
 done
 echo "=== all wchans ==="
 for t in /proc/$CPID/task/*; do echo "$(basename $t): $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null)"; done
-echo "=== dmesg tail ==="; dmesg | tail -15
+echo "=== POLL FD DECODE (what fds the do_poll threads actually wait on) ==="
+for t in /proc/$CPID/task/*; do
+    tid=$(basename "$t")
+    w=$(cat "$t/wchan" 2>/dev/null)
+    case "$w" in *poll*) ;; *) continue;; esac
+    python3 - "$tid" <<'PYEOF'
+import sys,struct
+tid=sys.argv[1]
+try:
+    sc=open(f"/proc/{tid}/syscall").read().split()
+except Exception as e:
+    print(f"tid {tid}: syscall read failed {e}"); sys.exit()
+# format: nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc
+nr=sc[0]
+if nr not in ("7","271"):  # poll / ppoll
+    print(f"tid {tid}: syscall nr={nr} (not poll)"); sys.exit()
+buf=int(sc[1],16); nfds=int(sc[2],16)
+fds=[]
+try:
+    with open(f"/proc/{tid}/mem","rb") as m:
+        m.seek(buf)
+        data=m.read(min(nfds,64)*8)
+    for i in range(min(nfds,64)):
+        fd,ev,rev=struct.unpack_from("<ihh",data,i*8)
+        fds.append(f"fd{fd}(ev=0x{ev&0xffff:x})")
+except Exception as e:
+    print(f"tid {tid}: mem read failed {e}"); sys.exit()
+print(f"tid {tid}: poll nfds={nfds} -> {' '.join(fds)}")
+PYEOF
+done
+echo "=== fd links for ALL cup2 fds (identify RM/UVM/eventfd) ==="
+for f in $(ls /proc/$CPID/fd 2>/dev/null); do
+    l=$(readlink /proc/$CPID/fd/$f 2>/dev/null)
+    case "$l" in *nvidia*|*uvm*) echo "fd$f -> $l";; esac
+done
+echo "=== os-event fds (from snoop, this run) ==="; grep "ALLOC_OS_EVENT" /tmp/snoop.err 2>/dev/null
+echo "=== event->fd bindings ==="; grep "RM_ALLOC EVENT" /tmp/snoop.err 2>/dev/null
+echo "=== dmesg tail ==="; dmesg | tail -8
 kill -9 $CPID 2>/dev/null
