@@ -59,7 +59,27 @@ CAN for the compute/GR context (PROMOTE_CTX carries the VA↔phys). So:
   is mostly VA-independent GR pipeline state, so a one-time capture+replay is
   plausible; verify it doesn't embed context-specific VAs.
 
-REVISED RECOMMENDATION: lean (b) for the FASTEST path to first cuCtxCreate+compute
+SYNTHESIS — the HYBRID (clearest path, resolves the fork): the two paths aren't
+exclusive. The cuCtxCreate crash (gdb RE in [[mode2-promote-ctx-and-uvm-wall]]) is
+libcuda dereferencing NULL from an RM_ALLOC that returned faked/zero data — so
+flipping THAT alloc (and the compute context's tree) to AUTHORITATIVE (return the
+host's real result + double-mmap its buffers) directly fixes it. And the compute
+context IS the path that has PROMOTE_CTX maps, so its VAS reconciles cleanly.
+Meanwhile the UVM/cuInit channels (the ones with GSP-internal maps) STAY FAKED via
+the working forge — we never need to forward them for compute. So:
+  - Control plane for cuInit / UVM channels: keep faking (forge) — already works.
+  - Compute context (cuCtxCreate's GR ctx + compute channel + its memory):
+    forward AUTHORITATIVELY (return host results to the guest) + double-mmap the
+    buffers, using the proven M5.0–M5.3a machinery + the PROMOTE_CTX VA maps.
+This is selective authoritative forwarding: fake the hard (UVM) parts, forward the
+compute parts where we have everything needed. It reuses all the M5.x work, fixes
+cuCtxCreate at its actual cause, and sidesteps the UVM-channel VAS problem.
+NEXT BUILD: identify the compute-context alloc/control/channel set (the 0xc1e…
+CUDA client's GR ctx + compute channel + PROMOTE_CTX'd buffers), forward those
+authoritatively, double-mmap their memory into the emulated FB, keep everything
+else faked. Then cup2 cuCtxCreate→cuMemAlloc→memcpy should pass.
+
+(superseded recommendation kept for history:) lean (b) for the FASTEST path
 (it reuses the working forge for the hard UVM channels and only forwards the
 compute channel, whose maps we already have via PROMOTE_CTX), with (a)'s
 machinery (now proven) kept for the compute channel's object tree. But this is a
