@@ -247,3 +247,33 @@ The dig confirmed full-SRIOV-VF is the only stock-driver "vGPU" posture -> real 
 (if unlockable on consumer GA106) is the path that yields HW chid-partition + HW doorbell
 translation for free; otherwise chid translation is a bounded per-channel cost, not the
 original collision nightmare.
+
+## 13. Doorbell transport DECISION (2026-06-05): read-only USERMODE page, trap-on-write
+
+The USERMODE 64KiB page is mostly reads (PTIMER TIME_0/1, CFG0, ERR_CONT) + one
+write target (DOORBELL @0x90). So:
+
+- Map the host's USERMODE register page into the guest as a **KVM_MEM_READONLY memslot**
+  (backed by QEMU's mmap of the host AMPERE_USERMODE_A object — same mmap-into-guest
+  machinery as Mode-1's GPA window, +the RO flag).
+  - **Reads → native** (no VM-exit): guest -> EPT -> host USERMODE registers. The GPU
+    nanosecond clock (PTIMER) and CFG0/ERR_CONT are read at hardware speed. Real win:
+    timestamp reads (CUDA events/profiling) cost nothing.
+  - **Writes → KVM_EXIT_MMIO -> QEMU** (the only writes are doorbell rings).
+- **Fast write handler** (the slightly-hot path): extract {runlistId, vChid} from the
+  token, O(1) array lookup vChid->host sChid, store {runlistId, sChid} to QEMU's RW
+  mapping of the host doorbell. ~sub-us CPU; VM-exit (~1-3us) dominates. Keep it
+  lockless/per-vCPU; no allocation; a flat per-runlist host_chid[] table.
+- **Adaptive**: if chid-identity holds (single-tenant, no host-channel collision, or real
+  SR-IOV) map the page **RW -> zero-trap doorbell**; else **RO -> trap-writes-only**.
+  Reads stay native in both modes. This is the perf knob: zero-trap best case, cheap
+  trap-per-submission-batch fallback (amortized for GPU-bound work, see §perf below).
+
+Perf framing: a doorbell ring submits a BATCH (CUDA-graph / coalesced GPFIFO), not one
+per kernel; ~1-3us/trap is hidden behind the GPU executing the batch. Mode-1 shipped a
++45us/launch tax (15-45x larger) at throughput parity on matmul+LLM decode because
+GPU-bound work hides submit overhead. So trap-write is a knob, not a showstopper.
+
+This makes the doorbell a clean instance of the data-plane object model (next doc): a
+"special" register-page object, RO-mapped, with a write-fault handler = chid-translate +
+forward. It is NOT GPU-physical-backed (corrects the older brainstorm).
