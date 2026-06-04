@@ -885,3 +885,29 @@ Then the host CE engine runs the memset and releases finishPayload -> guest poll
 cuCtxCreate proceeds to the next step. This is the M5.4 execution path; the CE scrubber is
 the right FIRST channel to forward (single buffer, no GR ctx). The GR compute channel
 follows the same recipe.
+
+### M5.4 CORRECTION (2026-06-04): 0x2efbaf000 identity NOT confirmed — page-table region
+
+A targeted write-trace of the 0x2ef FB region (non-zero writes) showed those writes are
+GMMU PAGE-TABLE entries being built by the guest RM (e.g. fb=0x2efbc2000 <- 0x2efbc302 =
+a PDE -> page 0x2efbc3000, valid/aperture low byte 0x02; chained 0x2efbc2->c3->c4->c5...),
+NOT a CE pushbuffer. The channel PDB is 0x2efba5000 and the page tables live at
+0x2efbc2000+. So 0x2efbaf000 (the 331x poll) sits INSIDE the guest's FB page-table region.
+
+=> The "CE scrubber finishPayload" identification (ce_utils.c, prior section) is a
+HYPOTHESIS, not confirmed. 0x2efbaf000 could instead be (a) a UVM/GSP page-table entry the
+guest polls waiting for a mapping to be populated, or (b) a notifier/semaphore the guest RM
+placed in that region. The CE-scrubber channel buffer (pushbuffer/GPFIFO/SET_SEMAPHORE) was
+NOT located by the 0x2ef-region write-trace (it is elsewhere, or written via a path not
+captured). Crude FB write-tracing is too noisy here (PRAMIN page-table builds dominate).
+
+NEXT DIAGNOSTIC (cleaner, before the execution build): identify exactly what 0x2efbaf000
+belongs to and its GPU VA. Options: (1) decode the pushbuffer methods (SET_SEMAPHORE_A/B
+operands give a sema GPU VA; correlate to 0x2efbaf000 via the channel VAS) — needs finding
+the pushbuffer first; (2) instrument the guest open driver (debug-only shim, the proven
+[[mode2_uvm_complete_proof]] technique) to print, at the busy-poll, the buffer's
+GPU-VA<->GPA + what RM call set it up; (3) correlate 0x2efbaf000 to a forwarded memory
+alloc's FB range (add FB-base tracking to forwarded 0x0040/0x003e allocs). Option (2) is the
+most decisive (the guest kernel knows what it's polling). THEN decide the execution-path
+backing. KEEP the confirmed wins: GR USERD double-mmap (step 1, committed, no regression)
+and the CRASHWIN/GPU-VA probes.
