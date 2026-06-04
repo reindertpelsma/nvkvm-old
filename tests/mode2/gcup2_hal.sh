@@ -20,40 +20,35 @@ cat > /tmp/hal.gdb <<'GDB'
 set pagination off
 set confirm off
 set breakpoint pending on
-break cuCtxCreate_v2
+set $armed = 0
+break *0x7ffff267acc4 if *(unsigned long*)$rbp == 0x7fffffffd660
 commands
   silent
-  set $b = (unsigned long)&cuVDPAUCtxCreate
-  break *($b + 0xc0e60) if $rdi == 0x7ffff007e010
-  commands
-    silent
-    set $o = *(unsigned long*)$rdi
-    printf "INV *(rdi)=%p", $o
-    if $o > 0x10000
-      set $y = *(unsigned long*)($o + 8)
-      printf " [+8]=%p", $y
-      if $y > 0x10000
-        set $sv = *(unsigned long*)($y + 0x40)
-        printf " [+0x40]=%p", $sv
-        if $sv > 0x10000
-          printf " *(sv+0xd78)=0x%x", *(unsigned int*)($sv + 0xd78)
-        end
-      end
-    end
-    set $q = *(unsigned long*)($rdi + 0x9488)
-    printf " rdi[0x9488]=%p", $q
-    if $q > 0x10000
-      printf " *q=0x%x", *(unsigned int*)$q
-    end
-    printf "\n"
-    continue
+  set $armed = 1
+  printf "[arm 47acc0] rbp=%p rsp=%p\n", $rbp, $rsp
+  continue
+end
+break *0x7ffff2697c88
+commands
+  silent
+  if $armed == 1
+    printf "[497b50 RET] rbp=%p rsp=%p eax=0x%x\n", $rbp, $rsp, $eax
+  end
+  continue
+end
+break *0x7ffff267acf8
+commands
+  silent
+  if $armed == 1
+    printf "[47acc0 RET] rbp=%p rsp=%p\n", $rbp, $rsp
+    set $armed = 2
   end
   continue
 end
 handle SIGSEGV stop nopass
 run
 echo \n==CRASH==\n
-printf "pc=%p rbp=%p\n", $pc, $rbp
+printf "pc=%p rbp=%p rsp=%p armed=%d\n", $pc, $rbp, $rsp, $armed
 GDB
 echo "=== gdb HAL inspect ==="
 sudo timeout 90 gdb -batch -nx -x /tmp/hal.gdb /tmp/cup2 2>&1 | grep -vE "Reading symbols|no debugging symbols|Thread|New Thread|^\[" | head -80

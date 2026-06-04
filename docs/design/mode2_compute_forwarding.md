@@ -771,3 +771,29 @@ NEXT (aligned with the docs, two tracks):
       range. Test if cuCtxCreate clears.
   (b) if GSP-internal mappings block it: guest nvidia.ko instrumentation (BAR0-backdoor report
       of GR context-buffer GPU-VA<->GPA), mirroring mode2_uvm_complete_proof.patch.
+
+### M5.3 CONCLUSIVE DIAGNOSIS (2026-06-04): guest-specific corruption in the alloc path
+
+Definitive host-vs-guest comparison of the SAME libcuda function under gdb:
+- HOST (bare metal, cup2 PASSES): the compute-context fn (cuVDPAUCtxCreate+0xc0e60) runs
+  8x; at the `call *0x560(%rax)` (-> 0x47acc0 -> 0x497b50, issues the 0xc7c0 RM_ALLOC)
+  rbp is PRESERVED across every call (AT-CALL rbp == AFTER-CALL rbp == 0x7fffffffd330, eax=0).
+- GUEST (crashes): SAME fn, SAME callee 0x47acc0, SAME halobj 0x7ffff7ca1fc0; AT-CALL
+  rbp=0x...d660 -> AFTER-CALL rbp=0 (eax=0). Crash at the next deref (0x466560).
+=> The corruption is GUEST-SPECIFIC and lives INSIDE the 0x47acc0->0x497b50 RM_ALLOC path,
+   NOT a libcuda bug. Mechanism (best supported): RSP corruption (the saved-rbp stack SLOT
+   is never zeroed per the ==0 watchpoint, the callee 0x47acc0 has a clean push/leave, yet
+   rbp returns 0 -> a stack-pointer imbalance, e.g. a variable-length stack alloc sized from
+   guest-divergent GPU-read data). Driven by un-backed GR-context GPU state.
+RULED OUT this session: control forge gaps (filled 0x20803601/0x20802a0a/0x20808162 -> crash
+unchanged), saved-value stack smash (watchpoint), C++ exception (catch throw), wrong heap
+reads (crash-site values valid: channel class 0xc56f, handle 0x5c000019), NVOS64 writeback
+divergence (byte-identical host/guest). Black-box libcuda RE is exhausted.
+
+THE FIX is the data-plane keystone (category-6 double-mmap of the GR-context buffers +,
+for GSP-internal mappings, the proven guest-instrumentation report a la
+mode2_uvm_complete_proof.patch). This is the flagged design fork (guest shim vs fuller
+fake-GSP page-table ownership) awaiting user steer. The FB->host overlay foundation
+(committed, inert) is the mechanism; populating it correctly needs the GR-context buffers'
+guest-FB<->host mapping, which is exactly what the address-virt #2 side-table + a guest
+report provide.
