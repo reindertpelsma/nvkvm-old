@@ -53,3 +53,4 @@ src/guest/modules.order
 # Claude Code session/memory (never commit — may hold secrets)
 .claude/
 host-libs-*/
+research_clones/
