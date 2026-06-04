@@ -96,8 +96,34 @@ gates (frontend NR / alloc class / control cmd / cross-VM hClient) before callin
 `nvkvm_isolate_ioctl()` — factor the gate checks into a shared helper and call it
 from both. Do NOT forward ungated.
 
+## Integration prerequisite (M5.0) — stand up the forwarding backend in Mode-2
+
+VERIFIED 2026-06-04: the Mode-2 VM instantiates ONLY `-device nvkvm-gpu-emul`
+(run_mode2_vm.sh:76; its own header comment line 12: "NO virtio-nvgpu / nvkvm-gpu
+identity device — Mode-2 forwards nothing yet"). So the Mode-1 forwarding backend
+(`VirtIONvgpu` singleton: isolate table, handle table, sparse GPA window, KVM-slot
+allocator) is **NOT initialized** — `nvkvm_get_global_device()` returns NULL and
+every reuse function above is unreachable. M5's true first step is to provide that
+backend. Two options:
+- **(A) Factor the backend out of `VirtIONvgpu`** into a standalone
+  `nvkvm_forward_backend` (isolate table + handle table + mmap/GPA-window state +
+  KVM fd) that `nvkvm_gpu_emul`'s realize() initializes directly — no virtio
+  device. Cleanest for Mode-2 (no spurious virtio-nvgpu in the guest).
+- **(B) Also instantiate a (headless) virtio-nvgpu backend** alongside the
+  emulated GPU purely for its infrastructure, ignoring its guest-facing virtqueue.
+  Faster to wire, but adds a guest-visible device we don't want.
+Recommend (A). Also resolve **GPA-window sharing**: Mode-1's GPA window is its own
+512 GiB KVM memslot; Mode-2's emulated GPU has its own FB BAR + the
+[[gpa-window-design]] window. Decide whether forwarded host buffers install into
+the emulated GPU's BAR-backed window or a dedicated Mode-2 forward window
+(MAP_FIXED slices either way). This is the one piece needing attended design
+before coding M5.1.
+
 ## Build increments (each commit-and-test; keep forge path as fallback)
 
+0. **M5.0 — backend init (above).** Factor `nvkvm_forward_backend` out of
+   `VirtIONvgpu`; initialize it in `nvkvm_gpu_emul` realize(); decide GPA-window
+   sharing. Gate behind a device property (default OFF).
 1. **M5.1 — isolate + root client.** On the guest's first forwardable
    GSP_RM_ALLOC (NV01_ROOT_CLIENT), lazily `nvkvm_isolate_create` a per-guest
    isolate, open a host /dev/nvidiactl handle, forward the alloc. Verify the stub
