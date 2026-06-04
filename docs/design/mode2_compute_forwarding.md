@@ -601,3 +601,24 @@ candidates for the keystone (next major milestone, likely worth user steer given
   (2) Direct host page-table fill: QEMU/stub writes the host VASpace's PTEs directly
       from the observed guest mappings (no host UVM), pointing at host backing.
   (1) reuses real UVM machinery (safer, matches residency design); (2) is lower-level.
+
+### M5.3 channel 0x1f diagnosis (2026-06-04): not memdescs; engineType/ctxshare differ
+
+After the EXTERNALLY_OWNED strip (VASpace/TSG/ctxshare all construct), the GR channel
+(0xc56f 0x5c000019) is at 0x1f INVALID_ARGUMENT. Compared working libcuda channels vs it:
+  memdescs (inst/userd/ramfc/mthd .base) are guest-FB offsets (addressSpace=2/FBMEM) in
+  BOTH — libcuda channels construct fine with them, so guest-FB bases are NOT the blocker
+  (host RM accepts/ignores them at alloc). Real differences on the UVM channel:
+    - engineType@128 = 0x0 (libcuda COPY channels: 0xb/0xc/0xd). The GR channel's TSG is
+      engineType=GRAPHICS(1); the channel passes 0 (NULL) — may need to match the TSG.
+    - hContextShare@24 = 0x5c000013 explicit (libcuda channels: 0, RM makes legacy default).
+    - gpFifoOff@8 = 0x200200000 (a UVM-managed GPU VA, unmapped in the fresh host VASpace).
+  Next: try engineType 0->GRAPHICS(1) (track TSG engineType by handle); if not, the
+  explicit-ctxshare channel path likely needs the gpFifoOffset VA mapped (RM_MAP_MEMORY_DMA
+  into the host VASpace) or specific channel flags. Then compute object should construct.
+
+NOTE the big win this tick: stripping IS_EXTERNALLY_OWNED makes the host build an
+RM-managed GR context (VASpace+TSG+ctxshare all OK), SIDESTEPPING the multi-week UVM
+keystone for host-side context construction. Remaining for cuCtxCreate-on-host: channel
+0x1f -> compute object, then back the guest's CPU-touched context buffers via the data
+plane. The guest keeps its UVM view; host uses RM-managed; reconcile at buffer level.

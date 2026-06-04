@@ -2348,8 +2348,21 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             uint32_t hctxshare = ldl_le_p(auxbuf + 24);
             uint32_t hvas      = ldl_le_p(auxbuf + 28);
             qemu_log("nvkvm-gpu[%s] M5.3 DIAG c56f obj=0x%08x hParent=0x%08x "
-                     "hContextShare@24=0x%08x hVASpace@28=0x%08x\n",
-                     s->chip->name, hObject, hParent, hctxshare, hvas);
+                     "hContextShare@24=0x%08x hVASpace@28=0x%08x gpFifoOff@8=0x%llx "
+                     "psize=%u\n", s->chip->name, hObject, hParent, hctxshare, hvas,
+                     (unsigned long long)ldq_le_p(auxbuf + 8), psize);
+            /* memory descriptors region (NV_MEMORY_DESC_PARAMS @144/168/192/216 for
+             * instanceMem/userdMem/ramfcMem/mthdbufMem; base@+0,addrSpace@+16) — the
+             * suspected two-RM reconciliation point (guest-FB bases). Dump u64s. */
+            if (psize >= 240) {
+                qemu_log("nvkvm-gpu[%s] M5.3 DIAG c56f memdescs: inst.base@144=0x%llx "
+                         "as@160=0x%x userd.base@168=0x%llx ramfc.base@192=0x%llx "
+                         "mthd.base@216=0x%llx engineType@128=0x%x\n", s->chip->name,
+                         (unsigned long long)ldq_le_p(auxbuf + 144), ldl_le_p(auxbuf + 160),
+                         (unsigned long long)ldq_le_p(auxbuf + 168),
+                         (unsigned long long)ldq_le_p(auxbuf + 192),
+                         (unsigned long long)ldq_le_p(auxbuf + 216), ldl_le_p(auxbuf + 128));
+            }
             if (hvas == 0u) {
                 uint32_t sub = 0;
                 for (int i = 0; i < s->m2_devvas_n; i++) {
