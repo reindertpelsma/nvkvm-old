@@ -65,6 +65,20 @@ except Exception as e:
 print(f"tid {tid}: poll nfds={nfds} -> {' '.join(fds)}")
 PYEOF
 done
+echo "=== re-poll vs blocked test (ctxt switches over 4s) ==="
+for t in /proc/$CPID/task/*; do
+    tid=$(basename "$t"); w=$(cat "$t/wchan" 2>/dev/null)
+    case "$w" in *poll*) ;; *) continue;; esac
+    v1=$(awk '/voluntary_ctxt/{print $2}' "$t/status" 2>/dev/null)
+    echo "tid $tid: ctxt_switches t0=$v1 (voluntary)"
+done
+sleep 4
+for t in /proc/$CPID/task/*; do
+    tid=$(basename "$t"); w=$(cat "$t/wchan" 2>/dev/null)
+    case "$w" in *poll*) ;; *) continue;; esac
+    v2=$(awk '/voluntary_ctxt/{print $2}' "$t/status" 2>/dev/null)
+    echo "tid $tid: ctxt_switches t1=$v2  (rising=re-polling, static=blocked)"
+done
 echo "=== kcmp dup test: are polled nvidia0 fds dups of os-event fds? ==="
 python3 - "$CPID" <<'PYEOF'
 import sys,ctypes,os
