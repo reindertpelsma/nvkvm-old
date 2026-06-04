@@ -448,3 +448,31 @@ zeroed). Once channels construct cleanly, 0xc7c0 should find its parent and
 construct → host self-promotes. The 0xc076 privileged profiler objects are a
 separate concern (probably skip/forge — not needed for compute). Then revisit the
 content-mirroring (double-mmap by bufferId) for libcuda-CPU-touched buffers.
+
+### M5.3 ROOT CAUSE pinned (2026-06-04): channelgroup embedded-handle not translated
+
+Full failure cascade for cuCtxCreate's compute context (the 0x5c0000xx RM-internal
+chain under UVM client 0xc1d00003 — note libcuda's OWN 0xcaf00xxx channel chains all
+forward OK):
+  [43] device   0x5c000002 (parent client 0xc1d00003) -> OK
+  [44] subdev   0x5c000003, [45] 0x2081, [46/47] VASPACE 0x5c000007/8 -> OK
+  [90] a06c channelgroup (parent device 0x5c000002, obj 0x5c000012) -> st=0x33
+       NV_ERR_INVALID_OBJECT_HANDLE  <-- THE ROOT
+  [92] c56f channel (parent group 0x5c000012) -> 0x57 OBJECT_NOT_FOUND (group missing)
+  [93] c7c0 AMPERE_COMPUTE_B (parent chan 0x5c000019) -> 0x57 (chan missing)
+
+INVALID_OBJECT_HANDLE on the channelgroup = an embedded object handle in its
+NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS (e.g. hVASpace) does not resolve on the host.
+`nvkvm_m2_shadow_fwd` remaps only h_root + h_object_parent — it copies alloc params
+verbatim (auxbuf), so any object handle EMBEDDED in the params reaches the host as a
+guest handle. For the 0xcaf00xxx libcuda chains it happens to work (their embedded
+refs are within the same forwarded set/verbatim), but the 0x5c0000xx (UVM
+RM-internal) channelgroup's embedded handle is wrong on the host. Matches the known
+residual "channelgroup VASpace handle INVALID_OBJECT_HANDLE".
+
+**NEXT (precise):** dump the 0xa06c alloc params (add a hex dump in shadow_fwd for
+hClass==0xa06c) to find which embedded handle field is the bad one; then translate
+embedded handles per-class in shadow_fwd (channelgroup hVASpace; channel hVASpace/
+hContextShare/hObjectError; compute-object none). Once the channelgroup constructs,
+the channel + compute object should follow, the host builds + self-promotes the GR
+context, and we move to mirroring the libcuda-CPU-touched buffers.
