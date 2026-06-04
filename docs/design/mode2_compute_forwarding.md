@@ -718,3 +718,31 @@ them directly. The data-plane keystone must therefore be solved one of:
       itself creates, not RM-internal GR buffers.
   (C) Privileged helper (rejected by the security constraint except for debugging).
 NEXT: host-vs-guest control-response diff to find the divergent forgeable value (approach A).
+
+### M5.3 DATA-PLANE implementation plan (2026-06-04, decision=double-mmap)
+
+User chose double-mmap (extend Mode-1 GPA-window). Feasibility nuance discovered:
+- Buffers libcuda/guest ALLOCATE explicitly (NV01_MEMORY_SYSTEM 0x003e / LOCAL_USER 0x0040,
+  channel inst/USERD) have RM handles -> we forward the alloc -> we can RM_MAP_MEMORY the
+  host copy (UNPRIVILEGED, proven primitive) -> double-mmap works.
+- RM-INTERNAL GR golden-context buffers have NO userspace handle -> locating the host
+  counterpart needs GR_GET_CTX_BUFFER_INFO (PRIVILEGED 0x1b) -> double-mmap blocked for them.
+The crash object is a libcuda HEAP struct built from earlier GPU-state reads; need to learn
+empirically whether the choke data lives in mappable buffers.
+
+PLAN (incremental, each step testable):
+1. FB->host overlay mechanism (FOUNDATION, safe/inert until populated): a small table
+   m2_fbback[]{fb_base,size,host_qva}; nvkvm_fb_read/write (and the BAR1/PRAMIN paths that
+   reach FB) check it first and redirect to host_qva. No behavior change when empty.
+2. Populate it for handle-bearing GR-context vidmem objects: when shadow_fwd forwards a
+   0x0040/0x003e memory object under the GR client, RM_MAP_MEMORY the host copy + mmap into
+   QEMU, and register the guest-FB range it occupies (from the object's memdesc / the
+   channel inst/userd/ramfc memdescs we already log) -> guest BAR1/PRAMIN reads of that
+   range return REAL host GPU content.
+3. Test cup2: does cuCtxCreate get past the crash? If yes -> the choke buffer was mappable;
+   continue to back GPFIFO/USERD for submission. If no -> the choke is RM-internal golden
+   context (privilege wall) -> escalate to user (narrow privileged helper vs forge).
+4. Once cuCtxCreate passes: converge to KVM-memslot backing (not per-access FB redirect) for
+   the hot buffers (doorbell/USERD/data) so the data plane is zero-copy/no-trap = host parity
+   (per [[mode2-dataplane-decision]] perf analysis). The FB-redirect of step 1-2 is the
+   bring-up mechanism; memslot is the perf endpoint.

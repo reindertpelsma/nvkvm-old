@@ -24,25 +24,30 @@ break cuCtxCreate_v2
 commands
   silent
   set $b = (unsigned long)&cuVDPAUCtxCreate
-  break *($b + 0xd5664) if *(unsigned long*)$rbp == 0x7fffffffd660
+  break *($b + 0xc0e60) if $rdi != 0 && *(unsigned long*)$rdi != 0
   commands
     silent
-    set $wa = $rbp
-    printf "ARMED watchpoint on saved-rbp slot %p (holds %p)\n", $wa, *(unsigned long*)$wa
-    watch *(unsigned long*)$wa if *(unsigned long*)$wa == 0
+    set $a0 = $rdi
+    set $p1 = *(unsigned long*)($a0 + 8)
+    printf "FN-ENTRY a0=%p a0[8]=%p", $a0, $p1
+    if $p1 > 0x1000
+      set $saved = *(unsigned long*)($p1 + 0x40)
+      printf " a0[8][0x40]=%p", $saved
+      if $saved > 0x1000
+        printf " *(saved+0xd78)=%p", *(unsigned int*)($saved + 0xd78)
+      end
+    end
+    printf " rbx=%p rbx[0x9488]=%p\n", $rbx, *(unsigned long*)($rbx + 0x9488)
     continue
   end
   continue
 end
 handle SIGSEGV stop nopass
 run
-echo \n==SMASH-CAUGHT (slot went 0)==\n
-printf "pc=%p\n", $pc
-x/4i $pc
-echo --regs--
-printf "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p r8=%p\n", $rax,$rbx,$rcx,$rdx,$rsi,$rdi,$r8
-echo --bt--
-bt 8
+echo \n==CRASH==\n
+printf "pc=%p rbp=%p\n", $pc, $rbp
+echo "-- which mapping is rbx, and the saved ptr? check /proc/PID/maps offsets --"
+info proc mappings
 GDB
 echo "=== gdb HAL inspect ==="
 sudo timeout 90 gdb -batch -nx -x /tmp/hal.gdb /tmp/cup2 2>&1 | grep -vE "Reading symbols|no debugging symbols|Thread|New Thread|^\[" | head -80

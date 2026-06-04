@@ -296,6 +296,14 @@ struct NvkvmGpuEmul {
      * GPU state (the proven cuCtxCreate fix). Tracked per GR client. */
     struct { uint32_t client, subdev; } m2_subdev[64];
     int      m2_subdev_n;
+    /* M5.3 DATA-PLANE (double-mmap): FB ranges backed by real host GPU memory. When the
+     * guest reads/writes a context-buffer FB address that we've backed with the host
+     * shadow context's counterpart (mapped via the proven RM_MAP_MEMORY primitive), serve
+     * it from host_qva instead of the local g_malloc0 FB page — so the guest sees real
+     * GPU-initialized state (the proven cuCtxCreate fix). Inert until populated. The
+     * bring-up mechanism; KVM-memslot backing is the perf endpoint (see design doc). */
+    struct { uint64_t fb_base, size; void *host_qva; } m2_fbback[32];
+    int      m2_fbback_n;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -344,9 +352,34 @@ static uint8_t *nvkvm_fb_page(NvkvmGpuEmul *s, uint64_t fb_addr, bool alloc)
     return p;
 }
 
+/* M5.3 DATA-PLANE: if fb_addr falls in a range backed by real host GPU memory
+ * (double-mmap), return the host VA for that byte; else NULL (use local FB page).
+ * Inert until m2_fbback[] is populated. */
+static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
+{
+    for (int i = 0; i < s->m2_fbback_n; i++) {
+        if (fb_addr >= s->m2_fbback[i].fb_base &&
+            fb_addr <  s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
+            return (uint8_t *)s->m2_fbback[i].host_qva +
+                   (fb_addr - s->m2_fbback[i].fb_base);
+        }
+    }
+    return NULL;
+}
+
 /* Aligned reg accesses never straddle a 4 KiB page. */
 static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 {
+    uint8_t *hp = (s->m2_fbback_n ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
+    if (hp) {                            /* M5.3: served from real host GPU memory */
+        switch (size) {
+        case 1: return *hp;
+        case 2: return lduw_le_p(hp);
+        case 4: return ldl_le_p(hp);
+        case 8: return ldq_le_p(hp);
+        default: return 0;
+        }
+    }
     uint8_t *p = nvkvm_fb_page(s, fb_addr, false);
     uint32_t o = fb_addr & 0xfffu;
     if (!p) {
@@ -364,6 +397,17 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
                            unsigned size)
 {
+    uint8_t *hp = (s->m2_fbback_n ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
+    if (hp) {                            /* M5.3: written through to real host GPU memory */
+        switch (size) {
+        case 1: *hp = (uint8_t)val; break;
+        case 2: stw_le_p(hp, (uint16_t)val); break;
+        case 4: stl_le_p(hp, (uint32_t)val); break;
+        case 8: stq_le_p(hp, val); break;
+        default: break;
+        }
+        return;
+    }
     uint8_t *p = nvkvm_fb_page(s, fb_addr, true);
     uint32_t o = fb_addr & 0xfffu;
     switch (size) {
