@@ -5,6 +5,68 @@ Status: design, code-accurate, 2026-06-04. This is the buildable plan for M5
 guest's RM control plane to a real host GPU and backing all GPU memory with real
 hardware. Supersedes the high-level M5 bullet in [[mode2-plan]].
 
+## STATUS 2026-06-04: control-plane forwarding WORKS; data-plane is the decision
+
+The shadow-forward harness (commits 4d37233→2e1bd54) drove the guest's REAL RM
+stream onto the live GA106 through every reconciliation layer, each empirically
+guided by the host kernel's own dmesg:
+- clients remapped (0xc1xxxxxx collide with host clients → 0xdeadNNNN) [M5.1b]
+- FREE forwarded; error-notifier dropped [M5.1c]
+- channel USERD/instance: zero hUserdMemory[0] → host RM allocates them [M5.3a]
+=> the FULL object tree, **including channels (class 0xc56f), now constructs on
+the real GPU** for the primary client. Two known residuals: non-kernel-priv
+forwarded clients can't skip the memory scrubber (chid exhaustion for the compute
+/RM-internal clients), and a channel-group VASpace handle for some clients.
+
+### The remaining work is the DATA PLANE, and it forks (a decision)
+Everything above is the control plane (object tree). Real compute needs the
+data plane: the guest must actually RUN on the host channels. Two paths, and the
+choice has large effort implications — flagging it as the architectural decision:
+
+- **(a) Continue op-by-op forwarding + double-mmap (authoritative).** We're far
+  along (tree + channels forward). Remaining: flip shadow→authoritative (return
+  host results to the guest); **VAS reconciliation** — make the host channel's
+  VAS map the SAME GPU-VAs the guest chose (gpFifoOffset 0x121010000, pushbuffers
+  0x120000000…) so the guest's GPFIFO contents (which reference guest GPU-VAs)
+  are valid on the host GPU; double-mmap the host channel's RM-allocated
+  USERD/GPFIFO into the guest's emulated FB at the guest's offsets so the guest's
+  GP_PUT drives real silicon; resolve the scrubber/priv + vaspace residuals. The
+  hard part is VAS reconciliation — the guest's and host's CPU-RM each pick their
+  own VA/FB layout, and bridging them per-buffer is the long tail's tail.
+- **(b) Clean host context + forward only compute.** Keep faking the control
+  plane (cuInit already works), maintain OUR OWN clean host GR/compute context
+  (built once by QEMU), copy its golden context image into the guest's emulated
+  context buffers (fixes the cuCtxCreate crash without mirroring allocs), and
+  forward only the COMPUTE pushbuffers with guest-GPU-VA→host-GPU-VA translation
+  (the PROMOTE_CTX side-table) + double-mmap of the compute buffers. Shorter
+  reconciliation (only buffer addresses, not the whole object tree + VAS), but
+  needs the golden-image copy + matching the guest's context config + compute
+  replay.
+
+COMPLICATION (found 2026-06-04): in GSP-RM the VA→phys maps for the cuInit/UVM
+channels are filled GSP-side — there is NO forwardable MAP_MEMORY_DMA (fn=14) in
+the stream (only fn=76/103/10). So path (a)'s VAS reconciliation can NOT be done
+by forwarding the guest's maps for those channels (they don't exist as RPCs). It
+CAN for the compute/GR context (PROMOTE_CTX carries the VA↔phys). So:
+- Path (a) works cleanly for the COMPUTE channel (PROMOTE_CTX gives the VA maps)
+  but for the UVM/RM-internal channels we'd have to reconstruct the host VAS some
+  other way (e.g. let the host RM map at the same gpFifoOffset via the channel
+  alloc's gpFifoOffset field, which IS in the params, + accept RM's other layout).
+- Path (b) sidesteps the UVM-channel VAS entirely: keep faking them (cuInit
+  already works that way via the forge), copy a captured host GR golden-context
+  image into the guest's context buffer to clear the cuCtxCreate crash, and
+  forward only the compute channel (which HAS PROMOTE_CTX maps). The golden image
+  is mostly VA-independent GR pipeline state, so a one-time capture+replay is
+  plausible; verify it doesn't embed context-specific VAs.
+
+REVISED RECOMMENDATION: lean (b) for the FASTEST path to first cuCtxCreate+compute
+(it reuses the working forge for the hard UVM channels and only forwards the
+compute channel, whose maps we already have via PROMOTE_CTX), with (a)'s
+machinery (now proven) kept for the compute channel's object tree. But this is a
+real strategic fork with large effort either way — the USER's call, given the
+GSP-internal-map complication makes neither obviously dominant. Control-plane
+forwarding (object tree + channels) is DONE and reusable in both.
+
 ## Why (the gate)
 
 cuCtxCreate crashes because the GR/context buffers are never populated by real
