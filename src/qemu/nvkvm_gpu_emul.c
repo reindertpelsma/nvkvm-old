@@ -268,6 +268,7 @@ struct NvkvmGpuEmul {
     uint32_t m2_iso_id;                  /* the per-guest host isolate id            */
     uint32_t m2_ctl_h;                   /* handle for /dev/nvidiactl in the isolate */
     uint32_t m2_gpu_h;                   /* handle for /dev/nvidia0                   */
+    int      m2_gpu_fd;                  /* the stub's /dev/nvidia0 fd in QEMU (SCM_RIGHTS) — for mmap */
     uint32_t m2_fwd_n;                   /* count of forwarded RPCs (diag)           */
     /* M5.1b: guest RM client handle -> host (synthetic, non-colliding) client.
      * Guest client handles live in the global 0xc1xxxxxx namespace and collide
@@ -2149,9 +2150,10 @@ static bool nvkvm_m2_iso_ensure(NvkvmGpuEmul *s)
         s->m2fwd = false;
         return false;
     }
-    int fd = -1;
-    int r1 = nvkvm_isolate_open_device(&s->m2_iso, id, 1, NVKVM_DEV_CTL,    O_RDWR, &fd);
-    int r2 = nvkvm_isolate_open_device(&s->m2_iso, id, 2, NVKVM_DEV_GPU(0), O_RDWR, &fd);
+    int ctlfd = -1, gpufd = -1;
+    int r1 = nvkvm_isolate_open_device(&s->m2_iso, id, 1, NVKVM_DEV_CTL,    O_RDWR, &ctlfd);
+    int r2 = nvkvm_isolate_open_device(&s->m2_iso, id, 2, NVKVM_DEV_GPU(0), O_RDWR, &gpufd);
+    s->m2_gpu_fd = gpufd;   /* the stub's /dev/nvidia0 fd in QEMU's process (SCM_RIGHTS) */
     if (r1 != 0 || r2 != 0) {
         qemu_log("nvkvm-gpu[%s] M5.1: open ctl/gpu FAILED r1=%d r2=%d — forwarding OFF\n",
                  s->chip->name, r1, r2);
@@ -2270,6 +2272,113 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
              "hObj=0x%08x -> rc=%d status=0x%x%s\n", s->chip->name, s->m2_fwd_n,
              hClass, hParent, hObject, rc, p.status,
              (rc == 0 && p.status == 0) ? "  OK" : "  <-- ERR/MISMATCH");
+}
+
+/* M5.3 helper: forward one RM_ALLOC (NVOS64) with client remap; returns nvstatus. */
+static int nvkvm_m2_alloc1(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hParent,
+                           uint32_t hObject, uint32_t hClass,
+                           void *aux, uint32_t auxlen, uint32_t *st)
+{
+    struct nvos64_parameters p;
+    memset(&p, 0, sizeof(p));
+    p.h_root = nvkvm_m2_client(s, hClient);
+    p.h_object_parent = nvkvm_m2_client_known(s, hParent) ? nvkvm_m2_client(s, hParent)
+                                                          : hParent;
+    p.h_object_new = hObject; p.h_class = hClass; p.alloc_parms_size = auxlen;
+    unsigned int ic = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC;
+    uint32_t nv = 0; uint64_t f = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, ic,
+                                 &p, sizeof(p), aux, auxlen, 0, &nv, &f);
+    if (st) { *st = p.status; }
+    return rc;
+}
+
+/* M5.3 DATA-PLANE PROOF: validate that QEMU can put REAL host GPU memory into its
+ * own address space via the isolate's /dev/nvidia0 fd (received over SCM_RIGHTS).
+ * Build a minimal client→device→subdevice→vidmem on the host GPU, RM_MAP_MEMORY
+ * it, mmap QEMU's fd at the returned offset, write+read a pattern. This is the
+ * foundation of the double-mmap (back the guest's FB/GPA with this host VA). */
+static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
+{
+    if (!nvkvm_m2_iso_ensure(s)) {
+        return;
+    }
+    const uint32_t C = 0xc1ee0001u, DEV = 0xde100001u, SUB = 0xde100002u,
+                   MEM = 0xde100003u;
+    uint32_t st = 0xffff;
+    /* client (NV01_ROOT): aux = NV0000_ALLOC_PARAMS {hClient} */
+    uint32_t c0 = C;
+    nvkvm_m2_alloc1(s, C, 0, 0, 0x0u, &c0, sizeof(c0), &st);
+    qemu_log("nvkvm-gpu[%s] MEMTEST client    -> 0x%x\n", s->chip->name, st);
+    /* device NV01_DEVICE_0 (0x0080): NV0080_ALLOC_PARAMS (deviceId + handles), 56B zeros */
+    uint8_t dev[56]; memset(dev, 0, sizeof(dev));
+    nvkvm_m2_alloc1(s, C, C, DEV, 0x0080u, dev, sizeof(dev), &st);
+    qemu_log("nvkvm-gpu[%s] MEMTEST device    -> 0x%x\n", s->chip->name, st);
+    /* subdevice NV20_SUBDEVICE_0 (0x2080): NV2080_ALLOC_PARAMS {subDeviceId}, 4B */
+    uint32_t sub = 0;
+    nvkvm_m2_alloc1(s, C, DEV, SUB, 0x2080u, &sub, sizeof(sub), &st);
+    qemu_log("nvkvm-gpu[%s] MEMTEST subdevice -> 0x%x\n", s->chip->name, st);
+    /* vidmem NV01_MEMORY_LOCAL_USER (0x0040): nv_memory_allocation_params_v545 */
+    struct nv_memory_allocation_params_v545 mp;
+    memset(&mp, 0, sizeof(mp));
+    mp.owner = C;
+    mp.type  = 0;                            /* NVOS32_TYPE_IMAGE */
+    mp.attr  = (2u << 27) | (1u << 25);      /* CONTIGUOUS | LOCATION_PCI (sysmem, CPU-mappable) */
+    mp.size  = 0x10000;                      /* 64 KiB */
+    mp.alignment = 0x10000;
+    nvkvm_m2_alloc1(s, C, DEV, MEM, 0x003eu, &mp, sizeof(mp), &st);  /* NV01_MEMORY_SYSTEM */
+    qemu_log("nvkvm-gpu[%s] MEMTEST vidmem    -> 0x%x size=0x%llx\n", s->chip->name,
+             st, (unsigned long long)mp.size);
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] MEMTEST: vidmem alloc failed; abort mmap proof\n",
+                 s->chip->name);
+        return;
+    }
+    /* Open a FRESH /dev/nvidia0 dedicated to this mapping (nvidia binds one memory
+     * mapping per fd). QEMU receives that fd via SCM_RIGHTS to mmap it. */
+    int mapfd = -1;
+    int ro = nvkvm_isolate_open_device(&s->m2_iso, s->m2_iso_id, 3,
+                                       NVKVM_DEV_GPU(0), O_RDWR, &mapfd);
+    qemu_log("nvkvm-gpu[%s] MEMTEST map-fd open rc=%d qemufd=%d\n",
+             s->chip->name, ro, mapfd);
+    /* RM_MAP_MEMORY (NVOS33): bind the vidmem to the fresh fd; then mmap(fd,0). */
+    struct nv_ioctl_nvos33_parameters_with_fd mm;
+    memset(&mm, 0, sizeof(mm));
+    mm.h_client = nvkvm_m2_client(s, C);
+    mm.h_device = DEV;
+    mm.h_memory = MEM;
+    mm.length   = 0x10000;
+    mm.fd       = 3;                      /* handle_id of the fresh fd (stub translates) */
+    unsigned int mc = (3u << 30) | ((unsigned int)sizeof(mm) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_MAP_MEMORY;
+    uint32_t mnv = 0; uint64_t mf = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, 3 /*the fresh map fd*/, mc,
+                                 &mm, sizeof(mm), NULL, 0, 0, &mnv, &mf);
+    qemu_log("nvkvm-gpu[%s] MEMTEST map -> rc=%d status=0x%x offset=0x%llx fd=%d\n",
+             s->chip->name, rc, mm.status,
+             (unsigned long long)(uintptr_t)mm.p_linear_address, mm.fd);
+    if (mm.status != 0 || rc != 0 || mapfd < 0) {
+        qemu_log("nvkvm-gpu[%s] MEMTEST: map failed (rc=%d st=0x%x mapfd=%d)\n",
+                 s->chip->name, rc, mm.status, mapfd);
+        return;
+    }
+    /* mmap QEMU's copy of the fresh mapping fd at the RM offset (fd-based: 0). */
+    off_t moff = (off_t)(uintptr_t)mm.p_linear_address;
+    void *hva = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     mapfd, moff);
+    if (hva == MAP_FAILED) {
+        qemu_log("nvkvm-gpu[%s] MEMTEST: mmap(fd=%d off=0x%llx) FAILED: %s\n",
+                 s->chip->name, mapfd, (unsigned long long)moff, strerror(errno));
+        return;
+    }
+    volatile uint32_t *p = (volatile uint32_t *)hva;
+    p[0] = 0xc0ffee01u; p[1] = 0xdeadbeefu;
+    uint32_t r0 = p[0], r1 = p[1];
+    qemu_log("nvkvm-gpu[%s] MEMTEST: *** mmap OK hva=%p  wrote/read 0x%08x 0x%08x "
+             "-> %s ***  DATA PLANE PRIMITIVE WORKS\n", s->chip->name, hva, r0, r1,
+             (r0 == 0xc0ffee01u && r1 == 0xdeadbeefu) ? "PASS" : "MISMATCH");
+    munmap(hva, 0x10000);
 }
 
 static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
@@ -2400,6 +2509,10 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 
     /* M5.1: forwarding (m2fwd) is lazy — the per-guest host isolate is created on
      * the first forwarded alloc in the cmdq path (nvkvm_m2_shadow_fwd). */
+    /* M5.3: one-shot data-plane proof (QEMU mmaps real host GPU vidmem). */
+    if (s->m2fwd) {
+        nvkvm_m2_memtest(s);
+    }
 }
 
 static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
