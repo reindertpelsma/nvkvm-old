@@ -393,3 +393,31 @@ object into a VASpace (hDma) at a caller-chosen GPU VA (`dmaOffset` with
 Recommended next: confirm the GR-context VA-vs-phys question by source, then wire
 RM_MAP_MEMORY_DMA into the channel VAS for the 6 cup2 context buffers + memslot the
 guest-FB ranges, and re-run cup2.
+
+### M5.3 BREAKTHROUGH INSIGHT (2026-06-04): GR context is kernel-RM-self-promoted
+
+Source: kernel_graphics_object.c `kgrobjPromoteContext` builds PROMOTE_CTX entries
+via `kgrctxPrepareInitializeCtxBuffer` (PA, from the buffer's MEMORY_DESCRIPTOR —
+`pEngCtx->pMemDesc`, `pmCtxswBuffer.pMemDesc`) + `kgrctxPreparePromoteCtxBuffer`
+(VA). The GR context buffers are **allocated and managed by the kernel RM itself**
+during GR-object/channel construction — NOT by guest userspace.
+
+**Consequence (eliminates the privileged-phys problem):** when we forward the GR
+object alloc (fn=103, compute class e.g. AMPERE_COMPUTE_A) to the host, the HOST
+kernel RM allocates its OWN GR context buffers (host memdescs, host-phys) and issues
+its OWN PROMOTE_CTX entirely in-kernel — no unprivileged client ever needs host-phys,
+and we do NOT forward or rewrite the guest's PROMOTE_CTX. The guest's PROMOTE_CTX
+stays a forge (as today).
+
+**The real remaining data-plane problem (reframed):** mirror the HOST's GR
+context-buffer CONTENTS into the guest's view, but ONLY for the buffers libcuda
+actually CPU-touches (the crash is libcuda reading a context buffer that holds NULL
+where a real pointer belongs). Kernel-only ctxsw buffers (engine ctx, PM) never need
+mirroring — the host GPU uses them in-place. libcuda-mapped buffers (patch / global /
+bundle CB) DO: those are the double-mmap targets, matched by bufferId.
+
+**Verify next (cup2):** confirm a compute-class GR object alloc is forwarded and the
+host RM logs its own context-buffer alloc+promote; then identify which PROMOTE_CTX
+bufferIds libcuda CPU-maps (the 0x200xxxxxxx mmaps) and double-mmap only those host
+buffers (RM_MAP_MEMORY_DMA into the channel VAS for GPU side + memslot/fb-redirect
+for the guest CPU side). This is far smaller than backing all 6 buffers.
