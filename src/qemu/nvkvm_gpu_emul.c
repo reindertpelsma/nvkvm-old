@@ -2284,16 +2284,16 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
      * hVASpace@0. The GR context share (under the GR TSG) leaves it 0 (device
      * default) → NV_ERR_INVALID_STATE (0x40) on the host, and it must match the
      * TSG/channel VASpace. Substitute the same first-VASpace-for-client. */
-    if (hClass == 0x9067u && psize >= 4 && ldl_le_p(auxbuf) == 0u) {
+    if (hClass == 0x9067u && psize >= 12) {
+        uint32_t cvas = ldl_le_p(auxbuf), cfl = ldl_le_p(auxbuf + 4),
+                 csub = ldl_le_p(auxbuf + 8);
         uint32_t sub = 0;
         for (int i = 0; i < s->m2_devvas_n; i++) {
             if (s->m2_devvas[i].client == hClient) { sub = s->m2_devvas[i].vas; break; }
         }
-        if (sub) {
-            stl_le_p(auxbuf, sub);
-            qemu_log("nvkvm-gpu[%s] M5.3 9067 ctxshare hVASpace 0 -> 0x%08x\n",
-                     s->chip->name, sub);
-        }
+        qemu_log("nvkvm-gpu[%s] M5.3 DIAG 9067 ctxshare hVASpace@0=0x%08x flags@4=0x%x "
+                 "subctxId@8=0x%x hClient=0x%08x trackedVAS=0x%08x (devvas_n=%d)\n",
+                 s->chip->name, cvas, cfl, csub, hClient, sub, s->m2_devvas_n);
     }
     /* M5.1c experiment: for channel classes, drop hObjectError (params+0) — its
      * error-notifier memory object isn't forwarded yet, so RM's notifier lookup
