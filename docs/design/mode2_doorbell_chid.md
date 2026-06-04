@@ -163,3 +163,28 @@ Passthrough implications:
   TRAP) vs a channel (wants PASSTHROUGH). Per-register trapping can't split by value, so
   VERIFY the guest rings GSP via the separate GSP queue doorbell 0x110c00 (what our
   emulator observes) and only uses 0x90 for channel submit — esp. under legacy-vGPU posture.
+
+## 10. GSP_DOORBELL wrinkle RESOLVED (2026-06-05): Blackwell-only; vGPU RPC uses a separate PRIV doorbell
+
+Confirmed from source:
+- `NV_VIRTUAL_FUNCTION_DOORBELL_GSP_DOORBELL` (bit 31) is defined ONLY in
+  `blackwell/gb100/dev_vm.h` — it does NOT exist on Ampere. The GA100/GA102 doorbell
+  register has no GSP bit, and `kfifoGenerateWorkSubmitToken_GA100` sets only RUNLIST_ID
+  + VECTOR (bit 31 = 0). => On GA106 the userspace VF doorbell (win 0x90) is
+  structurally CHANNEL-SUBMIT-ONLY; it cannot ring GSP. The §8 wrinkle does not apply.
+- vGPU RPC notification uses a SEPARATE privileged doorbell: `NV_VIRTUAL_FUNCTION_PRIV_DOORBELL`
+  @ 0x2200 (inside the PRIV region 0x0-0x2FFFF, kernel-mapped, NOT the userspace page).
+  `vgpu/arch/ampere/rpcga102.c:49` rings it: `GPU_VREG_WR32(.., PRIV_DOORBELL, doorbellToken)`
+  with NV_DOORBELL_NOTIFY_LEAF_VF_RPC_* tokens (SETUP/MESSAGE_REQUEST, nv_sriov_defines.h).
+  Also used by intr_sriov_tu102.c, kernel_gsp_gh100.c, kernel_hostvgpudeviceapi.c
+  (TRIGGER_PRIV_DOORBELL).
+
+=> In legacy-vGPU posture the control/data doorbell split is HARDWARE-NATIVE, by privilege/page:
+  - CONTROL (vGPU RPC -> host: chid/channel/instmem allocs): PRIV_DOORBELL 0x2200 (PRIV
+    region, privileged page) -> TRAP. This is the interception point for the vGPU control
+    plane (where we receive the RPCs to forward to the host RM).
+  - DATA (channel work submit): userspace VF doorbell win 0x90 (token {runlist,chid},
+    no GSP bit on Ampere) -> PASSTHROUGH.
+  Different pages by privilege => the per-page trap/passthrough split is native, not engineered.
+This RESOLVES §8 verify-item #2 and strengthens §6: legacy-vGPU gives both host-authoritative
+chid/instmem AND a clean control(0x2200)/data(0x90) doorbell separation.
