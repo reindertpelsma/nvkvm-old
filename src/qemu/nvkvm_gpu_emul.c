@@ -983,6 +983,31 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             static uint8_t resp[NVKVM_RESP_MAX];
             memset(resp, 0, sizeof(resp));
             memcpy(resp, cmd, 4096);
+            /* M5.3 FIX (cuCtxCreate SIGSEGV): GR-object allocs (compute/3D, e.g.
+             * AMPERE_COMPUTE_B 0xc7c0) register NV_GR_ALLOCATION_PARAMETERS (16B)
+             * as RS_OPTIONAL.  libcuda passes a non-NULL pAllocParms backed by only
+             * an 8-byte stack slot with paramsSize=0; a real GSP returns paramsSize=0
+             * (no params writeback) so the host driver copies 0 bytes back.  Our echo
+             * reply returned the full 16B params, and the guest's GSP-client deserialize
+             * copied 16B into libcuda's 8-byte buffer — clobbering a saved rbp on the
+             * stack -> NULL-rbp deref -> SIGSEGV in cuCtxCreate (proven byte-exact,
+             * host-vs-guest, 2026-06-04).  Match the real GSP: drop the params from the
+             * reply for GR objects so the guest copies nothing back.  GR object classes:
+             * low byte 0xC0 (compute) / 0x97 (3D), family >= 0xB0; excludes DMA-copy
+             * (0xB5), subdevice (0x2080), channel (0x..6F). */
+            if (fn == 103) {
+                uint32_t hc = ldl_le_p(resp + 92);
+                uint32_t lb = hc & 0xffu, fam = (hc >> 8) & 0xffu;
+                uint32_t opsize = ldl_le_p(resp + 100);
+                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) && opsize) {
+                    stl_le_p(resp + 100, 0);                 /* paramsSize = 0 */
+                    uint32_t rlen = ldl_le_p(resp + 56);
+                    stl_le_p(resp + 56, rlen > opsize ? rlen - opsize : rlen);
+                    qemu_log("nvkvm-gpu[%s] M5.3 GR-obj 0x%04x reply paramsSize %u->0 "
+                             "(match real GSP; avoid libcuda pAllocParms overflow)\n",
+                             s->chip->name, hc, opsize);
+                }
+            }
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
             if (fn == 76) {
                 stl_le_p(resp + 92, 0); /* body.status = NV_OK (default) */
