@@ -24,23 +24,25 @@ break cuCtxCreate_v2
 commands
   silent
   set $b = (unsigned long)&cuVDPAUCtxCreate
-  printf "CUCTX entry; base=0x%lx\n", $b
   break *($b + 0xd5664) if *(unsigned long*)$rbp == 0x7fffffffd660
   commands
     silent
-    printf "IN 0x47acc0: saved-rbp slot @%p holds %p\n", $rbp, *(unsigned long*)$rbp
-    watch *(unsigned long*)$rbp
+    set $wa = $rbp
+    printf "ARMED watchpoint on saved-rbp slot %p (holds %p)\n", $wa, *(unsigned long*)$wa
+    watch *(unsigned long*)$wa if *(unsigned long*)$wa == 0
     continue
   end
   continue
 end
 handle SIGSEGV stop nopass
 run
-echo \n==WATCH/STOP==\n
+echo \n==SMASH-CAUGHT (slot went 0)==\n
 printf "pc=%p\n", $pc
-x/5i $pc
-echo --backtrace--
-bt 12
+x/4i $pc
+echo --regs--
+printf "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p r8=%p\n", $rax,$rbx,$rcx,$rdx,$rsi,$rdi,$r8
+echo --bt--
+bt 8
 GDB
 echo "=== gdb HAL inspect ==="
 sudo timeout 90 gdb -batch -nx -x /tmp/hal.gdb /tmp/cup2 2>&1 | grep -vE "Reading symbols|no debugging symbols|Thread|New Thread|^\[" | head -80

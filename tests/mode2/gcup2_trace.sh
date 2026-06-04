@@ -18,8 +18,8 @@ nvcc -o /tmp/cup2 /tmp/cup2.c -lcuda 2>&1 | head -3
 gcc -shared -fPIC -o /tmp/ioctl_trace.so /tmp/ioctl_trace.c -ldl 2>&1 | head -3
 echo "=== running cup2 with ioctl tracer ==="
 sudo env NVKVM_TRACE=/tmp/ioctl_trace.log LD_PRELOAD=/tmp/ioctl_trace.so timeout 60 /tmp/cup2 2>&1 | tail -8
-echo "=== trace tail (last 60 RM ioctls before crash) ==="
-tail -60 /tmp/ioctl_trace.log 2>/dev/null
+echo "=== FULL CTRL OUT stream (for host-vs-guest diff) ==="
+grep -E "^CTRL=" /tmp/ioctl_trace.log 2>/dev/null
 echo "=== trace control-cmd histogram ==="
 grep -oE "CTRL  cmd=0x[0-9a-f]+" /tmp/ioctl_trace.log 2>/dev/null | sort | uniq -c | sort -rn | head -20
 echo "=== dmesg ==="
