@@ -277,3 +277,32 @@ GPU-bound work hides submit overhead. So trap-write is a knob, not a showstopper
 This makes the doorbell a clean instance of the data-plane object model (next doc): a
 "special" register-page object, RO-mapped, with a write-fault handler = chid-translate +
 forward. It is NOT GPU-physical-backed (corrects the older brainstorm).
+
+## §14 Doorbell trap as channel demux: fake kernel channels, forward userspace (user, 2026-06-05)
+
+Because chids need translation (guest vChid namespace != host sChid), the doorbell write MUST be
+trapped (no zero-trap/identity shortcut in the general case). That mandatory trap is also a free
+per-kick DEMUX point — at each doorbell we know which channel is rung (token->chid). Use it to
+split work:
+
+- **Kernel-internal channels** (the RM scrubber channel, other RM bookkeeping): SIMULATE
+  completion at the trap — write the channel's completion semaphore + raise the expected
+  NV906F_NON_STALL_INTERRUPT — WITHOUT forwarding to the host. Justified ONLY when the channel's
+  effect is REDUNDANT in our model: e.g. the FB scrub-to-zero is already done by our host
+  RM_ALLOC (RM scrubs every vidmem alloc for security), so re-running it is a no-op; we just owe
+  the guest init state machine the completion signal. This resolves the "scrub optional but the
+  scrubber-channel COMPLETION must still fire" caveat: fake the completion here.
+- **Userspace channels** (libcuda compute): FORWARD the kick (translate chid, write host
+  doorbell). The work runs on the real GPU at full speed, untouched — the trap is a lightweight
+  forward, not interpretation.
+
+THE LINE (keeps [[mode2-real-forward-not-fake]] intact): fake ONLY channels whose work is
+genuinely redundant/unneeded; NEVER fake a channel that produces GPU state the guest later
+CONSUMES. Sharp example: the GR golden-context load (FECS) IS the content libcuda reads -> must be
+REAL. It falls out correctly for free: FECS golden-load is triggered by the USERSPACE GR channel's
+first run (context switch), which we forward -> the host GPU loads the golden ctx for real into the
+double-mmapped ctx buffer. So: scrubber=fake; GR/compute=forward; FECS-load=real (via forwarding
+the userspace chan). Classification: tag each channel kernel|user at alloc by its owning RM client
+(RM-internal vs libcuda's client) — already tracked in the channel table; the chid table carries
+the bit. Doorbell handler (plan item 5) = translate chid -> if kernel-internal: fake-complete;
+else: write host doorbell.
