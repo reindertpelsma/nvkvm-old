@@ -1043,6 +1043,7 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                   const char *label); /* M5.7 */
 static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client); /* M5.8 fwd-decl */
 static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s); /* M5.9 fwd-decl */
+static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd); /* M6.4 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -1091,6 +1092,14 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * without leaf PTEs in our FB. */
         if (fn == 76 && ldl_le_p(cmd + 88) == 0x2080012bu) {
             nvkvm_snoop_promote_ctx(s, cmd);
+            /* M6.4 (item-4 step 4, the PROMOTE_CTX experiment): forward PROMOTE_CTX to the
+             * host with each sysmem buffer's gpuPhysAddr substituted to OUR backing (the
+             * OS_DESCRIPTOR'd guest RAM), so the host GR context maps the guest's GR VAs onto
+             * the guest's actual memory -> host GPU DMA-fills what libcuda reads. Proves we
+             * own the GR VA layout (the user's "fix any GR VA" question). Gated m2exec. */
+            if (s->m2exec) {
+                nvkvm_m2_forward_promote_ctx(s, cmd);
+            }
         }
         /* M5.1a: shadow-forward the guest's actual RM alloc stream to the real
          * host GPU (gated; non-disruptive — guest still uses the faked response). */
@@ -3327,6 +3336,59 @@ static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient)
                      ? "  OK — host GPU can now reach the guest's sysmem GR buffer!"
                      : (mst == 0x51u ? "  ALREADY-MAPPED" : "  <-- ERR"));
     }
+}
+
+/* M6.4 (item-4): forward the guest's PROMOTE_CTX to the host with each sysmem buffer's
+ * gpuPhysAddr substituted to OUR backing's host physical. For each promote entry that's
+ * sysmem + mapped: OS_DESCRIPTOR the guest RAM at its GPA -> host hMem -> GET_SURFACE_PHYS_ATTR
+ * -> host phys; write that into the entry's gpuPhysAddr. Then forward the (substituted)
+ * PROMOTE_CTX control (0x2080012b) on the GR subdevice. Effect: the host GR context maps the
+ * guest's GR VAs onto the guest's actual sysmem -> host GPU DMA-fills what libcuda reads.
+ * (Reframe: we don't replay the guest's calls — we reproduce the GR-VA->backing EFFECT.) */
+static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
+{
+    uint32_t hClient = ldl_le_p(cmd + 80), hObject = ldl_le_p(cmd + 84);
+    uint32_t psize   = ldl_le_p(cmd + 96);
+    if (psize < 48 || psize > 8192) {
+        return;
+    }
+    static uint8_t pc[8192];
+    memcpy(pc, cmd + 120, psize);                 /* the PROMOTE_CTX params */
+    uint32_t ec = ldl_le_p(pc + 40);
+    if (ec > 20) { ec = 20; }
+    uint32_t dev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == hClient) { dev = s->m2_devvas[i].dev; break; }
+    }
+    int subst = 0;
+    for (uint32_t i = 0; i < ec; i++) {
+        uint8_t *e = pc + 48 + (uint64_t)i * 32;
+        uint64_t phys = ldq_le_p(e + 0), va = ldq_le_p(e + 8), sz = ldq_le_p(e + 16);
+        uint32_t physAttr = ldl_le_p(e + 24);
+        uint8_t  bNonmapped = e[31];
+        if (!va || !sz || bNonmapped || (physAttr & 0x3u) == 0) {
+            continue;                             /* skip vidmem / unmapped / phys-only */
+        }
+        uint64_t sva = nvkvm_m2_gpa_to_stub_va(s, phys);
+        if (!sva || !dev) { continue; }
+        uint32_t hMem = 0xde000000u | (s->m2_databuf_next++ & 0xffffu);
+        uint32_t ost = 0xffff;
+        if (nvkvm_m2_os_descriptor(s, hClient, dev, hMem, sva, sz, &ost) != 0 || ost != 0) {
+            continue;
+        }
+        uint64_t hphys = 0; uint32_t aper = 0xff;
+        if (!nvkvm_m2_host_phys(s, hClient, hMem, &hphys, &aper) || !hphys) {
+            continue;
+        }
+        stq_le_p(e + 0, hphys);                   /* substitute gpuPhysAddr -> our backing */
+        subst++;
+    }
+    uint32_t st = 0xffff;
+    int rc = nvkvm_m2_control1(s, hClient, hObject, 0x2080012bu, pc, psize, &st);
+    qemu_log("nvkvm-gpu[%s] M6.4 forward PROMOTE_CTX: client=0x%08x subdev=0x%08x entries=%u "
+             "subst=%d -> rc=%d st=0x%x %s\n", s->chip->name, hClient, hObject, ec, subst,
+             rc, st, (rc == 0 && st == 0) ? "  OK — host GR ctx mapped onto guest RAM!"
+                                          : "  <-- ERR");
 }
 
 /* M5.5 EXECUTION-PLANE PRIMITIVE: map a host memory object into a host VASpace at a
