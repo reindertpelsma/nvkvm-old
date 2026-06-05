@@ -148,3 +148,19 @@ Order, each a checkpoint (the RING is the only wedge-risk step — keep it last)
    semaphore must be written by the GPU (not QEMU). Guest-green + host-idle = emulated, FAIL.
    See [[mode2-real-forward-not-fake]]. If the host GPU wedges (100% util / no procs): reload
    the host driver (rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia; modprobe nvidia).
+
+## cuCtxCreate blocker RE-DIAGNOSED (2026-06-05) — it's a GR-VAS page-table poll, not channels
+
+CRASHWIN data (m2exec run): when cuCtxCreate hangs, the guest RM busy-loops (~13.7k iters)
+manually WALKING/SCANNING its own GR VAS page tables via PRAMIN — PDE chain
+0x2f3392000->0x2efbc3000->4000->5000 (PD0 dual-PDE: SMALL half @0x2efbc5000 = 0 / not
+installed; BIG half @0x2efbc5008 -> 0x2efbc6000), then a swath of big-PT entries
+(0x2efbc6188..6360). The walk TARGET page is never read; there are NO channel-USERD (gva!=0)
+polls. So it is the guest KERNEL polling GR-VAS PAGE-TABLE STATE, not libcuda polling a
+channel completion. => the busy worker channels (client 0xc1d00001, scrubber gpfifo
+0x1210d0000) are UNRELATED to this hang; the M5.9 multi-channel channel-forward would NOT
+clear cuCtxCreate. The real gap is GR-VAS page-table POPULATION (the guest awaits a mapping/
+state GSP would install) — or an event the guest waits on before installing it. The
+exec-forward primitives (map_dma/double-mmap/USERMODE/token/schedule) remain correct and
+reusable, but must target populating the guest's GR page tables / the awaited mapping, not
+channel rings, for cuCtxCreate. See memory mode2_cuctxcreate_pagetable_poll.
