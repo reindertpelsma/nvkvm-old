@@ -326,3 +326,54 @@ GPU's live registers, or fake-the-boot breaks. So BAR0 is a MIX:
   - USERMODE doorbell + PTIMER -> host-mapped RO special object (native reads, trapped doorbell)
 This is the register-plane analog of the memory-plane double-mmap (same host-ioctl-backed model,
 mode=special with a write fault handler instead of mode=physical).
+
+---
+
+## §16 — Doorbell/chid demux: measured findings + build plan (2026-06-05)
+
+### Measured doorbell token format (GA106, cup2 m2exec run)
+The guest writes its work-submit token to the VF USERMODE doorbell (`NVKVM_VF_DOORBELL`,
+`NV_USERMODE_NOTIFY_CHANNEL_PENDING` @0x90). Captured distinct tokens during cuCtxCreate:
+```
+token=0x00000004   -> runlist 0, chid 4
+token=0x00010008   -> runlist 1, chid 8
+token=0x00010001   -> runlist 1, chid 1
+```
+=> **token = (runlist << 16) | chid**. Three channels submit work + are polled for completion
+during cuCtxCreate (confirms the blocker is multi-channel, not one). The guest assigns these
+vChids in ITS channel space; the host RM assigns DIFFERENT sChids to the forwarded channels →
+the token must be TRANSLATED (vrunlist:vChid -> srunlist:sChid) before writing the host doorbell.
+
+### Ownership model (user direction, 2026-06-05) — what we DO vs DON'T do
+- **GR context switching = the HOST kernel/GPU's job.** We do NOT manage ctxsw, golden context,
+  or ctx-buffer content. The host RM/GSP already builds a valid GR context when we forward the
+  0xc7c0 alloc (st=0x51 self-mapped ctx buffers). The guest's GR ctx buffers are
+  MEMDESC_FLAGS_GPU_PRIVILEGED (kernel-only) → guest USERSPACE never observes them, so we only
+  owe the guest KERNEL a non-faulting backed dummy page at the (deterministic) GR VA to satisfy
+  its open-source checks. We TRUST the host on channel execution.
+- **Pushbuffer + GPFIFO live in guest RAM (sysmem).** To let the host GPU run them, pin the
+  guest-RAM pages via OS_DESCRIPTOR (host nvidia ioctl, proven in item-4) and map_dma them FIXED
+  into the host channel's VAS at the guest VAs. These are chid-INDEPENDENT in content → shareable
+  to the host directly. USERD (GP_PUT) + the doorbell token are chid-DEPENDENT → translate.
+
+### Build plan (item 5 — the cuCtxCreate keystone), in order
+1. **chid/token table.** At each forwarded GPFIFO channel alloc (class ..6F), record
+   {guest_chan_hObj, gpfifo_va, vChid/vrunlist, host_chan_hObj, host_token (via 0xc36f0108 on the
+   host channel)}. Decode vChid/vrunlist from the channel's runlist slot or the token the guest
+   later writes; sChid/sToken from the host.
+2. **Working-set forward (per channel with new work).** OS_DESCRIPTOR-pin + map_dma FIXED the
+   guest-RAM pushbuffers + GPFIFO + referenced data + completion-semaphore page into the host
+   channel VAS at the guest VAs (M5.10 re-sweep handles vidmem leaves; guest-RAM via item-4).
+   Completion semaphore 0x2efbaf000 is reached via the BAR2 root 0x2f3392000 (NOT in chan_vas[])
+   — add that root to the enum so its leaf is backed.
+3. **Doorbell demux.** Trap the guest USERMODE write (already trapped), decode token ->
+   (vrunlist,vChid) -> table -> host channel -> write the host's token to the host USERMODE.
+   (Optimization later: make USERMODE a KVM_MEM_READONLY memslot so reads/PTIMER are native and
+   only writes fault.)
+4. **Gate the ring** on "this channel's working set fully mapped" (naive ring today -> cuInit=999
+   because the host faults on unmapped referenced VAs).
+5. Host runs the channel -> writes GP_GET + the completion semaphore -> guest poll satisfied ->
+   cuCtxCreate proceeds. Verify via host nvidia-smi util (real work), CRASHWIN 0x2efbaf000 0->nonzero.
+
+Quarantine the QEMU-side `nvkvm_chan_execute()` pushbuffer-parse/sema-fake path during the real
+build (it masks whether the host actually ran the work).

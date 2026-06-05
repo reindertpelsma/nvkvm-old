@@ -345,6 +345,8 @@ struct NvkvmGpuEmul {
     bool     m2exec;            /* M5.7 prop: enable execution-plane backing (default off) */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
+    uint32_t m2_last_db_token;  /* M5.11: last guest work-submit token seen at the doorbell (dedup log) */
+    bool     m2_last_db_valid;
     uint32_t m2_gr_client;      /* M5.7: the GR compute client (set at crashwin arm) */
     /* M5.7: per-client NV01_MEMORY_VIRTUAL mapper over the client's GR VASpace, so the
      * execution path can map_dma FIXED the guest's working-set buffers into the host
@@ -1843,6 +1845,17 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
      * ce_utils.c:349).  For now, log it so the doorbell offset/token are
      * confirmed against the GA100 HAL. */
     if (off == NVKVM_VF_DOORBELL) {
+        /* M5.11 (doorbell-demux observability): the guest writes its work-submit TOKEN here
+         * (val). On Ampere the token encodes the guest vChid+runlist (NVC36F GET_WORK_SUBMIT_TOKEN).
+         * Today we ignore it and ring the host GR token unconditionally — wrong for multi-channel.
+         * Log each distinct token (deduped) so we can map guest-token -> channel for the real
+         * vChid->sChid demux. No behavior change. */
+        if (s->m2_crashwin && (!s->m2_last_db_valid || s->m2_last_db_token != (uint32_t)val)) {
+            s->m2_last_db_token = (uint32_t)val; s->m2_last_db_valid = true;
+            qemu_log("nvkvm-gpu[%s] M5.11 DOORBELL token=0x%08x (chid-field guesses: [3:0]=%u "
+                     "[11:0]=%u [27:0]=0x%x); chan_n=%d\n", s->chip->name, (uint32_t)val,
+                     (uint32_t)val & 0xf, (uint32_t)val & 0xfff, (uint32_t)val & 0x0fffffff, s->chan_n);
+        }
         /* M5.6 EXECUTION-PLANE INVENTORY: once cuCtxCreate has built the GR context
          * (crashwin armed) and starts submitting work, dump the EXACT working set the
          * execution path must back+FIXED-map: va_map = the #2 side-table (PROMOTE_CTX
