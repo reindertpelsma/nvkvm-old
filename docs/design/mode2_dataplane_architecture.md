@@ -218,3 +218,22 @@ forwarded host object's real memory via a KVM memslot (KVM_SET_USER_MEMORY_REGIO
 GPA-window mechanism (docs: gpa_window_design). Intercept the guest object alloc + CPU-map to
 learn the guest-RAM GPA + size, RM_MAP_MEMORY the host object -> host VA, install the memslot.
 Reuses Mode-1 GPA-window code; NOT the FB overlay. This is the one remaining cuCtxCreate fix.
+
+## cuCtxCreate DIAGNOSIS CONVERGED (2026-06-05): un-backed SYSMEM GR-context buffers
+
+LD_PRELOAD mapshim correlated the crash buffers to RM objects (by RM_MAP_MEMORY len):
+2 MiB GPFIFO = hMem 0x5c000014, 64 MiB = 0x5c000016, 4 KiB (last mmap before crash) =
+0x5c000018 (client 0xc1d00003). NONE are in the SHADOW (GSP_RM_ALLOC fn=103) list -> the
+guest RM allocated them LOCALLY (NVOS32/VidHeapControl, ioctl 0x2a; not forwarded) with no
+GSP-RPC. Combined with 0 BAR1 reads -> these are SYSMEM (guest RAM) GR-context buffers the
+guest CPU-RM manages itself (no GSP cooperation), CPU-mapped by libcuda, that the GPU should
+fill (golden GR context / DMA) but doesn't (no host execution, no DMA forwarding) -> libcuda
+reads zeros -> NULL deref -> rbp=0 SIGSEGV.
+
+FIX = the full Mode-2 data plane (multi-week keystone): the guest-RM-managed sysmem GR
+objects must be backed by host memory the host GPU fills — forward the guest's sysmem GPU
+mappings (RM_MAP_MEMORY_DMA) so the host GPU DMAs into the guest RAM (GPU->CPU DMA, item-4) +
+forward channel execution so the GPU runs the GR-context fill. Diagnosis fully converged:
+channels (no), page-table poll (symptom), faked controls (not the direct filler), fds (ok);
+the EXACT buffers + their local-sysmem-alloc path are now identified. See memory
+mode2_cuctxcreate_pagetable_poll.
