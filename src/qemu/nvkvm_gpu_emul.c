@@ -354,6 +354,9 @@ struct NvkvmGpuEmul {
     void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
     bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
+    bool     m2ring;            /* M5.9 prop: actually RING the host doorbell (wedge-risk) */
+    uint64_t m2_mapped_va[128]; /* M5.9: VAs already backed+mapped (dedup pushbuffer maps) */
+    int      m2_mapped_va_n;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -1009,8 +1012,10 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
                                         uint32_t psize); /* M5.4 fwd-decl */
 static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M5.5 fwd-decl */
 static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
-                                  uint64_t phys, uint64_t size, const char *label); /* M5.7 */
+                                  uint64_t phys, uint64_t size, bool copy_content,
+                                  const char *label); /* M5.7 */
 static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client); /* M5.8 fwd-decl */
+static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s); /* M5.9 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -1722,7 +1727,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 char lbl[24];
                 snprintf(lbl, sizeof(lbl), "ctx%d", i);
                 if (nvkvm_m2_back_and_map(s, grc, s->va_map[i].va, s->va_map[i].phys,
-                                          s->va_map[i].size, lbl)) {
+                                          s->va_map[i].size, false, lbl)) {
                     mapped++;
                 }
             }
@@ -1757,13 +1762,24 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              "(chan_vas_n=%d) — VA-only map\n", s->chip->name,
                              (unsigned long long)gva, s->chan_vas_n);
                 }
-                nvkvm_m2_back_and_map(s, grc, gva, gphys, 0x10000, "gpfifo");
+                nvkvm_m2_back_and_map(s, grc, gva, gphys, 0x10000, true, "gpfifo");
                 break;
             }
             /* M5.8: set up doorbell-forward primitives (map host USERMODE + fetch the GR
              * channel work-submit token). NOT rung yet — ringing before pushbuffers are
              * mapped + the channel scheduled would fault/wedge the host GPU. */
             nvkvm_m2_doorbell_setup(s, grc);
+        }
+        /* M5.9: real execution forward — map this doorbell's new GR pushbuffers and, if
+         * m2ring, RING the host doorbell so the HOST GPU runs the work. When ringing for
+         * real, the chan_execute semaphore-FAKING below is DISABLED (a green guest must come
+         * from the host GPU, not QEMU — [[mode2-real-forward-not-fake]]); we still deliver
+         * the os-event so the guest's blocking-sync poll wakes and re-reads the semaphore the
+         * HOST GPU wrote. */
+        nvkvm_m2_exec_doorbell(s);
+        if (s->m2ring) {
+            nvkvm_gsp_deliver_events(s);
+            return;
         }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
@@ -3209,11 +3225,15 @@ static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
  *      -> nvkvm_fb_read/write) and the host GPU share the SAME bytes (no faking);
  *  (3) map_dma FIXED at the guest VA into the client's GR virtmem mapper, so the host GPU's
  *      MMU resolves that VA to this memory when it runs the channel.
- * Returns true on success. Buffers the GUEST writes (GPFIFO/pushbuffer/USERD) are the
- * correct-direction case; host-written buffers (golden ctx) the host GPU fills after it
- * runs. phys==0 => skip the FB overlay (VA-only mapping). */
+ * Returns true on success. CONTENT DIRECTION: `copy_content`=true for GUEST-written buffers
+ * (GPFIFO/pushbuffers) -> copy the guest's current FB bytes into the host vidmem so the host
+ * GPU reads the real commands; false for GPU-written buffers (completion semaphore) which the
+ * host fills. The FB overlay is registered ONLY on a successful PLACE (st=0): a 0x51
+ * (already-host-mapped, e.g. ctx) must NOT be overlaid or we'd shadow the host's real buffer
+ * with zeroed memory. phys==0 => VA-only mapping (no overlay). */
 static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
-                                  uint64_t phys, uint64_t size, const char *label)
+                                  uint64_t phys, uint64_t size, bool copy_content,
+                                  const char *label)
 {
     uint32_t hVirt = nvkvm_m2_grmapper(s, client);
     if (!hVirt) {
@@ -3235,24 +3255,29 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                  s->chip->name, label);
         return false;
     }
-    if (phys) {
+    uint32_t st = 0xffff; uint64_t outva = 0;
+    int rc = nvkvm_m2_map_dma(s, client, hDev, hVirt, hMem, 0, asize, true, va, &st, &outva);
+    /* st=0x51 (NV_ERR_NO_MEMORY) on a FIXED map => the VA is ALREADY mapped in the host
+     * VASpace (host RM self-promoted its GR ctx at the same VAs). Desired for ctx buffers —
+     * host already has them; do NOT overlay. Only genuinely-unmapped buffers get placed. */
+    bool already = (st == 0x51u);
+    bool ok = (rc == 0 && st == 0 && outva == va);
+    if (phys && ok) {                            /* overlay ONLY a buffer we actually placed */
+        if (copy_content) {                      /* preserve guest-written bytes (cmds) */
+            for (uint64_t off = 0; off < asize; off += 4096) {
+                uint8_t *gp = nvkvm_fb_page(s, phys + off, false);
+                if (gp) { memcpy((uint8_t *)hm.qva + off, gp, 4096); }
+            }
+        }
         s->m2_fbback[s->m2_fbback_n].fb_base  = phys;
         s->m2_fbback[s->m2_fbback_n].size     = asize;
         s->m2_fbback[s->m2_fbback_n].host_qva = hm.qva;
         s->m2_fbback_n++;
     }
-    uint32_t st = 0xffff; uint64_t outva = 0;
-    int rc = nvkvm_m2_map_dma(s, client, hDev, hVirt, hMem, 0, asize, true, va, &st, &outva);
-    /* st=0x51 (NV_ERR_NO_MEMORY) on a FIXED map => the VA is ALREADY mapped in the host
-     * VASpace (the host RM self-promoted its GR context buffers at the same VAs the guest
-     * uses). That's the desired state for ctx buffers — host already has them; no backing
-     * needed. Only genuinely-unmapped buffers (GPFIFO/pushbuffers) get placed by us. */
-    bool already = (st == 0x51u);
-    bool ok = (rc == 0 && st == 0 && outva == va);
-    qemu_log("nvkvm-gpu[%s] M5.7 back_and_map[%s] VA=0x%llx phys=0x%llx size=0x%llx -> "
+    qemu_log("nvkvm-gpu[%s] M5.7 back_and_map[%s] VA=0x%llx phys=0x%llx size=0x%llx copy=%d -> "
              "hMem=0x%08x qva=%p map rc=%d st=0x%x va=0x%llx%s\n", s->chip->name, label,
              (unsigned long long)va, (unsigned long long)phys, (unsigned long long)asize,
-             hMem, hm.qva, rc, st, (unsigned long long)outva,
+             copy_content, hMem, hm.qva, rc, st, (unsigned long long)outva,
              ok ? "  OK PLACED" : already ? "  ALREADY-HOST-MAPPED" : "  <-- ERR");
     return ok || already;
 }
@@ -3341,6 +3366,74 @@ static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client)
         qemu_log("nvkvm-gpu[%s] M5.8 doorbell: GPFIFO_SCHEDULE TSG=0x%08x rc=%d st=0x%x%s\n",
                  s->chip->name, s->m2_gr_tsg, src, sst,
                  (src == 0 && sst == 0) ? "  OK SCHEDULED" : "  <-- ERR");
+    }
+}
+
+/* M5.9: resolve a GR-VAS guest VA -> guest-FB phys by trying each snooped VAS PDB (FB leaf
+ * only; sysmem leaves are the GPU->CPU DMA path, handled elsewhere). 0 on miss. */
+static uint64_t nvkvm_m2_resolve_fb(NvkvmGpuEmul *s, uint64_t va)
+{
+    for (int v = 0; v < s->chan_vas_n; v++) {
+        bool sy = false;
+        uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[v].pdb, va, &sy);
+        if (p != NVKVM_GMMU_FAULT && !sy) { return p; }
+    }
+    return 0;
+}
+/* M5.9: has this VA already been backed+mapped? (dedup repeated pushbuffers). Adds if new. */
+static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint64_t va)
+{
+    for (int i = 0; i < s->m2_mapped_va_n; i++) {
+        if (s->m2_mapped_va[i] == va) { return true; }
+    }
+    if (s->m2_mapped_va_n < 128) { s->m2_mapped_va[s->m2_mapped_va_n++] = va; }
+    return false;
+}
+
+/* M5.9 EXECUTION FORWARD (per doorbell): map the GR channel's newly-submitted pushbuffers
+ * into the host GR VASpace (double-mmap + copy the guest's command bytes) so the host GPU's
+ * MMU resolves them, then — gated behind m2ring (default OFF, wedge-risk) — RING the host
+ * doorbell so the HOST GPU actually runs the guest's work and writes the completion semaphore
+ * for real ([[mode2-real-forward-not-fake]]). USERD (GP_PUT) + GPFIFO are already double-
+ * mmapped; here we add the pushbuffers each entry points at. Idempotent via the mapped set. */
+static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
+{
+    if (!s->m2exec || !s->m2_doorbell_ready) { return; }
+    uint32_t grc = s->m2_gr_client;
+    for (int i = 0; i < s->chan_n; i++) {
+        struct nvkvm_chan_entry *c = &s->chans[i];
+        if (c->client != grc || !c->gpfifo_va || !c->gpfifo_ent) { continue; }
+        uint64_t gpf_phys = nvkvm_m2_resolve_fb(s, c->gpfifo_va);
+        if (!gpf_phys) { continue; }
+        uint32_t gp_put = (uint32_t)nvkvm_fb_read(s, c->userd + 0x8C, 4);
+        if (gp_put == c->gp_get || gp_put > c->gpfifo_ent || gp_put < c->gp_get) {
+            continue;                            /* no new (non-wrapping) work */
+        }
+        int newmaps = 0;
+        for (uint32_t idx = c->gp_get; idx < gp_put && idx < c->gpfifo_ent; idx++) {
+            uint64_t epa = gpf_phys + (uint64_t)idx * 8;
+            uint32_t e0 = (uint32_t)nvkvm_fb_read(s, epa, 4);
+            uint32_t e1 = (uint32_t)nvkvm_fb_read(s, epa + 4, 4);
+            uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
+            uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
+            if (!pb) { continue; }
+            uint64_t pbbase = pb & ~0xfffull;
+            if (nvkvm_m2_va_seen(s, pbbase)) { continue; }
+            uint64_t pbphys = nvkvm_m2_resolve_fb(s, pbbase);
+            uint64_t sz = ((pb - pbbase) + (uint64_t)pblen * 4 + 0xfff) & ~0xfffull;
+            if (!sz) { sz = 0x1000; }
+            nvkvm_m2_back_and_map(s, grc, pbbase, pbphys, sz, true, "pushbuf");
+            newmaps++;
+        }
+        qemu_log("nvkvm-gpu[%s] M5.9 exec_doorbell GR gp_get=%u->%u newpushbufs=%d "
+                 "(m2ring=%d)\n", s->chip->name, c->gp_get, gp_put, newmaps, s->m2ring);
+        c->gp_get = gp_put;
+        if (s->m2ring && s->m2_usermode_qva) {
+            stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, s->m2_gr_token);
+            qemu_log("nvkvm-gpu[%s] M5.9 *** RANG host doorbell token=0x%08x (USERMODE+0x90) "
+                     "— host GPU should now run the GR work ***\n",
+                     s->chip->name, s->m2_gr_token);
+        }
     }
 }
 
@@ -3682,6 +3775,7 @@ static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("trace", NvkvmGpuEmul, trace, true),
     DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, false), /* M5: enable host-GPU forwarding */
     DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, false), /* M5.7: execution-plane backing */
+    DEFINE_PROP_BOOL("m2ring", NvkvmGpuEmul, m2ring, false), /* M5.9: ring host doorbell (real fwd) */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
     DEFINE_PROP_END_OF_LIST(),
 };
