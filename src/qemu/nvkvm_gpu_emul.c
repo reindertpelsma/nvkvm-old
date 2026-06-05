@@ -1616,7 +1616,17 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     memset(resp + 120, 0, 1284);
                     stl_le_p(resp + 56, 32u + 40u + 1284u);
                 }
-                /* else: void/SET control — echo with status=NV_OK */
+                /* else: void/SET control — echo with status=NV_OK.
+                 * NOTE (M11, 2026-06-06): a blanket "default-forward instead of fake NV_OK" was
+                 * tried and REVERTED — it regresses cuInit.  GSP-INTERNAL controls (e.g. the
+                 * NV2080 interface-0x0a / 0x2a "_INTERNAL_*" series like 0x20802a0a/0x20802a12)
+                 * are serviced by the real host's GSP and return NV_OK there, but when re-issued
+                 * by our unprivileged forwarded client via the userspace RM_CONTROL ioctl they
+                 * return 0x1b (INSUFFICIENT_PERMISSIONS) or 0x56 (NOT_SUPPORTED) — so status alone
+                 * cannot classify them (0x56 is legit for ECC/NVLINK but wrong here).  Correct fix
+                 * = a CURATED allowlist of forwardable controls (host-native trace as oracle:
+                 * scripts/mode2_diag), forwarding those and REPLAYING captured data for the
+                 * GSP-internal rest.  See [[mode2-control-forward-vs-replay]]. */
 
                 /* M9 (cuCtxCreate SIGSEGV root cause — proven 2026-06-05): a control reply
                  * must NEVER write more bytes than the caller's params buffer (= the REQUEST
