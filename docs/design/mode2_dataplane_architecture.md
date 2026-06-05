@@ -187,3 +187,21 @@ buffer holds the NULL (instrument the 0x4e handler + the mmap GPA, or LD_PRELOAD
 libcuda reads from 0x200400000 / 0x77f2f2ddf000 pre-crash). See memory
 mode2_cuctxcreate_pagetable_poll. Supersedes the "multi-channel forward" and "page-table
 population" next-steps (both were symptoms, not the crash).
+
+## cuCtxCreate root cause CONFIRMED (2026-06-05): un-backed CPU mmap; fix = item-2 memory plane
+
+gdb memory dumps at the crash: both GPU-mapped CPU regions libcuda reads are ALL ZEROS —
+0x200200000 (GPFIFO, /dev/nvidia0) and 0x200400000 (64 MiB, /dev/nvidiactl). The crash is a
+method dispatch through a zeroed structure (`*global -> +0x48 -> vtable -> call *0x560`) on the
+GR channel -> rbp corrupted -> SIGSEGV. With m2exec=on the GPFIFO backing FIRES (m2_fbback at
+FB 0xe0200000) but the region STAYS ZERO -> the guest's CPU mmap does NOT route through the FB
+overlay (it uses the BAR1 mapping / possibly guest-RAM, which resolves elsewhere than the
+channel-vaspace FB addr the overlay was keyed on). MECHANISM, not timing (backing ran before
+crash; 133 doorbells). RULED OUT this session as the cause: channels, GR page-table population,
+faked controls (fn=76), failed fds — all red herrings/symptoms.
+
+THE FIX (singular) = plan item-2 CPU->GPU memory plane: back the guest's CPU mmaps of GPU
+objects with the forwarded host objects' real memory. Immediate next step: instrument
+nvkvm_baraperture_read to log the bar1_pdb resolve of VA 0x200200000 (and whether libcuda's
+read traps there) -> decide BAR1-overlay vs KVM-memslot-over-guest-RAM -> back the CPU-mmap'd
+regions. See memory mode2_cuctxcreate_pagetable_poll.
