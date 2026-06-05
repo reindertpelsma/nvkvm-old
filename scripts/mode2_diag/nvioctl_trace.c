@@ -38,7 +38,17 @@ int ioctl(int fd, unsigned long req, ...){
          * as content=00.. vs nonzero. NVCONTENT env = N (default 48, 0=off). */
         const char *cd = getenv("NVCONTENT"); unsigned cn = cd ? (unsigned)atoi(cd) : 48;
         if (cn > 256) cn = 256;
-        if (cn && pptr) {
+        /* For ALLOC the kernel writes the CLASS param size back even when libcuda passes psz=0
+         * (e.g. GR object 0xc7c0 -> 16B caps). Dump a fixed NVALLOC bytes from pAllocParms so the
+         * forwarded GR-alloc reply can be compared host-vs-guest. NVALLOC env = N (default 32). */
+        if (nr == 0x2B) {
+            const char *ad = getenv("NVALLOC"); unsigned an = ad ? (unsigned)atoi(ad) : 32;
+            if (an > 256) an = 256;
+            if (an && pptr) {
+                fprintf(lg, " areply=");
+                for (unsigned i = 0; i < an; i++) fprintf(lg, "%02x", ((unsigned char *)(uintptr_t)pptr)[i]);
+            }
+        } else if (cn && pptr) {
             unsigned lim = (psz < cn) ? psz : cn;
             fprintf(lg, " content=");
             for (unsigned i = 0; i < lim; i++) fprintf(lg, "%02x", ((unsigned char *)(uintptr_t)pptr)[i]);
