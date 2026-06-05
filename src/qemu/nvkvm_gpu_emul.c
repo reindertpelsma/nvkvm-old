@@ -360,6 +360,7 @@ struct NvkvmGpuEmul {
      * old M5.3 force-paramsSize->0 was moot; forwarding the real params is the correct fix. */
     uint8_t  m2_gr_reply[64];
     uint32_t m2_gr_reply_obj;   /* hObject this reply belongs to (match in the reply builder) */
+    uint32_t m2_gr_reply_psize; /* host's RETURNED alloc_parms_size (paramsSize the real RM wrote) */
     bool     m2_gr_reply_valid;
     void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
@@ -1284,26 +1285,36 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 uint32_t lb = hc & 0xffu, fam = (hc >> 8) & 0xffu;
                 uint32_t opsize = ldl_le_p(resp + 100);
                 uint32_t robj = ldl_le_p(resp + 88);
-                /* M7 (cuCtxCreate fix, replaces the moot M5.3 force-paramsSize->0): the guest
-                 * kernel copies the LOCAL per-class size (16B for GR) from resp+112 into libcuda's
-                 * pAllocParms, IGNORING reply paramsSize (auditor: ogkm rpc.c:11040). resp+112
-                 * currently echoes the REQUEST params (caps@12=0). Pass through the HOST's real
-                 * reply params (captured in shadow_fwd) so the guest gets the GSP-filled caps,
-                 * not a fake. "Forward, don't emulate." */
-                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) && opsize &&
+                /* M8 (cuCtxCreate SIGSEGV — root cause refined 2026-06-05): host-vs-guest gdb
+                 * proved the crash function (libcuda+0x466560) is reached IDENTICALLY on host
+                 * and guest (same control flow, vtable call returns NV_OK), but rbp is a VALID
+                 * frame pointer on host and 0 on guest.  rbp is callee-saved; a callee corrupted
+                 * the saved-rbp slot with zeros on the guest only.  strace pins the last ioctl
+                 * before SIGSEGV as this RM_ALLOC.  => the guest kernel's params copy_to_user
+                 * OVERRUNS libcuda's pAllocParms by exactly the amount our reply's paramsSize
+                 * exceeds the host's.  Fix: forward the host's RETURNED alloc_parms_size verbatim
+                 * (resp+100) AND its params bytes (resp+112).  If the real RM returns paramsSize=0
+                 * (no writeback), the guest copies 0 bytes -> no overrun -> rbp preserved.
+                 * "Forward, don't emulate" — match the host reply byte-for-byte. */
+                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) &&
                     s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj) {
-                    uint32_t n = opsize < sizeof(s->m2_gr_reply) ? opsize
-                                                                 : (uint32_t)sizeof(s->m2_gr_reply);
-                    memcpy(resp + 112, s->m2_gr_reply, n);
+                    uint32_t hp = s->m2_gr_reply_psize;
+                    if (hp > sizeof(s->m2_gr_reply)) hp = (uint32_t)sizeof(s->m2_gr_reply);
+                    stl_le_p(resp + 100, hp);          /* reply paramsSize = host's returned size */
+                    if (hp) memcpy(resp + 112, s->m2_gr_reply, hp);
                     s->m2_gr_reply_valid = false;
-                    qemu_log("nvkvm-gpu[%s] M7 GR-obj 0x%04x reply: pass-through host params "
-                             "(%uB, caps@12=0x%08x) instead of request-echo\n",
-                             s->chip->name, hc, n, n >= 16 ? ldl_le_p(resp + 124) : 0);
+                    qemu_log("nvkvm-gpu[%s] M8 GR-obj 0x%04x reply: forward host paramsSize=%u "
+                             "(req_echo was %u, caps@12=0x%08x)\n", s->chip->name, hc, hp, opsize,
+                             hp >= 16 ? ldl_le_p(resp + 124) : 0);
                 }
             }
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
             if (fn == 76) {
                 stl_le_p(resp + 92, 0); /* body.status = NV_OK (default) */
+                /* M9: capture the caller's REQUEST paramsSize (the buffer libcuda/CPU-RM
+                 * allocated) BEFORE any handler overwrites resp+96, so we can clamp the
+                 * reply size and never overrun the caller's buffer (see clamp below). */
+                uint32_t req_psize = ldl_le_p(resp + 96);
                 const nvkvm_ctrl_resp_t *cr = NULL;
                 for (uint32_t i = 0; i < NVKVM_CTRL_RESP_COUNT; i++) {
                     if (nvkvm_ctrl_resps[i].cmd == ctrl) {
@@ -1311,7 +1322,39 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         break;
                     }
                 }
-                if (ctrl == 0x20800a5cu) {
+                if (s->m2fwd && (ctrl == 0x906f0101u || ctrl == 0x0080170du)) {
+                    /* item-3 (cuCtxCreate crash hunt): FORWARD these GET controls to
+                     * the real host GPU instead of replying NV_OK+zeros.  A faked
+                     * count/size here can shift libcuda's stack layout so the later
+                     * 0xc7c0 GR-alloc copy_to_user overruns pAllocParms (proven crash
+                     * mechanism).  Candidates: 0x906f0101 GET_CLASS_ENGINEID (returns
+                     * engineID — libcuda sizes per-engine arrays from it), 0x0080170d
+                     * FIFO_GET_CHANNELLIST (returns a channel COUNT that may size a
+                     * libcuda stack buffer).  nvkvm_m2_control1 does guest->host handle
+                     * translation and writes the host reply back into the buffer. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    if (ps && (120u + ps) <= NVKVM_RESP_MAX) {
+                        uint8_t cbuf[4096];
+                        uint32_t cn = ps < sizeof(cbuf) ? ps : (uint32_t)sizeof(cbuf);
+                        memcpy(cbuf, resp + 120, cn);
+                        uint32_t st = 0xffff;
+                        int rc = nvkvm_m2_control1(s, ldl_le_p(resp + 80),
+                                                   ldl_le_p(resp + 84), ctrl,
+                                                   cbuf, cn, &st);
+                        if (rc == 0) {
+                            memcpy(resp + 120, cbuf, cn);
+                            stl_le_p(resp + 92, st);
+                        } else {
+                            stl_le_p(resp + 92, 0); /* fall back to NV_OK echo */
+                        }
+                        stl_le_p(resp + 56, 32u + 40u + ps);
+                        qemu_log("nvkvm-gpu[%s] item-3 FWD ctrl=0x%08x ps=%u rc=%d "
+                                 "st=0x%x reply[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                 s->chip->name, ctrl, ps, rc, st,
+                                 resp[120], resp[121], resp[122], resp[123],
+                                 resp[124], resp[125], resp[126], resp[127]);
+                    }
+                } else if (ctrl == 0x20800a5cu) {
                     /* INTERNAL_INTR_GET_KERNEL_TABLE: the real GSP supplies the
                      * interrupt table via boot static-info so the host CPU-RM
                      * never issues this control; the guest's fake GSP forces the
@@ -1507,6 +1550,28 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     stl_le_p(resp + 56, 32u + 40u + 1284u);
                 }
                 /* else: void/SET control — echo with status=NV_OK */
+
+                /* M9 (cuCtxCreate SIGSEGV root cause — proven 2026-06-05): a control reply
+                 * must NEVER write more bytes than the caller's params buffer (= the REQUEST
+                 * paramsSize the caller allocated).  Several handlers above force a fixed,
+                 * larger reply paramsSize than was requested; the guest kernel's params
+                 * copyout then overruns the caller's (often stack) buffer.  Watchpoint +
+                 * host-vs-guest gdb pinned the crash: a kernel copy_to_user during a control
+                 * inside cuCtxCreate's GR-object setup zeroes libcuda's saved-rbp stack slot
+                 * -> rbp=0 -> SIGSEGV at libcuda+0x466560.  Clamp reply paramsSize to the
+                 * request.  (The caller always allocates its full struct, so legitimate large
+                 * controls — INTR_GET_KERNEL_TABLE, DEVICE_INFO_TABLE — request that size and
+                 * are unaffected; the clamp only fires on a genuine over-size, which is a bug
+                 * and a guest-OOB-write hazard.) */
+                if (req_psize > 0) {
+                    uint32_t out_psize = ldl_le_p(resp + 96);
+                    if (out_psize > req_psize) {
+                        qemu_log("nvkvm-gpu[%s] M9 CTRL-CLAMP cmd=0x%08x reply psize %u -> %u "
+                                 "(caller buffer)\n", s->chip->name, ctrl, out_psize, req_psize);
+                        stl_le_p(resp + 96, req_psize);
+                        stl_le_p(resp + 56, 32u + 40u + req_psize);
+                    }
+                }
                 /* DIAG(B-compute): log controls we did NOT fill with real data
                  * (cr==NULL and not special-cased) that REQUEST a non-zero
                  * response (a GET) — these return NV_OK+zeros and are the
@@ -3088,10 +3153,11 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             uint32_t n = psize < sizeof(s->m2_gr_reply) ? psize : (uint32_t)sizeof(s->m2_gr_reply);
             memcpy(s->m2_gr_reply, auxbuf, n);
             s->m2_gr_reply_obj = hObject;
+            s->m2_gr_reply_psize = p.alloc_parms_size; /* host's RETURNED paramsSize */
             s->m2_gr_reply_valid = true;
             qemu_log("nvkvm-gpu[%s] M7 captured host GR-alloc reply 0x%04x obj=0x%08x "
-                     "caps@12=0x%08x (vs request-echo)\n", s->chip->name, hClass, hObject,
-                     n >= 16 ? ldl_le_p(auxbuf + 12) : 0);
+                     "caps@12=0x%08x host_ret_psize=%u (req_psize=%u)\n", s->chip->name, hClass, hObject,
+                     n >= 16 ? ldl_le_p(auxbuf + 12) : 0, p.alloc_parms_size, psize);
         }
     }
 
