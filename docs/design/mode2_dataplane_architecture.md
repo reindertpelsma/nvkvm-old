@@ -205,3 +205,16 @@ objects with the forwarded host objects' real memory. Immediate next step: instr
 nvkvm_baraperture_read to log the bar1_pdb resolve of VA 0x200200000 (and whether libcuda's
 read traps there) -> decide BAR1-overlay vs KVM-memslot-over-guest-RAM -> back the CPU-mmap'd
 regions. See memory mode2_cuctxcreate_pagetable_poll.
+
+## MECHANISM RESOLVED: guest-RAM, not BAR1 — fix = Mode-1 GPA-window memslot (2026-06-05)
+
+Code smoking gun: emulated BAR1 = 256 MiB (bar1_size=256<<20, MMIO). libcuda's CPU mmaps are
+at 8 GiB+ VAs (0x200200000, 0x200400000) -> cannot be BAR1 accesses; CRASHWIN logged no BAR1
+access. So the guest driver maps these GPU objects to GUEST RAM (no real VRAM), CPU reads
+don't trap, and the m2_fbback overlay can never cover them (why m2exec leaves them zero).
+
+FIX (singular, plan item-2) = back the guest-RAM GPA of each CPU-mmap'd GPU object with the
+forwarded host object's real memory via a KVM memslot (KVM_SET_USER_MEMORY_REGION) — Mode-1's
+GPA-window mechanism (docs: gpa_window_design). Intercept the guest object alloc + CPU-map to
+learn the guest-RAM GPA + size, RM_MAP_MEMORY the host object -> host VA, install the memslot.
+Reuses Mode-1 GPA-window code; NOT the FB overlay. This is the one remaining cuCtxCreate fix.
