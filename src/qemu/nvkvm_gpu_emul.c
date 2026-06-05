@@ -341,6 +341,14 @@ struct NvkvmGpuEmul {
                                  * maps to a polled FB address (correlate 0x2efbaf000) */
     bool     m2_mapdma_tested;  /* M5.5: one-shot RM_MAP_MEMORY_DMA-FIXED primitive validation */
     bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
+    bool     m2exec;            /* M5.7 prop: enable execution-plane backing (default off) */
+    bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
+    uint32_t m2_gr_client;      /* M5.7: the GR compute client (set at crashwin arm) */
+    /* M5.7: per-client NV01_MEMORY_VIRTUAL mapper over the client's GR VASpace, so the
+     * execution path can map_dma FIXED the guest's working-set buffers into the host
+     * channel's address space at the guest VAs (see [[mode2-mapdma-primitive]]). */
+    struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[8];
+    int      m2_grmap_n;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -995,6 +1003,8 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
                                         uint32_t chanObj, uint8_t *auxbuf,
                                         uint32_t psize); /* M5.4 fwd-decl */
 static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M5.5 fwd-decl */
+static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                  uint64_t phys, uint64_t size, const char *label); /* M5.7 */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -1686,6 +1696,32 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                          s->chans[i].gpfifo_ent, (unsigned long long)s->chans[i].userd,
                          s->chans[i].userd_sys ? "sys" : "fb", s->chans[i].hvaspace);
             }
+        }
+        /* M5.7 EXECUTION PLANE (gated m2exec, default off): back the GR working set with
+         * real host GPU memory and FIXED-map it into the GR channel's VASpace at the guest
+         * VAs, so the host channel's MMU resolves the guest's submitted work. One-shot.
+         * The va_map (PROMOTE_CTX) entries carry VA<->guest-FB<->size for the ctx buffers
+         * (under sibling RM clients that share the GR address space); we map them under the
+         * GR compute client's GR vaspace (0x5c000007), proven mappable in M5.5 P2. This is
+         * the FIRST execution-path increment; doorbell-forward + GPFIFO/pushbuffer phys
+         * resolution follow. */
+        if (s->m2exec && !s->m2_exec_done && s->m2_gr_client) {
+            s->m2_exec_done = true;
+            uint32_t grc = s->m2_gr_client;
+            int mapped = 0;
+            for (int i = 0; i < s->va_map_n; i++) {
+                if (s->va_map[i].sys) {
+                    continue;                 /* sysmem leaf: GPU->CPU DMA path, not here */
+                }
+                char lbl[24];
+                snprintf(lbl, sizeof(lbl), "ctx%d", i);
+                if (nvkvm_m2_back_and_map(s, grc, s->va_map[i].va, s->va_map[i].phys,
+                                          s->va_map[i].size, lbl)) {
+                    mapped++;
+                }
+            }
+            qemu_log("nvkvm-gpu[%s] M5.7 EXEC: backed %d/%d FB working-set buffers into GR "
+                     "client 0x%08x VASpace\n", s->chip->name, mapped, s->va_map_n, grc);
         }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
@@ -2837,8 +2873,10 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
          * GPU memory and crashes (rbp=0); the reads logged from here pin the buffer. */
         if (!s->m2_crashwin) {
             s->m2_crashwin = true;
+            s->m2_gr_client = hClient;        /* M5.7: the GR compute client */
             qemu_log("nvkvm-gpu[GA106] CRASHWIN ARMED (after 0xc7c0 compute obj "
-                     "0x%08x) — logging subsequent FB reads\n", hObject);
+                     "0x%08x) client=0x%08x — logging subsequent FB reads\n",
+                     hObject, hClient);
         }
         /* M5.5: validate the RM_MAP_MEMORY_DMA-FIXED primitive once, on the GR client's
          * real host VASpace. Proves we can place a mapping at a VA we choose — the
@@ -3079,6 +3117,94 @@ static int nvkvm_m2_alloc_virtmem(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hD
     stq_le_p(p + 8, 0);            /* limit  = 0 (=> max) */
     stl_le_p(p + 16, hVASpace);    /* hVASpace (0 = device default) */
     return nvkvm_m2_alloc1(s, hClient, hDevice, hVirt, 0x0070u, p, sizeof(p), st);
+}
+
+/* M5.7 EXECUTION PLANE: get (allocating once) the NV01_MEMORY_VIRTUAL mapper spanning a
+ * client's GR VASpace. Returns the virtmem handle (0 on failure). The mapper is the hDma
+ * for all FIXED map_dma into that vaspace. */
+static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
+{
+    for (int i = 0; i < s->m2_grmap_n; i++) {
+        if (s->m2_grmap[i].client == client) {
+            return s->m2_grmap[i].hvirt;
+        }
+    }
+    uint32_t hDev = 0, hVas = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == client) {
+            hDev = s->m2_devvas[i].dev; hVas = s->m2_devvas[i].vas; break;
+        }
+    }
+    if (!hDev || !hVas || s->m2_grmap_n >= 8) {
+        qemu_log("nvkvm-gpu[%s] M5.7 grmapper: no dev/vas for client 0x%08x\n",
+                 s->chip->name, client);
+        return 0;
+    }
+    uint32_t hVirt = 0xdb000000u | (s->m2_databuf_next++ & 0xffffu);
+    uint32_t st = 0xffff;
+    nvkvm_m2_alloc_virtmem(s, client, hDev, hVirt, hVas, &st);
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.7 grmapper: virtmem alloc st=0x%x (client 0x%08x "
+                 "vas 0x%08x)\n", s->chip->name, st, client, hVas);
+        return 0;
+    }
+    s->m2_grmap[s->m2_grmap_n].client = client;
+    s->m2_grmap[s->m2_grmap_n].hvirt  = hVirt;
+    s->m2_grmap[s->m2_grmap_n].hvas   = hVas;
+    s->m2_grmap[s->m2_grmap_n].hdev   = hDev;
+    s->m2_grmap_n++;
+    qemu_log("nvkvm-gpu[%s] M5.7 grmapper: client 0x%08x -> virtmem 0x%08x over VAS "
+             "0x%08x (dev 0x%08x)\n", s->chip->name, client, hVirt, hVas, hDev);
+    return hVirt;
+}
+
+/* M5.7 EXECUTION PLANE unit op: back a guest working-set buffer with real host GPU vidmem
+ * and place it in the GR channel's address space at the guest's VA.
+ *  (1) alloc host vidmem(size) under the GR client+device;
+ *  (2) double-mmap it into m2_fbback at the guest-FB phys, so guest CPU access (BAR/PRAMIN
+ *      -> nvkvm_fb_read/write) and the host GPU share the SAME bytes (no faking);
+ *  (3) map_dma FIXED at the guest VA into the client's GR virtmem mapper, so the host GPU's
+ *      MMU resolves that VA to this memory when it runs the channel.
+ * Returns true on success. Buffers the GUEST writes (GPFIFO/pushbuffer/USERD) are the
+ * correct-direction case; host-written buffers (golden ctx) the host GPU fills after it
+ * runs. phys==0 => skip the FB overlay (VA-only mapping). */
+static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                  uint64_t phys, uint64_t size, const char *label)
+{
+    uint32_t hVirt = nvkvm_m2_grmapper(s, client);
+    if (!hVirt) {
+        return false;
+    }
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_grmap_n; i++) {
+        if (s->m2_grmap[i].client == client) { hDev = s->m2_grmap[i].hdev; break; }
+    }
+    uint64_t asize = (size + 0xffff) & ~0xffffull;     /* round to 64 KiB */
+    if (s->m2_fbback_n >= 64) {
+        qemu_log("nvkvm-gpu[%s] M5.7 back_and_map: m2_fbback full\n", s->chip->name);
+        return false;
+    }
+    uint32_t hMem = 0xdc000000u | (s->m2_databuf_next++ & 0xffffu);
+    struct nvkvm_host_map hm;
+    if (!nvkvm_m2_host_alloc_map_vidmem(s, client, hDev, hMem, asize, &hm)) {
+        qemu_log("nvkvm-gpu[%s] M5.7 back_and_map[%s]: host vidmem alloc failed\n",
+                 s->chip->name, label);
+        return false;
+    }
+    if (phys) {
+        s->m2_fbback[s->m2_fbback_n].fb_base  = phys;
+        s->m2_fbback[s->m2_fbback_n].size     = asize;
+        s->m2_fbback[s->m2_fbback_n].host_qva = hm.qva;
+        s->m2_fbback_n++;
+    }
+    uint32_t st = 0xffff; uint64_t outva = 0;
+    int rc = nvkvm_m2_map_dma(s, client, hDev, hVirt, hMem, 0, asize, true, va, &st, &outva);
+    qemu_log("nvkvm-gpu[%s] M5.7 back_and_map[%s] VA=0x%llx phys=0x%llx size=0x%llx -> "
+             "hMem=0x%08x qva=%p map rc=%d st=0x%x va=0x%llx%s\n", s->chip->name, label,
+             (unsigned long long)va, (unsigned long long)phys, (unsigned long long)asize,
+             hMem, hm.qva, rc, st, (unsigned long long)outva,
+             (rc == 0 && st == 0 && outva == va) ? "  OK" : "  <-- ERR");
+    return rc == 0 && st == 0 && outva == va;
 }
 
 /* M5.5 one-shot validation of the RM_MAP_MEMORY_DMA primitive via the CORRECT mapper
@@ -3418,6 +3544,7 @@ static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
 static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("trace", NvkvmGpuEmul, trace, true),
     DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, false), /* M5: enable host-GPU forwarding */
+    DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, false), /* M5.7: execution-plane backing */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
     DEFINE_PROP_END_OF_LIST(),
 };
