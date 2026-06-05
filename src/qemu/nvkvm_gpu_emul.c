@@ -215,6 +215,11 @@ struct NvkvmGpuEmul {
         uint32_t gpfifo_ent, gp_get, hvaspace, payload;
         uint32_t client;        /* owning RM client (hClient) — VAS scope key */
         bool     userd_sys;
+        uint32_t hobject;       /* M5.12: the channel's RM handle (== host handle: shadow_fwd
+                                 * creates the host channel with the SAME hObject) */
+        uint32_t host_token;    /* M5.12: host channel work-submit token (0xc36f0108), for the
+                                 * GP_PUT-driven doorbell demux: ring THIS channel's token */
+        bool     token_valid;
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -1249,8 +1254,10 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         s->chans[cslot].userd_sys  = s->chan_userd_sys;
                         s->chans[cslot].hvaspace   = s->chan_hvaspace;
                         s->chans[cslot].client     = ldl_le_p(cmd + 80); /* hClient */
+                        s->chans[cslot].hobject    = ldl_le_p(cmd + 88); /* channel handle */
                         s->chans[cslot].gp_get     = 0;
                         s->chans[cslot].payload    = 0;
+                        s->chans[cslot].token_valid = false;
                     }
                 }
                 qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
@@ -4095,6 +4102,24 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
         nvkvm_m2_enum_gr_sysmem(s, grc);
     }
     if (!s->m2_doorbell_ready) { return; }
+    /* M5.12 (chid/token table): fetch each forwarded channel's HOST work-submit token once.
+     * shadow_fwd creates the host channel with the SAME hObject, so 0xc36f0108 on the guest's
+     * channel handle hits the host channel. The GP_PUT-driven demux rings THIS token for whichever
+     * channel advanced (vs. decoding vChid from the guest token). Logged for correlation; the ring
+     * itself stays gated on m2ring + full working-set mapping. */
+    for (int i = 0; i < s->chan_n; i++) {
+        struct nvkvm_chan_entry *c = &s->chans[i];
+        if (c->token_valid || !c->hobject || !c->gpfifo_va) { continue; }
+        uint8_t tp[4]; memset(tp, 0, sizeof(tp)); uint32_t tst = 0xffff;
+        int trc = nvkvm_m2_control1(s, c->client, c->hobject, 0xc36f0108u, tp, 4, &tst);
+        if (trc == 0 && tst == 0) {
+            c->host_token = ldl_le_p(tp); c->token_valid = true;
+            qemu_log("nvkvm-gpu[%s] M5.12 chan[%d] hObj=0x%08x gpfifo=0x%llx -> HOST token=0x%08x "
+                     "(rl=%u chid=%u)\n", s->chip->name, i, c->hobject,
+                     (unsigned long long)c->gpfifo_va, c->host_token,
+                     (c->host_token >> 16) & 0xffff, c->host_token & 0xffff);
+        }
+    }
     for (int i = 0; i < s->chan_n; i++) {
         struct nvkvm_chan_entry *c = &s->chans[i];
         if (c->client != grc || !c->gpfifo_va || !c->gpfifo_ent) { continue; }
