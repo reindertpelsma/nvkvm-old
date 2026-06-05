@@ -111,3 +111,40 @@ GPA (KVM/GPA-window). The host GPU then DMAs to the same memory the guest CPU se
 
 QEMU/stub unprivileged; only unprivileged nvidia ioctls; one isolate per guest userspace
 process; apply Mode-1 allowlists/sanitizers before forwarding ([[access-model-split]]).
+
+## Execution-plane build status (2026-06-05) — primitives PROVEN, assembly remaining
+
+All execution-path primitives are built (gated behind the `m2exec` device prop, default
+off = zero regression) and validated on the RTX 3060 / GA106 host:
+
+- **map_dma FIXED** (`nvkvm_m2_map_dma`, NVOS46 V580): place a host memory object into a
+  host VASpace at a chosen GPU VA. KEY: `hDma` must be an **NV01_MEMORY_VIRTUAL (0x0070)**
+  mapper (`nvkvm_m2_alloc_virtmem`), NOT a raw FERMI_VASPACE_A (only virtual_mem.c
+  implements MapTo). Proven into the live GR VASpace 0x5c000007.
+- **ctx buffers already host-resident:** FIXED-mapping the PROMOTE_CTX va_map VAs returns
+  0x51 NV_ERR_NO_MEMORY = already mapped (host RM self-promoted its GR ctx at the SAME guest
+  VAs). Do NOT re-map them.
+- **GPFIFO double-mmap:** resolve the GPFIFO guest-FB phys by walking the guest GR PDB
+  (VA 0x200200000 -> FB 0xe0200000), `back_and_map` registers the FB overlay + FIXED-maps it
+  into 0x5c000007 (st=0). Guest GP writes now land in the host channel's GPFIFO. USERD was
+  already double-mmapped (M5.4).
+- **doorbell primitives:** alloc host AMPERE_USERMODE_A (0xc561) + RM_MAP_MEMORY + mmap;
+  fetch the GR channel work-submit token via NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN
+  (0xc36f0108) -> token=0xc. Ringing = write token to usermode_qva + 0x90.
+
+### Remaining final assembly (the cuCtxCreate keystone) — DO ATTENTIVELY
+Order, each a checkpoint (the RING is the only wedge-risk step — keep it last):
+1. **Forward channel schedule** (safe): `NVA06C_CTRL_CMD_GPFIFO_SCHEDULE` (0xa06c0101) on the
+   GR TSG (0x5c000012; track it like m2_gr_channel), params `NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS`
+   {bEnable=1}. The host TSG isn't scheduled today (schedule is a control; shadow_fwd only
+   forwards allocs/frees).
+2. **Map pushbuffers** (safe): at the guest doorbell, walk the guest GPFIFO entries
+   [gp_get,gp_put) -> pushbuffer VAs -> resolve phys (guest PDB walk) -> `back_and_map` each
+   (double-mmap + FIXED into 0x5c000007). Also double-mmap the completion-semaphore buffer so
+   the guest's PRAMIN poll sees the HOST GPU's write.
+3. **Disable chan_execute faking** under m2exec (so a green guest can ONLY come from the host).
+4. **RING** (wedge-risk): on the guest doorbell write the token (0xc) to usermode_qva+0x90.
+5. **VERIFY ON HOST**: `ssh vh nvidia-smi` must show utilization/process AND the completion
+   semaphore must be written by the GPU (not QEMU). Guest-green + host-idle = emulated, FAIL.
+   See [[mode2-real-forward-not-fake]]. If the host GPU wedges (100% util / no procs): reload
+   the host driver (rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia; modprobe nvidia).
