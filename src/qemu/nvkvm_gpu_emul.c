@@ -349,6 +349,10 @@ struct NvkvmGpuEmul {
      * channel's address space at the guest VAs (see [[mode2-mapdma-primitive]]). */
     struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[8];
     int      m2_grmap_n;
+    uint32_t m2_gr_channel;     /* M5.8: the host GR channel handle (c56f under GR TSG) */
+    void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
+    uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
+    bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -1005,6 +1009,7 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
 static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M5.5 fwd-decl */
 static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                   uint64_t phys, uint64_t size, const char *label); /* M5.7 */
+static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client); /* M5.8 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -1754,6 +1759,10 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 nvkvm_m2_back_and_map(s, grc, gva, gphys, 0x10000, "gpfifo");
                 break;
             }
+            /* M5.8: set up doorbell-forward primitives (map host USERMODE + fetch the GR
+             * channel work-submit token). NOT rung yet — ringing before pushbuffers are
+             * mapped + the channel scheduled would fault/wedge the host GPU. */
+            nvkvm_m2_doorbell_setup(s, grc);
         }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
@@ -2816,6 +2825,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             }
             if (is_gr) {
                 nvkvm_m2_back_channel_userd(s, hClient, hObject, auxbuf, psize);
+                s->m2_gr_channel = hObject;  /* M5.8: track for work-submit-token */
             }
         }
         /* M5.3: NV_CHANNEL_ALLOC_PARAMS hVASpace@28 (alloc_channel.h). Like the GR
@@ -3243,6 +3253,81 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
              hMem, hm.qva, rc, st, (unsigned long long)outva,
              ok ? "  OK PLACED" : already ? "  ALREADY-HOST-MAPPED" : "  <-- ERR");
     return ok || already;
+}
+
+/* M5.8 DOORBELL-FORWARD setup (no ring): alloc the host AMPERE_USERMODE_A (0xc561) doorbell
+ * register page under the GR client's subdevice, RM_MAP_MEMORY + mmap it into QEMU, and fetch
+ * the host GR channel's work-submit token (NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN
+ * 0xc36f0108). To RING (later, once pushbuffers are mapped + channel scheduled) we write the
+ * token to usermode_qva + NVC361_NOTIFY_CHANNEL_PENDING (0x90) -> the HOST GPU runs the
+ * channel. NOT rung here: ringing before the working set is mapped/scheduled would fault the
+ * host GPU (wedge). This validates the two new primitives (usermode map + token). */
+static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client)
+{
+    if (s->m2_doorbell_ready || !s->m2_gr_channel) {
+        return;
+    }
+    uint32_t hDev = 0, subdev = 0;
+    for (int i = 0; i < s->m2_grmap_n; i++) {
+        if (s->m2_grmap[i].client == client) { hDev = s->m2_grmap[i].hdev; break; }
+    }
+    for (int i = 0; i < s->m2_subdev_n; i++) {
+        if (s->m2_subdev[i].client == client) { subdev = s->m2_subdev[i].subdev; break; }
+    }
+    if (!hDev || !subdev) {
+        qemu_log("nvkvm-gpu[%s] M5.8 doorbell: no dev/subdev for client 0x%08x\n",
+                 s->chip->name, client);
+        return;
+    }
+    uint32_t hUM = 0xde900001u, st = 0xffff;
+    nvkvm_m2_alloc1(s, client, subdev, hUM, 0xc561u, NULL, 0, &st);   /* AMPERE_USERMODE_A */
+    qemu_log("nvkvm-gpu[%s] M5.8 doorbell: AMPERE_USERMODE_A alloc st=0x%x\n",
+             s->chip->name, st);
+    if (st != 0) {
+        return;
+    }
+    if (s->m2_maph_next < 16) { s->m2_maph_next = 16; }
+    uint32_t maph = s->m2_maph_next++;
+    int mapfd = -1;
+    if (nvkvm_isolate_open_device(&s->m2_iso, s->m2_iso_id, maph, NVKVM_DEV_GPU(0),
+                                  O_RDWR, &mapfd) != 0 || mapfd < 0) {
+        qemu_log("nvkvm-gpu[%s] M5.8 doorbell: usermode map-fd open failed\n", s->chip->name);
+        return;
+    }
+    struct nv_ioctl_nvos33_parameters_with_fd mm;
+    memset(&mm, 0, sizeof(mm));
+    mm.h_client = nvkvm_m2_client(s, client);
+    mm.h_device = hDev;
+    mm.h_memory = hUM;
+    mm.length   = 0x10000;                        /* NVC361_NV_USERMODE__SIZE = 64 KiB */
+    mm.fd       = (int32_t)maph;
+    unsigned int mc = (3u << 30) | ((unsigned int)sizeof(mm) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_MAP_MEMORY;
+    uint32_t mnv = 0; uint64_t mf = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, mc,
+                                 &mm, sizeof(mm), NULL, 0, 0, &mnv, &mf);
+    if (rc != 0 || mm.status != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.8 doorbell: usermode RM_MAP_MEMORY rc=%d st=0x%x\n",
+                 s->chip->name, rc, mm.status);
+        return;
+    }
+    void *qva = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mapfd, 0);
+    if (qva == MAP_FAILED) {
+        qemu_log("nvkvm-gpu[%s] M5.8 doorbell: usermode mmap failed: %s\n",
+                 s->chip->name, strerror(errno));
+        return;
+    }
+    s->m2_usermode_qva = qva;
+    uint8_t tp[4]; memset(tp, 0, sizeof(tp));
+    uint32_t tst = 0xffff;
+    int trc = nvkvm_m2_control1(s, client, s->m2_gr_channel, 0xc36f0108u, tp, 4, &tst);
+    s->m2_gr_token = ldl_le_p(tp);
+    s->m2_doorbell_ready = (trc == 0 && tst == 0);
+    qemu_log("nvkvm-gpu[%s] M5.8 doorbell: usermode qva=%p GR chan=0x%08x WORK_SUBMIT_TOKEN "
+             "trc=%d st=0x%x token=0x%08x -> %s\n", s->chip->name, qva, s->m2_gr_channel,
+             trc, tst, s->m2_gr_token,
+             s->m2_doorbell_ready ? "READY (ring deferred until pushbuffers mapped+scheduled)"
+                                  : "TOKEN-FAILED");
 }
 
 /* M5.5 one-shot validation of the RM_MAP_MEMORY_DMA primitive via the CORRECT mapper
