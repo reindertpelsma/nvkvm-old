@@ -2001,6 +2001,19 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
                      (unsigned long long)pa, (unsigned long long)rv, rep);
         }
     }
+    /* M5.10 DIAG: after the GR compute object constructs (crashwin), log ALL BAR1 reads
+     * (off -> resolved FB/SYS + value + whether m2_fbback-backed) to settle the
+     * cuCtxCreate access path: do libcuda's pre-crash reads go via BAR1 (trapped here)
+     * and to which FB, and is that FB backed? Capped. */
+    if (s->m2_crashwin) {
+        static uint32_t bcnt;
+        if (bcnt++ < 400) {
+            bool backed = (s->m2_fbback_n && nvkvm_fb_host_overlay(s, pa) != NULL);
+            qemu_log("nvkvm-gpu[GA106] M5.10 BAR1 RD off=0x%llx -> %s 0x%llx = 0x%llx %s\n",
+                     (unsigned long long)off, sys ? "SYS" : "FB", (unsigned long long)pa,
+                     (unsigned long long)rv, backed ? "[BACKED]" : "[unbacked]");
+        }
+    }
     return rv;
 }
 
