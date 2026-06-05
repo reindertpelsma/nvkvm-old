@@ -1722,6 +1722,17 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             }
             qemu_log("nvkvm-gpu[%s] M5.7 EXEC: backed %d/%d FB working-set buffers into GR "
                      "client 0x%08x VASpace\n", s->chip->name, mapped, s->va_map_n, grc);
+            /* Probe: the GR channel's GPFIFO VA is a UVM mapping NOT forwarded to the host,
+             * so it should be FREE in 0x5c000007 -> a FIXED map there should SUCCEED (st=0),
+             * unlike the already-host-mapped ctx VAs (0x51). VA-only (phys=0) connectivity
+             * check; the real path double-mmaps the guest GPFIFO content + pushbuffers. */
+            for (int i = 0; i < s->chan_n; i++) {
+                if (s->chans[i].client == grc && s->chans[i].gpfifo_va) {
+                    nvkvm_m2_back_and_map(s, grc, s->chans[i].gpfifo_va, 0, 0x8000,
+                                          "gpfifo-probe");
+                    break;
+                }
+            }
         }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
@@ -3199,12 +3210,18 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     }
     uint32_t st = 0xffff; uint64_t outva = 0;
     int rc = nvkvm_m2_map_dma(s, client, hDev, hVirt, hMem, 0, asize, true, va, &st, &outva);
+    /* st=0x51 (NV_ERR_NO_MEMORY) on a FIXED map => the VA is ALREADY mapped in the host
+     * VASpace (the host RM self-promoted its GR context buffers at the same VAs the guest
+     * uses). That's the desired state for ctx buffers — host already has them; no backing
+     * needed. Only genuinely-unmapped buffers (GPFIFO/pushbuffers) get placed by us. */
+    bool already = (st == 0x51u);
+    bool ok = (rc == 0 && st == 0 && outva == va);
     qemu_log("nvkvm-gpu[%s] M5.7 back_and_map[%s] VA=0x%llx phys=0x%llx size=0x%llx -> "
              "hMem=0x%08x qva=%p map rc=%d st=0x%x va=0x%llx%s\n", s->chip->name, label,
              (unsigned long long)va, (unsigned long long)phys, (unsigned long long)asize,
              hMem, hm.qva, rc, st, (unsigned long long)outva,
-             (rc == 0 && st == 0 && outva == va) ? "  OK" : "  <-- ERR");
-    return rc == 0 && st == 0 && outva == va;
+             ok ? "  OK PLACED" : already ? "  ALREADY-HOST-MAPPED" : "  <-- ERR");
+    return ok || already;
 }
 
 /* M5.5 one-shot validation of the RM_MAP_MEMORY_DMA primitive via the CORRECT mapper
