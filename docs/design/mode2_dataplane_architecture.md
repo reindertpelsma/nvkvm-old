@@ -452,3 +452,22 @@ buffers — GET_CTX_BUFFER_INFO / PROMOTE_CTX forward = 0x1b INSUFFICIENT_PERMIS
 
 Poll #1 favored (A); poll #2 (content) tilts toward (B). Next cheap experiment: multi-page sentinel
 or bar2-read instrumentation to inject poll #2 and measure whether the chain converges or explodes.
+
+### §X.1 Update 2026-06-05 — option C disproven; golden-ctx coherence needs a privileged path (B)
+Followed up the fork with source+experiment:
+- The golden-image channel is created whenever `IS_GSP_CLIENT` (kernel_graphics.c:478) — it is
+  CORRECT GSP-client behavior, not an artifact of a mis-advertised capability. So no clean cap flip
+  (C) suppresses it. The one plausible lever — regkey `RMSetClientRMAllocatedCtxBuffer=0` — changed
+  ctx-buffer management (PROMOTE_CTX stopped being issued) but the golden-image poll/wall persisted.
+- Ringing the host doorbell for real (A-real) does NOT write the guest's status/ctx pages: the GR
+  engine (FECS) writes the golden image + status into RM-INTERNAL PRIVILEGED ctx buffers (the
+  st=0x51 host-self-mapped set), not via a guest-visible pushbuffer SEM_RELEASE. The host writes its
+  own buffers; the guest's copies (0x2efbaf000 / 0x2efa6xxx) remain blank.
+- Sentinel faking (A-fake) clears the scalar status (poll #1) but poll #2 consumes ctx CONTENT.
+
+Conclusion: cuCtxCreate's keystone is GR golden-context COHERENCE, which requires a privileged
+mechanism (Option B) — mirror the host's real golden ctx into the guest's copies, or map the guest's
+ctx buffers onto the host's via a privileged path. Both weaken the unprivileged-stub tenet → user
+decision. Candidate mitigation: B-OFFLINE — extract the deterministic golden image once via a
+privileged/kernel path and replay the bytes at runtime (runtime stays unprivileged; the PATCH buffer
+fixes context-specific fields). PARKED for user sign-off.
