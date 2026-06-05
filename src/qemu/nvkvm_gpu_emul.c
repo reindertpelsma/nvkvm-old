@@ -3335,6 +3335,23 @@ static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient)
                  (mrc == 0 && mst == 0 && outva == va)
                      ? "  OK — host GPU can now reach the guest's sysmem GR buffer!"
                      : (mst == 0x51u ? "  ALREADY-MAPPED" : "  <-- ERR"));
+        /* M6.3b (the user's "can we fix ANY GR VA?" for SYSMEM): map the SAME OS_DESCRIPTOR'd
+         * guest RAM at a VA WE choose (free, not host-pre-mapped) into the GR VAS. st=0 proves
+         * we control the sysmem GR-VA layout end-to-end (guest RAM placeable at any chosen GR VA
+         * = the item-4 step-4 placement primitive, validated). Distinct from M6.3 which reuses
+         * the guest's own (often host-occupied) VA. */
+        if (hVirt) {
+            uint64_t freeva = 0x300000000ull;        /* well clear of GR ctx (0x120xxxxxx) + UVM */
+            uint32_t fst = 0xffff; uint64_t fova = 0;
+            int frc = nvkvm_m2_map_dma(s, hClient, hDev, hVirt, hMem, 0, sz, true, freeva,
+                                       &fst, &fova);
+            qemu_log("nvkvm-gpu[%s] M6.3b place guest-RAM sysmem at CHOSEN free GR VA=0x%llx -> "
+                     "rc=%d st=0x%x outva=0x%llx %s\n", s->chip->name,
+                     (unsigned long long)freeva, frc, fst, (unsigned long long)fova,
+                     (frc == 0 && fst == 0 && fova == freeva)
+                         ? "  OK — we OWN the sysmem GR-VA layout (item-4 step-4 primitive proven)"
+                         : (fst == 0x51u ? "  ALREADY-MAPPED (pick another VA)" : "  <-- ERR"));
+        }
     }
 }
 
