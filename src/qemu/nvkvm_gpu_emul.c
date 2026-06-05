@@ -352,6 +352,15 @@ struct NvkvmGpuEmul {
     int      m2_grmap_n;
     uint32_t m2_gr_channel;     /* M5.8: the host GR channel handle (c56f under GR TSG) */
     uint32_t m2_gr_tsg;         /* M5.8: the host GR TSG handle (a06c, channel's parent) */
+    /* M7 (cuCtxCreate fix): the HOST's real GR-object alloc reply params (NV_GR_ALLOCATION_
+     * PARAMETERS, 16B incl the GSP-filled `caps` output @+12). Captured by shadow_fwd after the
+     * forwarded 0xc7c0 alloc, then passed through into the GSP-RPC reply (resp+112) so the guest
+     * copies the REAL caps back instead of the echoed request (caps=0). The auditor proved the
+     * guest copies the LOCAL class size (16B) from resp+112 ignoring reply paramsSize, so the
+     * old M5.3 force-paramsSize->0 was moot; forwarding the real params is the correct fix. */
+    uint8_t  m2_gr_reply[64];
+    uint32_t m2_gr_reply_obj;   /* hObject this reply belongs to (match in the reply builder) */
+    bool     m2_gr_reply_valid;
     void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
     bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
@@ -1274,13 +1283,22 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 uint32_t hc = ldl_le_p(resp + 92);
                 uint32_t lb = hc & 0xffu, fam = (hc >> 8) & 0xffu;
                 uint32_t opsize = ldl_le_p(resp + 100);
-                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) && opsize) {
-                    stl_le_p(resp + 100, 0);                 /* paramsSize = 0 */
-                    uint32_t rlen = ldl_le_p(resp + 56);
-                    stl_le_p(resp + 56, rlen > opsize ? rlen - opsize : rlen);
-                    qemu_log("nvkvm-gpu[%s] M5.3 GR-obj 0x%04x reply paramsSize %u->0 "
-                             "(match real GSP; avoid libcuda pAllocParms overflow)\n",
-                             s->chip->name, hc, opsize);
+                uint32_t robj = ldl_le_p(resp + 88);
+                /* M7 (cuCtxCreate fix, replaces the moot M5.3 force-paramsSize->0): the guest
+                 * kernel copies the LOCAL per-class size (16B for GR) from resp+112 into libcuda's
+                 * pAllocParms, IGNORING reply paramsSize (auditor: ogkm rpc.c:11040). resp+112
+                 * currently echoes the REQUEST params (caps@12=0). Pass through the HOST's real
+                 * reply params (captured in shadow_fwd) so the guest gets the GSP-filled caps,
+                 * not a fake. "Forward, don't emulate." */
+                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) && opsize &&
+                    s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj) {
+                    uint32_t n = opsize < sizeof(s->m2_gr_reply) ? opsize
+                                                                 : (uint32_t)sizeof(s->m2_gr_reply);
+                    memcpy(resp + 112, s->m2_gr_reply, n);
+                    s->m2_gr_reply_valid = false;
+                    qemu_log("nvkvm-gpu[%s] M7 GR-obj 0x%04x reply: pass-through host params "
+                             "(%uB, caps@12=0x%08x) instead of request-echo\n",
+                             s->chip->name, hc, n, n >= 16 ? ldl_le_p(resp + 124) : 0);
                 }
             }
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
@@ -3059,6 +3077,23 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
              "hObj=0x%08x -> rc=%d status=0x%x%s\n", s->chip->name, s->m2_fwd_n,
              hClass, hParent, hObject, rc, p.status,
              (rc == 0 && p.status == 0) ? "  OK" : "  <-- ERR/MISMATCH");
+
+    /* M7 (cuCtxCreate fix): for GR-object allocs (fam>=0xb0, lowbyte 0xc0 compute / 0x97 3D —
+     * NV_GR_ALLOCATION_PARAMETERS, 16B with a GSP-filled `caps` output), capture the HOST's real
+     * reply params (auxbuf is in/out; the host RM wrote them) so the GSP-RPC reply builder can
+     * pass them through to the guest instead of echoing the request (caps=0). */
+    {
+        uint32_t lb = hClass & 0xffu, fam = (hClass >> 8) & 0xffu;
+        if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) && rc == 0 && p.status == 0) {
+            uint32_t n = psize < sizeof(s->m2_gr_reply) ? psize : (uint32_t)sizeof(s->m2_gr_reply);
+            memcpy(s->m2_gr_reply, auxbuf, n);
+            s->m2_gr_reply_obj = hObject;
+            s->m2_gr_reply_valid = true;
+            qemu_log("nvkvm-gpu[%s] M7 captured host GR-alloc reply 0x%04x obj=0x%08x "
+                     "caps@12=0x%08x (vs request-echo)\n", s->chip->name, hClass, hObject,
+                     n >= 16 ? ldl_le_p(auxbuf + 12) : 0);
+        }
+    }
 
     /* M5.3 DATA-PLANE step 1 (enumerate): once the compute object (AMPERE_COMPUTE_B
      * 0xc7c0) constructs on the host shadow context, query GR_GET_CTX_BUFFER_INFO on the
