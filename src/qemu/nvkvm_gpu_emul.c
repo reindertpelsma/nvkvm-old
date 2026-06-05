@@ -365,6 +365,14 @@ struct NvkvmGpuEmul {
     int      m2_guest_ram_fd;   /* memfd fd of guest RAM (-1 if not memfd-backed) */
     void    *m2_guest_ram_hva;  /* QEMU host VA of guest RAM base */
     uint64_t m2_guest_ram_size;
+    /* M6.1 (item-4 step 2): the guest-RAM memfd shared into the STUB. handle_table = the
+     * Mode-1 fd registry ([[mode2-per-proc-isolate-handle-reuse]]) so we can send_handle +
+     * isolate_mmap. The stub MAP_FIXEDs guest RAM at m2_stub_ram_base; for a guest GPA G the
+     * stub VA is m2_stub_ram_base+G -> OS_DESCRIPTOR there for host-GPU DMA (item-4 step 3). */
+    struct nvkvm_handle_table m2_ht;
+    uint32_t m2_guest_ram_handle;
+    uint64_t m2_stub_ram_base;  /* stub VA where guest RAM is MAP_FIXED (0 = not shared) */
+    bool     m2_ram_shared;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -2636,6 +2644,51 @@ static const MemoryRegionOps nvkvm_bar2_ops = {
  * and device nodes. Persists for the guest's lifetime (the host-side context the
  * forwarded RM stream builds on). Returns true once ready; on failure disables
  * forwarding cleanly so the guest keeps running on the faked path. */
+/* M6.1 (item-4 step 2): share the guest-RAM memfd into the stub and MAP_FIXED it at a
+ * reserved stub VA window, so the host nvidia driver (stub process) can address any guest
+ * GPA — the prerequisite for OS_DESCRIPTOR-registering the guest's sysmem GR buffers (item-4
+ * step 3) so the host GPU DMA-fills them. Reuses the Mode-1 handle_table + send_handle +
+ * isolate_mmap (the user's foreseen handle-reuse, [[mode2-per-proc-isolate-handle-reuse]]).
+ * One-shot; idempotent. */
+#define NVKVM_M2_STUB_RAMWIN 0x7e0000000000ull   /* 126 TiB: free in the fresh stub process */
+static bool nvkvm_m2_share_guest_ram(NvkvmGpuEmul *s)
+{
+    if (s->m2_ram_shared) {
+        return true;
+    }
+    if (s->m2_guest_ram_fd < 0 || s->m2_guest_ram_size == 0) {
+        qemu_log("nvkvm-gpu[%s] M6.1 share guest-RAM: no memfd (fd=%d) — need "
+                 "memory-backend-memfd,share=on\n", s->chip->name, s->m2_guest_ram_fd);
+        return false;
+    }
+    /* The stub keys handles in ONE id space shared with the isolate's device handles
+     * (ctl=1, gpu=2) and the data-plane map fds (m2_maph_next, 16+). Seed a high id so the
+     * guest-RAM handle can't collide (id 1 clobbered the stub's /dev/nvidiactl -> ENOTTY). */
+    s->m2_ht.next_id = 0x8000u;
+    uint32_t hid = 0;
+    if (nvkvm_handle_alloc_pending(&s->m2_ht, 1 /*session*/, 0, &hid) != 0) {
+        qemu_log("nvkvm-gpu[%s] M6.1 share guest-RAM: alloc_pending failed\n", s->chip->name);
+        return false;
+    }
+    if (nvkvm_handle_attach_fd(&s->m2_ht, hid, s->m2_guest_ram_fd) != 0) {
+        nvkvm_handle_abort_open(&s->m2_ht, hid);
+        qemu_log("nvkvm-gpu[%s] M6.1 share guest-RAM: attach_fd failed\n", s->chip->name);
+        return false;
+    }
+    int sr = nvkvm_isolate_send_handle(&s->m2_iso, &s->m2_ht, s->m2_iso_id, hid);
+    int mr = nvkvm_isolate_mmap(&s->m2_iso, s->m2_iso_id, hid, NVKVM_M2_STUB_RAMWIN,
+                                s->m2_guest_ram_size, 0, PROT_READ | PROT_WRITE, MAP_SHARED);
+    s->m2_guest_ram_handle = hid;
+    s->m2_stub_ram_base    = NVKVM_M2_STUB_RAMWIN;
+    s->m2_ram_shared       = (sr == 0 && mr == 0);
+    qemu_log("nvkvm-gpu[%s] M6.1 share guest-RAM: handle=%u send=%d mmap=%d stub_base=0x%llx "
+             "size=0x%llx -> %s\n", s->chip->name, hid, sr, mr,
+             (unsigned long long)NVKVM_M2_STUB_RAMWIN,
+             (unsigned long long)s->m2_guest_ram_size,
+             s->m2_ram_shared ? "SHARED (stub can address guest RAM)" : "FAILED");
+    return s->m2_ram_shared;
+}
+
 static bool nvkvm_m2_iso_ensure(NvkvmGpuEmul *s)
 {
     if (s->m2_iso_ready) {
@@ -2664,6 +2717,8 @@ static bool nvkvm_m2_iso_ensure(NvkvmGpuEmul *s)
     s->m2_iso_id = id; s->m2_ctl_h = 1; s->m2_gpu_h = 2; s->m2_iso_ready = true;
     qemu_log("nvkvm-gpu[%s] M5.1: host isolate %u ready (pid=%d, ctl+gpu0 open)\n",
              s->chip->name, id, (int)nvkvm_isolate_host_pid(&s->m2_iso, id));
+    /* M6.1 (item-4 step 2): share guest RAM into the stub so it can OS_DESCRIPTOR guest GPAs. */
+    nvkvm_m2_share_guest_ram(s);
     return true;
 }
 
@@ -3789,6 +3844,7 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
      * GPA + OS_DESCRIPTOR it for host-GPU DMA. Pick the largest fd-backed RAMBlock (the guest
      * RAM when run with -object memory-backend-memfd,share=on). fd=-1 if anon RAM. */
     s->m2_guest_ram_fd = -1;
+    nvkvm_handle_table_init(&s->m2_ht);   /* M6.1: fd registry for sharing guest RAM to stub */
     qemu_ram_foreach_block(nvkvm_m2_find_guest_ram, s);
     qemu_log("nvkvm-gpu[%s] M6.0 guest-RAM memfd: fd=%d hva=%p size=0x%llx %s\n",
              chip->name, s->m2_guest_ram_fd, s->m2_guest_ram_hva,
