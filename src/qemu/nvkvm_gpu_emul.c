@@ -3725,7 +3725,7 @@ static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t
 /* M6.5 leaf accumulator: coalesce contiguous (VA,GPA,sys) leaf pages into runs, back each
  * SYSMEM run via the primitive above. (Vidmem leaves are host-resident already — M6.4.) */
 struct nvkvm_leaf_acc { NvkvmGpuEmul *s; uint32_t client; uint64_t va0, gpa0, len;
-                        int sys, runs, backed; uint64_t sysbytes; };
+                        int sys, runs, backed; uint64_t sysbytes, vidbytes; };
 
 static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
 {
@@ -3735,6 +3735,21 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
         a->sysbytes += a->len;
         if (!nvkvm_m2_va_seen(a->s, a->va0) &&
             nvkvm_m2_back_and_map_sys(a->s, a->client, a->va0, a->gpa0, a->len)) {
+            a->backed++;
+        }
+    } else {
+        /* M6.6 (user direction): vidmem leaf — back with a BLANK host vidmem object,
+         * double-mmapped (back_and_map: m2_fbback CPU side at the FB addr + FIXED map_dma
+         * GPU side at the guest VA). The buffer is OPAQUE: the guest manages its contents
+         * and the host GPU fills the golden ctx on execution — both sides share ONE
+         * coherent host object. Replaces the dead malloc'd fb_pages backing that the host
+         * GPU can't touch (the cuCtxCreate crash = libcuda reads that dead vidmem as zero).
+         * 0x51 from map_dma = the host self-promoted its own object at this VA (no overlay;
+         * needs the avoid-self-promotion path). copy_content=false (blank). */
+        a->vidbytes += a->len;
+        if (!nvkvm_m2_va_seen(a->s, a->va0) &&
+            nvkvm_m2_back_and_map(a->s, a->client, a->va0, a->gpa0, a->len, false,
+                                  "grctx-vid")) {
             a->backed++;
         }
     }
@@ -3835,9 +3850,10 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
         nvkvm_m2_pt_enum(s, pdb, false, 0, 0, &a, &budget);
         nvkvm_m2_leaf_flush(&a);
         qemu_log("nvkvm-gpu[%s] M6.5 enum_gr_sysmem: vas=0x%08x pdb=0x%llx runs=%d "
-                 "sysbytes=0x%llx backed=%d (budget_left=%d)\n", s->chip->name,
+                 "sysbytes=0x%llx vidbytes=0x%llx backed=%d (budget_left=%d)\n", s->chip->name,
                  s->chan_vas[v].hvas, (unsigned long long)pdb, a.runs,
-                 (unsigned long long)a.sysbytes, a.backed, budget);
+                 (unsigned long long)a.sysbytes, (unsigned long long)a.vidbytes,
+                 a.backed, budget);
     }
 }
 
