@@ -253,3 +253,34 @@ RAM with no cooperation. So item-4's prerequisite:
   5. forward channel execution so the host GPU DMA-fills the buffers libcuda reads.
 The host-GPU-DMA-to-shared-RAM step is Mode-1-proven (partly de-risks the DMA-virt concern);
 the work is the shared-RAM plumbing + GR-mapping enumeration + execution. Multi-week keystone.
+
+## cuCtxCreate crash — CORRECTED root cause (2026-06-05 late): unfilled VIDMEM ctx buffer via BAR1
+
+Boot-free host-vs-guest LD_PRELOAD diff (shims in tests/mode2/shims/) + guest hObject<->class
+correlation DEFINITIVELY corrects the earlier "un-backed sysmem" diagnoses above — those were
+WRONG. Findings:
+
+- Host (real GA106, **same open KMD 580.159.04 + same libcuda** as guest) cuCtxCreate: allocates
+  client/device/subdevice/vaspace then the per-channel set, does 25 RM_MAP_MEMORY but only ONE
+  MAP_SHARED mmap (the 2MiB GPFIFO, which stays ALL-ZERO), and PASSES. A zero CPU buffer is not
+  fatal.
+- Guest replays the host's alloc sequence IDENTICALLY through 0xc56f (channel) + 0xc7c0 (compute),
+  then SIGSEGVs (rbp=0) exactly where the host does its next 0xc7b5 (DMA copy).
+- The crash buffers are **VIDMEM**: hMem 0x5c000016 (64MiB) and 0x5c000018 (4KiB) are alloc
+  **class 0x3e = NV01_MEMORY_LOCAL_USER**, ret=0 (alloc SUCCEEDS). Only the GPFIFO (0x5c000014) is
+  class 0x40 sysmem — sysmem on the host too. NEITHER side mmap()s the 0x3e buffers -> libcuda
+  reads them via the **BAR1 aperture**, not a CPU mmap.
+- HOST BAR1 read -> real GPU vidmem -> GPU-written **golden GR context** (non-zero) -> works.
+  GUEST BAR1 read -> emulated vidmem (m2_fbback/guest-RAM) -> **ZERO** (never filled) -> NULL deref.
+
+So the singular cuCtxCreate blocker = the emulated GPU's VIDMEM is never filled with the golden GR
+context that the real GPU writes. FIX = CPU->GPU memory plane (item-2) for vidmem-via-BAR: the
+guest's BAR1 read of the vidmem GR ctx (0x5c000016) must resolve to the host's real golden-context
+vidmem. The host HAS the golden ctx in host vidmem (self-promoted from the forwarded channel/
+compute allocs), but 0x5c000016 is allocated GUEST-LOCALLY (not in the fn=103 SHADOW stream) so
+there's no host counterpart handle. Options: (A) host GPU fills it — OS_DESCRIPTOR 0x5c000016's
+emulated-vidmem (guest-RAM) backing + map into the host GR VAS + trigger golden-ctx load
+(execution); (B) copy host golden-ctx content into 0x5c000016's m2_fbback backing (needs to name
+the host ctx buffer; GET_CTX_BUFFER_INFO was privileged 0x1b on the unprivileged stub). The CPU-RM
+regkey RMInstLoc* (force aperture) does NOT change it — aperture is already vidmem; the problem is
+content, not location. Supersedes ALL prior sysmem/page-table/channel diagnoses for this crash.
