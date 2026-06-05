@@ -1033,6 +1033,11 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
                                   uint32_t hMem, uint64_t stub_va, uint64_t size,
                                   uint32_t *st); /* M6.2 fwd-decl */
 static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
+static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client); /* M5.7 fwd-decl */
+static int nvkvm_m2_map_dma(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
+                            uint32_t hVas, uint32_t hMemory, uint64_t offset,
+                            uint64_t length, bool fixed, uint64_t va,
+                            uint32_t *st, uint64_t *out_va); /* M5.5 fwd-decl */
 static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                   uint64_t phys, uint64_t size, bool copy_content,
                                   const char *label); /* M5.7 */
@@ -3305,6 +3310,23 @@ static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient)
              (unsigned long long)gpa, (unsigned long long)sz, (unsigned long long)sva, hMem,
              rc, st, (rc == 0 && st == 0) ? "  OK — host RM pinned guest RAM!"
                                           : "  <-- ERR (tune flags/descriptor)");
+    /* M6.3 (item-4 step 4): map the pinned guest RAM into the GR VASpace at the guest's GR VA,
+     * so the host GPU's MMU resolves that VA to the guest's sysmem buffer (host GPU then
+     * DMA-reads/writes the SAME memory the guest CPU sees). Reuses the M5.5 map_dma primitive +
+     * the per-client GR virtmem mapper. */
+    if (rc == 0 && st == 0) {
+        uint64_t va = s->va_map[idx].va;
+        uint32_t hVirt = nvkvm_m2_grmapper(s, hClient);
+        uint32_t mst = 0xffff; uint64_t outva = 0;
+        int mrc = hVirt ? nvkvm_m2_map_dma(s, hClient, hDev, hVirt, hMem, 0, sz, true, va,
+                                           &mst, &outva) : -1;
+        qemu_log("nvkvm-gpu[%s] M6.3 map pinned guest RAM into GR VAS: hVirt=0x%08x va=0x%llx "
+                 "-> rc=%d st=0x%x outva=0x%llx %s\n", s->chip->name, hVirt,
+                 (unsigned long long)va, mrc, mst, (unsigned long long)outva,
+                 (mrc == 0 && mst == 0 && outva == va)
+                     ? "  OK — host GPU can now reach the guest's sysmem GR buffer!"
+                     : (mst == 0x51u ? "  ALREADY-MAPPED" : "  <-- ERR"));
+    }
 }
 
 /* M5.5 EXECUTION-PLANE PRIMITIVE: map a host memory object into a host VASpace at a
