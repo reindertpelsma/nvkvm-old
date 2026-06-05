@@ -237,3 +237,19 @@ forward channel execution so the GPU runs the GR-context fill. Diagnosis fully c
 channels (no), page-table poll (symptom), faked controls (not the direct filler), fds (ok);
 the EXACT buffers + their local-sysmem-alloc path are now identified. See memory
 mode2_cuctxcreate_pagetable_poll.
+
+## item-4 hard prerequisite (2026-06-05): shared guest-RAM memfd so the stub can OS_DESCRIPTOR it
+
+To back the guest's sysmem GR buffers, the host nvidia driver (STUB process) must
+OS_DESCRIPTOR-register the guest RAM. But the stub is a separate process; QEMU's guest RAM
+(anon mmap) isn't in its address space. Mode-1 works only because the guest nvkvm MODULE
+allocates in a SHARED GPA-window (memfd); the stock Mode-2 driver allocates in ordinary guest
+RAM with no cooperation. So item-4's prerequisite:
+  1. back Mode-2 guest RAM with -object memory-backend-memfd; pass the fd to the emul device.
+  2. share the fd to the stub (SCM_RIGHTS); stub mmaps it (any guest GPA -> stub VA).
+  3. OS_DESCRIPTOR(memfd + gpa_offset, size) primitive (NV01_MEMORY_SYSTEM_OS_DESCRIPTOR 0x71).
+  4. for each GR-VA->guest-GPA sysmem mapping (va_map sys=true / PROMOTE_CTX + more), OS_DESCRIPTOR
+     + RM_MAP_MEMORY_DMA FIXED at the GR VA into the host GR VAS.
+  5. forward channel execution so the host GPU DMA-fills the buffers libcuda reads.
+The host-GPU-DMA-to-shared-RAM step is Mode-1-proven (partly de-risks the DMA-virt concern);
+the work is the shared-RAM plumbing + GR-mapping enumeration + execution. Multi-week keystone.
