@@ -377,3 +377,26 @@ the token must be TRANSLATED (vrunlist:vChid -> srunlist:sChid) before writing t
 
 Quarantine the QEMU-side `nvkvm_chan_execute()` pushbuffer-parse/sema-fake path during the real
 build (it masks whether the host actually ran the work).
+
+### §16.1 — MEASURED: chid table + the demux decision (2026-06-05, GA106 cup2 m2exec)
+Built the per-channel host-token table (M5.12): `shadow_fwd` creates the host channel with the SAME
+hObject, so `0xc36f0108` (GET_WORK_SUBMIT_TOKEN) on the guest channel handle returns the HOST token.
+Measured host tokens (sequential per runlist):
+```
+gpfifo 0x121010000 -> 0x00000004 (rl0 chid4)   0x121040000 -> 0x05   0x121070000 -> 0x06
+0x1210a0000 -> 0x07   0x1210d0000 -> 0x00010008 (rl1 chid8)   0x121100000 -> 0x10009
+0x121130000 -> 0x0002000a (rl2 chid10)   0x121160000 -> 0x2000b   GR 0x200200000 -> 0x0c
+```
+Guest doorbell tokens written during cuCtxCreate: `0x4`, `0x10008`, `0x10001`.
+- `0x4`  == host chan token (gpfifo 0x121010000) ✅
+- `0x10008` == host chan token (gpfifo 0x1210d0000) ✅
+- `0x10001` — **NO host token equals it** ❌
+
+**DECISION: doorbell pass-through is INCORRECT.** Guest vChid and host sChid usually coincide
+(both RMs allocate chids sequentially in the same order) but NOT always (`0x10001` diverges). So we
+must NOT forward the guest's token verbatim. Use **GP_PUT-driven demux**: at the trapped doorbell,
+scan all forwarded channels' USERD GP_PUT, and for each that advanced since last ring, ring ITS
+`host_token` (from the M5.12 table). This needs no vChid→sChid decode and is robust to the divergence.
+
+Known gap: chan[0,1,2] (the 4096/32-ent early channels) didn't get tokens fetched (fetch err /
+gpfifo_va=0) — revisit when wiring the ring.
