@@ -1400,6 +1400,27 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                                  resp[120], resp[121], resp[122], resp[123],
                                  resp[124], resp[125], resp[126], resp[127]);
                     }
+                } else if (ctrl == 0x2080012fu) {
+                    /* M10 (cuCtxCreate rbp=0 ROOT CAUSE — host-vs-guest ioctl diff, 2026-06-06):
+                     * NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS (0x2080012f, params 1464B).  A GeForce
+                     * GA106 has NO ECC, so the REAL driver returns NV_ERR_NOT_SUPPORTED (0x56) and
+                     * the RM sets SKIP_COPYOUT -> libcuda's 1464B ECC buffer is left untouched.  Our
+                     * fake NV_OK instead copied 1464B of echoed/zero garbage over that buffer, so
+                     * libcuda acted on bogus ECC state and later crashed (saved-rbp clobber ->
+                     * rbp=0 SIGSEGV at libcuda+0x466560).  Match the host: report NOT_SUPPORTED.
+                     * (Found via the nvioctl_trace LD_PRELOAD host/guest diff: this was the ONLY
+                     * control whose status diverged — host 0x56 vs guest 0x0.) */
+                    stl_le_p(resp + 92, 0x56u);   /* NV_ERR_NOT_SUPPORTED */
+                } else if (ctrl == 0x20803002u) {
+                    /* M10: NV2080_CTRL_CMD_NVLINK_GET_NVLINK_STATUS (0x20803002).  The
+                     * params struct is huge (NV2080_CTRL_NVLINK_LINK_STATUS_INFO
+                     * linkInfo[MAX_ARR_SIZE], ~13 KB).  On a no-NVLink GeForce (GA106) the
+                     * real driver returns NV_ERR_NOT_SUPPORTED, on which the RM sets
+                     * RMAPI_PARAM_COPY_FLAGS_SKIP_COPYOUT and copies NOTHING back to libcuda.
+                     * Our fake NV_OK echo instead forced a full ~13 KB param copy_to_user into
+                     * libcuda's stack buffer.  Match the host: report NOT_SUPPORTED so the guest
+                     * skips the copyout.  (No NVLink on this part, so this is the correct status.) */
+                    stl_le_p(resp + 92, 0x56u);   /* NV_ERR_NOT_SUPPORTED */
                 } else if (ctrl == 0x20800a5cu) {
                     /* INTERNAL_INTR_GET_KERNEL_TABLE: the real GSP supplies the
                      * interrupt table via boot static-info so the host CPU-RM
