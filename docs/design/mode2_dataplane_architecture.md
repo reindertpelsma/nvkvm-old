@@ -164,3 +164,26 @@ state GSP would install) — or an event the guest waits on before installing it
 exec-forward primitives (map_dma/double-mmap/USERMODE/token/schedule) remain correct and
 reusable, but must target populating the guest's GR page tables / the awaited mapping, not
 channel rings, for cuCtxCreate. See memory mode2_cuctxcreate_pagetable_poll.
+
+## cuCtxCreate crash access-path RESOLVED (2026-06-05) — un-backed CPU-mmap of RM sysmem
+
+gdb + strace at the rbp=0 SIGSEGV: ALL guest open/ioctl/mmap SUCCEED (no failed fd; the
+gdb rdi=-1 was a mid-computation value). The crash is libcuda dereferencing a NULL it READ
+from a CPU-mmap'd RM buffer. Pre-crash pattern = RM_MAP_MEMORY (ioctl NR 0x4e / NVOS33) +
+mmap(MAP_SHARED|MAP_FIXED) on /dev/nvidia0 and /dev/nvidiactl:
+  mmap(0x200200000, 2 MiB,  /dev/nvidia0)     GPFIFO (FB; covered by m2_fbback via BAR1)
+  mmap(0x200400000, 64 MiB, /dev/nvidiactl)   large RM region   <- NOT FB; uncovered
+  mmap(0x77f2f2ddf000, 4 KiB,/dev/nvidiactl)  small RM struct (last mmap pre-crash)
+The /dev/nvidiactl maps are RM SYSTEM/heap memory (NV_CTL device), NOT GPU FB -> NOT covered
+by the FB/PRAMIN m2_fbback overlay -> content is UN-BACKED (zeros) -> libcuda reads a NULL
+struct ptr -> rbp=0 deref. This is the access path the FB-read CRASHWIN probe couldn't see
+(direct CPU mmap, not a PRAMIN/BAR access).
+
+NEXT BUILD: back the RM_MAP_MEMORY+mmap'd buffers with REAL host content. On the guest's
+RM_MAP_MEMORY (NR 0x4e), make the guest CPU mapping resolve to the forwarded host object's
+real memory (double-mmap: we already forward the alloc; map the host object + overlay the
+guest mmap target — including the /dev/nvidiactl sysmem maps, not just FB). Pin which mapped
+buffer holds the NULL (instrument the 0x4e handler + the mmap GPA, or LD_PRELOAD-log the bytes
+libcuda reads from 0x200400000 / 0x77f2f2ddf000 pre-crash). See memory
+mode2_cuctxcreate_pagetable_poll. Supersedes the "multi-channel forward" and "page-table
+population" next-steps (both were symptoms, not the crash).
