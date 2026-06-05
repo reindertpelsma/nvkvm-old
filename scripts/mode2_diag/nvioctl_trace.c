@@ -28,12 +28,22 @@ int ioctl(int fd, unsigned long req, ...){
     }
     int r = real_ioctl(fd, req, arg);
     if (type == 0x46 && lg) {
-        if (nr == 0x2A) fprintf(lg, "CTRL  cmd=0x%08x psz=%-6u status=0x%-4x params=0x%llx\n",
+        if (nr == 0x2A) fprintf(lg, "CTRL  cmd=0x%08x psz=%-6u status=0x%-4x params=0x%llx",
                                 cmd, psz, *(uint32_t*)((char*)arg+28), (unsigned long long)pptr);
-        else if (nr == 0x2B) fprintf(lg, "ALLOC class=0x%08x psz=%-6u status=0x%-4x params=0x%llx\n",
+        else if (nr == 0x2B) fprintf(lg, "ALLOC class=0x%08x psz=%-6u status=0x%-4x params=0x%llx",
                                 hcls, psz, *(uint32_t*)((char*)arg+28), (unsigned long long)pptr);
-        else fprintf(lg, "IOCTL nr=0x%02x ret=%d\n", nr, r);
-        fflush(lg);
+        else { fprintf(lg, "IOCTL nr=0x%02x ret=%d\n", nr, r); fflush(lg); return r; }
+        /* dump first N bytes of the params buffer (post-call) so guest vs host CONTENT can be
+         * diffed: a control returning real data on the host but NV_OK+zeros on the guest shows up
+         * as content=00.. vs nonzero. NVCONTENT env = N (default 48, 0=off). */
+        const char *cd = getenv("NVCONTENT"); unsigned cn = cd ? (unsigned)atoi(cd) : 48;
+        if (cn > 256) cn = 256;
+        if (cn && pptr) {
+            unsigned lim = (psz < cn) ? psz : cn;
+            fprintf(lg, " content=");
+            for (unsigned i = 0; i < lim; i++) fprintf(lg, "%02x", ((unsigned char *)(uintptr_t)pptr)[i]);
+        }
+        fprintf(lg, "\n"); fflush(lg);
     }
     return r;
 }
