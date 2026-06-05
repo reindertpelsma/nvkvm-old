@@ -344,6 +344,7 @@ struct NvkvmGpuEmul {
     bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
     bool     m2exec;            /* M5.7 prop: enable execution-plane backing (default off) */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
+    uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
     uint32_t m2_gr_client;      /* M5.7: the GR compute client (set at crashwin arm) */
     /* M5.7: per-client NV01_MEMORY_VIRTUAL mapper over the client's GR VASpace, so the
      * execution path can map_dma FIXED the guest's working-set buffers into the host
@@ -4065,8 +4066,22 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
  * mmapped; here we add the pushbuffers each entry points at. Idempotent via the mapped set. */
 static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
 {
-    if (!s->m2exec || !s->m2_doorbell_ready) { return; }
+    if (!s->m2exec) { return; }
     uint32_t grc = s->m2_gr_client;
+    /* M5.10: re-sweep the GR VAS at the doorbell (decoupled from doorbell_ready / channel-client
+     * match — the semaphore-releasing channel may be under a different client than m2_gr_client).
+     * The guest maps its working set (pushbuffers, data, completion semaphore 0x2efbaf000) only
+     * WHEN it submits work, AFTER the one-shot M6.5 sweep at the 0xc7c0 alloc — so those leaves are
+     * still UNBACKED at this point. Re-sweep (idempotent: only NEW VAs backed) so the full working
+     * set, incl. the semaphore the host must write, is FIXED-mapped into the host VAS before any
+     * ring (else a ring faults the host GPU on the SEM_RELEASE target -> cuInit=999). Bounded. */
+    if (grc && s->m2_exec_sweeps < 8) {
+        s->m2_exec_sweeps++;
+        qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x) — back newly-mapped "
+                 "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps, grc);
+        nvkvm_m2_enum_gr_sysmem(s, grc);
+    }
+    if (!s->m2_doorbell_ready) { return; }
     for (int i = 0; i < s->chan_n; i++) {
         struct nvkvm_chan_entry *c = &s->chans[i];
         if (c->client != grc || !c->gpfifo_va || !c->gpfifo_ent) { continue; }
