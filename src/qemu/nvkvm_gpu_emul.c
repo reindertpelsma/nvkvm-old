@@ -1044,6 +1044,9 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
 static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client); /* M5.8 fwd-decl */
 static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s); /* M5.9 fwd-decl */
 static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd); /* M6.4 fwd-decl */
+static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                      uint64_t gpa, uint64_t size); /* M6.5 fwd-decl */
+static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client); /* M6.5 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -3042,6 +3045,13 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             nvkvm_m2_mapdma_selftest(s, hClient);
             nvkvm_m2_osdesc_selftest(s, hClient);   /* M6.2: OS_DESCRIPTOR guest RAM (item-4 step 3) */
         }
+        /* M6.5 (item-4 step 4): DISCOVERY sweep — walk the GR VAS page tables, enumerate every
+         * sysmem leaf, and OS_DESCRIPTOR+map_dma each into the host GR VASpace so the host GPU
+         * can DMA into the guest's actual NVOS32-local sysmem GR buffers (the crash buffers).
+         * Idempotent; re-run on each later compute-obj alloc to catch mappings built afterward. */
+        if (s->m2exec) {
+            nvkvm_m2_enum_gr_sysmem(s, hClient);
+        }
         uint32_t subdev = 0;
         for (int i = 0; i < s->m2_subdev_n; i++) {
             if (s->m2_subdev[i].client == hClient) { subdev = s->m2_subdev[i].subdev; break; }
@@ -3677,6 +3687,158 @@ static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint64_t va)
     }
     if (s->m2_mapped_va_n < 128) { s->m2_mapped_va[s->m2_mapped_va_n++] = va; }
     return false;
+}
+
+/* M6.5 (item-4 DISCOVERY+backing): place a contiguous guest-RAM SYSMEM run at its GR VA in
+ * the host GR VASpace, so the host GPU can DMA into the guest's actual buffer. Reuses the
+ * M6.2/M6.3b primitive chain: gpa->stub VA (memfd, 1:1) -> OS_DESCRIPTOR (host RM pins guest
+ * RAM) -> per-client GR virtmem mapper -> FIXED map_dma at the guest VA. (st=0x51 = the VA is
+ * already host-resident, e.g. self-promoted GR ctx — treated as success, do not re-place.) */
+static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                      uint64_t gpa, uint64_t size)
+{
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+    }
+    if (!hDev || !size) { return false; }
+    uint64_t sva = nvkvm_m2_gpa_to_stub_va(s, gpa);
+    if (!sva) { return false; }
+    uint32_t hMem = 0xdf000000u | (s->m2_databuf_next++ & 0xffffu);
+    uint32_t ost = 0xffff;
+    if (nvkvm_m2_os_descriptor(s, client, hDev, hMem, sva, size, &ost) != 0 || ost != 0) {
+        return false;
+    }
+    uint32_t hVirt = nvkvm_m2_grmapper(s, client);
+    if (!hVirt) { return false; }
+    uint32_t mst = 0xffff; uint64_t outva = 0;
+    int mrc = nvkvm_m2_map_dma(s, client, hDev, hVirt, hMem, 0, size, true, va, &mst, &outva);
+    bool ok = (mrc == 0 && mst == 0 && outva == va);
+    bool already = (mst == 0x51u);
+    qemu_log("nvkvm-gpu[%s] M6.5 back_sys VA=0x%llx gpa=0x%llx size=0x%llx -> hMem=0x%08x "
+             "os_st=0x%x map rc=%d st=0x%x %s\n", s->chip->name, (unsigned long long)va,
+             (unsigned long long)gpa, (unsigned long long)size, hMem, ost, mrc, mst,
+             ok ? "  PLACED" : already ? "  ALREADY-MAPPED" : "  <-- ERR");
+    return ok || already;
+}
+
+/* M6.5 leaf accumulator: coalesce contiguous (VA,GPA,sys) leaf pages into runs, back each
+ * SYSMEM run via the primitive above. (Vidmem leaves are host-resident already — M6.4.) */
+struct nvkvm_leaf_acc { NvkvmGpuEmul *s; uint32_t client; uint64_t va0, gpa0, len;
+                        int sys, runs, backed; uint64_t sysbytes; };
+
+static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
+{
+    if (a->len == 0) { return; }
+    a->runs++;
+    if (a->sys) {
+        a->sysbytes += a->len;
+        if (!nvkvm_m2_va_seen(a->s, a->va0) &&
+            nvkvm_m2_back_and_map_sys(a->s, a->client, a->va0, a->gpa0, a->len)) {
+            a->backed++;
+        }
+    }
+    a->len = 0;
+}
+
+static void nvkvm_m2_leaf_add(struct nvkvm_leaf_acc *a, uint64_t va, uint64_t gpa,
+                              int sys, uint64_t pgsz)
+{
+    if (a->len && a->sys == sys && va == a->va0 + a->len && gpa == a->gpa0 + a->len) {
+        a->len += pgsz;                          /* extend run (VA+GPA both contiguous) */
+        return;
+    }
+    nvkvm_m2_leaf_flush(a);
+    a->va0 = va; a->gpa0 = gpa; a->sys = sys; a->len = pgsz;
+}
+
+/* Recursive GMMU-VER2 descent: PD3->PD2->PD1 (8B PDEs), PD0 (16B dual-PDE / 2 MiB leaf),
+ * small (4K) / big (64K) PTs. Mirrors nvkvm_walk_pdb's decode but ENUMERATES every valid
+ * leaf instead of resolving one VA. `budget` bounds total entries visited (sparse tables). */
+static void nvkvm_m2_pt_enum(NvkvmGpuEmul *s, uint64_t tbl, bool tsys, int level,
+                             uint64_t vabase, struct nvkvm_leaf_acc *a, int *budget)
+{
+    if (*budget <= 0 || tbl == 0) { return; }
+    static const struct { int lo, n; } L[3] = { {47, 2}, {38, 512}, {29, 512} };
+    if (level < 3) {
+        for (uint32_t i = 0; i < (uint32_t)L[level].n && *budget > 0; i++) {
+            uint64_t pde = nvkvm_pt_rd64(s, tbl + (uint64_t)i * 8, tsys);
+            uint32_t ap = (uint32_t)((pde >> 1) & 0x3);
+            uint64_t nt; bool ntsys;
+            if (ap == 1) { nt = ((pde >> 8) & ((1ull << 25) - 1)) << 12; ntsys = false; }
+            else if (ap == 2 || ap == 3) { nt = ((pde >> 8) & ((1ull << 46) - 1)) << 12; ntsys = true; }
+            else { continue; }
+            nvkvm_m2_pt_enum(s, nt, ntsys, level + 1,
+                             vabase | ((uint64_t)i << L[level].lo), a, budget);
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < 256 && *budget > 0; i++) {       /* PD0: 256 dual-PDEs */
+        uint64_t e = tbl + (uint64_t)i * 16;
+        uint64_t lo = nvkvm_pt_rd64(s, e, tsys), hi = nvkvm_pt_rd64(s, e + 8, tsys);
+        uint64_t pdva = vabase | ((uint64_t)i << 21);
+        (*budget)--;
+        if (lo & 1) {                                          /* 2 MiB leaf PTE */
+            uint32_t lap = (uint32_t)((lo >> 1) & 0x3); uint64_t pg; int sys;
+            if (lap == 0) { pg = ((lo >> 8) & ((1ull << 25) - 1)) << 12; sys = 0; }
+            else if (lap == 2 || lap == 3) { pg = ((lo >> 8) & ((1ull << 46) - 1)) << 12; sys = 1; }
+            else { continue; }
+            nvkvm_m2_leaf_add(a, pdva, pg, sys, 0x200000ull);
+            continue;
+        }
+        uint32_t big_ap = (uint32_t)((lo >> 1) & 0x3), small_ap = (uint32_t)((hi >> 1) & 0x3);
+        if (small_ap == 1 || small_ap == 2 || small_ap == 3) {
+            bool stsys = (small_ap != 1);
+            uint64_t st = stsys ? (((hi >> 8) & ((1ull << 46) - 1)) << 12)
+                                : (((hi >> 8) & ((1ull << 25) - 1)) << 12);
+            for (uint32_t j = 0; st && j < 512 && *budget > 0; j++) {
+                uint64_t pte = nvkvm_pt_rd64(s, st + (uint64_t)j * 8, stsys); (*budget)--;
+                if (!(pte & 1)) { continue; }
+                uint32_t apt = (uint32_t)((pte >> 1) & 0x3); uint64_t pg; int sys;
+                if (apt == 0) { pg = ((pte >> 8) & ((1ull << 25) - 1)) << 12; sys = 0; }
+                else if (apt == 2 || apt == 3) { pg = ((pte >> 8) & ((1ull << 46) - 1)) << 12; sys = 1; }
+                else { continue; }
+                nvkvm_m2_leaf_add(a, pdva | ((uint64_t)j << 12), pg, sys, 0x1000ull);
+            }
+        }
+        if (big_ap == 1 || big_ap == 2 || big_ap == 3) {
+            bool btsys = (big_ap != 1);
+            uint64_t bt = btsys ? (((lo >> 4) & ((1ull << 50) - 1)) << 8)
+                                : (((lo >> 4) & ((1ull << 29) - 1)) << 8);
+            for (uint32_t j = 0; bt && j < 32 && *budget > 0; j++) {
+                uint64_t pte = nvkvm_pt_rd64(s, bt + (uint64_t)j * 8, btsys); (*budget)--;
+                if (!(pte & 1)) { continue; }
+                uint32_t apt = (uint32_t)((pte >> 1) & 0x3); uint64_t pg; int sys;
+                if (apt == 0) { pg = ((pte >> 8) & ((1ull << 25) - 1)) << 12; sys = 0; }
+                else if (apt == 2 || apt == 3) { pg = ((pte >> 8) & ((1ull << 46) - 1)) << 12; sys = 1; }
+                else { continue; }
+                nvkvm_m2_leaf_add(a, pdva | ((uint64_t)j << 16), pg, sys, 0x10000ull);
+            }
+        }
+    }
+}
+
+/* M6.5 (item-4 step 4, the DISCOVERY sweep): the crash buffers are NVOS32-local sysmem GR
+ * buffers with NO GSP-RPC, so QEMU only learns their GR-VA->guest-GPA mapping by WALKING the
+ * GR VAS page tables (the guest RM builds them in guest-RAM-as-vidmem). Walk each snooped VAS
+ * PDB, enumerate every sysmem leaf, coalesce runs, and OS_DESCRIPTOR+map_dma each into the host
+ * GR VASpace (host GPU can then DMA into the guest's real sysmem working set). Idempotent
+ * (re-runs only back NEW VAs). Gated by the m2exec caller. Bounded by `budget`. */
+static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
+{
+    int budget = 300000;                          /* total PT entries to visit (sparse) */
+    for (int v = 0; v < s->chan_vas_n && budget > 0; v++) {
+        uint64_t pdb = s->chan_vas[v].pdb;
+        if (!pdb) { continue; }
+        struct nvkvm_leaf_acc a; memset(&a, 0, sizeof(a));
+        a.s = s; a.client = client;
+        nvkvm_m2_pt_enum(s, pdb, false, 0, 0, &a, &budget);
+        nvkvm_m2_leaf_flush(&a);
+        qemu_log("nvkvm-gpu[%s] M6.5 enum_gr_sysmem: vas=0x%08x pdb=0x%llx runs=%d "
+                 "sysbytes=0x%llx backed=%d (budget_left=%d)\n", s->chip->name,
+                 s->chan_vas[v].hvas, (unsigned long long)pdb, a.runs,
+                 (unsigned long long)a.sysbytes, a.backed, budget);
+    }
 }
 
 /* M5.9 EXECUTION FORWARD (per doorbell): map the GR channel's newly-submitted pushbuffers
