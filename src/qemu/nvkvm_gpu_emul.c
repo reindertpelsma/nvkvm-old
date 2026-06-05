@@ -2016,6 +2016,13 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
     bool sys = false;
     uint64_t pa = nvkvm_walk_pdb(s, s->bar1_pdb, off, &sys);
     if (pa == NVKVM_GMMU_FAULT) {
+        if (s->m2_crashwin) {                /* M6.6 DIAG: does libcuda read BAR1 but FAULT? */
+            static uint32_t fcnt;
+            if (fcnt++ < 200) {
+                qemu_log("nvkvm-gpu[GA106] M6.6 BAR1 RD off=0x%llx -> WALK-FAULT (returns 0)\n",
+                         (unsigned long long)off);
+            }
+        }
         return 0;
     }
     uint64_t rv;

@@ -284,3 +284,55 @@ emulated-vidmem (guest-RAM) backing + map into the host GR VAS + trigger golden-
 the host ctx buffer; GET_CTX_BUFFER_INFO was privileged 0x1b on the unprivileged stub). The CPU-RM
 regkey RMInstLoc* (force aperture) does NOT change it — aperture is already vidmem; the problem is
 content, not location. Supersedes ALL prior sysmem/page-table/channel diagnoses for this crash.
+
+## REFACTOR PLAN (2026-06-05, user-directed): replace fb_pages with the GPGA/gpu_memory_object model
+
+Decision (user): the ad-hoc memory backing is the core flaw and must be replaced wholesale,
+not patched. Point-fixes (M5.7/M6.5/M6.6) kept dead-ending on it. Evidence it's the foundation,
+not a logic bug: at the cuCtxCreate rbp=0 SIGSEGV, the libcuda dispatch chain is INTACT
+(global->A(heap)->B(libcuda data)->FP=valid libcuda function with a normal prologue) — so it is
+NOT a corrupt function pointer from a wrong control value; the corruption is downstream of the
+broken memory model. Also: 0 BAR1 reads in the crash window, so the buffer libcuda faults on is
+reached via a path the current fb_pages/m2_fbback design does not even cover.
+
+WHY fb_pages is fatal: emulated "vidmem" = g_malloc0 pages in a hash (nvkvm_fb_page). Coherent
+for guest-only access (BAR1/PRAMIN/BAR2 -> our handlers), but the real host GPU CANNOT touch it.
+So nothing the host GPU must produce (golden GR ctx, compute output, HW semaphores) can ever land
+where the guest reads it. Every GPU-physical byte that must cross to the real GPU has to live in
+REAL host-GPU memory (a host RM object, double-mmapped), not malloc.
+
+### Target model (from the bookkeeping section above)
+- `gpu_memory_object { mode(special|general|physical); fault_handler; int nvkvm_handle;
+  nvidia_handle; void *cpu_qva; uint64_t host_va_in_gr_vas; ... }` — one descriptor per real
+  backing (a host RM_ALLOC, double-mmapped: cpu_qva for QEMU/guest-CPU view, mapped into the host
+  GR VAS at the guest VA for the host-GPU view).
+- GPGA page table: `gpga_page_range { u64 gpga_addr; u64 size_pages; gpu_memory_object *target;
+  u64 offset_in_target; bool readable, writable; }` — page-granular GPGA -> (object, offset).
+- `nvkvm_fb_read/write` resolve fb_addr(=GPGA) -> gpga_page_range -> object->cpu_qva+offset.
+  fb_pages becomes the FALLBACK only for GPGAs with no real backing (pure guest bookkeeping that
+  the host GPU never needs); everything GR/channel/ctx is real-backed.
+
+### Sequenced increments (each gated by m2exec, each a commit + no-regression boot)
+- R1. Introduce structs + a gpga table keyed by page; `nvkvm_m2_gpga_lookup(fb_addr)`. Route
+  nvkvm_fb_read/write through it (miss => current fb_pages path => zero behavior change). COMMIT.
+- R2. `nvkvm_m2_gpga_back(va, fb_addr, size)`: alloc ONE blank host vidmem gpu_memory_object,
+  CPU-map it (cpu_qva), map_dma it into the host GR VAS at `va`, register gpga_page_range(s) for
+  [fb_addr, fb_addr+size). Both views = one host object => coherent. Replaces back_and_map's
+  split FB-overlay-vs-map. COMMIT.
+- R3. SOLVE 0x51: do NOT let the host self-promote its GR ctx (which collides). Either (a) before
+  the host constructs the ctx, pre-map OUR objects at the ctx VAs so the host adopts them; or
+  (b) intercept PROMOTE_CTX and substitute our gpu_memory_object handles so the host promotes
+  OURS. Goal: every GR-ctx VA is backed by an object we own (CPU+GPU). COMMIT.
+- R4. Drive R2 from the guest PDB walk (M6.5 enumerator) for BOTH apertures: each leaf {VA, GPGA,
+  sys} -> gpga_back. Lazy variant: on a BAR1/PRAMIN miss in the crash path, back on demand. COMMIT.
+- R5. Re-test cuCtxCreate. Expect: libcuda's faulting buffer now resolves to real host memory the
+  host GPU also sees; rbp=0 should clear or move. VERIFY host nvidia-smi for real work
+  ([[mode2-real-forward-not-fake]]). COMMIT.
+
+### Risks / notes
+- fb_pages is used by boot/page-table/channel paths; R1 must be a pure pass-through (miss=fb_pages)
+  to avoid breaking boot. Gate everything on m2exec.
+- The hard core is unchanged by the refactor: connecting the guest buffer to host-GPU-written
+  content (R3 0x51 + R4 VA mapping). The refactor makes that connection EXPRESSIBLE (one object,
+  both views) instead of impossible (malloc). It does not by itself prove the host GPU fills the
+  ctx — that's R5 + the execution/doorbell plane (still the DMA-virt gate).
