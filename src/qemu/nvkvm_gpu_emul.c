@@ -3038,20 +3038,35 @@ static int nvkvm_m2_map_dma(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
     return rc;
 }
 
-/* M5.5 one-shot validation matrix for the RM_MAP_MEMORY_DMA primitive. Runs once the GR
- * compute object constructs. To isolate the primitive from the (UVM-owned, EXT_OWNED-
- * stripped) forwarded GR handles, it FIRST builds a fully private client->device->
- * vaspace(FERMI_VASPACE_A)->memory tuple and maps into THAT — proving the primitive in
- * isolation. Then it repeats against the GR client's forwarded VASpace, and tries the
- * device-as-mapper variant, so one boot reveals exactly which hDma RM accepts. Pure
- * validation — private handles, never the live forward chain — cannot regress GR build. */
+/* M5.5: allocate an NV01_MEMORY_VIRTUAL (class 0x0070) mapper spanning a VASpace. RM's
+ * RM_MAP_MEMORY_DMA mapper (hDma) must be a VirtualMemory resource — virtual_mem.c is the
+ * only class that implements MapTo; vaspace_api.c does NOT — so a raw FERMI_VASPACE_A or
+ * Device handle as hDma returns INVALID_OBJECT_HANDLE. NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS
+ * (cl0070.h, 24B): offset@0(u64), limit@8(u64), hVASpace@16(u32) (NULL => device default,
+ * else a FERMI_VASPACE_A). One mapper per vaspace, then many FIXED map_dma into it. */
+static int nvkvm_m2_alloc_virtmem(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
+                                  uint32_t hVirt, uint32_t hVASpace, uint32_t *st)
+{
+    uint8_t p[24];
+    memset(p, 0, sizeof(p));
+    stq_le_p(p + 0, 0);            /* offset = 0 */
+    stq_le_p(p + 8, 0);            /* limit  = 0 (=> max) */
+    stl_le_p(p + 16, hVASpace);    /* hVASpace (0 = device default) */
+    return nvkvm_m2_alloc1(s, hClient, hDevice, hVirt, 0x0070u, p, sizeof(p), st);
+}
+
+/* M5.5 one-shot validation of the RM_MAP_MEMORY_DMA primitive via the CORRECT mapper
+ * (NV01_MEMORY_VIRTUAL). P1: fully private client->device->vaspace->virtmem->memory,
+ * map NON-FIXED then FIXED. P2: against the forwarded GR VASpace (alloc a virtmem mapper
+ * referencing 0x5c000007, map a fresh host vidmem FIXED at a guest VA). Pure validation —
+ * private handles, never the live forward chain — cannot regress GR build. */
 static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient)
 {
     uint64_t sz = 0x10000;                        /* 64 KiB (PMA granularity) */
 
-    /* ---- Part 1: fully self-contained tuple (own client/device/vaspace/memory) ---- */
+    /* ---- Part 1: fully self-contained tuple ---- */
     const uint32_t C = 0xc1ee0011u, DEV = 0xde110001u, VAS = 0xde110002u,
-                   MEM = 0xde110003u;
+                   VIRT = 0xde110004u, MEM = 0xde110003u;
     uint32_t st = 0xffff;
     uint32_t c0 = C;
     nvkvm_m2_alloc1(s, C, 0, 0, 0x0u, &c0, sizeof(c0), &st);
@@ -3061,26 +3076,24 @@ static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient)
     uint8_t vasp[56]; memset(vasp, 0, sizeof(vasp));   /* NV_VASPACE_ALLOCATION_PARAMETERS, default */
     nvkvm_m2_alloc1(s, C, DEV, VAS, 0x90f1u, vasp, sizeof(vasp), &st);
     uint32_t vst = st;
-    qemu_log("nvkvm-gpu[%s] M5.5 selftest: private dev st=0x%x vaspace(0x90f1) st=0x%x\n",
-             s->chip->name, dst, vst);
+    uint32_t vmst = 0xffff;
+    nvkvm_m2_alloc_virtmem(s, C, DEV, VIRT, VAS, &vmst);
+    qemu_log("nvkvm-gpu[%s] M5.5 selftest P1: dev st=0x%x vaspace st=0x%x virtmem(0x0070) "
+             "st=0x%x\n", s->chip->name, dst, vst, vmst);
     struct nvkvm_host_map hm;
     if (nvkvm_m2_host_alloc_map_vidmem(s, C, DEV, MEM, sz, &hm)) {
-        uint32_t s1 = 0xffff, s2 = 0xffff, s3 = 0xffff; uint64_t v1 = 0, v2 = 0, v3 = 0;
-        int r1 = nvkvm_m2_map_dma(s, C, DEV, VAS, MEM, 0, sz, false, 0, &s1, &v1);
-        qemu_log("nvkvm-gpu[%s] M5.5 [P1a] map hDma=VASPACE NON-FIXED -> rc=%d st=0x%x "
+        uint32_t s1 = 0xffff, s2 = 0xffff; uint64_t v1 = 0, v2 = 0;
+        int r1 = nvkvm_m2_map_dma(s, C, DEV, VIRT, MEM, 0, sz, false, 0, &s1, &v1);
+        qemu_log("nvkvm-gpu[%s] M5.5 [P1a] map hDma=VIRTMEM NON-FIXED -> rc=%d st=0x%x "
                  "va=0x%llx%s\n", s->chip->name, r1, s1, (unsigned long long)v1,
                  (r1 == 0 && s1 == 0) ? "  OK" : "  <-- ERR");
         uint64_t want = 0x7f0000000000ull;
-        int r2 = nvkvm_m2_map_dma(s, C, DEV, VAS, MEM, 0, sz, true, want, &s2, &v2);
-        qemu_log("nvkvm-gpu[%s] M5.5 [P1b] map hDma=VASPACE FIXED@0x%llx -> rc=%d st=0x%x "
+        int r2 = nvkvm_m2_map_dma(s, C, DEV, VIRT, MEM, 0, sz, true, want, &s2, &v2);
+        qemu_log("nvkvm-gpu[%s] M5.5 [P1b] map hDma=VIRTMEM FIXED@0x%llx -> rc=%d st=0x%x "
                  "va=0x%llx%s\n", s->chip->name, (unsigned long long)want, r2, s2,
                  (unsigned long long)v2,
                  (r2 == 0 && s2 == 0 && v2 == want) ? "  OK FIXED-PLACEMENT-WORKS"
                                                     : "  <-- ERR");
-        int r3 = nvkvm_m2_map_dma(s, C, DEV, DEV, MEM, 0, sz, false, 0, &s3, &v3);
-        qemu_log("nvkvm-gpu[%s] M5.5 [P1c] map hDma=DEVICE NON-FIXED -> rc=%d st=0x%x "
-                 "va=0x%llx%s\n", s->chip->name, r3, s3, (unsigned long long)v3,
-                 (r3 == 0 && s3 == 0) ? "  OK" : "  <-- ERR");
         munmap(hm.qva, hm.size);
     } else {
         qemu_log("nvkvm-gpu[%s] M5.5 selftest P1: private vidmem alloc failed\n",
@@ -3097,15 +3110,23 @@ static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient)
     qemu_log("nvkvm-gpu[%s] M5.5 selftest P2: GR client 0x%08x -> host 0x%08x dev=0x%08x "
              "vas=0x%08x\n", s->chip->name, hClient, nvkvm_m2_client(s, hClient), hDev, hVas);
     if (hDev && hVas) {
-        uint32_t hMem = 0xda100000u | (s->m2_databuf_next++ & 0xffffu);
+        uint32_t hVirt = 0xdb000000u | (s->m2_databuf_next & 0xffffu);
+        uint32_t hMem  = 0xda100000u | (s->m2_databuf_next++ & 0xffffu);
+        uint32_t gvm = 0xffff;
+        nvkvm_m2_alloc_virtmem(s, hClient, hDev, hVirt, hVas, &gvm);
         struct nvkvm_host_map gm;
-        if (nvkvm_m2_host_alloc_map_vidmem(s, hClient, hDev, hMem, sz, &gm)) {
+        if (gvm == 0 && nvkvm_m2_host_alloc_map_vidmem(s, hClient, hDev, hMem, sz, &gm)) {
+            uint64_t want = 0x200000000ull;       /* a guest-style VA in the GR vaspace */
             uint32_t gs = 0xffff; uint64_t gv = 0;
-            int gr = nvkvm_m2_map_dma(s, hClient, hDev, hVas, hMem, 0, sz, false, 0, &gs, &gv);
-            qemu_log("nvkvm-gpu[%s] M5.5 [P2] map into GR VASPACE 0x%08x NON-FIXED -> "
-                     "rc=%d st=0x%x va=0x%llx%s\n", s->chip->name, hVas, gr, gs,
-                     (unsigned long long)gv, (gr == 0 && gs == 0) ? "  OK" : "  <-- ERR");
+            int gr = nvkvm_m2_map_dma(s, hClient, hDev, hVirt, hMem, 0, sz, true, want, &gs, &gv);
+            qemu_log("nvkvm-gpu[%s] M5.5 [P2] virtmem(0x%08x) over GR VAS 0x%08x map "
+                     "FIXED@0x%llx -> rc=%d st=0x%x va=0x%llx%s\n", s->chip->name, hVirt,
+                     hVas, (unsigned long long)want, gr, gs, (unsigned long long)gv,
+                     (gr == 0 && gs == 0) ? "  OK GR-VAS-MAP-WORKS" : "  <-- ERR");
             munmap(gm.qva, gm.size);
+        } else {
+            qemu_log("nvkvm-gpu[%s] M5.5 [P2] virtmem alloc st=0x%x (skip map)\n",
+                     s->chip->name, gvm);
         }
     }
 }
