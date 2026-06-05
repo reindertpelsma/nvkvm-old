@@ -3238,14 +3238,20 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
     p.h_object_parent = nvkvm_m2_client_known(s, device) ? nvkvm_m2_client(s, device) : device;
     p.h_object_new    = hMem;
     p.h_class         = 0x00000071u;             /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */
-    p.flags           = (1u << 4) | (0u << 8) | (1u << 12); /* NONCONTIG | PCI | CACHED */
+    /* Flags captured from a real host CUDA OS_DESCRIPTOR (cuMemHostAlloc/Register on driver
+     * 580.159.04): 0x40001010 = NONCONTIG(0x10) | LOCATION_PCI(0) | COHERENCY_CACHED(0x1000) |
+     * MAPPING_NO_MAP(0x40000000, bits31:30=1). MAPPING_NO_MAP is required — without it the
+     * driver returns EINVAL (it tried to auto-map a describe-only allocation). */
+    p.flags           = 0x40001010u;
     p.p_memory        = stub_va;                 /* [IN] descriptor: stub VA of the guest RAM */
     p.limit           = size ? (size - 1) : 0;
     p.fd              = -1;
     unsigned int ic = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
                       ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC_MEMORY;
     uint32_t nv = 0; uint64_t f = 0;
-    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, ic,
+    /* OS_DESCRIPTOR must run on the GPU DEVICE fd (/dev/nvidia0, m2_gpu_h), NOT the ctl fd —
+     * a real host CUDA app does it on /dev/nvidia0 (captured). ctl fd -> EINVAL. */
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_gpu_h, ic,
                                  &p, sizeof(p), NULL, 0, 0, &nv, &f);
     if (st) { *st = p.status; }
     return rc;
