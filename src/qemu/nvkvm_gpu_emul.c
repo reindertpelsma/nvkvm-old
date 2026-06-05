@@ -373,6 +373,7 @@ struct NvkvmGpuEmul {
     uint32_t m2_guest_ram_handle;
     uint64_t m2_stub_ram_base;  /* stub VA where guest RAM is MAP_FIXED (0 = not shared) */
     bool     m2_ram_shared;
+    bool     m2_gpu_registered;  /* M6.2: m2_gpu_h REGISTER_FD'd to the ctl session */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -3232,6 +3233,21 @@ static uint64_t nvkvm_m2_gpa_to_stub_va(NvkvmGpuEmul *s, uint64_t gpa)
 static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t device,
                                   uint32_t hMem, uint64_t stub_va, uint64_t size, uint32_t *st)
 {
+    /* The GR client lives in the ctl-fd session; OS_DESCRIPTOR runs on the /dev/nvidia0 device
+     * fd, which must be REGISTER_FD'd to that ctl session or RM returns 0x23 INVALID_CLIENT
+     * (real host libcuda does NV_ESC_REGISTER_FD(nvidia0, ctl_fd) before using the device fd). */
+    if (!s->m2_gpu_registered) {
+        struct nv_ioctl_register_fd rf; memset(&rf, 0, sizeof(rf));
+        rf.ctl_fd = (int32_t)s->m2_ctl_h;   /* handle; stub translates @off 0 -> real ctl fd */
+        unsigned int rc2 = (3u << 30) | ((unsigned int)sizeof(rf) << 16) |
+                           ((unsigned int)'F' << 8) | NV_ESC_REGISTER_FD;
+        uint32_t rnv = 0; uint64_t rf2 = 0;
+        int rr = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_gpu_h, rc2,
+                                     &rf, sizeof(rf), NULL, 0, 0, &rnv, &rf2);
+        s->m2_gpu_registered = (rr == 0);
+        qemu_log("nvkvm-gpu[%s] M6.2 REGISTER_FD(gpu0, ctl) rc=%d -> %s\n", s->chip->name,
+                 rr, s->m2_gpu_registered ? "registered" : "FAILED");
+    }
     struct nv_ioctl_nvos02_parameters_with_fd p;
     memset(&p, 0, sizeof(p));
     p.h_root          = nvkvm_m2_client(s, client);
