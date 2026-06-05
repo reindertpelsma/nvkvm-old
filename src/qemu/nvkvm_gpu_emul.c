@@ -3766,6 +3766,62 @@ static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t
     return ok || already;
 }
 
+/* M7 R2: the unified gpu_memory_object backing primitive (replaces back_and_map's split
+ * FB-overlay-vs-map). Allocates ONE blank host vidmem object and double-mmaps it:
+ *   CPU view  — cpu_qva, registered in the GPGA table so guest BAR1/PRAMIN reads of `gpga`
+ *               resolve (nvkvm_fb_host_overlay) to this object (replaces dead fb_pages);
+ *   GPU view  — FIXED map_dma at the guest VA into the host GR VAS (the host GPU sees the
+ *               same bytes). 0x51 = host self-promoted its own object at this VA -> our GPU
+ *               view isn't placed (gr_va=0); R3 makes the host adopt OURS instead.
+ * One nvkvm/RM handle backs both views = coherent. Returns obj_idx, or -1. Idempotent caller
+ * (dedup by va via m2_va_seen). */
+static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                             uint64_t gpga, uint64_t size)
+{
+    if (s->m2_objs_n >= 128 || s->m2_gpga_n >= 256) {
+        return -1;
+    }
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+    }
+    if (!hDev || !size) {
+        return -1;
+    }
+    uint64_t asize = (size + 0xffffu) & ~0xffffull;        /* 64 KiB granular */
+    uint32_t hMem = 0xda000000u | (s->m2_databuf_next++ & 0xffffu);
+    struct nvkvm_host_map hm;
+    if (!nvkvm_m2_host_alloc_map_vidmem(s, client, hDev, hMem, asize, &hm)) {
+        return -1;
+    }
+    /* GPU view: FIXED-map into the host GR VAS at the guest VA. */
+    uint32_t hVirt = nvkvm_m2_grmapper(s, client);
+    uint32_t mst = 0xffff; uint64_t outva = 0; int mrc = -1;
+    if (hVirt) {
+        mrc = nvkvm_m2_map_dma(s, client, hDev, hVirt, hm.h_mem, 0, asize, true, va, &mst, &outva);
+    }
+    bool gpu_mapped = (mrc == 0 && mst == 0 && outva == va);
+    int oi = s->m2_objs_n++;
+    s->m2_objs[oi].mode = 0;                                /* physical (FB-backed general) */
+    s->m2_objs[oi].cpu_qva = hm.qva;
+    s->m2_objs[oi].size = asize;
+    s->m2_objs[oi].client = client;
+    s->m2_objs[oi].hMemory = hm.h_mem;
+    s->m2_objs[oi].gr_va = gpu_mapped ? va : 0;
+    int gi = s->m2_gpga_n++;
+    s->m2_gpga[gi].gpga_base = gpga;
+    s->m2_gpga[gi].size = asize;
+    s->m2_gpga[gi].obj_idx = oi;
+    s->m2_gpga[gi].off = 0;
+    s->m2_gpga[gi].readable = true;
+    s->m2_gpga[gi].writable = true;
+    qemu_log("nvkvm-gpu[%s] M7 R2 gpga_obj: va=0x%llx gpga=0x%llx size=0x%llx hMem=0x%08x "
+             "cpu_qva=%p gpu_mapped=%d(st=0x%x) obj=%d gpga_n=%d\n", s->chip->name,
+             (unsigned long long)va, (unsigned long long)gpga, (unsigned long long)asize,
+             hm.h_mem, hm.qva, gpu_mapped, mst, oi, s->m2_gpga_n);
+    return oi;
+}
+
 /* M6.5 leaf accumulator: coalesce contiguous (VA,GPA,sys) leaf pages into runs, back each
  * SYSMEM run via the primitive above. (Vidmem leaves are host-resident already — M6.4.) */
 struct nvkvm_leaf_acc { NvkvmGpuEmul *s; uint32_t client; uint64_t va0, gpa0, len;
@@ -3792,9 +3848,8 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
          * needs the avoid-self-promotion path). copy_content=false (blank). */
         a->vidbytes += a->len;
         if (!nvkvm_m2_va_seen(a->s, a->va0) &&
-            nvkvm_m2_back_and_map(a->s, a->client, a->va0, a->gpa0, a->len, false,
-                                  "grctx-vid")) {
-            a->backed++;
+            nvkvm_m2_gpga_obj(a->s, a->client, a->va0, a->gpa0, a->len) >= 0) {
+            a->backed++;          /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
         }
     }
     a->len = 0;

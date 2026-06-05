@@ -336,3 +336,35 @@ REAL host-GPU memory (a host RM object, double-mmapped), not malloc.
   content (R3 0x51 + R4 VA mapping). The refactor makes that connection EXPRESSIBLE (one object,
   both views) instead of impossible (malloc). It does not by itself prove the host GPU fills the
   ctx — that's R5 + the execution/doorbell plane (still the DMA-virt gate).
+
+## REFACTOR perf rules (user, 2026-06-05): trap only rare triggers; hot paths native via memslots
+
+Two refinements that apply across the refactor — the guiding rule is "trap only the rare control/
+trigger events; make every hot path native via KVM memslots."
+
+### BAR0 is THREE tiers (not two)
+boot/GSP/PMC/control regs can't come from host ioctls (privileged/root-only) -> fully simulated,
+agreed. But split BAR0 by access pattern:
+  1. CONSTANT regs (chip id, fused caps, invariant read-only config): KVM_MEM_READONLY memslot
+     PRE-WRITTEN with the constant values -> reads native (no exit), writes trap/ignored. Kills
+     the exit cost of the many constant-register polls during init.
+  2. DYNAMIC/logic regs (GFW_BOOT progress, WPR2 state machine, the GSP-RPC doorbell 0x110c00,
+     anything needing emulation logic): MMIO-emulated, both directions trap.
+  3. USERMODE + PTIMER window: host-mapped RO (real host regs) -> native reads (real PTIMER),
+     doorbell writes trap (chid translate -> host doorbell). (See doorbell §15.)
+  CAVEAT: classify carefully — some "config" regs change during boot (GFW_BOOT, WPR2); those stay
+  in tier 2. Only TRULY invariant data goes in the tier-1 RO-constant memslot.
+
+### PDB tables: never trap per-access; walk live + re-sync on trigger
+Trapping every page-table read/write is a hot-path killer. Instead:
+  - Back the PDB/FB memory with a real object as a NORMAL RW memslot -> the guest reads/writes its
+    page tables NATIVELY, untrapped.
+  - Keep NO separate copy. WALK the live RAM-backed tables on-demand (via cpu_qva) only when we
+    actually need a resolution: backing a new buffer, or a doorbell/exec. Always reads current
+    state; no per-write trap, no staleness.
+  - Use the TLB-INVALIDATE as the proactive re-sync hook (the guest MMU invalidate register write
+    — rare, we DO trap it) ONLY when we must react to a change: tear down a memslot for an
+    unmapped range, or install one for a newly-mapped GPGA. Steady-state PTE r/w is never trapped.
+
+Consistent rule: trap rare triggers (invalidate, doorbell, dynamic regs); hot (PTIMER reads, PDB
+r/w, backed GPGA access) is native via memslots.
