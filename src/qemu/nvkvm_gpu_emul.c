@@ -472,6 +472,23 @@ static uint8_t *nvkvm_fb_page(NvkvmGpuEmul *s, uint64_t fb_addr, bool alloc)
 /* M5.3 DATA-PLANE: if fb_addr falls in a range backed by real host GPU memory
  * (double-mmap), return the host VA for that byte; else NULL (use local FB page).
  * Inert until m2_fbback[] is populated. */
+/* M5.15 DIAG: log every device->guest DMA write while the crash-window is armed, to catch the
+ * mistranslated pci_dma_write that zeroes libcuda's saved-rbp slot (the cuCtxCreate rbp=0 SIGSEGV).
+ * Set from realize; gated on m2_crashwin so it only fires after the 0xc7c0 GR alloc. */
+static NvkvmGpuEmul *g_nvkvm_dma_s;
+static int g_nvkvm_dma_logs;
+static MemTxResult nvkvm_dmaw(PCIDevice *dev, dma_addr_t gpa, const void *buf, dma_addr_t len)
+{
+    if (g_nvkvm_dma_s && g_nvkvm_dma_s->m2_crashwin && g_nvkvm_dma_logs < 200000) {
+        g_nvkvm_dma_logs++;
+        uint64_t v0 = (len >= 8) ? ldq_le_p(buf) : (len >= 4 ? ldl_le_p(buf) : 0);
+        void *caller = __builtin_return_address(0);
+        qemu_log("nvkvm-gpu[GA106] M5.15 DMAW gpa=0x%llx len=%llu v0=0x%llx site=%p\n",
+                 (unsigned long long)gpa, (unsigned long long)len, (unsigned long long)v0, caller);
+    }
+    return pci_dma_write(dev, gpa, buf, len);
+}
+
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
     /* M7 REFACTOR: the GPGA table (gpu_memory_object model) is consulted FIRST. fb_addr is a
@@ -826,14 +843,14 @@ static void nvkvm_m3_post_status(NvkvmGpuEmul *s, const uint8_t *src,
             ? ((s->stat_writeptr + i) % s->q_msgcount) : 0;
         uint64_t gpa = s->q_shmem + s->q_stat_base + s->q_stat_entryoff +
                        (uint64_t)slot * msgsize;
-        pci_dma_write(pdev, gpa, el + (uint64_t)i * msgsize, msgsize);
+        nvkvm_dmaw(pdev, gpa, el + (uint64_t)i * msgsize, msgsize);
     }
 
     s->stat_writeptr = (s->stat_writeptr + nelems) % s->q_msgcount; /* modulo ring */
     s->stat_seqnum++;                    /* per-message seqNum is ABSOLUTE (no wrap) */
     uint8_t wp[4];
     stl_le_p(wp, s->stat_writeptr);
-    pci_dma_write(pdev, s->q_shmem + s->q_stat_base + 16, wp, sizeof(wp));
+    nvkvm_dmaw(pdev, s->q_shmem + s->q_stat_base + 16, wp, sizeof(wp));
 }
 
 /* M3 keystone: post GSP_INIT_DONE (seqNum 0). */
@@ -1709,7 +1726,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
      * accumulated ~msgCount(63) command elements. */
     uint8_t rp[4];
     stl_le_p(rp, s->cmd_readptr);
-    pci_dma_write(pdev, s->q_shmem + s->q_stat_base + 0x20, rp, sizeof(rp));
+    nvkvm_dmaw(pdev, s->q_shmem + s->q_stat_base + 0x20, rp, sizeof(rp));
 }
 
 /* M3-step-1: read the LibOS init-args region array from guest RAM at the GPA
@@ -1779,7 +1796,7 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                     if (pci_dma_read(pdev, shmem + cmdoff, txh, sizeof(txh))
                             == MEMTX_OK) {
                         stl_le_p(txh + 16, 0); /* writePtr = 0 */
-                        if (pci_dma_write(pdev, shmem + statoff, txh,
+                        if (nvkvm_dmaw(pdev, shmem + statoff, txh,
                                           sizeof(txh)) == MEMTX_OK) {
                             qemu_log("nvkvm-gpu[%s] M3:   wrote status-queue tx "
                                      "header @0x%llx (ver=%u size=0x%x msgSize=%u "
@@ -1858,7 +1875,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         uint64_t gpa = ((uint64_t)s->dbg_gpa_hi << 32) | s->dbg_gpa_lo;
         uint8_t b[4]; stl_le_p(b, (uint32_t)val);
         if (gpa) {
-            pci_dma_write(&s->parent_obj, gpa, b, 4);
+            nvkvm_dmaw(&s->parent_obj, gpa, b, 4);
             qemu_log("nvkvm-gpu[%s] M5: DBG-FORGE uvm sema GPA=0x%llx <- payload=%u\n",
                      s->chip->name, (unsigned long long)gpa, (uint32_t)val);
         }
@@ -2019,7 +2036,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (phys != NVKVM_GMMU_FAULT) {
                 uint32_t payload = ++c->payload;
                 if (is_sys) { uint8_t b[4]; stl_le_p(b, payload);
-                              pci_dma_write(&s->parent_obj, phys, b, 4); }
+                              nvkvm_dmaw(&s->parent_obj, phys, b, 4); }
                 else        { nvkvm_fb_write(s, phys, payload, 4); }
                 qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> completed: "
                          "semaVA=0x%llx -> %s phys=0x%llx payload=%u\n",
@@ -2238,7 +2255,7 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
     if (sys) {
         uint8_t b[8];
         stn_le_p(b, size, val);
-        pci_dma_write(&s->parent_obj, pa, b, size);
+        nvkvm_dmaw(&s->parent_obj, pa, b, size);
     } else {
         nvkvm_fb_write(s, pa, val, size);
     }
@@ -2496,7 +2513,7 @@ static void nvkvm_phys_wr32(NvkvmGpuEmul *s, uint64_t phys, bool sys, uint32_t v
 {
     if (sys) {
         uint8_t b[4]; stl_le_p(b, v);
-        pci_dma_write(&s->parent_obj, phys, b, 4);
+        nvkvm_dmaw(&s->parent_obj, phys, b, 4);
     } else {
         nvkvm_fb_write(s, phys, v, 4);
     }
@@ -2718,7 +2735,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                         uint64_t p = nvkvm_chan_translate(s, ce_sem_addr, &sy);
                         if (p != NVKVM_GMMU_FAULT) {
                             if (sy) { uint8_t bb[4]; stl_le_p(bb, ce_sem_pay);
-                                      pci_dma_write(&s->parent_obj, p, bb, 4); }
+                                      nvkvm_dmaw(&s->parent_obj, p, bb, 4); }
                             else    { nvkvm_fb_write(s, p, ce_sem_pay, 4); }
                             s->chan_sem_released = true;
                             qemu_log("nvkvm-gpu[%s] M5: CE_SEM_RELEASE addr=0x%llx "
@@ -2742,12 +2759,12 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                             bool sz64 = (d >> 24) & 1;       /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
                             if (sz64) {
                                 if (sy) { uint8_t b[4]; stl_le_p(b, sem_pay_lo);
-                                          pci_dma_write(&s->parent_obj, p, b, 4); }
+                                          nvkvm_dmaw(&s->parent_obj, p, b, 4); }
                                 else    { nvkvm_fb_write(s, p, sem_pay_lo, 4); }
                             } else {
                                 if (sy) { uint8_t b[8]; stl_le_p(b, sem_pay_lo);
                                           stl_le_p(b + 4, sem_pay_hi);
-                                          pci_dma_write(&s->parent_obj, p, b, 8); }
+                                          nvkvm_dmaw(&s->parent_obj, p, b, 8); }
                                 else    { nvkvm_fb_write(s, p, sem_pay_lo, 4);
                                           nvkvm_fb_write(s, p + 4, sem_pay_hi, 4); }
                             }
@@ -2771,11 +2788,11 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                         if (p != NVKVM_GMMU_FAULT) {
                             bool one_word = (d >> 28) & 1;     /* STRUCTURE_SIZE: 1=ONE_WORD(4B), 0=FOUR_WORDS(16B w/ ts) */
                             if (sy) { uint8_t b[4]; stl_le_p(b, cr_sem_pay);
-                                      pci_dma_write(&s->parent_obj, p, b, 4); }
+                                      nvkvm_dmaw(&s->parent_obj, p, b, 4); }
                             else    { nvkvm_fb_write(s, p, cr_sem_pay, 4); }
                             if (!one_word) {                   /* 4-word: also zero the timestamp dwords */
                                 if (sy) { uint8_t z[12] = {0};
-                                          pci_dma_write(&s->parent_obj, p + 4, z, 12); }
+                                          nvkvm_dmaw(&s->parent_obj, p + 4, z, 12); }
                                 else    { nvkvm_fb_write(s, p + 4, 0, 4);
                                           nvkvm_fb_write(s, p + 8, 0, 4);
                                           nvkvm_fb_write(s, p + 12, 0, 4); }
@@ -4444,6 +4461,7 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     uint8_t *cfg = pci_dev->config;
 
     s->chip = chip;
+    g_nvkvm_dma_s = s;                    /* M5.15 DIAG: enable DMA-write logging hook */
     s->access_count = 0;
     s->prom_reads = 0;
     s->mbox0 = 0;
