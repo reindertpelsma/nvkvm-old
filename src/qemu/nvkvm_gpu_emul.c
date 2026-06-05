@@ -1027,6 +1027,11 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
                                         uint32_t chanObj, uint8_t *auxbuf,
                                         uint32_t psize); /* M5.4 fwd-decl */
 static void nvkvm_m2_mapdma_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M5.5 fwd-decl */
+static uint64_t nvkvm_m2_gpa_to_stub_va(NvkvmGpuEmul *s, uint64_t gpa); /* M6.2 fwd-decl */
+static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t device,
+                                  uint32_t hMem, uint64_t stub_va, uint64_t size,
+                                  uint32_t *st); /* M6.2 fwd-decl */
+static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
 static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                   uint64_t phys, uint64_t size, bool copy_content,
                                   const char *label); /* M5.7 */
@@ -3020,6 +3025,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         if (!s->m2_mapdma_tested) {
             s->m2_mapdma_tested = true;
             nvkvm_m2_mapdma_selftest(s, hClient);
+            nvkvm_m2_osdesc_selftest(s, hClient);   /* M6.2: OS_DESCRIPTOR guest RAM (item-4 step 3) */
         }
         uint32_t subdev = 0;
         for (int i = 0; i < s->m2_subdev_n; i++) {
@@ -3193,6 +3199,90 @@ static bool nvkvm_m2_host_alloc_map_vidmem(NvkvmGpuEmul *s, uint32_t hClient,
     out->qva = qva; out->mapfd = mapfd; out->h_mem = hMem; out->maph = maph;
     out->size = size;
     return true;
+}
+
+/* M6.2 (item-4 step 3): translate a guest GPA to the stub VA where the guest-RAM memfd is
+ * MAP_FIXED'd. Uses pci_dma_map to get QEMU's host VA for the GPA (hole-safe across the q35
+ * PCI hole), then stub_va = stub_base + (hva - ram_base_hva) since the stub mmapped the SAME
+ * memfd at m2_stub_ram_base. Returns 0 if not shared / GPA outside the main RAM block. */
+static uint64_t nvkvm_m2_gpa_to_stub_va(NvkvmGpuEmul *s, uint64_t gpa)
+{
+    if (!s->m2_ram_shared || !s->m2_guest_ram_hva) {
+        return 0;
+    }
+    dma_addr_t len = 0x1000;
+    void *p = pci_dma_map(&s->parent_obj, gpa, &len, DMA_DIRECTION_TO_DEVICE);
+    if (!p) {
+        return 0;
+    }
+    uint64_t off = (uint64_t)((uintptr_t)p - (uintptr_t)s->m2_guest_ram_hva);
+    pci_dma_unmap(&s->parent_obj, p, len, DMA_DIRECTION_TO_DEVICE, 0);
+    if (off >= s->m2_guest_ram_size) {
+        return 0;                                /* GPA not in the main (memfd) RAM block */
+    }
+    return s->m2_stub_ram_base + off;
+}
+
+/* M6.2 (item-4 step 3): OS_DESCRIPTOR-register guest RAM (at stub VA) as a host sysmem object,
+ * so the host nvidia driver pins the guest pages and the host GPU can DMA into them — the fix
+ * for libcuda's un-backed sysmem GR buffers ([[mode2-cuctxcreate-pagetable-poll]]). NVOS02
+ * (NV_ESC_RM_ALLOC_MEMORY, NR 0x27), hClass=NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (0x0071),
+ * p_memory = the descriptor (stub VA the kernel pin_user_pages walks), limit = size-1, flags =
+ * PHYSICALITY_NONCONTIGUOUS | LOCATION_PCI | COHERENCY_CACHED. */
+static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t device,
+                                  uint32_t hMem, uint64_t stub_va, uint64_t size, uint32_t *st)
+{
+    struct nv_ioctl_nvos02_parameters_with_fd p;
+    memset(&p, 0, sizeof(p));
+    p.h_root          = nvkvm_m2_client(s, client);
+    p.h_object_parent = nvkvm_m2_client_known(s, device) ? nvkvm_m2_client(s, device) : device;
+    p.h_object_new    = hMem;
+    p.h_class         = 0x00000071u;             /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */
+    p.flags           = (1u << 4) | (0u << 8) | (1u << 12); /* NONCONTIG | PCI | CACHED */
+    p.p_memory        = stub_va;                 /* [IN] descriptor: stub VA of the guest RAM */
+    p.limit           = size ? (size - 1) : 0;
+    p.fd              = -1;
+    unsigned int ic = (3u << 30) | ((unsigned int)sizeof(p) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_ALLOC_MEMORY;
+    uint32_t nv = 0; uint64_t f = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, ic,
+                                 &p, sizeof(p), NULL, 0, 0, &nv, &f);
+    if (st) { *st = p.status; }
+    return rc;
+}
+
+/* M6.2 selftest: OS_DESCRIPTOR the first real GR sysmem buffer (va_map sys=true entry) to prove
+ * the shared-memfd -> stub-VA -> OS_DESCRIPTOR chain works (host RM pins guest RAM). One-shot. */
+static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient)
+{
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == hClient) { hDev = s->m2_devvas[i].dev; break; }
+    }
+    int idx = -1;
+    for (int i = 0; i < s->va_map_n; i++) {
+        if (s->va_map[i].sys && s->va_map[i].size) { idx = i; break; }
+    }
+    if (!hDev || idx < 0) {
+        qemu_log("nvkvm-gpu[%s] M6.2 osdesc-selftest: no dev (0x%08x) or no sysmem va_map "
+                 "entry (va_map_n=%d)\n", s->chip->name, hDev, s->va_map_n);
+        return;
+    }
+    uint64_t gpa = s->va_map[idx].phys, sz = s->va_map[idx].size;
+    uint64_t sva = nvkvm_m2_gpa_to_stub_va(s, gpa);
+    if (!sva) {
+        qemu_log("nvkvm-gpu[%s] M6.2 osdesc-selftest: GPA 0x%llx -> no stub VA (shared=%d)\n",
+                 s->chip->name, (unsigned long long)gpa, s->m2_ram_shared);
+        return;
+    }
+    uint32_t hMem = 0xdd000000u | (s->m2_databuf_next++ & 0xffffu);
+    uint32_t st = 0xffff;
+    int rc = nvkvm_m2_os_descriptor(s, hClient, hDev, hMem, sva, sz, &st);
+    qemu_log("nvkvm-gpu[%s] M6.2 osdesc-selftest: GR sysmem buf GPA=0x%llx size=0x%llx -> "
+             "stub_va=0x%llx OS_DESCRIPTOR hMem=0x%08x rc=%d st=0x%x %s\n", s->chip->name,
+             (unsigned long long)gpa, (unsigned long long)sz, (unsigned long long)sva, hMem,
+             rc, st, (rc == 0 && st == 0) ? "  OK — host RM pinned guest RAM!"
+                                          : "  <-- ERR (tune flags/descriptor)");
 }
 
 /* M5.5 EXECUTION-PLANE PRIMITIVE: map a host memory object into a host VASpace at a
