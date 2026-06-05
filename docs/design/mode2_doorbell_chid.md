@@ -306,3 +306,23 @@ the userspace chan). Classification: tag each channel kernel|user at alloc by it
 (RM-internal vs libcuda's client) — already tracked in the channel table; the chid table carries
 the bit. Doorbell handler (plan item 5) = translate chid -> if kernel-internal: fake-complete;
 else: write host doorbell.
+
+## §15 BAR0 register plane: host-map the USERMODE/PTIMER window RO; keep boot/GSP emulated (user 2026-06-05)
+
+Pivot the USERMODE doorbell + PTIMER window of BAR0 from full software emulation to a host-backed
+RO memslot (part of the refactor; the register-plane special gpu_memory_object):
+- Back it with the REAL host USERMODE mapping: host AMPERE_USERMODE_A alloc -> RM_MAP_MEMORY ->
+  host VA -> install as a KVM_MEM_READONLY memslot at the guest BAR0 sub-region GPA.
+- REMOVE THE WRITE BIT: reads native (no exit) -> the high-precision PTIMER nanosecond clock is
+  read at full speed directly from the real host GPU registers; doorbell WRITES fault
+  (KVM_EXIT_MMIO) -> handler -> chid translate (vChid->sChid) -> write the host doorbell. A single
+  KVM_MEM_READONLY memslot gives both (reads from backing, writes exit).
+
+SCOPE (sharp edge): host-map-RO ONLY the USERMODE+PTIMER window. The rest of BAR0 — boot/GSP/PMC/
+WPR2/GFW_BOOT/control regs + the GSP-RPC doorbell 0x110c00 — MUST stay EMULATED, because those
+carry our fake-the-boot identity/state; the guest must read OUR emulated values, not the host
+GPU's live registers, or fake-the-boot breaks. So BAR0 is a MIX:
+  - boot/GSP/PMC/control       -> emulated (MMIO-trapped, our fake-boot state)
+  - USERMODE doorbell + PTIMER -> host-mapped RO special object (native reads, trapped doorbell)
+This is the register-plane analog of the memory-plane double-mmap (same host-ioctl-backed model,
+mode=special with a write fault handler instead of mode=physical).
