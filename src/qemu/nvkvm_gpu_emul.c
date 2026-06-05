@@ -340,6 +340,7 @@ struct NvkvmGpuEmul {
                                  * so the CRASHWIN probe can report the guest GPU VA that
                                  * maps to a polled FB address (correlate 0x2efbaf000) */
     bool     m2_mapdma_tested;  /* M5.5: one-shot RM_MAP_MEMORY_DMA-FIXED primitive validation */
+    bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -1661,6 +1662,31 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
      * ce_utils.c:349).  For now, log it so the doorbell offset/token are
      * confirmed against the GA100 HAL. */
     if (off == NVKVM_VF_DOORBELL) {
+        /* M5.6 EXECUTION-PLANE INVENTORY: once cuCtxCreate has built the GR context
+         * (crashwin armed) and starts submitting work, dump the EXACT working set the
+         * execution path must back+FIXED-map: va_map = the #2 side-table (PROMOTE_CTX
+         * GPU-VA->guest-FB ctx buffers) and chans[] = the channel rings (GPFIFO/USERD).
+         * One-shot; logging only. */
+        if (s->m2_crashwin && !s->m2_inventory_done) {
+            s->m2_inventory_done = true;
+            qemu_log("nvkvm-gpu[%s] M5.6 INVENTORY @doorbell va_map_n=%d chan_n=%d:\n",
+                     s->chip->name, s->va_map_n, s->chan_n);
+            for (int i = 0; i < s->va_map_n; i++) {
+                qemu_log("nvkvm-gpu[%s] M5.6   va_map[%d] client=0x%08x VA=0x%llx -> "
+                         "%s phys=0x%llx size=0x%llx\n", s->chip->name, i,
+                         s->va_map[i].client, (unsigned long long)s->va_map[i].va,
+                         s->va_map[i].sys ? "SYS" : "FB",
+                         (unsigned long long)s->va_map[i].phys,
+                         (unsigned long long)s->va_map[i].size);
+            }
+            for (int i = 0; i < s->chan_n; i++) {
+                qemu_log("nvkvm-gpu[%s] M5.6   chan[%d] client=0x%08x gpfifo_va=0x%llx "
+                         "ent=%u userd=0x%llx(%s) hvas=0x%08x\n", s->chip->name, i,
+                         s->chans[i].client, (unsigned long long)s->chans[i].gpfifo_va,
+                         s->chans[i].gpfifo_ent, (unsigned long long)s->chans[i].userd,
+                         s->chans[i].userd_sys ? "sys" : "fb", s->chans[i].hvaspace);
+            }
+        }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
          * + its self-verify channel + the host/compute channel) and tracking only
