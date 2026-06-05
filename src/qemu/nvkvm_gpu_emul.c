@@ -347,6 +347,7 @@ struct NvkvmGpuEmul {
                                  * maps to a polled FB address (correlate 0x2efbaf000) */
     bool     m2_mapdma_tested;  /* M5.5: one-shot RM_MAP_MEMORY_DMA-FIXED primitive validation */
     bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
+    bool     m2_sem_probe_done; /* M5.13: one-shot DRY-RUN locate of the completion semaphore PDB */
     bool     m2exec;            /* M5.7 prop: enable execution-plane backing (default off) */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
@@ -374,6 +375,11 @@ struct NvkvmGpuEmul {
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
     bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
     bool     m2ring;            /* M5.9 prop: actually RING the host doorbell (wedge-risk) */
+    uint64_t m2semval;          /* M5.14 DIAG prop: if nonzero, fb_read of m2sempage returns this
+                                 * (satisfy the guest-kernel post-PROMOTE_CTX ctx-completion poll
+                                 * that nothing writes in the fake-GSP model; userspace never
+                                 * observes it). 0 = disabled. */
+    uint64_t m2sempage;         /* M5.14: guest-FB page (4K-aligned) the sentinel applies to */
     uint64_t m2_mapped_va[128]; /* M5.9: VAs already backed+mapped (dedup pushbuffer maps) */
     int      m2_mapped_va_n;
     /* M6.0 (item-4 prereq): guest RAM as a shared memfd, so the STUB can mmap any guest GPA
@@ -495,6 +501,19 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 /* Aligned reg accesses never straddle a 4 KiB page. */
 static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 {
+    /* M5.14 DIAG: satisfy the guest-kernel post-PROMOTE_CTX completion poll. The fake-GSP model
+     * never runs the real golden-image/ctx-init work, so the vidmem status word the guest RM
+     * busy-polls stays 0 forever. Inject a sentinel (host owns real ctx-switch; guest userspace
+     * never observes this kernel-internal word). One read per offset within the page is served. */
+    if (s->m2semval && (fb_addr & ~0xfffull) == (s->m2sempage & ~0xfffull)) {
+        uint64_t v = (size >= 8) ? s->m2semval : (s->m2semval & ((1ull << (size * 8)) - 1));
+        if (s->m2_crashwin && s->m2_crashwin_reads < 100000) {
+            s->m2_crashwin_reads++;
+            qemu_log("nvkvm-gpu[GA106] M5.14 SEM-INJECT fb=0x%llx sz=%u -> 0x%llx\n",
+                     (unsigned long long)fb_addr, size, (unsigned long long)v);
+        }
+        return v;
+    }
     uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: served from real host GPU memory */
         uint64_t v;
@@ -3947,12 +3966,32 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
 /* M6.5 leaf accumulator: coalesce contiguous (VA,GPA,sys) leaf pages into runs, back each
  * SYSMEM run via the primitive above. (Vidmem leaves are host-resident already — M6.4.) */
 struct nvkvm_leaf_acc { NvkvmGpuEmul *s; uint32_t client; uint64_t va0, gpa0, len;
-                        int sys, runs, backed; uint64_t sysbytes, vidbytes; };
+                        int sys, runs, backed; uint64_t sysbytes, vidbytes;
+                        /* M5.13 DRY-RUN probe: when dry, do NOT back anything; just log which
+                         * leaf (VA range) maps the `target` guest-phys. Used to definitively
+                         * identify the completion-semaphore page's owning PDB + GR-VA before we
+                         * commit to backing it (blindly backing e.g. a BAR2 walk would overlay
+                         * the guest's own page tables with blank objects -> wedge). */
+                        bool dry; uint64_t target; const char *tag; bool found; };
 
 static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
 {
     if (a->len == 0) { return; }
     a->runs++;
+    if (a->dry) {
+        if (a->target >= a->gpa0 && a->target < a->gpa0 + a->len) {
+            uint64_t hit_va = a->va0 + (a->target - a->gpa0);
+            a->found = true;
+            qemu_log("nvkvm-gpu[GA106] M5.13 PROBE[%s] *** target gpa=0x%llx FOUND: %s "
+                     "run VA=0x%llx gpa=0x%llx len=0x%llx -> sem GR-VA=0x%llx ***\n",
+                     a->tag ? a->tag : "?", (unsigned long long)a->target,
+                     a->sys ? "SYS" : "VID", (unsigned long long)a->va0,
+                     (unsigned long long)a->gpa0, (unsigned long long)a->len,
+                     (unsigned long long)hit_va);
+        }
+        a->len = 0;
+        return;
+    }
     if (a->sys) {
         a->sysbytes += a->len;
         if (!nvkvm_m2_va_seen(a->s, a->va0) &&
@@ -4078,6 +4117,39 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
     }
 }
 
+/* M5.13 DRY-RUN: locate which page-directory maps a target guest-phys (the completion
+ * semaphore 0x2efbaf000), at what GR-VA, WITHOUT backing anything. Walks every candidate root
+ * — the snooped GR VASes (chan_vas[]) plus the BAR1/BAR2 aperture PDBs — so we can see whether
+ * the semaphore lives in a GR channel VAS (mappable into the host GR VAS at the same GR-VA) or
+ * only in a kernel aperture (which would need a different bridge). Pure diagnostic; one-shot. */
+static void nvkvm_m2_probe_sem_pdb(NvkvmGpuEmul *s, uint32_t client, uint64_t target)
+{
+    struct { const char *tag; uint64_t pdb; } roots[16 + 2];
+    int nr = 0;
+    for (int v = 0; v < s->chan_vas_n && nr < 16; v++) {
+        if (s->chan_vas[v].pdb) {
+            roots[nr].tag = "chan_vas"; roots[nr].pdb = s->chan_vas[v].pdb; nr++;
+        }
+    }
+    if (s->bar1_pdb) { roots[nr].tag = "bar1_pdb"; roots[nr].pdb = s->bar1_pdb; nr++; }
+    if (s->bar2_pdb) { roots[nr].tag = "bar2_pdb"; roots[nr].pdb = s->bar2_pdb; nr++; }
+    qemu_log("nvkvm-gpu[%s] M5.13 PROBE start: target gpa=0x%llx across %d roots "
+             "(chan_vas_n=%d bar1=0x%llx bar2=0x%llx)\n", s->chip->name,
+             (unsigned long long)target, nr, s->chan_vas_n,
+             (unsigned long long)s->bar1_pdb, (unsigned long long)s->bar2_pdb);
+    for (int r = 0; r < nr; r++) {
+        int budget = 300000;
+        struct nvkvm_leaf_acc a; memset(&a, 0, sizeof(a));
+        a.s = s; a.client = client; a.dry = true; a.target = target; a.tag = roots[r].tag;
+        nvkvm_m2_pt_enum(s, roots[r].pdb, false, 0, 0, &a, &budget);
+        nvkvm_m2_leaf_flush(&a);
+        qemu_log("nvkvm-gpu[%s] M5.13 PROBE root[%d] %s pdb=0x%llx runs=%d sysB=0x%llx "
+                 "vidB=0x%llx found=%d (budget_left=%d)\n", s->chip->name, r, roots[r].tag,
+                 (unsigned long long)roots[r].pdb, a.runs, (unsigned long long)a.sysbytes,
+                 (unsigned long long)a.vidbytes, a.found, budget);
+    }
+}
+
 /* M5.9 EXECUTION FORWARD (per doorbell): map the GR channel's newly-submitted pushbuffers
  * into the host GR VASpace (double-mmap + copy the guest's command bytes) so the host GPU's
  * MMU resolves them, then — gated behind m2ring (default OFF, wedge-risk) — RING the host
@@ -4100,6 +4172,13 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
         qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x) — back newly-mapped "
                  "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps, grc);
         nvkvm_m2_enum_gr_sysmem(s, grc);
+    }
+    /* M5.13: one-shot DRY-RUN locate of the completion semaphore (0x2efbaf000, the page the
+     * guest RM busy-polls during cuCtxCreate) so we learn its owning PDB + GR-VA before backing.
+     * No side effects. */
+    if (grc && !s->m2_sem_probe_done) {
+        s->m2_sem_probe_done = true;
+        nvkvm_m2_probe_sem_pdb(s, grc, 0x2efbaf000ull);
     }
     if (!s->m2_doorbell_ready) { return; }
     /* M5.12 (chid/token table): fetch each forwarded channel's HOST work-submit token once.
@@ -4522,6 +4601,8 @@ static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, false), /* M5: enable host-GPU forwarding */
     DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, false), /* M5.7: execution-plane backing */
     DEFINE_PROP_BOOL("m2ring", NvkvmGpuEmul, m2ring, false), /* M5.9: ring host doorbell (real fwd) */
+    DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
+    DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
     DEFINE_PROP_END_OF_LIST(),
 };

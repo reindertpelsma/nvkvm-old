@@ -76,7 +76,7 @@ exec "$QEMU" \
     `# Mode-2 emulated NVIDIA GPU — the device under test, behind a PCIe root` \
     `# port so it enumerates as a real express endpoint (like a GeForce).` \
     -device pcie-root-port,id=rp0,chassis=0,slot=0 \
-    -device nvkvm-gpu-emul,bus=rp0,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on} \
+    -device nvkvm-gpu-emul,bus=rp0,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
     \
     `# Open driver source + GSP firmware (RO) + repo, all over 9p.` \
     -virtfs local,path="$OGKM",mount_tag=ogkm,security_model=mapped,readonly=on \
