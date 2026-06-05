@@ -421,3 +421,34 @@ keep it OFF for the real build; it masks whether the host actually ran the work.
 Iteration is slow (~6 min boot/attempt + GPU-wedge risk on a bad ring) → this is a sustained focused
 build, not an overnight tick. Reload host driver if wedged (rmmod nvidia_uvm nvidia_drm
 nvidia_modeset nvidia; modprobe nvidia).
+
+---
+## §X cuCtxCreate completion CHAIN — measured 2026-06-05 (HEAD 5691bd0)
+
+After forwarding the GR object alloc (0xc7c0) and faking PROMOTE_CTX (0x2080012b, status=0 to the
+fake GSP), the guest CPU-RM enters a sequence of completion waits that the fake-GSP golden-image
+flow never satisfies. Located with two new tools (`nvkvm_m2_probe_sem_pdb` dry-run PDB walk;
+`m2semval`/`m2sempage` sentinel-inject props, both default-off).
+
+**Poll #1 (CLEARED):** vidmem 0x2efbaf000 (GR-VA 0x40fbaf000 via a linear FB window in chan_vas
+pdb=0x2efa6c000; CPU-read via bar2_pdb=0x2f3392000 at BAR2-VA 0xfea000). The pushbuffer faker
+releases a *different* semaphore (NVC56F host sema 0x12006c004, sysmem), so 0x2efbaf000 is
+engine/kernel-written (golden-ctx status) and never set in our model. Injecting a sentinel (0x1)
+satisfies it (331 reads served) and the guest advances.
+
+**Poll #2 (CURRENT):** the CPU-RM repeatedly resolves one VA via bar2_pdb → guest-phys 0x2efa6000
+(a GR ctx-buffer page) ~2225× and polls it; the golden-image CONTENT there is blank in the fake-GSP
+model. This is the golden-context coherence wall at the *content* level (host's real golden ctx,
+built when we forward 0xc7c0 with st=0x51 ALREADY-HOST-MAPPED, lives in the host's privileged ctx
+buffers — GET_CTX_BUFFER_INFO / PROMOTE_CTX forward = 0x1b INSUFFICIENT_PERMISSIONS).
+
+**The fork (unchanged shape, now with decisive data):**
+- (A) **Sentinel-satisfy chain** — keep injecting per-poll sentinels (unprivileged; matches
+  "satisfy guest-kernel checks, host owns real ctx-switch"). Viable iff the chain is short and each
+  link is a scalar status; risk = faking past a check whose *content* the guest actually consumes.
+- (B) **Real host golden-ctx** — make the guest's ctx reads resolve to the host's real golden image,
+  or forward the golden-image/PROMOTE_CTX GSP ops. Blocked by the ctx-buffer privilege wall (needs a
+  privileged ctx helper or a CE-copy bridge).
+
+Poll #1 favored (A); poll #2 (content) tilts toward (B). Next cheap experiment: multi-page sentinel
+or bar2-read instrumentation to inject poll #2 and measure whether the chain converges or explodes.
