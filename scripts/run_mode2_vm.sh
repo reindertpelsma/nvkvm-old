@@ -59,7 +59,10 @@ echo ""
 # -d unimp,guest_errors enables the global logfile so the device's qemu_log()
 # BAR0 trace lands in $QLOG.
 exec "$QEMU" \
-    -machine q35,accel=kvm \
+    `# M6.0 (item-4): back guest RAM with a SHARED memfd so the Mode-2 stub can mmap any` \
+    `# guest GPA + OS_DESCRIPTOR it for host-GPU DMA into the guest's sysmem GR buffers.` \
+    -machine q35,accel=kvm,memory-backend=pcram \
+    -object memory-backend-memfd,id=pcram,size="$MEM",share=on \
     -cpu host \
     -m "$MEM" \
     -smp "$SMP" \

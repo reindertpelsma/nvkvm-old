@@ -50,6 +50,7 @@
 #include "mode2_gspstaticinfo_ga106.h" /* captured GA106 GSP static config (M5) */
 #include "mode2_compute_ctrls_ga106.h" /* captured GA106 cuInit compute-cap ctrls */
 #include "virtio_nvgpu.h"   /* M5: Mode-1 forwarding stack (isolate API + NVOS structs) */
+#include "exec/cpu-common.h" /* M6.0: qemu_ram_foreach_block/get_fd — guest-RAM memfd for item-4 */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -357,6 +358,13 @@ struct NvkvmGpuEmul {
     bool     m2ring;            /* M5.9 prop: actually RING the host doorbell (wedge-risk) */
     uint64_t m2_mapped_va[128]; /* M5.9: VAs already backed+mapped (dedup pushbuffer maps) */
     int      m2_mapped_va_n;
+    /* M6.0 (item-4 prereq): guest RAM as a shared memfd, so the STUB can mmap any guest GPA
+     * and OS_DESCRIPTOR-register it -> the host GPU can DMA into the guest's sysmem GR buffers
+     * (the un-backed objects libcuda reads, [[mode2-cuctxcreate-pagetable-poll]]). Found at
+     * realize from the largest fd-backed RAMBlock (memory-backend-memfd,share=on). */
+    int      m2_guest_ram_fd;   /* memfd fd of guest RAM (-1 if not memfd-backed) */
+    void    *m2_guest_ram_hva;  /* QEMU host VA of guest RAM base */
+    uint64_t m2_guest_ram_size;
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -3637,6 +3645,20 @@ static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
     munmap(hm.qva, hm.size);
 }
 
+/* M6.0: RAMBlock iterator — record the largest fd-backed (memfd) block as guest RAM. */
+static int nvkvm_m2_find_guest_ram(RAMBlock *rb, void *opaque)
+{
+    NvkvmGpuEmul *s = opaque;
+    int fd = qemu_ram_get_fd(rb);
+    uint64_t len = qemu_ram_get_used_length(rb);
+    if (fd >= 0 && len > s->m2_guest_ram_size) {
+        s->m2_guest_ram_fd   = fd;
+        s->m2_guest_ram_hva  = qemu_ram_get_host_addr(rb);
+        s->m2_guest_ram_size = len;
+    }
+    return 0;
+}
+
 static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 {
     NvkvmGpuEmul *s = NVKVM_GPU_EMUL(pci_dev);
@@ -3762,6 +3784,17 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
          * CURRENT_LINK_SPEED[19:16]=4, NEG_LINK_WIDTH[25:20]=16. */
         pci_set_word(cfg + exp + PCI_EXP_LNKSTA, (uint16_t)(4u | (16u << 4)));
     }
+
+    /* M6.0 (item-4 prereq): locate the guest-RAM memfd so the stub can later mmap any guest
+     * GPA + OS_DESCRIPTOR it for host-GPU DMA. Pick the largest fd-backed RAMBlock (the guest
+     * RAM when run with -object memory-backend-memfd,share=on). fd=-1 if anon RAM. */
+    s->m2_guest_ram_fd = -1;
+    qemu_ram_foreach_block(nvkvm_m2_find_guest_ram, s);
+    qemu_log("nvkvm-gpu[%s] M6.0 guest-RAM memfd: fd=%d hva=%p size=0x%llx %s\n",
+             chip->name, s->m2_guest_ram_fd, s->m2_guest_ram_hva,
+             (unsigned long long)s->m2_guest_ram_size,
+             s->m2_guest_ram_fd >= 0 ? "[shareable to stub for item-4]"
+                                     : "[anon RAM — add memory-backend-memfd,share=on]");
 
     /* M5.1: forwarding (m2fwd) is lazy — the per-guest host isolate is created on
      * the first forwarded alloc in the cmdq path (nvkvm_m2_shadow_fwd). */
