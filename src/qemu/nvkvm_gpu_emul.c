@@ -375,6 +375,29 @@ struct NvkvmGpuEmul {
     bool     m2_ram_shared;
     bool     m2_gpu_registered;  /* M6.2: m2_gpu_h REGISTER_FD'd to the ctl session */
 
+    /* M7 REFACTOR (user-directed) — the proper memory model that replaces fb_pages/m2_fbback:
+     * gpu_memory_object = ONE real backing (host RM alloc, double-mmapped: cpu_qva for the
+     * guest-CPU/QEMU view, gr_va for the host-GPU view via the host GR VAS). The GPGA page
+     * table maps a guest-GPU-physical range -> (object, offset). The SAME nvkvm/RM handle backs
+     * both views, so host GPU and guest CPU are coherent. See docs/design/mode2_dataplane_
+     * architecture.md "REFACTOR PLAN". m2_fbback stays as the legacy fallback until retired. */
+    struct {
+        uint8_t  mode;        /* 0=physical(FB-backed general), 1=special(reg page) */
+        void    *cpu_qva;     /* QEMU/guest-CPU mapping of the host object (NULL=none) */
+        uint64_t size;
+        uint32_t client;      /* host RM client (nvkvm-tracked) */
+        uint32_t hMemory;     /* host RM object handle = the 'real' backing */
+        uint64_t gr_va;       /* host GR-VAS VA where map_dma'd (0=not GPU-mapped) */
+    } m2_objs[128];
+    int      m2_objs_n;
+    struct {                  /* GPGA page-range -> (object, offset_in_target) */
+        uint64_t gpga_base, size;
+        int      obj_idx;     /* index into m2_objs[] (-1 = none) */
+        uint64_t off;         /* offset_in_target */
+        bool     readable, writable;
+    } m2_gpga[256];
+    int      m2_gpga_n;
+
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
     uint64_t access_count;   /* monotonically increasing, for the trace      */
@@ -427,6 +450,20 @@ static uint8_t *nvkvm_fb_page(NvkvmGpuEmul *s, uint64_t fb_addr, bool alloc)
  * Inert until m2_fbback[] is populated. */
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
+    /* M7 REFACTOR: the GPGA table (gpu_memory_object model) is consulted FIRST. fb_addr is a
+     * GPGA; resolve it to its backing gpu_memory_object's CPU mapping. Empty => fall through to
+     * the legacy m2_fbback overlay, then (in the caller) to the local fb_pages. */
+    for (int i = 0; i < s->m2_gpga_n; i++) {
+        if (fb_addr >= s->m2_gpga[i].gpga_base &&
+            fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
+            int oi = s->m2_gpga[i].obj_idx;
+            if (oi < 0 || oi >= s->m2_objs_n || !s->m2_objs[oi].cpu_qva) {
+                break;                       /* GPGA known but no CPU backing -> fb_pages */
+            }
+            return (uint8_t *)s->m2_objs[oi].cpu_qva + s->m2_gpga[i].off +
+                   (fb_addr - s->m2_gpga[i].gpga_base);
+        }
+    }
     for (int i = 0; i < s->m2_fbback_n; i++) {
         if (fb_addr >= s->m2_fbback[i].fb_base &&
             fb_addr <  s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
@@ -440,7 +477,7 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 /* Aligned reg accesses never straddle a 4 KiB page. */
 static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 {
-    uint8_t *hp = (s->m2_fbback_n ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
+    uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: served from real host GPU memory */
         uint64_t v;
         switch (size) {
@@ -487,7 +524,7 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
                            unsigned size)
 {
-    uint8_t *hp = (s->m2_fbback_n ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
+    uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: written through to real host GPU memory */
         switch (size) {
         case 1: *hp = (uint8_t)val; break;
