@@ -368,3 +368,56 @@ Trapping every page-table read/write is a hot-path killer. Instead:
 
 Consistent rule: trap rare triggers (invalidate, doorbell, dynamic regs); hot (PTIMER reads, PDB
 r/w, backed GPGA access) is native via memslots.
+
+---
+
+## Execution-path blueprint (the cuCtxCreate keystone) — 2026-06-05
+
+Root cause of the cuCtxCreate hang/crash, pinned by the CRASHWIN read-probe (m2exec=on) and
+host-vs-guest gdb (see memory mode2-grctx-privilege-wall, mode2-cuctxcreate-rbp-clobber):
+the guest RM busy-loops (~13k iters) walking its GR-VAS page tables down to a **completion
+semaphore (guest-FB 0x2efbaf000, reads 0/UNBACKED)** and channel **USERD GP_GET fields (0x..008c,
+read 0)**. It is polling a channel completion that NEVER arrives because the HOST GPU never *runs*
+the submitted GR-init/scrubber work. The rbp=0 SIGSEGV is the downstream symptom of that stall.
+
+### Key simplifying insight (avoids the golden-ctx privilege fork)
+When the HOST channel runs the work it uses the HOST's OWN GR context buffers, which the host RM
+already built+self-mapped (st=0x51) at the SAME deterministic GR VAs (0x120020000…) the guest uses.
+So **the guest never needs to read GR-ctx-buffer CONTENT** — only the COMPLETION. Therefore we do
+NOT need PROMOTE_CTX / GET_CTX_BUFFER_INFO (both privileged, 0x1b) and do NOT need to bridge the
+golden context. The entire problem reduces to EXECUTION forwarding, which is fully UNPRIVILEGED.
+
+### What already works
+- GPFIFO double-mmap + FIXED map_dma into the host channel VAS: st=0x0 (host does NOT auto-map it).
+- OS_DESCRIPTOR pins guest RAM (st=0); GPGA/gpu_memory_object model; GR construct forwards (status=0).
+- Host's GR ctx buffers are valid (host built them) at the matching VAs.
+
+### The build (M5.4 steps 2-3 / item-5), unprivileged, in order
+1. **Working-set inventory** per channel that must run (the GR-init / golden-image / scrubber chan
+   that releases 0x2efbaf000, plus the GR compute channel): GPFIFO, pushbuffers (from GPFIFO
+   entries), referenced data buffers, and the completion semaphore surface. Sources: the snooped
+   NV_CHANNEL_ALLOC_PARAMS (gpFifoOffset/USERD) + GPFIFO-entry walk (pb VA from e0/e1) + the
+   SEM_RELEASE addr parsed from the pushbuffer method stream.
+2. **Back + FIXED-map each into the HOST channel's VAS at the guest VA**, backed by the guest's REAL
+   bytes (so the host reads real methods and writes the real semaphore the guest polls):
+   - guest-RAM (sysmem) buffers: OS_DESCRIPTOR(guest GPA)→host hMem→map_dma FIXED (item-4, proven).
+   - guest-FB (vidmem) buffers: host vidmem obj + copy the guest's emulated-FB content in + map_dma
+     FIXED; double-mmap the completion-semaphore page so the guest CPU reads the host-written value.
+   - VAS reconciliation: all VAs the pushbuffer references must resolve in the host channel VAS;
+     where the host already self-mapped (ctx buffers, st=0x51) leave it — those are the host's valid
+     buffers and the deterministic VAs already match.
+3. **Schedule + ring**: GPFIFO_SCHEDULE the host TSG (done in M5.8), then on the guest doorbell write
+   translate vChid→host work-submit token and write the host USERMODE doorbell (m2ring). Naive ring
+   today breaks cuInit→999 BECAUSE the working set isn't mapped first — gate the ring on
+   "working-set fully mapped for this channel".
+4. Host GPU runs the channel → writes 0x2efbaf000 + advances USERD GP_GET → guest poll satisfies →
+   cuCtxCreate proceeds. Verify via CRASHWIN: 0x2efbaf000 transitions 0→nonzero (host-written),
+   and via HOST nvidia-smi util (real work) — never a green guest log alone (mode2_real_forward_not_fake).
+
+### Quarantine
+`nvkvm_chan_execute()` (QEMU parses pushbuffer + writes the semaphore itself) is the FAKING path —
+keep it OFF for the real build; it masks whether the host actually ran the work.
+
+Iteration is slow (~6 min boot/attempt + GPU-wedge risk on a bad ring) → this is a sustained focused
+build, not an overnight tick. Reload host driver if wedged (rmmod nvidia_uvm nvidia_drm
+nvidia_modeset nvidia; modprobe nvidia).
