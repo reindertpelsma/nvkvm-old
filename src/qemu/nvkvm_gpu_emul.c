@@ -350,6 +350,7 @@ struct NvkvmGpuEmul {
     struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[8];
     int      m2_grmap_n;
     uint32_t m2_gr_channel;     /* M5.8: the host GR channel handle (c56f under GR TSG) */
+    uint32_t m2_gr_tsg;         /* M5.8: the host GR TSG handle (a06c, channel's parent) */
     void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
     bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
@@ -2826,6 +2827,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             if (is_gr) {
                 nvkvm_m2_back_channel_userd(s, hClient, hObject, auxbuf, psize);
                 s->m2_gr_channel = hObject;  /* M5.8: track for work-submit-token */
+                s->m2_gr_tsg     = hParent;  /* M5.8: GR TSG (for GPFIFO_SCHEDULE) */
             }
         }
         /* M5.3: NV_CHANNEL_ALLOC_PARAMS hVASpace@28 (alloc_channel.h). Like the GR
@@ -3328,6 +3330,18 @@ static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client)
              trc, tst, s->m2_gr_token,
              s->m2_doorbell_ready ? "READY (ring deferred until pushbuffers mapped+scheduled)"
                                   : "TOKEN-FAILED");
+    /* M5.8: schedule the host GR TSG so a future doorbell ring actually runs it. The guest's
+     * GPFIFO_SCHEDULE is a control (not forwarded by shadow_fwd), so the host TSG is idle
+     * until we schedule it. NVA06C_CTRL_CMD_GPFIFO_SCHEDULE (0xa06c0101) on the TSG,
+     * NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS{bEnable,bSkipSubmit,bSkipEnable}. Safe (no ring). */
+    if (s->m2_gr_tsg) {
+        uint8_t sp[3]; memset(sp, 0, sizeof(sp)); sp[0] = 1;   /* {bEnable=1,bSkipSubmit,bSkipEnable} */
+        uint32_t sst = 0xffff;
+        int src = nvkvm_m2_control1(s, client, s->m2_gr_tsg, 0xa06c0101u, sp, sizeof(sp), &sst);
+        qemu_log("nvkvm-gpu[%s] M5.8 doorbell: GPFIFO_SCHEDULE TSG=0x%08x rc=%d st=0x%x%s\n",
+                 s->chip->name, s->m2_gr_tsg, src, sst,
+                 (src == 0 && sst == 0) ? "  OK SCHEDULED" : "  <-- ERR");
+    }
 }
 
 /* M5.5 one-shot validation of the RM_MAP_MEMORY_DMA primitive via the CORRECT mapper
