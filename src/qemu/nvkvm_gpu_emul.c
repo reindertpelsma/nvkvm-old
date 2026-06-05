@@ -1722,16 +1722,37 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             }
             qemu_log("nvkvm-gpu[%s] M5.7 EXEC: backed %d/%d FB working-set buffers into GR "
                      "client 0x%08x VASpace\n", s->chip->name, mapped, s->va_map_n, grc);
-            /* Probe: the GR channel's GPFIFO VA is a UVM mapping NOT forwarded to the host,
-             * so it should be FREE in 0x5c000007 -> a FIXED map there should SUCCEED (st=0),
-             * unlike the already-host-mapped ctx VAs (0x51). VA-only (phys=0) connectivity
-             * check; the real path double-mmaps the guest GPFIFO content + pushbuffers. */
+            /* The GR channel's GPFIFO VA is a UVM mapping NOT forwarded to the host, so it
+             * is FREE in 0x5c000007 (probe: FIXED map there SUCCEEDS, unlike the already-
+             * host-mapped ctx VAs). For real operation we must DOUBLE-mmap it: resolve its
+             * guest-FB phys by walking the guest GR page tables (try each snooped VAS PDB),
+             * so the guest's submitted GP entries (written via BAR->fb_write at that phys)
+             * land in the SAME host memory the host channel's GPFIFO reads. */
             for (int i = 0; i < s->chan_n; i++) {
-                if (s->chans[i].client == grc && s->chans[i].gpfifo_va) {
-                    nvkvm_m2_back_and_map(s, grc, s->chans[i].gpfifo_va, 0, 0x8000,
-                                          "gpfifo-probe");
-                    break;
+                if (s->chans[i].client != grc || !s->chans[i].gpfifo_va) {
+                    continue;
                 }
+                uint64_t gva = s->chans[i].gpfifo_va, gphys = 0;
+                for (int v = 0; v < s->chan_vas_n; v++) {
+                    bool sy = false;
+                    uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[v].pdb, gva, &sy);
+                    if (p != NVKVM_GMMU_FAULT && !sy) {
+                        gphys = p & ~0xfffull;
+                        qemu_log("nvkvm-gpu[%s] M5.7 GPFIFO VA=0x%llx resolved via VAS[%d] "
+                                 "pdb=0x%llx -> FB phys=0x%llx\n", s->chip->name,
+                                 (unsigned long long)gva, v,
+                                 (unsigned long long)s->chan_vas[v].pdb,
+                                 (unsigned long long)gphys);
+                        break;
+                    }
+                }
+                if (!gphys) {
+                    qemu_log("nvkvm-gpu[%s] M5.7 GPFIFO VA=0x%llx phys UNRESOLVED "
+                             "(chan_vas_n=%d) — VA-only map\n", s->chip->name,
+                             (unsigned long long)gva, s->chan_vas_n);
+                }
+                nvkvm_m2_back_and_map(s, grc, gva, gphys, 0x10000, "gpfifo");
+                break;
             }
         }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
