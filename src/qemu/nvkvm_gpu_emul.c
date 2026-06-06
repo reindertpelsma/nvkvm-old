@@ -314,6 +314,11 @@ struct NvkvmGpuEmul {
      * GPU state (the proven cuCtxCreate fix). Tracked per GR client. */
     struct { uint32_t client, subdev; } m2_subdev[64];
     int      m2_subdev_n;
+    /* M14: device-info-table (engine enumeration) captured LIVE from the host GPU via a
+     * private QEMU-owned client/subdevice — no hardcoded per-GPU blob. 100B/entry, 32/page. */
+    uint8_t  m2_devinfo[256 * 100];
+    uint32_t m2_devinfo_n;               /* entries captured (0 = none) */
+    bool     m2_devinfo_tried;           /* capture attempted once (success or fail) */
     /* M5.3 DATA-PLANE (double-mmap): FB ranges backed by real host GPU memory. When the
      * guest reads/writes a context-buffer FB address that we've backed with the host
      * shadow context's counterpart (mapped via the proven RM_MAP_MEMORY primitive), serve
@@ -1138,6 +1143,7 @@ static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd); /
 static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                       uint64_t gpa, uint64_t size); /* M6.5 fwd-decl */
 static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client); /* M6.5 fwd-decl */
+static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s); /* M14 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -1447,20 +1453,47 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     stl_le_p(resp + 96, INTRTABLE_GA106_PSIZE);
                     stl_le_p(resp + 56, 32u + 40u + INTRTABLE_GA106_PSIZE);
                 } else if (ctrl == 0x20801112u) {
-                    /* FIFO_GET_DEVICE_INFO_TABLE: paginated; replay real GA106
-                     * engine table (separate capture). params@120: baseIndex@120,
-                     * numEntries@124, bMore@128, entries@132 (100B each). */
+                    /* FIFO_GET_DEVICE_INFO_TABLE: the engine enumeration that drives the guest's
+                     * classDB + KernelCE objects. M14 (user direction — forward, don't hardcode):
+                     * this control is ROUTE_TO_PHYSICAL but NOT privileged/internal (flags 0x5c040),
+                     * so FORWARD it to the host's real GSP and return THIS GPU's actual engine table
+                     * dynamically — no per-GPU baked blob (which was captured truncated: 10 entries,
+                     * no video engines -> guest GET_CLASSLIST_V2 numClasses 97 vs host 107). Fall back
+                     * to the captured GA106 blob only if the forward isn't serviceable yet. */
                     uint32_t base = ldl_le_p(resp + 120);
-                    uint32_t psize = 12u + 32u * DEVINFO_GA106_ENTRY_SIZE; /* 3212 */
-                    memset(resp + 120, 0, psize);
-                    stl_le_p(resp + 120, base);
-                    if (base == 0) {
-                        stl_le_p(resp + 124, DEVINFO_GA106_NUM_ENTRIES);
-                        memcpy(resp + 132, devinfo_ga106_entries,
-                               sizeof(devinfo_ga106_entries));
+                    if (s->m2fwd) {
+                        nvkvm_m2_capture_devinfo(s);   /* one-shot live host capture */
                     }
-                    stl_le_p(resp + 96, psize);
-                    stl_le_p(resp + 56, 32u + 40u + psize);
+                    if (s->m2_devinfo_n > 0) {
+                        /* serve from the live host capture, paginated (32/page) */
+                        uint32_t psize = 12u + 32u * 100u; /* 3212 */
+                        memset(resp + 120, 0, psize);
+                        stl_le_p(resp + 120, base);
+                        uint32_t n_this = 0;
+                        if (base < s->m2_devinfo_n) {
+                            n_this = s->m2_devinfo_n - base;
+                            if (n_this > 32u) n_this = 32u;
+                            memcpy(resp + 132, s->m2_devinfo + (uint64_t)base * 100,
+                                   (uint64_t)n_this * 100);
+                        }
+                        stl_le_p(resp + 124, n_this);
+                        stl_le_p(resp + 128, (base + n_this < s->m2_devinfo_n) ? 1u : 0u);
+                        stl_le_p(resp + 96, psize);
+                        stl_le_p(resp + 92, 0);
+                        stl_le_p(resp + 56, 32u + 40u + psize);
+                    } else {
+                        /* fallback: captured GA106 blob (only if live capture unavailable) */
+                        uint32_t psize = 12u + 32u * DEVINFO_GA106_ENTRY_SIZE; /* 3212 */
+                        memset(resp + 120, 0, psize);
+                        stl_le_p(resp + 120, base);
+                        if (base == 0) {
+                            stl_le_p(resp + 124, DEVINFO_GA106_NUM_ENTRIES);
+                            memcpy(resp + 132, devinfo_ga106_entries,
+                                   sizeof(devinfo_ga106_entries));
+                        }
+                        stl_le_p(resp + 96, psize);
+                        stl_le_p(resp + 56, 32u + 40u + psize);
+                    }
                 } else if (ctrl == 0x20802a08u) {
                     /* CE_GET_FAULT_METHOD_BUFFER_SIZE: { NvU32 size }.  Our
                      * capture truncated the 4B payload (size replayed as 0) ->
@@ -4437,6 +4470,75 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
              "[DOUBLE-MMAP]\n", s->chip->name, chanObj, (unsigned long long)ubase,
              (unsigned long long)usize, uas, hUserd, hm.qva,
              (unsigned long long)asize);
+}
+
+/* M14: capture THIS host GPU's real device-info-table (engine enumeration) once, via a
+ * private QEMU-owned client→device→subdevice on the host. The guest's classDB and KernelCE
+ * objects are built from this table, so serving the host's real one makes the guest advertise
+ * exactly the engines/classes the physical GPU has — no hardcoded per-GPU blob (which was
+ * captured truncated: 10 entries, missing video engines → numClasses 97 vs host 107).
+ * GPU-AGNOSTIC: contains zero GA106-specific data; works for any NVIDIA GPU the host exposes.
+ *
+ * FINDING (2026-06-06): 0x20801112 flags=0x5c040 has NEITHER _PRIVILEGED(0x4) NOR
+ * _NON_PRIVILEGED(0x8) -> defaults to KERNEL_PRIVILEGED, so an UNPRIVILEGED isolate client
+ * gets NV_ERR_NOT_SUPPORTED (0x1b) here. This code therefore falls back to the captured blob.
+ * The unprivileged dynamic route (TODO if numClasses ever matters for correctness — it does
+ * NOT for compute; the 10 missing classes are video engines NVENC/NVDEC/NVJPG/OFA, and the GR
+ * compute class 0xc7c0 IS already advertised) is to SYNTHESIZE the table from GET_ENGINES_V2
+ * (0x20800170, flags=0x48 = NON_PRIVILEGED), which an unprivileged client CAN issue.
+ * Paginated: 32 entries/call, 100B/entry; bMore drives the loop. */
+static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s)
+{
+    if (s->m2_devinfo_tried) {
+        return;
+    }
+    s->m2_devinfo_tried = true;
+    if (!nvkvm_m2_iso_ensure(s)) {
+        return;
+    }
+    const uint32_t C = 0xc1ee0011u, DEV = 0xde100011u, SUB = 0xde100012u;
+    uint32_t st = 0xffff;
+    uint32_t c0 = C;
+    nvkvm_m2_alloc1(s, C, 0, 0, 0x0u, &c0, sizeof(c0), &st);           /* NV01_ROOT */
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] M14 devinfo: client alloc st=0x%x\n", s->chip->name, st);
+        return;
+    }
+    uint8_t dev[56]; memset(dev, 0, sizeof(dev));
+    nvkvm_m2_alloc1(s, C, C, DEV, 0x0080u, dev, sizeof(dev), &st);     /* NV01_DEVICE_0 */
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] M14 devinfo: device alloc st=0x%x\n", s->chip->name, st);
+        return;
+    }
+    uint32_t sub = 0;
+    nvkvm_m2_alloc1(s, C, DEV, SUB, 0x2080u, &sub, sizeof(sub), &st);  /* NV20_SUBDEVICE_0 */
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] M14 devinfo: subdevice alloc st=0x%x\n", s->chip->name, st);
+        return;
+    }
+    static uint8_t buf[12 + 32 * 100];
+    uint32_t base = 0, total = 0; int pages = 0;
+    for (;;) {
+        memset(buf, 0, sizeof(buf));
+        stl_le_p(buf + 0, base);                  /* baseIndex */
+        st = 0xffff;
+        int rc = nvkvm_m2_control1(s, C, SUB, 0x20801112u, buf, sizeof(buf), &st);
+        if (rc != 0 || st != 0) {
+            qemu_log("nvkvm-gpu[%s] M14 devinfo: control base=%u rc=%d st=0x%x\n",
+                     s->chip->name, base, rc, st);
+            break;
+        }
+        uint32_t num = ldl_le_p(buf + 4), bMore = ldl_le_p(buf + 8);
+        if (num > 32u) num = 32u;
+        if (total + num > 256u) num = 256u - total;
+        memcpy(s->m2_devinfo + (uint64_t)total * 100, buf + 12, (uint64_t)num * 100);
+        total += num;
+        if (++pages > 16 || !bMore || total >= 256u) break;
+        base += num ? num : 32u;
+    }
+    s->m2_devinfo_n = total;
+    qemu_log("nvkvm-gpu[%s] M14 devinfo CAPTURED %u engine entries LIVE from host GPU "
+             "(no blob)\n", s->chip->name, total);
 }
 
 /* M5.3 DATA-PLANE PROOF: validate that QEMU can put REAL host GPU memory into its
