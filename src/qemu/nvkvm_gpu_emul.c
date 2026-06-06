@@ -1575,6 +1575,23 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     if (ps >= 129) { resp[120 + 128] = 0x0f; }
                     stl_le_p(resp + 92, 0);
                     stl_le_p(resp + 56, 32u + 40u + ps);
+                } else if (ctrl == 0x20802a0bu) {
+                    /* M13 (host-vs-guest ptrace diff, 2026-06-06): CE_GET_ALL_PHYSICAL_CAPS.
+                     * The guest kernel's subdeviceCtrlCmdCeGetAllCaps builds the user-visible
+                     * CE_GET_ALL_CAPS reply from THIS GSP physical-caps RPC (kernel_ce_shared.c).
+                     * We weren't answering it -> base caps stayed 0 -> guest CE_GET_ALL_CAPS
+                     * capsTbl=0 vs host 0x03e3 (the nvtrace/nvdecode diff caught this). Struct =
+                     * { NvU8 capsTbl[64][2]; NvU64 present@128 }. Replay the host GA106 values:
+                     * CE0/CE1=0x03e3 (GRCE|SHARED|SYSMEM|P2P|BL>64K), CE2/CE3=0x03e2, present=0xf. */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    memset(resp + 120, 0, ps);
+                    if (ps >= 8) {
+                        stw_le_p(resp + 120, 0x03e3); stw_le_p(resp + 122, 0x03e3);
+                        stw_le_p(resp + 124, 0x03e2); stw_le_p(resp + 126, 0x03e2);
+                    }
+                    if (ps >= 136) { stq_le_p(resp + 120 + 128, 0x0full); }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
                 } else if (ctrl == 0x20808162u) {
                     /* M5.3 forge gap: host returns bool=1. */
                     uint32_t ps = ldl_le_p(resp + 96);
