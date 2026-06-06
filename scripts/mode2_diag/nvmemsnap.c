@@ -140,8 +140,8 @@ static void register_region(void *addr, size_t len, int prot, off_t off, const c
     if (nregs < MAXR) {
         regs[nregs].addr = addr; regs[nregs].len = len; regs[nregs].prot = prot; regs[nregs].off = off;
         strncpy(regs[nregs].path, path, sizeof(regs[0].path) - 1);
-        fprintf(lg, "REG #%d path=%s off=0x%lx len=0x%zx prot=0x%x (after %ld ioctls)\n",
-                nregs, path, (long)off, len, prot, n_ioctl);
+        fprintf(lg, "REG #%d path=%s addr=%p off=0x%lx len=0x%zx prot=0x%x (after %ld ioctls)\n",
+                nregs, path, addr, (long)off, len, prot, n_ioctl);
         nregs++;
     }
     pthread_mutex_unlock(&lk);
