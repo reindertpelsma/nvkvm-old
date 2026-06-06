@@ -1030,10 +1030,23 @@ backing, keyed by that identifier.**
 Result: `chan_exec entry[0] pb=0x120000000 w0=0x20016000` — the guest **userspace pushbuffer is
 readable from the host end-to-end**.
 
-### Next blocker — completion-semaphore vidmem aliasing
-`cuCtxCreate` still spins because the completion sema (`semaVA=0x121018004 → FB 0x2eee18004`,
-vidmem) is **written** at the channel-VAS page but libcuda **reads** it via BAR1 at a different page
-(same aliasing as #1). Symmetric fix: write the sema where libcuda reads it (BAR1-resolved page).
-The principled end-state remains the `m2_objs`/`m2_gpga` single-backing refactor (one backing per
-object, all mappings resolve to it); `bar1_wpg` + VAS-pin + sema-redirect are the pragmatic
-increments that get first-compute green first. See [[mode2_first_compute_blocker]].
+### Completion-semaphore vidmem redirect (M5.18 — correct, but not the blocker)
+`nvkvm_chan_sem_wr32` now ALSO writes a sema payload at `chan_gpfifo_phys + (va - gpfifo_va)` (the
+BAR1-contiguous backing — proven: GPFIFO `BAR1 0xa0000→0x3130000`, USERD `0xb0000→0x3140000`), for
+the doorbell-completion sema and the parsed CE/NVC56F/COMPUTE report-sem releases. Live: `DOORBELL …
+semaVA=0x121018004 … redir=0x3138004` fires.
+
+### Next blocker — identify libcuda's ACTUAL cuCtxCreate completion wait
+M5.18 didn't unblock cuCtxCreate, and the trace shows we're writing the wrong target:
+- **No BAR1 reads** anywhere near the sema region (`0x3138xxx`/`0x2eee18xxx`) → libcuda is NOT
+  polling the `gpfifo+0x8004` vidmem sema via BAR1.
+- **No `COMPUTE_REPORT_SEM`** (`SET_REPORT_SEMAPHORE`, method 0x1b0c) in the compute pushbuffer
+  (`pb=0x120000000`, 10 words, `w0=SET_OBJECT`).
+So the `gpfifo+0x8004` heuristic sema is the wrong target. cuCtxCreate's real wait is probably a
+**sysmem** semaphore (guest reads its own RAM coherently — QEMU never sees the read; fix = write the
+right guest GPA), an **os-event/interrupt** wakeup, or it needs fuller pushbuffer parsing / actual
+compute forwarding to the host channel (`m2_exec_doorbell` doorbell mirror). NEXT: instrument what
+libcuda spins on right before the wedge (the repeated read target / the post-doorbell ioctl/poll),
+then write/forward that. The principled end-state remains the `m2_objs`/`m2_gpga` single-backing
+refactor; `bar1_wpg` + VAS-pin + sema-redirect are the pragmatic increments. See
+[[mode2_first_compute_blocker]].

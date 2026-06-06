@@ -1160,6 +1160,8 @@ static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t
                                       uint64_t gpa, uint64_t size); /* M6.5 fwd-decl */
 static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client); /* M6.5 fwd-decl */
 static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s); /* M14 fwd-decl */
+static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
+                                uint64_t *out_redir); /* M5.18 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -2139,16 +2141,15 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             uint64_t sema_va = c->gpfifo_va + 0x8004ull;
             bool is_sys = false;
             uint64_t phys = nvkvm_chan_translate(s, sema_va, &is_sys);
-            if (phys != NVKVM_GMMU_FAULT) {
+            if (phys != NVKVM_GMMU_FAULT || s->chan_gpfifo_phys) {
                 uint32_t payload = ++c->payload;
-                if (is_sys) { uint8_t b[4]; stl_le_p(b, payload);
-                              nvkvm_dmaw(&s->parent_obj, phys, b, 4); }
-                else        { nvkvm_fb_write(s, phys, payload, 4); }
+                uint64_t redir = 0;
+                nvkvm_chan_sem_wr32(s, sema_va, payload, &redir);  /* M5.18: also write the BAR1 page libcuda polls */
                 qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> completed: "
-                         "semaVA=0x%llx -> %s phys=0x%llx payload=%u\n",
+                         "semaVA=0x%llx -> %s phys=0x%llx payload=%u redir=0x%llx\n",
                          s->chip->name, (uint32_t)val, i,
                          (unsigned long long)sema_va, is_sys ? "SYS" : "FB",
-                         (unsigned long long)phys, payload);
+                         (unsigned long long)phys, payload, (unsigned long long)redir);
             } else {
                 qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> sema VA "
                          "0x%llx FAULTED; gpfifo=0x%llx\n", s->chip->name,
@@ -2660,6 +2661,35 @@ static void nvkvm_phys_wr32(NvkvmGpuEmul *s, uint64_t phys, bool sys, uint32_t v
         nvkvm_fb_write(s, phys, v, 4);
     }
 }
+
+/* M5.18 — write a completion-semaphore payload at a CHANNEL GPU VA, redirected to
+ * the location the guest CPU actually READS.  For a GSP-managed vidmem channel the
+ * channel-VAS walk gives a stale aliasing FB page (libcuda never reads it); the
+ * guest accesses the channel buffer through BAR1, which the earlier trace showed is
+ * FB-contiguous from chan_gpfifo_phys (the page where the guest wrote the GP entry:
+ * GPFIFO BAR1 0xa0000->FB 0x3130000, USERD 0xb0000->0x3140000).  So when the sema
+ * VA lies inside the channel's GPFIFO buffer window, ALSO write it at
+ * chan_gpfifo_phys + (va - chan_gpfifo_va) — the page libcuda polls.  We write both
+ * the channel-VAS page (harmless, may be the real one for sysmem semas) AND the
+ * BAR1-relative page, so sysmem semas (other channels) are unaffected. */
+#define NVKVM_CHAN_BUF_WINDOW 0x20000ull   /* GPFIFO + USERD + sema slack (128 KiB) */
+static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
+                                uint64_t *out_redir)
+{
+    bool wrote = false;
+    bool sy; uint64_t p = nvkvm_chan_translate(s, va, &sy);
+    if (p != NVKVM_GMMU_FAULT) { nvkvm_phys_wr32(s, p, sy, payload); wrote = true; }
+    if (s->chan_gpfifo_phys && va >= s->chan_gpfifo_va &&
+        va <  s->chan_gpfifo_va + NVKVM_CHAN_BUF_WINDOW) {
+        uint64_t rp = s->chan_gpfifo_phys + (va - s->chan_gpfifo_va);
+        nvkvm_fb_write(s, rp, payload, 4);     /* the page libcuda actually polls */
+        if (out_redir) { *out_redir = rp; }
+        wrote = true;
+    } else if (out_redir) {
+        *out_redir = 0;
+    }
+    return wrote;
+}
 /* Read one 32-bit word at a CHANNEL GPU VA (translate then phys read). */
 static bool nvkvm_chan_rd32(NvkvmGpuEmul *s, uint64_t va, uint32_t *out)
 {
@@ -2990,17 +3020,13 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                      * sema at semaOffset), so honoring only that left this one
                      * unwritten and the scrubber timed out (ce_utils.c:349). */
                     if (sem_type != 0 && ce_sem_addr) {
-                        bool sy = false;
-                        uint64_t p = nvkvm_chan_translate(s, ce_sem_addr, &sy);
-                        if (p != NVKVM_GMMU_FAULT) {
-                            if (sy) { uint8_t bb[4]; stl_le_p(bb, ce_sem_pay);
-                                      nvkvm_dmaw(&s->parent_obj, p, bb, 4); }
-                            else    { nvkvm_fb_write(s, p, ce_sem_pay, 4); }
+                        uint64_t redir = 0;                    /* M5.18: also write the BAR1 page libcuda polls */
+                        if (nvkvm_chan_sem_wr32(s, ce_sem_addr, ce_sem_pay, &redir)) {
                             s->chan_sem_released = true;
                             qemu_log("nvkvm-gpu[%s] M5: CE_SEM_RELEASE addr=0x%llx "
-                                     "-> %s phys=0x%llx payload=%u\n", s->chip->name,
-                                     (unsigned long long)ce_sem_addr, sy ? "SYS" : "FB",
-                                     (unsigned long long)p, ce_sem_pay);
+                                     "payload=%u redir=0x%llx\n", s->chip->name,
+                                     (unsigned long long)ce_sem_addr, ce_sem_pay,
+                                     (unsigned long long)redir);
                         }
                     }
                     break;
@@ -3012,26 +3038,20 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 case 0x68: sem_pay_hi = d; break;                                            /* SEM_PAYLOAD_HI */
                 case 0x6c: {                                                                 /* SEM_EXECUTE */
                     if ((d & 0x7u) == 0x1u && sem_addr) {   /* OPERATION == RELEASE */
-                        bool sy = false;
-                        uint64_t p = nvkvm_chan_translate(s, sem_addr, &sy);
-                        if (p != NVKVM_GMMU_FAULT) {
-                            bool sz64 = (d >> 24) & 1;       /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
-                            if (sz64) {
-                                if (sy) { uint8_t b[4]; stl_le_p(b, sem_pay_lo);
-                                          nvkvm_dmaw(&s->parent_obj, p, b, 4); }
-                                else    { nvkvm_fb_write(s, p, sem_pay_lo, 4); }
-                            } else {
-                                if (sy) { uint8_t b[8]; stl_le_p(b, sem_pay_lo);
-                                          stl_le_p(b + 4, sem_pay_hi);
-                                          nvkvm_dmaw(&s->parent_obj, p, b, 8); }
-                                else    { nvkvm_fb_write(s, p, sem_pay_lo, 4);
-                                          nvkvm_fb_write(s, p + 4, sem_pay_hi, 4); }
+                        bool sz64 = (d >> 24) & 1;           /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
+                        uint64_t redir = 0;                  /* M5.18: also write the BAR1 page libcuda polls */
+                        if (nvkvm_chan_sem_wr32(s, sem_addr, sem_pay_lo, &redir)) {
+                            if (!sz64) {                     /* 64-bit value: high word too */
+                                bool sy2 = false;
+                                uint64_t p2 = nvkvm_chan_translate(s, sem_addr + 4, &sy2);
+                                if (p2 != NVKVM_GMMU_FAULT) { nvkvm_phys_wr32(s, p2, sy2, sem_pay_hi); }
+                                if (redir) { nvkvm_fb_write(s, redir + 4, sem_pay_hi, 4); }
                             }
                             s->chan_sem_released = true;
-                            qemu_log("nvkvm-gpu[%s] M5: SEM_RELEASE addr=0x%llx -> %s "
-                                     "phys=0x%llx payload=%u\n", s->chip->name,
-                                     (unsigned long long)sem_addr, sy ? "SYS" : "FB",
-                                     (unsigned long long)p, sem_pay_lo);
+                            qemu_log("nvkvm-gpu[%s] M5: SEM_RELEASE addr=0x%llx "
+                                     "payload=%u redir=0x%llx\n", s->chip->name,
+                                     (unsigned long long)sem_addr, sem_pay_lo,
+                                     (unsigned long long)redir);
                         }
                     }
                     break;
@@ -3042,25 +3062,27 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 case 0x1b08: cr_sem_pay = d; break;                                                            /* PAYLOAD */
                 case 0x1b0c: {                                                                                 /* D: trigger */
                     if ((d & 0x3u) == 0x0u && cr_sem_addr) {   /* OPERATION == RELEASE */
-                        bool sy = false;
-                        uint64_t p = nvkvm_chan_translate(s, cr_sem_addr, &sy);
-                        if (p != NVKVM_GMMU_FAULT) {
-                            bool one_word = (d >> 28) & 1;     /* STRUCTURE_SIZE: 1=ONE_WORD(4B), 0=FOUR_WORDS(16B w/ ts) */
-                            if (sy) { uint8_t b[4]; stl_le_p(b, cr_sem_pay);
-                                      nvkvm_dmaw(&s->parent_obj, p, b, 4); }
-                            else    { nvkvm_fb_write(s, p, cr_sem_pay, 4); }
-                            if (!one_word) {                   /* 4-word: also zero the timestamp dwords */
-                                if (sy) { uint8_t z[12] = {0};
-                                          nvkvm_dmaw(&s->parent_obj, p + 4, z, 12); }
-                                else    { nvkvm_fb_write(s, p + 4, 0, 4);
-                                          nvkvm_fb_write(s, p + 8, 0, 4);
-                                          nvkvm_fb_write(s, p + 12, 0, 4); }
+                        bool one_word = (d >> 28) & 1;         /* STRUCTURE_SIZE: 1=ONE_WORD(4B), 0=FOUR_WORDS(16B w/ ts) */
+                        uint64_t redir = 0;                    /* M5.18: also write the BAR1 page libcuda polls */
+                        bool ok = nvkvm_chan_sem_wr32(s, cr_sem_addr, cr_sem_pay, &redir);
+                        if (ok) {
+                            if (!one_word) {                   /* 4-word: also zero the 12B timestamp */
+                                bool sy2 = false;
+                                uint64_t p2 = nvkvm_chan_translate(s, cr_sem_addr + 4, &sy2);
+                                if (p2 != NVKVM_GMMU_FAULT) {
+                                    nvkvm_phys_wr32(s, p2, sy2, 0);
+                                    nvkvm_phys_wr32(s, p2 + 4, sy2, 0);
+                                    nvkvm_phys_wr32(s, p2 + 8, sy2, 0);
+                                }
+                                if (redir) { nvkvm_fb_write(s, redir + 4, 0, 4);
+                                             nvkvm_fb_write(s, redir + 8, 0, 4);
+                                             nvkvm_fb_write(s, redir + 12, 0, 4); }
                             }
                             s->chan_sem_released = true;
-                            qemu_log("nvkvm-gpu[%s] M5: COMPUTE_REPORT_SEM addr=0x%llx -> %s "
-                                     "phys=0x%llx payload=%u awaken=%d\n", s->chip->name,
-                                     (unsigned long long)cr_sem_addr, sy ? "SYS" : "FB",
-                                     (unsigned long long)p, cr_sem_pay, (int)((d >> 20) & 1));
+                            qemu_log("nvkvm-gpu[%s] M5: COMPUTE_REPORT_SEM addr=0x%llx "
+                                     "payload=%u redir=0x%llx awaken=%d\n", s->chip->name,
+                                     (unsigned long long)cr_sem_addr, cr_sem_pay,
+                                     (unsigned long long)redir, (int)((d >> 20) & 1));
                         }
                     }
                     break;
