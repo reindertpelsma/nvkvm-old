@@ -241,6 +241,22 @@ struct NvkvmGpuEmul {
     } va_map[NVKVM_MAX_MAPS];
     int va_map_n;
 
+    /* M5.16 — physical FB pages the guest CPU has WRITTEN via BAR1 (vidmem).
+     * For a GSP-managed channel VAS the channel-GMMU walk of gpFifoVA resolves to
+     * a stale aliasing page (reads 0), but the guest's OWN CPU mapping of the ring
+     * goes through BAR1 (bar1_pdb, CPU-built PTEs) and lands in our FB at the TRUE
+     * backing page (proven: compute GPFIFO write hit FB 0x3130000 via BAR1 off
+     * 0xa0000, while the VAS walk wrongly gave 0x2eee10000).  Record those pages,
+     * most-recent-first, so chan_execute can resolve the GPFIFO to where the guest
+     * actually wrote it rather than trusting the unreliable channel-VAS walk. */
+#define NVKVM_MAX_BAR1PG 64
+    struct { uint64_t page; uint64_t seq; } bar1_wpg[NVKVM_MAX_BAR1PG];
+    int      bar1_wpg_n;
+    uint64_t bar1_wpg_seq;
+    uint64_t chan_gpfifo_phys;  /* M5.16: if non-0, read GP entries DIRECTLY from this
+                                 * FB phys (the BAR1-resolved true ring), bypassing the
+                                 * stale channel-VAS walk for the GPFIFO entry. */
+
     /* M7 — CPU interrupt tree (raise MSI-X on LEAF_TRIGGER; ISR reads TOP/LEAF) */
     uint32_t intr_leaf[NVKVM_VF_INTR_NLEAF];     /* pending per leaf reg */
     uint32_t intr_leaf_en[NVKVM_VF_INTR_NLEAF];  /* enables */
@@ -2348,6 +2364,25 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
         nvkvm_dmaw(&s->parent_obj, pa, b, size);
     } else {
         nvkvm_fb_write(s, pa, val, size);
+        /* M5.16: remember this vidmem page as a guest-CPU-written backing (the
+         * authoritative ring location; see bar1_wpg comment).  MRU-ordered. */
+        uint64_t pg = pa & ~0xFFFull;
+        int hit = -1;
+        for (int i = 0; i < s->bar1_wpg_n; i++) {
+            if (s->bar1_wpg[i].page == pg) { hit = i; break; }
+        }
+        if (hit < 0) {
+            if (s->bar1_wpg_n < NVKVM_MAX_BAR1PG) {
+                hit = s->bar1_wpg_n++;
+            } else {                         /* evict LRU (smallest seq) */
+                hit = 0;
+                for (int i = 1; i < s->bar1_wpg_n; i++) {
+                    if (s->bar1_wpg[i].seq < s->bar1_wpg[hit].seq) { hit = i; }
+                }
+            }
+            s->bar1_wpg[hit].page = pg;
+        }
+        s->bar1_wpg[hit].seq = ++s->bar1_wpg_seq;
     }
     /* DIAG: BAR1 writes into the low-FB region reveal where the guest CPU lays
      * down the UVM channel's GPFIFO entry, pushbuffer, and inits the semaphore. */
@@ -2665,6 +2700,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
      * this channel's ring.  Pin it in chan_pdb so every translate in this walk
      * (entry/pushbuffer/sema) uses the same correct VAS. */
     s->chan_pdb = 0;
+    s->chan_gpfifo_phys = 0;
     if (gp_put < s->chan_gpfifo_ent && gp_put != s->chan_gp_get) {
         uint64_t eva = s->chan_gpfifo_va + (uint64_t)s->chan_gp_get * 8;
         for (int i = 0; i < s->chan_vas_n; i++) {
@@ -2727,6 +2763,45 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
             }
         }
     }
+    /* M5.16 — last-resort GPFIFO resolution for GSP-managed channel VASes.  When
+     * the channel-VAS walk above failed to find a PDB under which the pending GP
+     * entry reads non-zero (chan_pdb==0), the ring's leaf PTE isn't reliable in
+     * our FB — but the guest's OWN CPU mapping wrote the entry through BAR1, and
+     * that landed in our FB at the TRUE backing page (recorded in bar1_wpg).
+     * Try each guest-written vidmem page (MRU first) as the GPFIFO base: if the
+     * pending entry there decodes to a plausible pushbuffer (non-zero, sane len,
+     * pb VA resolves), pin it as chan_gpfifo_phys so the entry read below reads
+     * the real ring instead of the stale aliased page.  This is the data-plane
+     * keystone: stop trusting the channel-VAS walk for GSP-managed rings. */
+    if (s->chan_pdb == 0 && gp_put < s->chan_gpfifo_ent && gp_put != s->chan_gp_get) {
+        bool visited[NVKVM_MAX_BAR1PG] = { false };
+        uint64_t off = (uint64_t)s->chan_gp_get * 8;
+        for (int scan = 0; scan < s->bar1_wpg_n && off + 8 <= 0x1000; scan++) {
+            int best = -1;                       /* pick MRU (highest seq) unvisited */
+            for (int i = 0; i < s->bar1_wpg_n; i++) {
+                if (visited[i] || !s->bar1_wpg[i].page) { continue; }
+                if (best < 0 || s->bar1_wpg[i].seq > s->bar1_wpg[best].seq) { best = i; }
+            }
+            if (best < 0) { break; }
+            visited[best] = true;
+            uint64_t cand = s->bar1_wpg[best].page;
+            uint32_t e0 = (uint32_t)nvkvm_fb_read(s, cand + off, 4);
+            uint32_t e1 = (uint32_t)nvkvm_fb_read(s, cand + off + 4, 4);
+            if (e0 == 0 && e1 == 0) { continue; }
+            uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
+            uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
+            if (!pb || pblen == 0 || pblen > 0x40000) { continue; }
+            bool psy; uint64_t pp = nvkvm_chan_translate(s, pb, &psy);
+            if (pp == NVKVM_GMMU_FAULT) { continue; }
+            s->chan_gpfifo_phys = cand;
+            qemu_log("nvkvm-gpu[%s] M5.16: GPFIFO resolved via BAR1-written page "
+                     "FB 0x%llx (seq %llu) -> entry pb=0x%llx len=%u [VAS-walk gave "
+                     "wrong page]\n", s->chip->name, (unsigned long long)cand,
+                     (unsigned long long)s->bar1_wpg[best].seq,
+                     (unsigned long long)pb, pblen);
+            break;
+        }
+    }
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
     }
@@ -2765,7 +2840,12 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
          guard < s->chan_gpfifo_ent; idx = (idx + 1) % s->chan_gpfifo_ent, guard++) {
         uint32_t e0, e1;
         uint64_t eva = s->chan_gpfifo_va + (uint64_t)idx * 8;
-        if (!nvkvm_chan_rd32(s, eva, &e0) || !nvkvm_chan_rd32(s, eva + 4, &e1)) {
+        if (s->chan_gpfifo_phys && (uint64_t)idx * 8 + 8 <= 0x1000) {
+            /* M5.16: read the entry from the BAR1-resolved true ring page (the
+             * channel-VAS walk gives a stale page for GSP-managed VASes). */
+            e0 = (uint32_t)nvkvm_fb_read(s, s->chan_gpfifo_phys + (uint64_t)idx * 8, 4);
+            e1 = (uint32_t)nvkvm_fb_read(s, s->chan_gpfifo_phys + (uint64_t)idx * 8 + 4, 4);
+        } else if (!nvkvm_chan_rd32(s, eva, &e0) || !nvkvm_chan_rd32(s, eva + 4, &e1)) {
             qemu_log("nvkvm-gpu[%s] M5: chan_exec GPFIFO entry[%u] @VA 0x%llx "
                      "FAULTED (no VAS maps it)\n", s->chip->name, idx,
                      (unsigned long long)eva);
