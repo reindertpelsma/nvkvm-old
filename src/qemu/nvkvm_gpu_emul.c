@@ -3512,8 +3512,19 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                     is_gr = true; break;
                 }
             }
-            if (is_gr) {
+            /* M5.23 USERD double-mmap (host-channel bridge step 1): back the USERD of
+             * EVERY real forwarded channel with host GPU memory + double-mmap at the
+             * guest USERD FB addr, so the guest's GP_PUT (userd+0x8C) lands where the
+             * host GPU reads GP_PUT/GP_GET — the prerequisite for the rung host channel
+             * to actually run.  EXCLUDE libcuda PROBE/sentinel channels (0xbaba.. /
+             * 0x31415..): M5.4 proved backing those returns 0x51/0x33 (they aren't real
+             * runnable channels).  No-copy: the double-mmap shares the page, not a copy. */
+            bool is_sentinel = ((hObject & 0xffff0000u) == 0xbaba0000u) ||
+                               ((hObject & 0xffffff00u) == 0x31415900u);
+            if (!is_sentinel) {
                 nvkvm_m2_back_channel_userd(s, hClient, hObject, auxbuf, psize);
+            }
+            if (is_gr) {
                 s->m2_gr_channel = hObject;  /* M5.8: track for work-submit-token */
                 s->m2_gr_tsg     = hParent;  /* M5.8: GR TSG (for GPFIFO_SCHEDULE) */
             }
