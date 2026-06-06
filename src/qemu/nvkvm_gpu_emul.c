@@ -1348,16 +1348,25 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                  * (resp+100) AND its params bytes (resp+112).  If the real RM returns paramsSize=0
                  * (no writeback), the guest copies 0 bytes -> no overrun -> rbp preserved.
                  * "Forward, don't emulate" — match the host reply byte-for-byte. */
-                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u) &&
-                    s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj) {
-                    uint32_t hp = s->m2_gr_reply_psize;
+                if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u)) {
+                    /* GR compute/3D object (e.g. AMPERE_COMPUTE_B 0xc7c0): NV_GR_ALLOCATION_PARAMETERS
+                     * is RS_OPTIONAL; libcuda passes pAllocParms backed by only a tiny stack slot with
+                     * paramsSize=0, and the REAL GSP returns paramsSize=0 (no params writeback).
+                     * HOST-PROVEN 2026-06-06: c7c0 psz=0, reply bytes are libcuda's untouched stack.
+                     * gdb-PROVEN: our reply's 16B params -> guest open-driver copy_to_user overruns
+                     * the slot, zeroing a saved rbp -> NULL-rbp deref -> cuCtxCreate SIGSEGV at
+                     * ioctl 129. Force the reply paramsSize to the host's value (0 when no shadow
+                     * capture) so the guest copies 0 bytes back. UNCONDITIONAL: the previous version
+                     * gated this on a shadow-forward capture (m2_gr_reply_valid) that often didn't
+                     * fire -> overrun -> crash (why "force-paramsSize-0" looked moot before). */
+                    uint32_t hp = (s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj)
+                                      ? s->m2_gr_reply_psize : 0u;
                     if (hp > sizeof(s->m2_gr_reply)) hp = (uint32_t)sizeof(s->m2_gr_reply);
-                    stl_le_p(resp + 100, hp);          /* reply paramsSize = host's returned size */
+                    stl_le_p(resp + 100, hp);          /* reply paramsSize = host's (0 for GR) */
                     if (hp) memcpy(resp + 112, s->m2_gr_reply, hp);
                     s->m2_gr_reply_valid = false;
-                    qemu_log("nvkvm-gpu[%s] M8 GR-obj 0x%04x reply: forward host paramsSize=%u "
-                             "(req_echo was %u, caps@12=0x%08x)\n", s->chip->name, hc, hp, opsize,
-                             hp >= 16 ? ldl_le_p(resp + 124) : 0);
+                    qemu_log("nvkvm-gpu[%s] M8 GR-obj 0x%04x: reply paramsSize=%u (req_echo was %u) "
+                             "[anti-overrun]\n", s->chip->name, hc, hp, opsize);
                 }
             }
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
