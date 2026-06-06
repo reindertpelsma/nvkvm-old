@@ -1080,3 +1080,24 @@ channel's client gets a forwarded host device+GR-VAS (extend `shadow_fwd`/`m2_de
 that client), THEN write GP entries into the host channel's own GPFIFO + ring its `host_token`
 (`m2_exec_doorbell`, currently `m2ring`-gated). Then the host GPU runs the real work and writes the
 completion the guest polls. See [[mode2_first_compute_blocker]].
+
+### ROOT CAUSE of the compute-client map failure — single-isolate handle collision (decision fork)
+The compute client's grmapper (virtmem-over-GR-VAS) returns `st=0x57`. Why: the guest **reuses VAS
+handle `0xcaf00000` across many RM clients** (`0xc1e00004/05/06/09`, `0xc1d0000a/0b`, `0xc1d00001` all
+alloc the `0x90f1` VASpace as `hObj=0xcaf00000`). Mode-2 currently runs ONE isolate (`m2_iso`) = one
+host RM session = one handle namespace, so `0xcaf00000` resolves to whichever client created it FIRST;
+a later client's virtmem parented under "its" `0xcaf00000` is cross-client → RM denies (`0x57`).
+**Proof:** the lone client with a *unique* VAS handle (`0xc1e00008 → 0x0000000a`) grmapper SUCCEEDED
+and its pushbuffer/sema MAPPED; every `0xcaf00000`-reuser fails. This is exactly the single-isolate
+handle-collision seam already earmarked for the **Mode-1-table consolidation** (per-CR3 isolate +
+global handle table — see "Consolidate onto Mode-1's spine" above and `[[mode2_isolation_cr3_key]]`).
+
+**Fix options (DECISION FORK):**
+1. **Proper:** per-CR3 isolate + Mode-1 global handle table (each guest process = its own host RM
+   session, so reused guest handles never collide). Larger refactor; also the planned consolidation.
+2. **Interim:** per-guest-client handle remap inside `m2fwd`'s handle translation so each client's
+   `0xcaf00000` maps to a unique host handle. Scoped, but touches `nvkvm_m2_client` (used everywhere)
+   → risk to the currently-working CeUtils forwarding path.
+
+Either unblocks the compute-client map; then host-GPFIFO write + ring (`m2ring`). See
+[[mode2_first_compute_blocker]].
