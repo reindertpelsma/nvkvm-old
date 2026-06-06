@@ -990,3 +990,50 @@ diagnosis + nv.c shims are the only instrumentation surface.
 
 **Build order:** (a) userspace compute forwarding [critical path now]; (b) Mode-1-table
 consolidation; (c) debug compile-out/security pass.
+
+---
+
+## UPDATE 2026-06-06 (b) — first-compute data-plane: GPFIFO + userspace pushbuffer resolve from host (M5.16/M5.17)
+
+Validated live (open driver 580.159.04 on the emulated GA106; `cuInit`+`cuCtxCreate` reach the
+compute channel). **WPR2 does NOT block** the working overlay — no guest reinstall needed.
+
+### The core insight (corrects the earlier "captured nowhere" conclusion)
+The GPGA / guest-GPU-physical address is **not** a real address — real compute never DMAs to it
+(that happens on the host GPU against host-physical). It is only a **consistent identifier +
+offset** that tells QEMU (a) which backing object a VA names and (b) the offset within it. There is
+**one** physical vidmem allocator and it is **CPU-side** (`memmgrPmaInitialize`, CPU MemoryManager);
+GSP never secretly allocates client memory, and BAR1 mapping (`kbusMapFbAperture` + `UPDATE_BAR_PDE`)
+is CPU-driven and *requires* the physical address — so the HW is structurally forced to keep every
+physical address CPU-visible. Therefore QEMU (the fake GSP) knows the full FB layout; nothing is
+hidden. The whole problem reduces to: **make the guest's write and QEMU's read land on the same
+backing, keyed by that identifier.**
+
+### Two-layer resolution (both DONE)
+1. **GPFIFO ring (vidmem)** — the channel-VAS walk of `gpFifoVA=0x121010000` resolves to a *stale
+   aliasing* FB page (`0x2eee10000`, reads 0) because channel-VAS PTEs and BAR1 PTEs for the same
+   vidmem object disagree (no unified GPGA allocator yet). But the guest's *own* CPU mapping wrote
+   the GP entry through **BAR1** (`bar1_pdb`, CPU-built PTEs) and it landed correctly in our FB at
+   `0x3130000`. **Fix (M5.16):** record every guest-CPU-written vidmem page (`bar1_wpg`, MRU) in the
+   BAR1 write path; when the channel-VAS content-pick fails (GSP-managed ring), pin the page whose
+   pending GP entry decodes to a pushbuffer that actually resolves to real data → read the entry
+   from FB directly (`chan_gpfifo_phys`).
+2. **Userspace pushbuffer (sysmem)** — `RM_MAP_MEMORY_DMA` is **CPU-local** in Mode-2 (no GSP RPC
+   carries `VA 0x120000000`), so it can't be snooped from the RPC stream. Root cause was a
+   **VAS-selection bug**: `chan_translate`'s try-all picks the first VAS that resolves non-fault (an
+   empty aliasing page) instead of the channel's real device-default VAS (`pdb 0x2efa4c000` →
+   `SYS 0x137492000` → valid `SET_OBJECT` header `0x20016000`). **Fix:** in the M5.16 block,
+   content-pick the VAS under which the decoded `pb` reads non-zero and **pin it as `chan_pdb`** — the
+   whole working set (pushbuffer + sema) lives in that VAS. `M5.17` DIAG dumps per-VAS FB-vs-SYS
+   resolution when `pb` reads 0.
+
+Result: `chan_exec entry[0] pb=0x120000000 w0=0x20016000` — the guest **userspace pushbuffer is
+readable from the host end-to-end**.
+
+### Next blocker — completion-semaphore vidmem aliasing
+`cuCtxCreate` still spins because the completion sema (`semaVA=0x121018004 → FB 0x2eee18004`,
+vidmem) is **written** at the channel-VAS page but libcuda **reads** it via BAR1 at a different page
+(same aliasing as #1). Symmetric fix: write the sema where libcuda reads it (BAR1-resolved page).
+The principled end-state remains the `m2_objs`/`m2_gpga` single-backing refactor (one backing per
+object, all mappings resolve to it); `bar1_wpg` + VAS-pin + sema-redirect are the pragmatic
+increments that get first-compute green first. See [[mode2_first_compute_blocker]].

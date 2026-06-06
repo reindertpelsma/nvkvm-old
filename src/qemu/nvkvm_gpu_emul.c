@@ -2791,14 +2791,32 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
             uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
             uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
             if (!pb || pblen == 0 || pblen > 0x40000) { continue; }
-            bool psy; uint64_t pp = nvkvm_chan_translate(s, pb, &psy);
-            if (pp == NVKVM_GMMU_FAULT) { continue; }
+            /* The decoded pushbuffer must resolve to REAL content (a valid method
+             * header), not just any non-faulting page.  chan_translate's try-all
+             * fallback picks the FIRST VAS that maps pb — often a wrong aliasing
+             * VAS whose page reads 0 (proven: vas[0] pdb 0x2efba5000 -> empty,
+             * vs the channel's real device-default vas pdb 0x2efa4c000 -> the
+             * pushbuffer 0x20016000).  So content-pick the VAS under which pb's
+             * first word is non-zero and PIN it as chan_pdb — that VAS owns the
+             * whole channel working set (pushbuffer + sema), so every subsequent
+             * translate uses it.  Skip this GPFIFO candidate if NO VAS yields a
+             * non-zero pb word (the page was a stale/foreign ring). */
+            uint64_t pb_pdb = 0;
+            for (int v = 0; v < s->chan_vas_n; v++) {
+                bool sy = false;
+                uint64_t pp = nvkvm_walk_pdb(s, s->chan_vas[v].pdb, pb, &sy);
+                if (pp == NVKVM_GMMU_FAULT) { continue; }
+                if (nvkvm_phys_rd32(s, pp, sy) != 0) { pb_pdb = s->chan_vas[v].pdb; break; }
+            }
+            if (pb_pdb == 0) { continue; }   /* pb has no real backing in any VAS */
             s->chan_gpfifo_phys = cand;
+            s->chan_pdb = pb_pdb;            /* pin the channel's true VAS for pb/sema */
             qemu_log("nvkvm-gpu[%s] M5.16: GPFIFO resolved via BAR1-written page "
-                     "FB 0x%llx (seq %llu) -> entry pb=0x%llx len=%u [VAS-walk gave "
-                     "wrong page]\n", s->chip->name, (unsigned long long)cand,
+                     "FB 0x%llx (seq %llu) -> entry pb=0x%llx len=%u; pinned VAS "
+                     "pdb=0x%llx (pushbuffer-backed) [VAS-walk gave wrong page]\n",
+                     s->chip->name, (unsigned long long)cand,
                      (unsigned long long)s->bar1_wpg[best].seq,
-                     (unsigned long long)pb, pblen);
+                     (unsigned long long)pb, pblen, (unsigned long long)pb_pdb);
             break;
         }
     }
@@ -2856,7 +2874,35 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
         { uint32_t w0 = 0; bool pbok = nvkvm_chan_rd32(s, pb, &w0);
           qemu_log("nvkvm-gpu[%s] M5: chan_exec entry[%u] pb=0x%llx pblen=%u "
                    "pb_read=%s w0=0x%08x\n", s->chip->name, idx,
-                   (unsigned long long)pb, pblen, pbok ? "ok" : "FAULT", w0); }
+                   (unsigned long long)pb, pblen, pbok ? "ok" : "FAULT", w0);
+          /* M5.17 DIAG: when the userspace pushbuffer's first word reads 0 (no valid
+           * method header), the VAS-selection picked a wrong/aliasing page.  Dump how
+           * pb resolves under EACH snooped VAS (phys+aperture+value), and the SYS read
+           * at the same numeric addr — to find which VAS owns the compute pushbuffer
+           * and whether it's a sysmem-aperture miss.  Capped one-shot. */
+          if (s->trace && w0 == 0) {
+              static uint32_t pbd;
+              if (pbd++ < 12) {
+                  for (int v = 0; v < s->chan_vas_n; v++) {
+                      bool sy = false;
+                      uint64_t pp = nvkvm_walk_pdb(s, s->chan_vas[v].pdb, pb, &sy);
+                      if (pp == NVKVM_GMMU_FAULT) {
+                          qemu_log("nvkvm-gpu[%s] M5.17 pb=0x%llx vas[%d] hvas=0x%08x "
+                                   "pdb=0x%llx -> FAULT\n", s->chip->name,
+                                   (unsigned long long)pb, v, s->chan_vas[v].hvas,
+                                   (unsigned long long)s->chan_vas[v].pdb);
+                      } else {
+                          qemu_log("nvkvm-gpu[%s] M5.17 pb=0x%llx vas[%d] hvas=0x%08x "
+                                   "pdb=0x%llx -> %s phys=0x%llx fbval=0x%08x sysval=0x%08x\n",
+                                   s->chip->name, (unsigned long long)pb, v,
+                                   s->chan_vas[v].hvas, (unsigned long long)s->chan_vas[v].pdb,
+                                   sy ? "SYS" : "FB", (unsigned long long)pp,
+                                   (uint32_t)nvkvm_fb_read(s, pp, 4),
+                                   nvkvm_phys_rd32(s, pp, true));
+                      }
+                  }
+              }
+          } }
         /* method-stream parse */
         uint64_t off_in = 0, off_out = 0;
         uint32_t llen = 0, lcount = 1, remapA = 0;
