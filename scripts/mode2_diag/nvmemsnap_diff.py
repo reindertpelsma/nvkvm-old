@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--guest", nargs="+", required=True)
     ap.add_argument("--tag", default=None, help="only this snapshot tag (e.g. post/pre/crash)")
     ap.add_argument("--context", type=int, default=4, help="bytes of context around a run")
+    ap.add_argument("--breakdown", action="store_true", help="per-region raw/var/flagged stats")
     args = ap.parse_args()
 
     H = [parse(p) for p in args.host]
@@ -58,6 +59,8 @@ def main():
         keys.update(d.keys())
 
     flagged_total = 0
+    skipped = 0
+    raw_total = hvar_total = gvar_total = 0
     for key in sorted(keys):
         tag, occ, rk = key
         if args.tag and tag != args.tag:
@@ -66,16 +69,30 @@ def main():
         gvals = [d.get(key) for d in G]
         if any(v is None for v in hvals) or any(v is None for v in gvals):
             # region not present in every run -> can't apply the 3x3 filter reliably
+            skipped += 1
             continue
         n = min(len(v) for v in hvals + gvals)
         if n == 0:
             continue
         flags = []
+        raw = hvar = gvar = nz = 0
         for i in range(n):
             hs = {v[i] for v in hvals}
             gs = {v[i] for v in gvals}
-            if len(hs) == 1 and len(gs) == 1 and hs != gs:
+            if any(v[i] for v in hvals) or any(v[i] for v in gvals):
+                nz += 1
+            if hvals[0][i] != gvals[0][i]:
+                raw += 1
+            hv1 = len(hs) == 1; gv1 = len(gs) == 1
+            if not hv1: hvar += 1
+            if not gv1: gvar += 1
+            if hv1 and gv1 and hs != gs:
                 flags.append(i)
+        raw_total += raw; hvar_total += hvar; gvar_total += gvar
+        if args.breakdown:
+            path, off, length = rk
+            print(f"[{tag}#{occ}] {path} len={length} cmp={n} nonzero={nz} "
+                  f"raw_diff={raw} host_var={hvar} guest_var={gvar} FLAGGED={len(flags)}")
         if not flags:
             continue
         # group consecutive offsets
@@ -99,7 +116,10 @@ def main():
             print(f"    host : {hb}")
             print(f"    guest: {gb}")
             flagged_total += (b - a + 1)
-    print(f"\n[summary] {flagged_total} consistently-divergent bytes "
+    print(f"\n[summary] raw_diff={raw_total} (host[0] vs guest[0])  "
+          f"host_var={hvar_total} guest_var={gvar_total} (benign, within-platform)  "
+          f"regions_skipped={skipped} (not in every run)")
+    print(f"[summary] {flagged_total} consistently-divergent bytes "
           f"(stable within platform, host!=guest)")
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <setjmp.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -47,14 +49,16 @@ static FILE *lg;
 static int   snap_seq;
 static unsigned long trig_class = 0;
 static int   snap_all;
+static long  snap_from = 0;            /* NVSNAP_FROM: snapshot every ioctl with n_ioctl>=this */
 static size_t snap_max = 65536;
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
 static long n_ioctl, n_mmap, nanon, n_trig;
 static int  memfd = -1;                 /* /proc/self/mem — fault-safe reads */
 static void snapshot(const char *tag, uint32_t cmd, uint32_t cls);
 
-/* fault-safe read of `n` bytes at `addr` from our own address space; returns bytes read.
- * pread(/proc/self/mem) returns -1/short on unmapped pages instead of SIGSEGV. */
+/* fault-safe read via /proc/self/mem — used only for scanning UNKNOWN param pointers (sysmem).
+ * NOTE: this CANNOT read device/VM_PFNMAP mappings (vidmem/BAR via RM_MAP_MEMORY) — the kernel's
+ * access_remote_vm returns zeros for them. So region snapshots must use read_direct() instead. */
 static size_t read_mem(void *dst, uintptr_t addr, size_t n)
 {
     size_t got = 0;
@@ -63,6 +67,24 @@ static size_t read_mem(void *dst, uintptr_t addr, size_t n)
         if (r <= 0) break;
         got += (size_t)r;
     }
+    return got;
+}
+
+/* fault-guarded DIRECT read: a normal CPU load reaches device mappings that /proc/self/mem can't.
+ * Page-granular so one unmapped page only truncates. Thread-local guard => the SIGSEGV/SIGBUS
+ * handler siglongjmps only the faulting thread (snapshot holds lk, so reads don't race here). */
+static __thread sigjmp_buf g_jb;
+static __thread volatile sig_atomic_t guarding;
+static size_t read_direct(void *dst, uintptr_t addr, size_t n)
+{
+    size_t got = 0;
+    guarding = 1;
+    while (got < n) {
+        size_t chunk = 4096 - ((addr + got) & 4095); if (chunk > n - got) chunk = n - got;
+        if (sigsetjmp(g_jb, 1) == 0) { memcpy((char *)dst + got, (void *)(addr + got), chunk); got += chunk; }
+        else break;                              /* this page faulted -> stop */
+    }
+    guarding = 0;
     return got;
 }
 
@@ -75,6 +97,7 @@ __attribute__((constructor)) static void init(void)
     lg = p ? fopen(p, "w") : stderr;
     const char *c = getenv("NVSNAP_CLASS"); if (c) trig_class = strtoul(c, NULL, 0);
     snap_all = getenv("NVSNAP_ALL") ? 1 : 0;
+    const char *f = getenv("NVSNAP_FROM"); if (f) snap_from = strtol(f, NULL, 0);
     const char *m = getenv("NVSNAP_MAX"); if (m) snap_max = strtoul(m, NULL, 0);
 }
 __attribute__((destructor)) static void fini(void)
@@ -153,7 +176,7 @@ static void snapshot(const char *tag, uint32_t cmd, uint32_t cls)
     for (int i = 0; i < nregs; i++) {
         if (!(regs[i].prot & PROT_READ)) continue;
         size_t n = regs[i].len; if (n > snap_max) n = snap_max; if (n > SNAPBUF) n = SNAPBUF;
-        size_t got = read_mem(snapbuf, (uintptr_t)regs[i].addr, n);  /* fault-safe */
+        size_t got = read_direct(snapbuf, (uintptr_t)regs[i].addr, n);  /* reaches device mem */
         fprintf(lg, "SNAP %s seq=%d cmd=0x%x class=0x%x path=%s off=0x%lx len=0x%zx got=0x%zx prot=0x%x h=",
                 tag, snap_seq, cmd, cls, regs[i].path, (long)regs[i].off, regs[i].len, got, regs[i].prot);
         for (size_t k = 0; k < got; k++) fprintf(lg, "%02x", snapbuf[k]);
@@ -162,6 +185,39 @@ static void snapshot(const char *tag, uint32_t cmd, uint32_t cls)
     snap_seq++;
     fflush(lg);
     pthread_mutex_unlock(&lk);
+}
+
+/* Crash-instant snapshot: the guest dies (rbp=0) microseconds after 0xc7c0; capture what's
+ * mapped at that moment. read_mem is fault-safe; best-effort no-lock (we're dying anyway). */
+static struct sigaction old_segv, old_bus;
+static volatile sig_atomic_t in_seg;
+static void on_fault(int sig, siginfo_t *si, void *uc)
+{
+    (void)uc;
+    if (guarding) siglongjmp(g_jb, 1);          /* fault during a guarded read_direct() */
+    if (!in_seg && lg) {                         /* real crash: capture the crash-instant state */
+        in_seg = 1;
+        fprintf(lg, "CRASH si_addr=%p ioctls=%ld\n", si->si_addr, n_ioctl);
+        for (int i = 0; i < nregs; i++) {
+            if (!(regs[i].prot & PROT_READ)) continue;
+            size_t n = regs[i].len; if (n > snap_max) n = snap_max; if (n > SNAPBUF) n = SNAPBUF;
+            size_t got = read_direct(snapbuf, (uintptr_t)regs[i].addr, n);
+            fprintf(lg, "SNAP crash seq=%d cmd=0x0 class=0x0 path=%s off=0x%lx len=0x%zx got=0x%zx prot=0x%x h=",
+                    snap_seq, regs[i].path, (long)regs[i].off, regs[i].len, got, regs[i].prot);
+            for (size_t k = 0; k < got; k++) fprintf(lg, "%02x", snapbuf[k]);
+            fprintf(lg, "\n");
+        }
+        snap_seq++; fflush(lg);
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);          /* restore -> let it crash for real */
+}
+__attribute__((constructor)) static void hook_segv(void)
+{
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_fault; sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
 }
 
 void *mmap(void *a, size_t len, int prot, int flags, int fd, off_t off)
@@ -200,10 +256,10 @@ int ioctl(int fd, unsigned long req, ...)
                 snapshot("pre", cmd ? cmd : cls, cls); }
     int rc = real_ioctl(fd, req, arg);
     if (type == 0x46 && arg) {
-        /* OS_DESCRIPTOR (host-CPU-RAM marked for GPU DMA) carries the anon VA in the RM_ALLOC
-         * params buffer pp (kernel-validated to psz bytes -> safe to read). We deliberately do
-         * NOT scan `arg` by _IOC_SIZE: libcuda often passes a struct smaller than the ioctl's
-         * encoded size, so reading `size` bytes overreads and faults. */
+        /* Promote anon host-CPU-RAM marked for GPU DMA: the marking VA can be in the ioctl arg
+         * struct (e.g. OS_DESCRIPTOR via NVOS02) or in the RM_ALLOC params buffer. Both reads go
+         * via /proc/self/mem so an oversized _IOC_SIZE/psz can never fault us. */
+        scan_for_anon((uintptr_t)arg, size ? size : 64);
         if (pp && psz) scan_for_anon((uintptr_t)pp, psz);
         if (nr == 0x4e) {                                   /* NV_ESC_RM_MAP_MEMORY (NVOS33) */
             uint64_t va = 0, len = 0;
@@ -215,5 +271,11 @@ int ioctl(int fd, unsigned long req, ...)
         }
     }
     if (trig) snapshot("post", cmd ? cmd : cls, cls);
+    /* per-ioctl snapshot from an index: lets us compare the host at the guest's exact crash
+     * ioctl-count. Tag carries the ioctl ordinal so io<N> on host matches io<N> on guest. */
+    if (snap_from && n_ioctl >= snap_from) {
+        char t[24]; snprintf(t, sizeof(t), "io%ld", n_ioctl);
+        snapshot(t, cmd ? cmd : cls, cls);
+    }
     return rc;
 }
