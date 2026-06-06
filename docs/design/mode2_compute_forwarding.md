@@ -1050,3 +1050,33 @@ libcuda spins on right before the wedge (the repeated read target / the post-doo
 then write/forward that. The principled end-state remains the `m2_objs`/`m2_gpga` single-backing
 refactor; `bar1_wpg` + VAS-pin + sema-redirect are the pragmatic increments. See
 [[mode2_first_compute_blocker]].
+
+### UPDATE 2026-06-06(c) — real forwarding: DMA/VA selection PROVEN (M5.19, WB)
+Goal: the real host GPU reads the guest's userspace pushbuffer and writes the completion sema
+DIRECTLY from/to guest sysmem, no trap. Mechanism (`nvkvm_m2_back_and_map_sys`, gated `m2exec`):
+guest VA → GPA (corrected resolution: pinned `chan_pdb` → SYS) → **shared-memfd stub VA**
+(`gpa_to_stub_va`) → **OS_DESCRIPTOR `COHERENCY_CACHED`=WB** → FIXED-map at the matching VA in the
+host GR VAS. Applied to pushbuffers (in the GP parse) and sema targets (in `nvkvm_chan_sem_wr32`).
+
+**Live result (m2fwd+m2exec on): the mechanism WORKS** — for channels whose client is forwarded:
+```
+M5.19 fwd-map pushbuffer VA=0x420000000 gpa=0x12d2ee000 -> MAPPED (host GPU reads guest sysmem, WB)
+M5.19 fwd-map sema      VA=0x42006c000 gpa=0x14092e000 -> MAPPED (host GPU writes completion, WB)
+M6.5 back_sys VA=0x420000000 ... os_st=0x0 map rc=0 st=0x0   PLACED
+```
+The guest GPA→host-VAS double-map is byte-identical (shared memfd) and WB-coherent. Host GPU stayed
+healthy (0% util, no wedge — the ring did not actually fire).
+
+**Memory types** (per HW): sysmem working set (pushbuffer/data/sema) = **WB** via `COHERENCY_CACHED`
+so GPU DMA ↔ guest-CPU stay cache-coherent (x86 snoop). Guest's own CPU pushbuffer mapping is **WC**
+(weakly ordered; guest SFENCEs before the doorbell, so bytes are in RAM when the host reads). GPU
+registers/USERD via BAR1 are **UC**; the BAR1-reached vidmem GPFIFO is handled by the existing path
+([[nvkvm_window_uc_gvisor_fix]] forces guest PTE WB where needed).
+
+**Remaining gap (next):** the COMPUTE channel's VA→GPA *also resolves* (`0x120000000→0x12bc9a000`)
+but its host-VAS map FAILS because its RM client (`0xc1d0000a`) has **no forwarded host device/VAS**
+in `m2_devvas` (only the CeUtils clients `0xc1e0xxxx` were forwarded). NEXT: ensure the compute
+channel's client gets a forwarded host device+GR-VAS (extend `shadow_fwd`/`m2_devvas` coverage to
+that client), THEN write GP entries into the host channel's own GPFIFO + ring its `host_token`
+(`m2_exec_doorbell`, currently `m2ring`-gated). Then the host GPU runs the real work and writes the
+completion the guest polls. See [[mode2_first_compute_blocker]].
