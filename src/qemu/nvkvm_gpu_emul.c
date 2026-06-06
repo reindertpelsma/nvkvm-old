@@ -2359,6 +2359,23 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
                      (unsigned long long)pa, (unsigned long long)val, size);
         }
     }
+    /* M5.16 DIAG: the LOFB-only filter above is blind to the COMPUTE channel's
+     * GPFIFO/pushbuffer, which resolve to HIGH FB (e.g. 0x2eee10000 via the CPU-
+     * built device-default VAS).  cuCtxCreate's GP-entry never showed up because
+     * its write was never logged — not because it never happened.  Log EVERY
+     * vidmem BAR1 write outside LOFB too (hard-capped), so the next run settles
+     * whether the guest lays the GP entry into the page our GMMU walk resolves
+     * (FB 0x2eee1xxxx) — if it does, the data-capture path is correct and the
+     * content-pick "require non-zero" heuristic is the only thing rejecting it;
+     * if it doesn't, the GPFIFO is reached via a different aperture/backing. */
+    if (s->trace && !sys && !(pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI)) {
+        static uint32_t htotal;
+        if (htotal++ < 4000) {
+            qemu_log("nvkvm-gpu[GA106] M5.16 BAR1 WR off=0x%llx -> FB 0x%llx "
+                     "<- 0x%llx sz=%u\n", (unsigned long long)off,
+                     (unsigned long long)pa, (unsigned long long)val, size);
+        }
+    }
 }
 
 static const MemoryRegionOps nvkvm_aperture_ops = {
