@@ -2602,6 +2602,37 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
     return page + (va & ((1ull << pgshift) - 1));
 }
 
+/* M5.21: the executing channel's OWN VAS PDB, derived from its client's GR
+ * VASpace (chan_client -> m2_devvas vas handle -> chan_vas pdb).  This is the
+ * AUTHORITATIVE address space for the channel's pushbuffer/sema — unlike the
+ * content-pick heuristic below, which scans ALL snooped VASes and can land on a
+ * FOREIGN client's VAS that merely aliases the same guest VA (the confirmed
+ * wrong-channel bug: the compute channel's working set resolved through the
+ * probe client 0xc1d0000a's VAS 0x2efa4c000 instead of its own 0x3114000).
+ * Returns 0 if the client's VAS or its PDB isn't known yet (caller falls back). */
+static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
+{
+    if (!s->chan_client) {
+        return 0;
+    }
+    uint32_t hvas = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == s->chan_client) {
+            hvas = s->m2_devvas[i].vas;
+            break;
+        }
+    }
+    if (!hvas) {
+        return 0;
+    }
+    for (int i = 0; i < s->chan_vas_n; i++) {
+        if (s->chan_vas[i].hvas == hvas) {
+            return s->chan_vas[i].pdb;
+        }
+    }
+    return 0;
+}
+
 /* Translate a channel GPU VA by trying every snooped VAS PDB (from
  * VASPACE_COPY_SERVER_RESERVED_PDES) and returning the first that resolves.  The
  * channel's pushbuffer/sema live in its own VAS, but the scrubber's vid/sys test
@@ -2746,7 +2777,17 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     s->chan_gpfifo_phys = 0;
     if (gp_put < s->chan_gpfifo_ent && gp_put != s->chan_gp_get) {
         uint64_t eva = s->chan_gpfifo_va + (uint64_t)s->chan_gp_get * 8;
-        for (int i = 0; i < s->chan_vas_n; i++) {
+        /* M5.21: prefer the channel's OWN client VAS — authoritative, avoids the
+         * cross-client aliasing the content-pick below falls into. */
+        uint64_t own = nvkvm_chan_own_pdb(s);
+        if (own) {
+            bool sy = false;
+            uint64_t p = nvkvm_walk_pdb(s, own, eva, &sy);
+            if (p != NVKVM_GMMU_FAULT && nvkvm_phys_rd32(s, p, sy) != 0) {
+                s->chan_pdb = own;
+            }
+        }
+        for (int i = 0; s->chan_pdb == 0 && i < s->chan_vas_n; i++) {
             bool sy = false;
             uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, eva, &sy);
             if (p == NVKVM_GMMU_FAULT) { continue; }
@@ -2845,7 +2886,18 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
              * translate uses it.  Skip this GPFIFO candidate if NO VAS yields a
              * non-zero pb word (the page was a stale/foreign ring). */
             uint64_t pb_pdb = 0;
-            for (int v = 0; v < s->chan_vas_n; v++) {
+            /* M5.21: prefer the channel's OWN client VAS so pb (and the whole
+             * working set) resolves through the right address space and mirrors
+             * under the right client — not a foreign client's aliasing VAS. */
+            uint64_t own = nvkvm_chan_own_pdb(s);
+            if (own) {
+                bool sy = false;
+                uint64_t pp = nvkvm_walk_pdb(s, own, pb, &sy);
+                if (pp != NVKVM_GMMU_FAULT && nvkvm_phys_rd32(s, pp, sy) != 0) {
+                    pb_pdb = own;
+                }
+            }
+            for (int v = 0; pb_pdb == 0 && v < s->chan_vas_n; v++) {
                 bool sy = false;
                 uint64_t pp = nvkvm_walk_pdb(s, s->chan_vas[v].pdb, pb, &sy);
                 if (pp == NVKVM_GMMU_FAULT) { continue; }
