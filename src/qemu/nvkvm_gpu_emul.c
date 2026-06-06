@@ -2663,6 +2663,32 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                  "gpfifoVA=0x%llx\n", s->chip->name, s->chan_hvaspace,
                  (unsigned long long)s->chan_pdb,
                  (unsigned long long)s->chan_gpfifo_va);
+        /* M5.14: content-pick failed -> device-default-VAS channel (hVASpace=0), whose VAS is never
+         * snooped into chan_vas[] (only explicit VASpace objects are). Derive the channel's PDB
+         * from its INSTANCE BLOCK (RAMIN PAGE_DIR_BASE @0x200 LO / @0x204 HI) — the HW-authoritative
+         * VAS root for THIS channel (libcuda's compute USERMODE channel gpfifo 0x121010000). Use it
+         * only if it resolves the pending GPFIFO entry to a non-zero pushbuffer pointer. */
+        if (s->chan_pdb == 0 && s->chan_inst_block) {
+            bool isys = s->chan_inst_sys;
+            uint32_t plo = isys ? nvkvm_phys_rd32(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, true)
+                                : (uint32_t)nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_LO_OFF, 4);
+            uint32_t phi = isys ? nvkvm_phys_rd32(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, true)
+                                : (uint32_t)nvkvm_fb_read(s, s->chan_inst_block + NVKVM_RAMIN_PDB_HI_OFF, 4);
+            uint64_t ipdb = ((uint64_t)phi << 32) | ((uint64_t)plo & 0xFFFFF000ull);
+            if (ipdb) {
+                bool sy = false;
+                uint64_t p = nvkvm_walk_pdb(s, ipdb, eva, &sy);
+                uint32_t v = (p != NVKVM_GMMU_FAULT) ? nvkvm_phys_rd32(s, p, sy) : 0;
+                qemu_log("nvkvm-gpu[%s] M5.14: instblk=0x%llx(%s) PDB=0x%llx; gpfifo eva=0x%llx -> "
+                         "%s val=0x%08x\n", s->chip->name, (unsigned long long)s->chan_inst_block,
+                         isys ? "sys" : "fb", (unsigned long long)ipdb, (unsigned long long)eva,
+                         (p == NVKVM_GMMU_FAULT) ? "FAULT" : (sy ? "SYS" : "FB"), v);
+                if (p != NVKVM_GMMU_FAULT && v != 0) { s->chan_pdb = ipdb; }
+            } else {
+                qemu_log("nvkvm-gpu[%s] M5.14: instblk=0x%llx PDB empty (GSP-managed)\n",
+                         s->chip->name, (unsigned long long)s->chan_inst_block);
+            }
+        }
         /* DIAG: when content-pick fails, show what EACH snooped VAS resolves the
          * GPFIFO entry VA to (fault / phys+aperture) and the value read there. */
         if (s->trace && s->chan_pdb == 0) {
