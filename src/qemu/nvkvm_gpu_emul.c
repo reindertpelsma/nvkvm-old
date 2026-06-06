@@ -1162,6 +1162,7 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client); /* M6.5 f
 static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s); /* M14 fwd-decl */
 static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                                 uint64_t *out_redir); /* M5.18 fwd-decl */
+static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint64_t va); /* M5.19 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -2679,6 +2680,18 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
     bool wrote = false;
     bool sy; uint64_t p = nvkvm_chan_translate(s, va, &sy);
     if (p != NVKVM_GMMU_FAULT) { nvkvm_phys_wr32(s, p, sy, payload); wrote = true; }
+    /* M5.19 — REAL forward prep: if the completion sema is SYSMEM, map it into the
+     * host GR VAS so the REAL host GPU writes the payload here (guest GPA -> shared
+     * memfd -> OS_DESCRIPTOR WB -> FIXED map at the matching VA).  Guest then reads
+     * the host GPU's write coherently (WB snooped).  Idempotent; m2exec-gated. */
+    if (s->m2exec && p != NVKVM_GMMU_FAULT && sy && !nvkvm_m2_va_seen(s, va & ~0xfffull)) {
+        uint64_t gbase = p & ~0xfffull;
+        bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, va & ~0xfffull, gbase, 0x1000);
+        qemu_log("nvkvm-gpu[%s] M5.19 fwd-map sema VA=0x%llx gpa=0x%llx -> %s\n",
+                 s->chip->name, (unsigned long long)(va & ~0xfffull),
+                 (unsigned long long)gbase, mok ? "MAPPED (host GPU writes completion, WB)"
+                                                : "map-FAILED");
+    }
     if (s->chan_gpfifo_phys && va >= s->chan_gpfifo_va &&
         va <  s->chan_gpfifo_va + NVKVM_CHAN_BUF_WINDOW) {
         uint64_t rp = s->chan_gpfifo_phys + (va - s->chan_gpfifo_va);
@@ -2901,6 +2914,29 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
         }
         uint64_t pb   = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
         uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;   /* GP_ENTRY1_LENGTH: # method words */
+        /* M5.19 — REAL forward prep: make the host GPU able to read this pushbuffer
+         * DIRECTLY from guest sysmem.  The pushbuffer is SYSMEM (resolved via the
+         * pinned chan_pdb -> SYS guest GPA).  Map guest VA -> GPA -> shared-memfd
+         * stub VA -> OS_DESCRIPTOR(COHERENCY_CACHED=WB) -> FIXED-map at the matching
+         * VA in the host GR VAS.  The host channel (shadow_fwd, same handles) then
+         * reads the exact bytes the guest wrote — no trap, WB-coherent.  Gated on
+         * m2exec; idempotent (m2_va_seen). */
+        if (s->m2exec && pb && pblen) {
+            bool psy = false; uint64_t pgpa = nvkvm_chan_translate(s, pb, &psy);
+            if (pgpa != NVKVM_GMMU_FAULT && psy) {        /* sysmem pushbuffer only */
+                uint64_t pbbase = pb & ~0xfffull;
+                uint64_t gbase  = pgpa - (pb - pbbase);   /* GPA of the page base */
+                uint64_t msz    = (((pb + (uint64_t)pblen * 4) - pbbase) + 0xfffull) & ~0xfffull;
+                if (!nvkvm_m2_va_seen(s, pbbase)) {
+                    bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, pbbase, gbase, msz);
+                    qemu_log("nvkvm-gpu[%s] M5.19 fwd-map pushbuffer VA=0x%llx gpa=0x%llx "
+                             "sz=0x%llx client=0x%08x -> %s\n", s->chip->name,
+                             (unsigned long long)pbbase, (unsigned long long)gbase,
+                             (unsigned long long)msz, s->chan_client,
+                             mok ? "MAPPED (host GPU reads guest sysmem, WB)" : "map-FAILED");
+                }
+            }
+        }
         { uint32_t w0 = 0; bool pbok = nvkvm_chan_rd32(s, pb, &w0);
           qemu_log("nvkvm-gpu[%s] M5: chan_exec entry[%u] pb=0x%llx pblen=%u "
                    "pb_read=%s w0=0x%08x\n", s->chip->name, idx,
