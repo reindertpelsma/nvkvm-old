@@ -4022,9 +4022,34 @@ static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
     uint32_t st = 0xffff;
     nvkvm_m2_alloc_virtmem(s, client, hDev, hVirt, hVas, &st);
     if (st != 0) {
-        qemu_log("nvkvm-gpu[%s] M5.7 grmapper: virtmem alloc st=0x%x (client 0x%08x "
-                 "vas 0x%08x)\n", s->chip->name, st, client, hVas);
-        return 0;
+        /* M5.20 FRESH-VAS FALLBACK: the guest's forwarded VAS (0xcaf00000) for the
+         * COMPUTE client is parented to a libcuda PROBE device (0x3141590x) and is an
+         * index=3 / EXTERNALLY_OWNED-class VASpace; the host RM rejects NV01_MEMORY_
+         * VIRTUAL over it with 0x57 (INSUFFICIENT_PERMISSIONS). The self-contained
+         * selftest path (fresh client->device->vaspace->virtmem) succeeds, so allocate
+         * a FRESH, normal RM-managed device+VASpace under THIS client and map into it.
+         * The host compute channel is pointed at this fresh VAS in shadow_fwd (M5.21)
+         * so its working set (pushbuffer/sema mapped here) resolves when it runs.
+         * Contained to the failure path — the CeUtils clients (st==0 above) are
+         * untouched. */
+        uint32_t fDev  = 0xdf100000u | (s->m2_databuf_next++ & 0xffffu);
+        uint32_t fVas  = 0xdf200000u | (s->m2_databuf_next++ & 0xffffu);
+        uint32_t fVirt = 0xdf300000u | (s->m2_databuf_next++ & 0xffffu);
+        uint8_t devp[56]; memset(devp, 0, sizeof(devp));
+        uint8_t vasp[56]; memset(vasp, 0, sizeof(vasp));
+        uint32_t dst = 0xffff, vst = 0xffff, st2 = 0xffff;
+        nvkvm_m2_alloc1(s, client, client, fDev, 0x0080u, devp, sizeof(devp), &dst);
+        nvkvm_m2_alloc1(s, client, fDev, fVas, 0x90f1u, vasp, sizeof(vasp), &vst);
+        if (dst == 0 && vst == 0) {
+            nvkvm_m2_alloc_virtmem(s, client, fDev, fVirt, fVas, &st2);
+        }
+        qemu_log("nvkvm-gpu[%s] M5.20 grmapper: guest-VAS 0x%08x virtmem st=0x%x -> "
+                 "FRESH dev=0x%08x(st=0x%x) vas=0x%08x(st=0x%x) virtmem=0x%08x(st=0x%x)\n",
+                 s->chip->name, hVas, st, fDev, dst, fVas, vst, fVirt, st2);
+        if (!(dst == 0 && vst == 0 && st2 == 0)) {
+            return 0;
+        }
+        hVirt = fVirt; hVas = fVas; hDev = fDev;
     }
     s->m2_grmap[s->m2_grmap_n].client = client;
     s->m2_grmap[s->m2_grmap_n].hvirt  = hVirt;
