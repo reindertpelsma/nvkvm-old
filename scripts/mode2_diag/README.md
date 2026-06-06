@@ -25,3 +25,20 @@ the host skips the param copyout, the guest copies garbage over libcuda's buffer
 - This diff found NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS (0x2080012f) returning fake NV_OK on the
   guest vs NOT_SUPPORTED on the no-ECC GeForce host -> fixed (QEMU returns 0x56).
 - And NVLINK_GET_NVLINK_STATUS (0x20803002) likewise (no NVLink on GeForce).
+
+## ptrace tracer (nvtrace.c) + semantic decoder/differ (nvdecode.py)  [2026-06-06]
+Full kernel-boundary coverage (catches inline-asm/raw syscalls + /dev/nvidia-uvm that LD_PRELOAD
+missed). Field-by-field NVOS struct decode from the SDK headers; host==guest for semantic diff.
+
+    gcc -O2 -o nvtrace nvtrace.c
+    # host:  ./nvtrace -o /tmp/host_nvtrace.txt  -- /tmp/cup2_host
+    # guest: bash nvtrace_outer.sh   (boots VM, runs cup2 under nvtrace, pulls /tmp/guest_nvtrace.txt)
+    python3 nvdecode.py decode /tmp/host_nvtrace.txt          # decoded, named fields
+    python3 nvdecode.py diff   /tmp/host_nvtrace.txt /tmp/guest_nvtrace.txt   # field-level host-vs-guest
+
+### First findings (the tool's first run, cuCtxCreate crash):
+- NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2 numClasses: host 0x6b(107) vs guest 0x61(97) — guest
+  advertises 10 FEWER GPU classes (forged/replayed classlist wrong).
+- NV2080_CTRL_CMD_CE_GET_ALL_CAPS capsTbl: host 0xe3 vs guest 0 — guest reports NO copy-engine caps.
+- guest stops right after ALLOC class=0xc7c0 (GR compute object). Both upstream divergences are
+  candidates for the crash; fix = correct these forged/replayed control replies to match host.
