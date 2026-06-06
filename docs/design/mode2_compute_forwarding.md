@@ -942,3 +942,51 @@ now scoped from every angle. Tooling constraint discovered: the open driver's RM
 a PRECOMPILED BLOB in the DKMS build (nv-kernel.o_binary) — only nv.c (kernel interface)
 is patchable, so RM-internal printk instrumentation is NOT available; QEMU-side
 diagnosis + nv.c shims are the only instrumentation surface.
+
+---
+
+## UPDATE 2026-06-06 — milestone + refined approach (post-c7c0)
+
+**Milestone reached:** cuInit + cuCtxCreate work in Mode-2 (c7c0 anti-overrun fix, commits
+1443793/864ddbe). nvidia-smi enumerates the RTX 3060; the RM alloc stream passes the GR object
+(VASPACE/USERMODE/GPFIFO-channel). Next blocker = first compute submission.
+
+**Decisions (this session):**
+
+1. **Don't parse pushbuffers** — they're chid-independent (no chid in the methods; binding is via
+   GPFIFO/doorbell). The `nvkvm_chan_execute` parse-and-fake-semaphore path is a bring-up shim for
+   KERNEL channels only. For real userspace compute we FORWARD, never parse, never fake.
+
+2. **Forward userspace, fake kernel** (the recurring principle):
+   - userspace pushbuffers (libcuda compute via USERMODE doorbell) → execute on the real host GPU.
+   - kernel-created pushbuffers (scrubber, GR-ctx promote, channel init) → fake completion; the
+     host's real RM already built the authoritative kernel state via our forwarded RM allocs.
+     Caveat: kernel pushbuffers with memory side effects the guest reads (scrubber zeroing) need
+     the effect replicated in QEMU or that one forwarded.
+
+3. **Mechanism = unified address space + mirror the doorbell** (NOT read/parse in QEMU):
+   back the userspace channel's working set (GPFIFO/USERD/pushbuffer/data/sema) with REAL host
+   memory, map_dma'd into the host channel VAS at the SAME guest GPU VA; then trap the guest
+   USERMODE doorbell and write the channel's `host_token` to the host doorbell. Host GPU reads the
+   shared GPFIFO/pushbuffer and runs it; completion sema (shared) is written by the real GPU.
+   The current "compute GPFIFO reads zero" = libcuda's compute channel working set is in EMULATED
+   vidmem, not real/shared — fix is to route it to real host vidmem (m2_objs) at matching VAs.
+   See [[mode2_first_compute_blocker]].
+
+4. **USERD ≠ doorbell**: USERD = per-channel memory block (GP_PUT/GP_GET); doorbell = USERMODE MMIO
+   work-submit register (token).
+
+5. **Consolidate onto Mode-1's spine** (after compute is green): drop Mode-2's `m2_iso`/`m2_ht`/fd
+   storage; use Mode-1's global handle table (fd-by-handle) + CR3-keyed isolate table (one per guest
+   process; cross-CR3 → COPY_HANDLE_TO_ISOLATE). Shared verbs: create/kill/open/ioctl/copy-handle.
+   Stub fully shared. Mode-2-specific = the mmap/KVM-region/BAR/DMA path only. See
+   [[mode2_isolation_cr3_key]].
+
+6. **Debug hardening** (before any prod build): compile out ALL bring-up/debug constructs —
+   `#ifdef NVKVM_DEBUG` (Mode-1) and `#ifdef NVKVM_MODE2_DEBUG` (Mode-2), SAME principle for both.
+   Compiled-out of prod, runtime-gated when in, documented as **VM↔host-boundary-breaking →
+   trusted VMs only** (e.g. the 0xFFF500 GPA-write backdoor, MEMTEST/selftests, DIAG FB dumps).
+   Verbose logging is a SEPARATE, security-safe axis (read-only) and stays available.
+
+**Build order:** (a) userspace compute forwarding [critical path now]; (b) Mode-1-table
+consolidation; (c) debug compile-out/security pass.
