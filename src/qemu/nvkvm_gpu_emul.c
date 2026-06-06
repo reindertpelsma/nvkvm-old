@@ -296,7 +296,7 @@ struct NvkvmGpuEmul {
      * emulated GPU hosts its own forwarding backend (separate QEMU process from
      * any Mode-1 instance, so this is additive and cannot disturb Mode-1). M5.0
      * smoke test validates the Mode-2-process -> host-GPU path at realize(). */
-    bool     m2fwd;                      /* device prop: enable forwarding (default off) */
+    bool     m2fwd;                      /* device prop: host-GPU forwarding (default ON; debug-only off) */
     struct nvkvm_isolate_table m2_iso;   /* per-Mode-2 isolate table (own host stub) */
     bool     m2_iso_ready;               /* lazy: isolate created + devices opened   */
     uint32_t m2_iso_id;                  /* the per-guest host isolate id            */
@@ -369,7 +369,7 @@ struct NvkvmGpuEmul {
     bool     m2_mapdma_tested;  /* M5.5: one-shot RM_MAP_MEMORY_DMA-FIXED primitive validation */
     bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
     bool     m2_sem_probe_done; /* M5.13: one-shot DRY-RUN locate of the completion semaphore PDB */
-    bool     m2exec;            /* M5.7 prop: enable execution-plane backing (default off) */
+    bool     m2exec;            /* M5.7 prop: execution-plane backing (default ON; debug-only off) */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
     uint32_t m2_last_db_token;  /* M5.11: last guest work-submit token seen at the doorbell (dedup log) */
@@ -395,7 +395,6 @@ struct NvkvmGpuEmul {
     void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
     bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
-    bool     m2ring;            /* M5.9 prop: actually RING the host doorbell (wedge-risk) */
     uint64_t m2semval;          /* M5.14 DIAG prop: if nonzero, fb_read of m2sempage returns this
                                  * (satisfy the guest-kernel post-PROMOTE_CTX ctx-completion poll
                                  * that nothing writes in the fake-GSP model; userspace never
@@ -2095,17 +2094,12 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
              * mapped + the channel scheduled would fault/wedge the host GPU. */
             nvkvm_m2_doorbell_setup(s, grc);
         }
-        /* M5.9: real execution forward — map this doorbell's new GR pushbuffers and, if
-         * m2ring, RING the host doorbell so the HOST GPU runs the work. When ringing for
-         * real, the chan_execute semaphore-FAKING below is DISABLED (a green guest must come
-         * from the host GPU, not QEMU — [[mode2-real-forward-not-fake]]); we still deliver
-         * the os-event so the guest's blocking-sync poll wakes and re-reads the semaphore the
-         * HOST GPU wrote. */
+        /* M5.9/M5.22: real execution forward — map this doorbell's new GR pushbuffers and RING
+         * the host doorbell (per-channel token, unconditional) so the HOST GPU runs the work.
+         * The chan_execute Phase-B semaphore write below still runs as a fallback until the host
+         * GPFIFO/USERD are bridged; we also deliver the os-event so the guest's blocking-sync
+         * poll wakes and re-reads the semaphore the HOST GPU (or Phase-B) wrote. */
         nvkvm_m2_exec_doorbell(s);
-        if (s->m2ring) {
-            nvkvm_gsp_deliver_events(s);
-            return;
-        }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
          * + its self-verify channel + the host/compute channel) and tracking only
@@ -2135,6 +2129,20 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 continue;                        /* no new work on this channel */
             }
             any_completed = true;
+            /* M5.22 (b): RING this channel's HOST doorbell with ITS own work-submit
+             * token so the real host GPU executes the channel's work and writes the
+             * real completion.  The working set is mapped into the host VAS at the
+             * matching guest VAs (M5.19/M5.21).  Unconditional (the m2ring gate was
+             * removed): until the host GPFIFO/USERD are bridged the host sees
+             * GP_PUT==GP_GET so a stale ring is a harmless no-op; once bridged this
+             * is the real submission.  The Phase-B sema write below still runs as a
+             * fallback. */
+            if (s->m2_usermode_qva && c->token_valid) {
+                stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, c->host_token);
+                qemu_log("nvkvm-gpu[%s] M5.22 RANG host doorbell ch[%d] token=0x%08x "
+                         "(client=0x%08x gpfifo=0x%llx)\n", s->chip->name, i,
+                         c->host_token, c->client, (unsigned long long)c->gpfifo_va);
+            }
             if (s->chan_sem_released) {
                 continue;                        /* explicit release already done */
             }
@@ -3037,6 +3045,18 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 uint32_t d;
                 if (!nvkvm_chan_rd32(s, pb + (uint64_t)w * 4, &d)) { w = pblen; break; }
                 uint32_t m = (secop == 3) ? maddr : maddr + j * 4; /* NON_INC holds */
+                /* M5.22 (a) INSTRUMENT: dump every decoded method so we can see
+                 * EXACTLY what cuCtxCreate submits (esp. any completion-signalling
+                 * method the parser doesn't yet honor, and the compute QMD launch).
+                 * Capped + trace-gated; compiled in for bring-up. */
+                if (s->trace) {
+                    static uint32_t m22n;
+                    if (m22n++ < 1200) {
+                        qemu_log("nvkvm-gpu[%s] M5.22 method client=0x%08x gpfifo=0x%llx "
+                                 "m=0x%04x d=0x%08x\n", s->chip->name, s->chan_client,
+                                 (unsigned long long)s->chan_gpfifo_va, m, d);
+                    }
+                }
                 switch (m) {
                 case 0x400: off_in  = (off_in  & 0xFFFFFFFFull) | ((uint64_t)d << 32); break; /* IN_UPPER  */
                 case 0x404: off_in  = (off_in  & ~0xFFFFFFFFull) | d; break;                  /* IN_LOWER  */
@@ -4563,8 +4583,8 @@ static void nvkvm_m2_probe_sem_pdb(NvkvmGpuEmul *s, uint32_t client, uint64_t ta
 
 /* M5.9 EXECUTION FORWARD (per doorbell): map the GR channel's newly-submitted pushbuffers
  * into the host GR VASpace (double-mmap + copy the guest's command bytes) so the host GPU's
- * MMU resolves them, then — gated behind m2ring (default OFF, wedge-risk) — RING the host
- * doorbell so the HOST GPU actually runs the guest's work and writes the completion semaphore
+ * MMU resolves them, then RING the host doorbell (per-channel token, unconditional since M5.22)
+ * so the HOST GPU actually runs the guest's work and writes the completion semaphore
  * for real ([[mode2-real-forward-not-fake]]). USERD (GP_PUT) + GPFIFO are already double-
  * mmapped; here we add the pushbuffers each entry points at. Idempotent via the mapped set. */
 static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
@@ -4595,8 +4615,8 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
     /* M5.12 (chid/token table): fetch each forwarded channel's HOST work-submit token once.
      * shadow_fwd creates the host channel with the SAME hObject, so 0xc36f0108 on the guest's
      * channel handle hits the host channel. The GP_PUT-driven demux rings THIS token for whichever
-     * channel advanced (vs. decoding vChid from the guest token). Logged for correlation; the ring
-     * itself stays gated on m2ring + full working-set mapping. */
+     * channel advanced (vs. decoding vChid from the guest token). M5.22: the ring is now
+     * unconditional (per-channel token). */
     for (int i = 0; i < s->chan_n; i++) {
         struct nvkvm_chan_entry *c = &s->chans[i];
         if (c->token_valid || !c->hobject || !c->gpfifo_va) { continue; }
@@ -4635,14 +4655,18 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             nvkvm_m2_back_and_map(s, grc, pbbase, pbphys, sz, true, "pushbuf");
             newmaps++;
         }
-        qemu_log("nvkvm-gpu[%s] M5.9 exec_doorbell GR gp_get=%u->%u newpushbufs=%d "
-                 "(m2ring=%d)\n", s->chip->name, c->gp_get, gp_put, newmaps, s->m2ring);
+        qemu_log("nvkvm-gpu[%s] M5.9 exec_doorbell GR gp_get=%u->%u newpushbufs=%d\n",
+                 s->chip->name, c->gp_get, gp_put, newmaps);
         c->gp_get = gp_put;
-        if (s->m2ring && s->m2_usermode_qva) {
-            stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, s->m2_gr_token);
+        /* M5.22: ring THIS channel's own host token (per-channel, unconditional —
+         * m2ring removed).  Prefer the per-channel token; fall back to the GR token
+         * for the GR channel whose USERD is double-mmapped (M5.4). */
+        if (s->m2_usermode_qva) {
+            uint32_t tok = c->token_valid ? c->host_token : s->m2_gr_token;
+            stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, tok);
             qemu_log("nvkvm-gpu[%s] M5.9 *** RANG host doorbell token=0x%08x (USERMODE+0x90) "
-                     "— host GPU should now run the GR work ***\n",
-                     s->chip->name, s->m2_gr_token);
+                     "— host GPU should now run gpfifo=0x%llx ***\n",
+                     s->chip->name, tok, (unsigned long long)c->gpfifo_va);
         }
     }
 }
@@ -5079,9 +5103,11 @@ static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
 
 static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("trace", NvkvmGpuEmul, trace, true),
-    DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, false), /* M5: enable host-GPU forwarding */
-    DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, false), /* M5.7: execution-plane backing */
-    DEFINE_PROP_BOOL("m2ring", NvkvmGpuEmul, m2ring, false), /* M5.9: ring host doorbell (real fwd) */
+    /* Host-GPU forwarding is the ONLY supported Mode-2 operating mode (there is no
+     * pure-emulation-without-host-GPU path).  Default ON; the props remain solely as a
+     * DEBUG off-switch for the no-host-GPU fake-the-boot bring-up (M0-M3). */
+    DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, true), /* M5: host-GPU forwarding (always on) */
+    DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, true), /* M5.7: execution-plane backing (always on) */
     DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
     DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
