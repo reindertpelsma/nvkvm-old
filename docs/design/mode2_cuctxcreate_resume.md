@@ -28,15 +28,17 @@ Guest CUDA now reaches:
 - Device query path PASS (`RTX 3060`, compute 8.6, 11909 MiB).
 - `cuCtxCreate` PASS.
 - `cuMemAlloc` PASS.
-- A 4-byte `cuMemcpyHtoD` / `cuMemcpyDtoH` round-trip PASS when run with the debug UVM shadow bridge:
+- A 4-byte `cuMemcpyHtoD` / `cuMemcpyDtoH` round-trip PASS with no `LD_PRELOAD` and no
+  `NVUVM_SHADOW`, using the guest-kernel debug UVM uprobe bridge:
 
 ```text
+pid=2222
 ok   cuCtxCreate(&ctx, 0, d)
 CTX OK
 ok   cuMemAlloc(&dp, 4096)
-MEMALLOC OK 0x704c9e200000
+MEMALLOC OK 0x753d1e200000
 ok   cuMemcpyHtoD(dp, &hv, 4)
-HTOD OK dp=0x704c9e200000 sleeping-before-dtoh
+HTOD OK dp=0x753d1e200000 sleeping-before-dtoh
 ok   cuMemcpyDtoH(&rv, dp, 4)
 CE rv=0xabcd1234 want=0xabcd1234 -> PASS
 DONE
@@ -46,46 +48,68 @@ The important reframe: the old active blocker was `cuCtxCreate` crashing after `
 longer the current blocker. With the live `m2pbmap` bridge, `cuCtxCreate` gets through and the next
 real blocker is UVM external-allocation backing for CE data movement.
 
-Without the new debug shadow, the final DtoH path had already narrowed to:
+Before the uprobe bridge, a no-shadow control run narrowed the final DtoH failure to:
 
 - Destination staging sysmem resolved through pbmap.
 - Source `dp` faulted because it is a UVM external allocation that QEMU does not own.
 
-The passing run proves that if QEMU can resolve the device pointer source to coherent backing, the
-existing local CE copy path writes the correct bytes into the guest DtoH staging page.
+The passing no-`LD_PRELOAD` run proves that if QEMU can resolve the device pointer source to coherent
+backing, the existing local CE copy path writes the correct bytes into the guest DtoH staging page.
+This is still debug bring-up plumbing: the backing is created by a guest kernel uprobe module that
+copies HtoD source bytes into guest RAM and reports them to QEMU through a BAR0 debug aperture.
 
 ## 2. Last Run Proof
 
 Artifacts:
 
-- `docs/design/mode2_traces/guest_uvm_shadow_trace.txt`
-- `docs/design/mode2_traces/qemu_ce_shadow_pass.txt`
-- `docs/design/mode2_traces/pbmap_shadow_row.txt`
+- `docs/design/mode2_traces/guest_uvm_uprobe_bridge_pass.txt`
+- `docs/design/mode2_traces/qemu_uvm_uprobe_bridge_pass.txt`
+- `docs/design/mode2_traces/host_uvm_uprobe_bridge_residual_xid.txt`
 
-Guest trace:
+Guest run, with no `LD_PRELOAD` and no `NVUVM_SHADOW`:
 
 ```text
-UVM_MAP_EXTERNAL base=0x704c9e200000 len=0x200000 off=0x0 rmfd=10 hClient=0xc1d00003 hMemory=0x5c00007f rm_status=0x0 ret=0 req=0x21
-CUDA_HTOD dst=0x704c9e200000 bytes=0x4 shadow=0x704cbefe3000 len=0x1000 ret=0 data=3412cdab
-CUDA_DTOH src=0x704c9e200000 bytes=0x4 dst=0x7ffe32ed23b0 ret=0 data=3412cdab
+ok   cuCtxCreate(&ctx, 0, d)
+CTX OK
+ok   cuMemAlloc(&dp, 4096)
+MEMALLOC OK 0x753d1e200000
+ok   cuMemcpyHtoD(dp, &hv, 4)
+HTOD OK dp=0x753d1e200000 sleeping-before-dtoh
+ok   cuMemcpyDtoH(&rv, dp, 4)
+CE rv=0xabcd1234 want=0xabcd1234 -> PASS
+DONE
 ```
 
-pbmap row generated from the HtoD shadow:
+Guest kernel bridge proof:
 
 ```text
-704c9e200000 10d9be000 1000
+[   70.217075] nvkvm_uvm_bridge: mapped BAR0 debug aperture at 0000:00:07.0 start=0xfb000000
+[   70.226711] nvkvm_uvm_bridge: registered cuMemcpyHtoD at /usr/local/nvidia-guest/lib/libcuda.so.580.159.04+0x378af0
+[   70.226744] nvkvm_uvm_bridge: registered cuMemcpyHtoD_v2 at /usr/local/nvidia-guest/lib/libcuda.so.580.159.04+0x37aab0
+[   70.226749] nvkvm_uvm_bridge: loaded max_bytes=4096
+[  129.252353] nvkvm_uvm_bridge: HtoD dst=0x753d1e200000 bytes=0x4 gpa=0x13a989000 first=0xabcd1234 slot=1
 ```
 
 QEMU CE proof:
 
 ```text
-nvkvm-gpu[GA106] M5:   COPY[0] src 0x10d9be000(sys)=0xabcd1234 -> dst 0x155ce7100(sys)
-nvkvm-gpu[GA106] M5: CE COPY in=0x704c9e200000(virt) out=0x704ca2800100(virt) bytes=4 const=0x0
+nvkvm-gpu[GA106] M8.14 UVM-SHADOW[0] VA=0x753d1e200000 GPA=0x13a989000 size=0x4 commit=0x1
+nvkvm-gpu[GA106] M5:   COPY[0] src 0x13a989000(sys)=0xabcd1234 -> dst 0x13730d100(sys)
+nvkvm-gpu[GA106] M5: CE COPY in=0x753d1e200000(virt) out=0x753d22800100(virt) bytes=4 const=0x0
 ```
 
 Host dmesg still showed `dmaAllocMapping_GM107: can't alloc VA space for mapping` and Xid 32 from
-other high-UVM CE packets during the run. Treat the PASS as a proof of the missing UVM source
-backing, not a production-clean first-compute milestone.
+other high-UVM CE packets during the run:
+
+```text
+NVRM: dmaAllocMapping_GM107: can't alloc VA space for mapping.
+NVRM: Xid (PCI:0000:00:07): 32, pid=162582, name=nvkvm_stub, channel 0x01000008 intr 00800000
+NVRM: Xid (PCI:0000:00:07): 32, pid=162582, name=nvkvm_stub, channel 0x01000008 intr1 00000004 HCE_DBG0 00000300 HCE_DBG1 04002186
+NVRM: Xid (PCI:0000:00:07): 32, pid=162582, name=nvkvm_stub, channel 0x00000004 intr0 00000000 intr1 80000000
+```
+
+Treat the PASS as a proof of the missing UVM source backing, not a production-clean first-compute
+milestone.
 
 ## 3. What Is Implemented Locally
 
@@ -96,8 +120,25 @@ Tracked local changes:
   - CE virtual address resolution checks pbmap before channel page-table translation.
   - CE copy-fault logging now includes virtual address, resolved aperture, physical address, and
     phys-mode fields.
-  - Per-channel VAS and pbmap target mapping changes from the previous session are still in this
-    dirty tree.
+  - Adds M8.14 guest-kernel UVM shadow rows reported through BAR0 writes:
+    - `0xFFF520` / `0xFFF524`: CUDA device VA low/high.
+    - `0xFFF528` / `0xFFF52c`: shadow guest PA low/high.
+    - `0xFFF530` / `0xFFF534`: size low/high.
+    - `0xFFF538`: commit token.
+  - CE write, read, and resolve paths check the M8.14 shadow table before falling back to channel
+    page-table translation.
+
+- `scripts/mode2_diag/nvkvm_uvm_uprobe_bridge.c`
+  - Guest kernel debug module.
+  - Registers uprobes on `cuMemcpyHtoD` and `cuMemcpyHtoD_v2` in guest `libcuda.so.580.159.04`.
+  - On HtoD entry, copies up to `max_bytes` from the user source into a kernel page, computes the
+    guest PA with `virt_to_phys`, and reports `<dst deviceVA, shadowGPA, size>` through the BAR0
+    aperture above.
+  - This removes the previous trusted guest userspace `LD_PRELOAD` requirement for the 4-byte proof.
+
+- `scripts/mode2_diag/build_uvm_uprobe_bridge.sh`
+  - Guest-side build/load helper for the bridge module.
+  - Derives `cuMemcpyHtoD` and `cuMemcpyHtoD_v2` offsets with `readelf -Ws`.
 
 - `scripts/mode2_diag/nvioctl_trace.c`
   - Existing RM ioctl tracing remains.
@@ -111,40 +152,43 @@ Tracked local changes:
     maps.
   - Parses `CUDA_HTOD` records from `NVKVM_UVM_TRACE` (default `/tmp/guest_uvm_trace.txt`) and emits
     synthetic `<device VA> <shadow guest GPA> <size>` rows.
+  - For the new uprobe-bridge PASS, pbmap is still used for ordinary guest staging pages, but not for
+    HtoD shadow rows.
 
 - `scripts/mode2_diag/cup2_pause.c`
   - Paused CUDA probe that sleeps after HtoD so the live pbmap exporter can catch shadow/staging pages
     before DtoH.
 
-Do not confuse the debug shadow with a production fix. It is a controlled proof that source backing
-is the missing piece.
+Do not confuse the debug uprobe bridge with a production fix. It is a controlled proof that source
+backing is the missing piece.
 
 ## 4. What Is Ruled Out
 
-- The old `c7c0` / rbp SIGSEGV line is no longer the live failure. `cuCtxCreate` now completes in the
-  current dirty tree.
+- The old `c7c0` / rbp SIGSEGV line is no longer the live failure. `cuCtxCreate` now completes on
+  the current branch.
 - The NV0000 gpuId divergence and `0x20800102` high bit lead were already mostly ruled out after
   root-slot `addr=0x7` and response normalization.
 - The final DtoH mismatch was not a destination staging problem. `/dev/zero` and command-window pbmap
   coverage fixed the destination.
+- A no-`LD_PRELOAD` / no-`NVUVM_SHADOW` control run without the M8.14 bridge reached HtoD but read
+  back zero from DtoH because the source device VA faulted in QEMU.
 - The UVM allocation handle `hMemory=0x5c00007f` is guest RM/UVM state. QEMU has no matching
   shadow-forwarded host object for it, so "map the existing hMemory on the host" is not currently a
   valid fix path.
 
 ## 5. Active Next Step
 
-Replace the LD_PRELOAD shadow proof with a real Mode-2 UVM external-allocation bridge.
+Replace the debug guest-kernel uprobe proof with a real Mode-2 UVM external-allocation bridge.
 
 Concrete path:
 
 1. Capture `UVM_MAP_EXTERNAL_ALLOCATION` information through a guest-kernel or VMM-visible reporting
-   path, not through user LD_PRELOAD:
+   path:
    `<base, len, hClient, hMemory, offset>`.
 2. Add a QEMU side table for UVM external ranges. The table must associate guest device VA ranges
    with coherent backing that the CE resolver can read/write.
-3. Populate that backing on HtoD. The debug shadow did this by mirroring `cuMemcpyHtoD` bytes into
-   guest RAM; the production path needs the equivalent state from the real UVM/RM migration/copy
-   operation.
+3. Populate that backing from the real UVM/RM migration/copy operation. The M8.14 bridge currently
+   proves the shape by mirroring `cuMemcpyHtoD` bytes into guest kernel pages on uprobe entry.
 4. Make CE resolution use the UVM side table before falling back to pbmap/channel translation, or map
    the backing into the forwarded host channel VAS if the operation must execute on the host GPU.
 5. Investigate the remaining high-UVM CE packets that still cause host `dmaAllocMapping_GM107` spam
@@ -198,7 +242,12 @@ Direct QEMU launch used for the PASS:
 Guest setup after every fresh boot:
 
 ```bash
-scp -q scripts/mode2_diag/cup2_pause.c scripts/mode2_diag/nvioctl_trace.c vg:/tmp/
+scp -q \
+  scripts/mode2_diag/cup2_pause.c \
+  scripts/mode2_diag/nvioctl_trace.c \
+  scripts/mode2_diag/nvkvm_uvm_uprobe_bridge.c \
+  scripts/mode2_diag/build_uvm_uprobe_bridge.sh \
+  vg:/tmp/
 ssh vg 'bash -s' <<'SH'
 set -euo pipefail
 NVMODS=/home/ubuntu/nvmods
@@ -225,26 +274,34 @@ gcc -shared -fPIC -O2 -o /tmp/nvioctl_trace.so /tmp/nvioctl_trace.c -ldl
 SH
 ```
 
-Launch the debug-shadow run:
+Build and load the no-`LD_PRELOAD` debug UVM bridge:
 
 ```bash
 ssh vg 'bash -s' <<'SH'
-rm -f /tmp/cup2_live.out /tmp/cup2_live.pid /tmp/guest_uvm_trace.txt
-GUESTLIB=/usr/local/nvidia-guest/lib
-LIBCUDA=$GUESTLIB/libcuda.so.580.159.04
-(NVTRACE=/tmp/guest_uvm_trace.txt NVUVM_SHADOW=1 NVALLOC=64 NVOUTER=64 \
- LD_PRELOAD=/tmp/nvioctl_trace.so:$LIBCUDA LD_LIBRARY_PATH=$GUESTLIB \
- stdbuf -oL -eL /tmp/cup2 > /tmp/cup2_live.out 2>&1 & echo $! > /tmp/cup2_live.pid)
+set -euo pipefail
+chmod +x /tmp/build_uvm_uprobe_bridge.sh
+SRC=/tmp/nvkvm_uvm_uprobe_bridge.c /tmp/build_uvm_uprobe_bridge.sh
 SH
 ```
 
-Refresh pbmap during the pre-DtoH sleep:
+Launch the no-`LD_PRELOAD` run:
+
+```bash
+ssh vg 'bash -s' <<'SH'
+rm -f /tmp/cup2_live.out /tmp/cup2_live.pid /tmp/guest_uvm_trace_absent.txt
+GUESTLIB=/usr/local/nvidia-guest/lib
+(LD_LIBRARY_PATH=$GUESTLIB stdbuf -oL -eL /tmp/cup2 > /tmp/cup2_live.out 2>&1 & echo $! > /tmp/cup2_live.pid)
+SH
+```
+
+Refresh pbmap during the pre-DtoH sleep. This is still required for ordinary guest staging pages, but
+the HtoD source row comes from the uprobe bridge, not from `NVUVM_SHADOW`:
 
 ```bash
 for i in $(seq 1 55); do
-  NVKVM_PBMAP_AHEAD_PAGES=16 NVKVM_UVM_TRACE=/tmp/guest_uvm_trace.txt \
+  NVKVM_PBMAP_AHEAD_PAGES=16 NVKVM_UVM_TRACE=/tmp/guest_uvm_trace_absent.txt \
     scripts/mode2_diag/gcup2_pbmap.sh /tmp/m2_pbmap.txt
-  ssh vg 'tail -n 10 /tmp/cup2_live.out; grep -E "CUDA_HTOD|CUDA_DTOH|UVM_MAP_EXTERNAL" /tmp/guest_uvm_trace.txt | tail -n 8'
+  ssh vg 'tail -n 12 /tmp/cup2_live.out'
   ssh vg 'grep -q "CE rv=" /tmp/cup2_live.out' && break
   sleep 2
 done
@@ -277,3 +334,9 @@ Added for this milestone:
 - `docs/design/mode2_traces/guest_uvm_shadow_trace.txt`
 - `docs/design/mode2_traces/qemu_ce_shadow_pass.txt`
 - `docs/design/mode2_traces/pbmap_shadow_row.txt`
+
+Added for the M8.14 no-`LD_PRELOAD` bridge milestone:
+
+- `docs/design/mode2_traces/guest_uvm_uprobe_bridge_pass.txt`
+- `docs/design/mode2_traces/qemu_uvm_uprobe_bridge_pass.txt`
+- `docs/design/mode2_traces/host_uvm_uprobe_bridge_residual_xid.txt`

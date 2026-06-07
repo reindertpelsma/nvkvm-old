@@ -426,6 +426,15 @@ struct NvkvmGpuEmul {
     time_t   m2_pbmap_mtime;
     int64_t  m2_pbmap_size;
     uint32_t m2_pbmap_logs;
+    /* M8.14 DEBUG: guest-kernel HtoD shadow rows.  A debug guest kernel module
+     * copies cuMemcpyHtoD source bytes into guest RAM and reports
+     * <deviceVA, shadowGPA, size> through BAR0 0xFFF520..0xFFF538. */
+    struct { uint64_t va, gpa, size; } m2_uvm_shadow[1024];
+    int      m2_uvm_shadow_n;
+    uint32_t m2_uvm_shadow_logs;
+    uint32_t m2_uvm_lo, m2_uvm_hi;
+    uint32_t m2_uvm_gpa_lo, m2_uvm_gpa_hi;
+    uint32_t m2_uvm_size_lo, m2_uvm_size_hi;
     /* M5.27: VAs already backed+mapped (dedup pushbuffer/sema/gpfifo maps).  Was 128 — the
      * compute working set (30 GP entries x ~8 channels of pushbuffers + semas + gpfifos) blows
      * past that, and once full the dedup silently STOPPED recording, so every VA re-mapped on
@@ -1258,6 +1267,8 @@ static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint32_t client, uint64_t va); /* 
 static void nvkvm_m2_va_forget(NvkvmGpuEmul *s, uint32_t client, uint64_t va); /* M8.11 */
 static bool nvkvm_m2_pbmap_lookup(NvkvmGpuEmul *s, uint64_t va, uint64_t size,
                                   uint64_t *out_gpa); /* M8.11 */
+static bool nvkvm_m2_uvm_shadow_lookup(NvkvmGpuEmul *s, uint64_t va,
+                                        uint64_t size, uint64_t *out_gpa); /* M8.14 */
 static uint32_t nvkvm_m2_tsg_engine(NvkvmGpuEmul *s, uint32_t tsg); /* M8.12 */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
@@ -2208,6 +2219,54 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         }
         return;
     }
+    /* M8.14 DEBUG HtoD shadow bridge.  Guest kernel instrumentation reports a
+     * coherent guest-RAM page containing cuMemcpyHtoD source bytes, keyed by
+     * the destination CUDA device VA.  QEMU resolves later CE reads from that
+     * VA through this live table, replacing the older LD_PRELOAD+m2pbmap row. */
+    if (off == 0xFFF520u) { s->m2_uvm_lo = (uint32_t)val; return; }
+    if (off == 0xFFF524u) { s->m2_uvm_hi = (uint32_t)val; return; }
+    if (off == 0xFFF528u) { s->m2_uvm_gpa_lo = (uint32_t)val; return; }
+    if (off == 0xFFF52cu) { s->m2_uvm_gpa_hi = (uint32_t)val; return; }
+    if (off == 0xFFF530u) { s->m2_uvm_size_lo = (uint32_t)val; return; }
+    if (off == 0xFFF534u) { s->m2_uvm_size_hi = (uint32_t)val; return; }
+    if (off == 0xFFF538u) {
+        uint64_t va = ((uint64_t)s->m2_uvm_hi << 32) | s->m2_uvm_lo;
+        uint64_t gpa = ((uint64_t)s->m2_uvm_gpa_hi << 32) | s->m2_uvm_gpa_lo;
+        uint64_t sz = ((uint64_t)s->m2_uvm_size_hi << 32) | s->m2_uvm_size_lo;
+        if (va && gpa && sz && sz <= (16ull << 20)) {
+            int slot = -1;
+            for (int i = 0; i < s->m2_uvm_shadow_n; i++) {
+                if (s->m2_uvm_shadow[i].va == va) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                if (s->m2_uvm_shadow_n < (int)ARRAY_SIZE(s->m2_uvm_shadow)) {
+                    slot = s->m2_uvm_shadow_n++;
+                } else {
+                    slot = (int)(val % ARRAY_SIZE(s->m2_uvm_shadow));
+                }
+            }
+            s->m2_uvm_shadow[slot].va = va;
+            s->m2_uvm_shadow[slot].gpa = gpa;
+            s->m2_uvm_shadow[slot].size = sz;
+            if (s->m2_uvm_shadow_logs++ < 64) {
+                qemu_log("nvkvm-gpu[%s] M8.14 UVM-SHADOW[%d] VA=0x%llx "
+                         "GPA=0x%llx size=0x%llx commit=0x%x\n",
+                         s->chip->name, slot, (unsigned long long)va,
+                         (unsigned long long)gpa, (unsigned long long)sz,
+                         (uint32_t)val);
+            }
+        } else if (s->trace) {
+            qemu_log("nvkvm-gpu[%s] M8.14 UVM-SHADOW reject VA=0x%llx "
+                     "GPA=0x%llx size=0x%llx commit=0x%x\n",
+                     s->chip->name, (unsigned long long)va,
+                     (unsigned long long)gpa, (unsigned long long)sz,
+                     (uint32_t)val);
+        }
+        return;
+    }
     /* M5 — work-submit doorbell.  Detect the channel submission (the guest wrote
      * the work-submit token).  TODO(M5): execute the channel — walk its GPFIFO ->
      * pushbuffer -> CE semaphore release and write the payload so the driver's
@@ -3044,6 +3103,10 @@ static bool nvkvm_chan_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload)
         nvkvm_phys_wr32(s, gpa, true, payload);
         return true;
     }
+    if (nvkvm_m2_uvm_shadow_lookup(s, va, 4, &gpa)) {
+        nvkvm_phys_wr32(s, gpa, true, payload);
+        return true;
+    }
     bool sy = false;
     uint64_t p = nvkvm_chan_translate(s, va, &sy);
     if (p != NVKVM_GMMU_FAULT) {
@@ -3057,6 +3120,10 @@ static uint64_t nvkvm_chan_resolve(NvkvmGpuEmul *s, uint64_t va, bool *out_sys)
 {
     uint64_t gpa = 0;
     if (nvkvm_m2_pbmap_lookup(s, va, 4, &gpa)) {
+        *out_sys = true;
+        return gpa;
+    }
+    if (nvkvm_m2_uvm_shadow_lookup(s, va, 4, &gpa)) {
         *out_sys = true;
         return gpa;
     }
@@ -3077,6 +3144,11 @@ static bool nvkvm_m2_pbmap_rd32(NvkvmGpuEmul *s, uint64_t va, uint32_t *out)
 static bool nvkvm_chan_rd32(NvkvmGpuEmul *s, uint64_t va, uint32_t *out)
 {
     if (nvkvm_m2_pbmap_rd32(s, va, out)) {
+        return true;
+    }
+    uint64_t gpa = 0;
+    if (nvkvm_m2_uvm_shadow_lookup(s, va, 4, &gpa)) {
+        *out = nvkvm_phys_rd32(s, gpa, true);
         return true;
     }
     bool sys; uint64_t p = nvkvm_chan_translate(s, va, &sys);
@@ -4979,6 +5051,32 @@ static bool nvkvm_m2_pbmap_lookup(NvkvmGpuEmul *s, uint64_t va, uint64_t size,
         if (va >= rva && end <= rend) {
             if (out_gpa) {
                 *out_gpa = s->m2_pbmap[i].gpa + (va - rva);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool nvkvm_m2_uvm_shadow_lookup(NvkvmGpuEmul *s, uint64_t va,
+                                        uint64_t size, uint64_t *out_gpa)
+{
+    if (!size) {
+        size = 1;
+    }
+    uint64_t end = va + size;
+    if (end < va) {
+        return false;
+    }
+    for (int i = 0; i < s->m2_uvm_shadow_n; i++) {
+        uint64_t rva = s->m2_uvm_shadow[i].va;
+        uint64_t rend = rva + s->m2_uvm_shadow[i].size;
+        if (rend < rva) {
+            continue;
+        }
+        if (va >= rva && end <= rend) {
+            if (out_gpa) {
+                *out_gpa = s->m2_uvm_shadow[i].gpa + (va - rva);
             }
             return true;
         }
