@@ -48,6 +48,15 @@ int ioctl(int fd, unsigned long req, ...){
                 fprintf(lg, " areply=");
                 for (unsigned i = 0; i < an; i++) fprintf(lg, "%02x", ((unsigned char *)(uintptr_t)pptr)[i]);
             }
+            /* Also dump the OUTER NVOS64 struct (arg) post-call so the outer-struct layout /
+             * copyout can be diffed host-vs-guest — the rbp-clobber is an alloc-reply ABI
+             * mismatch, likely in the outer struct, not the params buffer. NVOUTER env = N (default 64). */
+            const char *od = getenv("NVOUTER"); unsigned on = od ? (unsigned)atoi(od) : 64;
+            if (on > 256) on = 256;
+            if (on && arg) {
+                fprintf(lg, " outer=");
+                for (unsigned i = 0; i < on; i++) fprintf(lg, "%02x", ((unsigned char *)arg)[i]);
+            }
         } else if (cn && pptr) {
             unsigned lim = (psz < cn) ? psz : cn;
             fprintf(lg, " content=");
