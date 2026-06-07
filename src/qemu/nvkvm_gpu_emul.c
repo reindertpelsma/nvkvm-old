@@ -1380,6 +1380,12 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 uint32_t lb = hc & 0xffu, fam = (hc >> 8) & 0xffu;
                 uint32_t opsize = ldl_le_p(resp + 100);
                 uint32_t robj = ldl_le_p(resp + 88);
+                /* M8.2 DIAG (rbp-clobber hunt): the cuCtxCreate SIGSEGV is a ~368B zeros
+                 * writeback overflowing libcuda's stack params buffer (368 == c56f channel
+                 * alloc psize). Log every alloc's reply paramsSize so we can see if our reply
+                 * exceeds libcuda's request (the overflow) — esp. the c56f channel alloc. */
+                qemu_log("nvkvm-gpu[%s] M8.2 alloc-reply class=0x%04x obj=0x%08x "
+                         "reply_paramsSize=%u\n", s->chip->name, hc, robj, opsize);
                 /* M8 (cuCtxCreate SIGSEGV — root cause refined 2026-06-05): host-vs-guest gdb
                  * proved the crash function (libcuda+0x466560) is reached IDENTICALLY on host
                  * and guest (same control flow, vtable call returns NV_OK), but rbp is a VALID
