@@ -67,16 +67,17 @@ exec "$QEMU" \
     -m "$MEM" \
     -smp "$SMP" \
     \
-    -drive file="$IMG",format=qcow2,if=virtio \
-    -drive file="$SEED",format=raw,if=virtio,readonly=on \
+    -drive if=none,id=hd0,file="$IMG",format=qcow2 \
+    -device virtio-blk-pci,drive=hd0,addr=0x9 \
+    -drive if=none,id=seed,file="$SEED",format=raw,readonly=on \
+    -device virtio-blk-pci,drive=seed,addr=0xa \
     \
     -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \
-    -device virtio-net-pci,netdev=net0 \
+    -device virtio-net-pci,netdev=net0,addr=0x2 \
     \
-    `# Mode-2 emulated NVIDIA GPU — the device under test, behind a PCIe root` \
-    `# port so it enumerates as a real express endpoint (like a GeForce).` \
-    -device pcie-root-port,id=rp0,chassis=0,slot=0 \
-    -device nvkvm-gpu-emul,bus=rp0,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
+    `# Mode-2 emulated NVIDIA GPU — put it directly on root slot 7 so the` \
+    `# guest RM-generated gpuId encodes as 0x7, matching the forwarded host GPU.` \
+    -device nvkvm-gpu-emul,addr=0x7,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
     \
     `# Open driver source + GSP firmware (RO) + repo, all over 9p.` \
     -virtfs local,path="$OGKM",mount_tag=ogkm,security_model=mapped,readonly=on \

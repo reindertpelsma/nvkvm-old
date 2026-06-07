@@ -19,6 +19,17 @@ Then diff (normalize out ASLR params= addrs):
 A control whose `status` differs (guest NV_OK vs host NOT_SUPPORTED) = a faked-success bug:
 the host skips the param copyout, the guest copies garbage over libcuda's buffer.
 
+Opt-in patch modes for negative tests:
+
+    NVPATCH_GPUFLAGS=1
+    NVCLASSLIST_HEX_FILE=/tmp/host_classlist.hex
+
+`NVPATCH_GPUFLAGS=1` forces `NV0000_CTRL_CMD_GPU_GET_ID_INFO(_V2).gpuFlags |= IN_USE` after the
+ioctl. `NVCLASSLIST_HEX_FILE` replaces `NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2` content with a hex
+blob captured from the host. Both were used on 2026-06-07 to rule out the remaining early
+gpuFlags/classlist content diffs: even with both patched to host values, Mode-2 still crashes after
+the `c7c0` alloc.
+
 ## report.py  — joins the guest dmesg (instrumented driver) with the QEMU RPC log
 
 ## Wins so far (2026-06-06)
@@ -38,7 +49,8 @@ missed). Field-by-field NVOS struct decode from the SDK headers; host==guest for
 
 ### First findings (the tool's first run, cuCtxCreate crash):
 - NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2 numClasses: host 0x6b(107) vs guest 0x61(97) — guest
-  advertises 10 FEWER GPU classes (forged/replayed classlist wrong).
+  advertises 10 FEWER GPU classes. Later LD_PRELOAD replay proved this is not the current crash.
 - NV2080_CTRL_CMD_CE_GET_ALL_CAPS capsTbl: host 0xe3 vs guest 0 — guest reports NO copy-engine caps.
-- guest stops right after ALLOC class=0xc7c0 (GR compute object). Both upstream divergences are
-  candidates for the crash; fix = correct these forged/replayed control replies to match host.
+- guest stops right after ALLOC class=0xc7c0 (GR compute object). As of 2026-06-07, the classlist
+  divergence is ruled out for this crash; keep using the trace to separate causal reply deltas from
+  harmless host/guest shape differences.

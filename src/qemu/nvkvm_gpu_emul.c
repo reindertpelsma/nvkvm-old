@@ -1590,6 +1590,14 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         uint32_t eoff = 124u + e * 8u;
                         if (eoff + 8u > 120u + ps) break;
                         uint32_t idx = ldl_le_p(resp + eoff);
+                        if (ctrl == 0x20800102u) {
+                            /* Match host RM: bit 31 is reserved in NV2080_CTRL_GPU_INFO_INDEX
+                             * and is stripped from the returned list entry.  The guest request
+                             * currently arrives as 0x80000011; leaving that bit set is the
+                             * remaining non-gpuId control divergence in the cuCtxCreate trace. */
+                            idx &= 0x7fffffffu;
+                            stl_le_p(resp + eoff, idx);
+                        }
                         uint32_t val = 0;
                         for (uint32_t k = 0; k < mapn; k++) {
                             if (map[k].index == idx) { val = map[k].value; break; }

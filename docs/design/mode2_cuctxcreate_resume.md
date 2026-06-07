@@ -126,10 +126,12 @@ Captured baselines (saved in repo):
 - `docs/design/mode2_traces/host_cup2_trace.txt` — native `cup2_host` on the host (full PASS, 100
   allocs, runs the whole compute test incl. CE PASS).
 - `docs/design/mode2_traces/guest_cup2_trace.txt` — guest Mode-2 cup2 (crashes at alloc #22 = c7c0).
+- `docs/design/mode2_traces/guest_root7_trace.txt` — guest Mode-2 after root-slot `addr=0x7` and
+  `0x20800102` index-bit fix (gpuId/engine-index diffs gone; still crashes at alloc #22).
 - `docs/design/mode2_traces/ctrl_divergence.txt` — every CTRL cmd whose first-occurrence content
   differs host-vs-guest.
 
-### What the diff shows
+### What the original diff showed
 Alloc class sequence is **identical** host-vs-guest through #22 (c7c0); guest crashes before #23
 (c7b5). c56f (#21) and c7c0 (#22) have `psz=0` (no kernel writeback) so their `areply` bytes are
 libcuda's *own* buffers — and they already diverge (e.g. c56f `flags@20`: host `0x20`, guest `0x00`),
@@ -149,17 +151,32 @@ Other diffs to weigh:
 - `0x0080170d`, `0x20801201`, `0x00000101`, `0x00000d04` — pointer / client-handle differences
   (benign: addresses + remapped client `0xc1d00003` vs host `0xc1d005fd`).
 
-### Concrete next step (the fix path)
-1. **Decide the gpuId story.** Confirm whether the `0x07` vs `0x10000` mismatch breaks a libcuda
-   GPU/device lookup. Easiest test: make the divergent NV0000 enumeration controls return a value
-   *consistent* with whatever the guest uses everywhere (or forward them so libcuda always sees the
-   host's `0x07`). The existing code already forwards a curated set of GET controls (search the
-   `0x906f0101` / `0x0080170d` forward block, ~line 1429, gated `m2fwd`) precisely because faking
-   them shifts libcuda's stack/behavior — extend that set to the divergent enumeration controls,
-   carefully (NV0000 root-client controls; mind handle/address translation).
-2. After each change: rebuild → fresh QEMU boot → run cup2 under gdb (`gcup2_segv.sh`) and check
-   whether the crash clears or moves. Use the trace diff to confirm the target control now matches.
-3. Once cuCtxCreate stops crashing, the channel-execution path is already de-risked (Xid 32 fixed);
+### 2026-06-07 follow-up: this lead is mostly ruled out
+- The emulated GPU now boots directly on q35 root slot `addr=0x7` (see `scripts/run_mode2_vm.sh`).
+  Guest `lspci` is `0000:00:07.0`, so guest CPU-RM naturally emits gpuId `0x7` for the NV0000 enum
+  controls. This removes the old `0x100`/`0x10000` gpuId divergence without forwarding root controls.
+- QEMU now strips bit 31 from returned `0x20800102` info indices, matching the host trace.
+- Clean final trace: `docs/design/mode2_traces/guest_root7_trace.txt`. It has gpuId `0x7`,
+  `0x20800102` matching host, no Xids, but still crashes after alloc #22 (`c7c0`).
+- LD_PRELOAD diagnostics also ruled out the remaining meaningful early content diffs:
+  `NVPATCH_GPUFLAGS=1` forces `GPU_GET_ID_INFO(_V2).gpuFlags |= IN_USE`, and
+  `NVCLASSLIST_HEX_FILE=/tmp/host_classlist.hex` replays the full host `GET_CLASSLIST_V2` payload
+  (107 classes instead of 97). With both patched, the trace still crashes at alloc #22.
+- A QEMU-side experiment forcing `NVOS04_FLAGS_PRIVILEGED_CHANNEL` on `c56f` also did not move the
+  crash and was removed.
+
+### Concrete next step (updated)
+1. Treat first-occurrence RM-control content divergence as largely ruled out. The remaining diffs
+   before `c7c0` are pointer values (`0x101`, `0x0080170d`, `0x20801201`) and remapped client handles
+   (`0x00000d04`).
+2. Re-focus on the transition immediately after the guest-visible `c7c0` success: compare the host
+   and guest libcuda state around the missing host-native next calls (`0x906f0101`, then `c7b5`).
+   The guest never issues them because it dereferences a null object first.
+3. Use `gcup2_stack.sh`/gdb plus the ioctl trace together: set breakpoints/watchpoints around the
+   `c7c0` ioctl return and inspect the object keyed by `r15=0x5c00001a`. The question is now why
+   libcuda fails to materialize that object after a nominally successful compute-object alloc, not
+   which early enum reply has the wrong gpuId.
+4. Once cuCtxCreate stops crashing, the channel-execution path is already de-risked (Xid 32 fixed);
    pick up first-compute (the matmul) — and only then revisit COPY-channel VAS + completion delivery.
 
 Decode the exact cmd meanings from the open driver source on the host (9p: `/usr/src/nvidia-580.159.04`,
