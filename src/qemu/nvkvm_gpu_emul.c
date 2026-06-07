@@ -2926,6 +2926,30 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     if (gp_put >= s->chan_gpfifo_ent) {
         return;                                  /* implausible -> bail */
     }
+    /* M5.24 GPFIFO double-mmap (host-channel bridge step 2): the host channel
+     * expects its GPFIFO ring at gpFifoOffset (gpfifo_va) in its VAS — client-
+     * allocated, NOT RM-allocated — but we never mapped it, so the rung host channel
+     * fetched empty entries.  The guest wrote its GP entries (vidmem) via BAR1 to
+     * chan_gpfifo_phys (M5.16-resolved).  back_and_map: alloc host GPU mem, seed-copy
+     * the current entries, double-mmap at chan_gpfifo_phys (future guest BAR1 GP
+     * writes land in host mem), and map_dma FIXED at gpfifo_va into the channel's VAS
+     * (via the client grmapper — same VAS the host channel runs in, M5.20/M5.21).
+     * Then the rung host channel fetches the REAL GP entries -> the pushbuffers
+     * (already zero-copy-mapped, M5.19) -> runs + writes the completion.  Gated on
+     * m2exec + a resolved GSP-managed ring (chan_gpfifo_phys); idempotent per VA. */
+    if (s->m2exec && s->chan_gpfifo_phys && s->chan_gpfifo_va &&
+        !nvkvm_m2_va_seen(s, s->chan_gpfifo_va)) {
+        uint64_t gsz = ((uint64_t)s->chan_gpfifo_ent * 8 + 0xfffull) & ~0xfffull;
+        if (gsz == 0 || gsz > 0x10000) { gsz = 0x10000; }
+        bool gok = nvkvm_m2_back_and_map(s, s->chan_client, s->chan_gpfifo_va,
+                                         s->chan_gpfifo_phys, gsz, true, "gpfifo-bridge");
+        qemu_log("nvkvm-gpu[%s] M5.24 GPFIFO double-mmap va=0x%llx phys=0x%llx sz=0x%llx "
+                 "client=0x%08x -> %s\n", s->chip->name,
+                 (unsigned long long)s->chan_gpfifo_va,
+                 (unsigned long long)s->chan_gpfifo_phys, (unsigned long long)gsz,
+                 s->chan_client, gok ? "MAPPED (host channel fetches guest GP entries)"
+                                     : "map-FAILED");
+    }
     /* NVC56F host-channel semaphore-release tracking (methods 0x5c..0x6c).  The
      * golden-image / watchdog / scrubber channels append a SEM_EXECUTE RELEASE
      * after their engine work to signal completion; channelWaitForFinishPayload
