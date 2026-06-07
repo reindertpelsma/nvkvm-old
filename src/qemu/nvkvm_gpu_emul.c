@@ -403,7 +403,14 @@ struct NvkvmGpuEmul {
                                  * that nothing writes in the fake-GSP model; userspace never
                                  * observes it). 0 = disabled. */
     uint64_t m2sempage;         /* M5.14: guest-FB page (4K-aligned) the sentinel applies to */
-    uint64_t m2_mapped_va[128]; /* M5.9: VAs already backed+mapped (dedup pushbuffer maps) */
+    /* M5.27: VAs already backed+mapped (dedup pushbuffer/sema/gpfifo maps).  Was 128 — the
+     * compute working set (30 GP entries x ~8 channels of pushbuffers + semas + gpfifos) blows
+     * past that, and once full the dedup silently STOPPED recording, so every VA re-mapped on
+     * EVERY doorbell -> dmaAllocMapping flood + a leaked host mem object per re-map + host VAS
+     * exhaustion -> legitimate buffer maps then failed -> the host GPU stalled mid-channel
+     * (GP_GET stuck). Size it well past any cuCtxCreate/matmul working set. */
+#define NVKVM_MAX_MAPPED_VA 65536
+    uint64_t m2_mapped_va[NVKVM_MAX_MAPPED_VA];
     int      m2_mapped_va_n;
     /* M6.0 (item-4 prereq): guest RAM as a shared memfd, so the STUB can mmap any guest GPA
      * and OS_DESCRIPTOR-register it -> the host GPU can DMA into the guest's sysmem GR buffers
@@ -2159,10 +2166,25 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              c->tsg, c->client, src, sst,
                              (src == 0 && sst == 0) ? "  OK SCHEDULED" : "  <-- ERR");
                 }
+                /* M5.26 DIAG: read the HOST USERD GP_PUT/GP_GET (the double-mmapped
+                 * page the host GPU reads) to verify (a) the guest's GP_PUT actually
+                 * propagated to the host channel and (b) whether the host GPU consumes
+                 * it (GP_GET advancing across rings). USERD: GP_GET@0x88, GP_PUT@0x8C. */
+                void *uqva = NULL;
+                for (int k = 0; k < s->m2_chanbuf_n; k++) {
+                    if (s->m2_chanbuf[k].client == c->client &&
+                        s->m2_chanbuf[k].chan == c->hobject) {
+                        uqva = s->m2_chanbuf[k].qva; break;
+                    }
+                }
+                uint32_t hput = uqva ? ldl_le_p((uint8_t *)uqva + 0x8C) : 0xffffffffu;
+                uint32_t hget = uqva ? ldl_le_p((uint8_t *)uqva + 0x88) : 0xffffffffu;
                 stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, c->host_token);
                 qemu_log("nvkvm-gpu[%s] M5.22 RANG host doorbell ch[%d] token=0x%08x "
-                         "(client=0x%08x gpfifo=0x%llx)\n", s->chip->name, i,
-                         c->host_token, c->client, (unsigned long long)c->gpfifo_va);
+                         "(client=0x%08x gpfifo=0x%llx) hostUSERD put=%u get=%u%s\n",
+                         s->chip->name, i, c->host_token, c->client,
+                         (unsigned long long)c->gpfifo_va, hput, hget,
+                         uqva ? "" : " [no host USERD qva]");
             }
             if (s->chan_sem_released) {
                 continue;                        /* explicit release already done */
@@ -4357,7 +4379,7 @@ static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint64_t va)
     for (int i = 0; i < s->m2_mapped_va_n; i++) {
         if (s->m2_mapped_va[i] == va) { return true; }
     }
-    if (s->m2_mapped_va_n < 128) { s->m2_mapped_va[s->m2_mapped_va_n++] = va; }
+    if (s->m2_mapped_va_n < NVKVM_MAX_MAPPED_VA) { s->m2_mapped_va[s->m2_mapped_va_n++] = va; }
     return false;
 }
 
