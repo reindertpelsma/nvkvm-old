@@ -1402,14 +1402,23 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      * capture) so the guest copies 0 bytes back. UNCONDITIONAL: the previous version
                      * gated this on a shadow-forward capture (m2_gr_reply_valid) that often didn't
                      * fire -> overrun -> crash (why "force-paramsSize-0" looked moot before). */
-                    uint32_t hp = (s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj)
-                                      ? s->m2_gr_reply_psize : 0u;
-                    if (hp > sizeof(s->m2_gr_reply)) hp = (uint32_t)sizeof(s->m2_gr_reply);
-                    stl_le_p(resp + 100, hp);          /* reply paramsSize = host's (0 for GR) */
-                    if (hp) memcpy(resp + 112, s->m2_gr_reply, hp);
+                    /* M8.1 (2026-06-07, rbp-clobber REGRESSION fix): FORCE reply paramsSize=0
+                     * for GR objects. libcuda's RM_ALLOC for NV_GR_ALLOCATION_PARAMETERS does
+                     * NOT want params written back; a correct GSP/driver copies min(req,reply)
+                     * = 0 bytes. Commit 1443793 proved paramsSize=0 makes cuCtxCreate SUCCEED
+                     * (2-day wall broken). The later M7 "forward host's real 16B caps" change
+                     * (m2_gr_reply_valid -> psize=16) RE-OPENED the clobber: the guest copies
+                     * 16B into libcuda's stack slot, zeroing a saved rbp -> SIGSEGV at libcuda
+                     * +0x300560 (mov -0x38(%rbp),%rax, rbp=0), exactly after c7c0. The captured
+                     * caps are NOT needed for cuCtxCreate. Keep the M7 capture only as a diag. */
+                    uint32_t cap_psize = (s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj)
+                                             ? s->m2_gr_reply_psize : 0u;
+                    uint32_t hp = 0;                   /* never write GR alloc params back */
+                    stl_le_p(resp + 100, hp);
                     s->m2_gr_reply_valid = false;
-                    qemu_log("nvkvm-gpu[%s] M8 GR-obj 0x%04x: reply paramsSize=%u (req_echo was %u) "
-                             "[anti-overrun]\n", s->chip->name, hc, hp, opsize);
+                    qemu_log("nvkvm-gpu[%s] M8.1 GR-obj 0x%04x: reply paramsSize=%u (req_echo %u, "
+                             "host_caps_psize %u dropped) [rbp-clobber fix]\n",
+                             s->chip->name, hc, hp, opsize, cap_psize);
                 }
             }
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
