@@ -383,6 +383,17 @@ struct NvkvmGpuEmul {
      * channel's address space at the guest VAs (see [[mode2-mapdma-primitive]]). */
     struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[8];
     int      m2_grmap_n;
+    /* M5.28 PER-CHANNEL VAS (user-directed): each forwarded GR channel runs in its OWN
+     * fresh nvkvm-allocated VAS (FERMI_VASPACE_A under the channel's forwarded device),
+     * NOT the guest's forwarded VAS (0xcaf00005) — that one the host RM auto-promoted its
+     * GR ctx into, so the guest's working-set VAs collide (st=0x51 / Xid 32). Keyed by the
+     * parent TSG handle (all channels in a TSG share its VAS). The working set is mapped
+     * into THIS vas (fvirt over fvas) instead of the per-client grmapper. m2_cur_cvas is the
+     * active index for the current map ops (set per-channel in the doorbell loop; -1 = use
+     * the legacy per-client grmapper, e.g. CeUtils). */
+    struct { uint32_t client, tsg, hdev, fvas, fvirt; bool populated; } m2_cvas[16];
+    int      m2_cvas_n;
+    int      m2_cur_cvas;
     uint32_t m2_gr_channel;     /* M5.8: the host GR channel handle (c56f under GR TSG) */
     uint32_t m2_gr_tsg;         /* M5.8: the host GR TSG handle (a06c, channel's parent) */
     /* M7 (cuCtxCreate fix): the HOST's real GR-object alloc reply params (NV_GR_ALLOCATION_
@@ -1155,6 +1166,8 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
                                   uint32_t *st); /* M6.2 fwd-decl */
 static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
 static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client); /* M5.7 fwd-decl */
+static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg); /* M5.28 fwd-decl */
+static void nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c); /* M5.28 fwd-decl */
 static int nvkvm_m2_map_dma(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
                             uint32_t hVas, uint32_t hMemory, uint64_t offset,
                             uint64_t length, bool fixed, uint64_t va,
@@ -2134,6 +2147,21 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             s->chan_hvaspace   = c->hvaspace;
             s->chan_client     = c->client;
             s->chan_gp_get     = c->gp_get;
+            /* M5.28: route this channel's working-set maps into ITS per-channel fresh VAS
+             * (matched by parent TSG). On first touch, mirror the channel's whole guest PDB
+             * into the fresh VAS so every guest VA places into a VAS we own (no host-RM
+             * ctx self-promote collision). m2_cur_cvas stays set for chan_execute's reactive
+             * maps below, then is reset after the iteration. */
+            s->m2_cur_cvas = -1;
+            for (int ci = 0; ci < s->m2_cvas_n; ci++) {
+                if (s->m2_cvas[ci].client == c->client && s->m2_cvas[ci].tsg == c->tsg) {
+                    s->m2_cur_cvas = ci; break;
+                }
+            }
+            if (s->m2_cur_cvas >= 0 && !s->m2_cvas[s->m2_cur_cvas].populated) {
+                nvkvm_m2_populate_cvas(s, c);
+                s->m2_cvas[s->m2_cur_cvas].populated = true;
+            }
             uint32_t before = c->gp_get;
             nvkvm_chan_execute(s);
             c->gp_get = s->chan_gp_get;          /* save consumed index */
@@ -2209,6 +2237,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                          (unsigned long long)c->gpfifo_va);
             }
         }
+        s->m2_cur_cvas = -1;    /* M5.28: clear per-channel VAS routing after the loop */
         /* M5/M7 — a channel finished: deliver the os-event completion so
          * libcuda's blocking-sync poll() wakes (write sema THEN signal, so the
          * payload is already visible when the guest re-checks).  Posting per
@@ -3378,6 +3407,7 @@ static bool nvkvm_m2_iso_ensure(NvkvmGpuEmul *s)
         return false;
     }
     s->m2_iso_id = id; s->m2_ctl_h = 1; s->m2_gpu_h = 2; s->m2_iso_ready = true;
+    s->m2_cur_cvas = -1;        /* M5.28: no per-channel VAS active until the doorbell loop sets it */
     qemu_log("nvkvm-gpu[%s] M5.1: host isolate %u ready (pid=%d, ctl+gpu0 open)\n",
              s->chip->name, id, (int)nvkvm_isolate_host_pid(&s->m2_iso, id));
     /* M6.1 (item-4 step 2): share guest RAM into the stub so it can OS_DESCRIPTOR guest GPAs. */
@@ -3509,7 +3539,9 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
      * construct and the host RM self-promotes its GR context.
      * NV_CHANNEL_GROUP_ALLOCATION_PARAMS: hObjectError@0,hObjectEccError@4,
      * hVASpace@8, engineType@12. */
-    if (hClass == 0xa06cu && psize >= 16 && ldl_le_p(auxbuf + 8) == 0u) {
+    if (hClass == 0xa06cu && psize >= 16) {
+        uint32_t cur_vas = ldl_le_p(auxbuf + 8);
+        uint32_t engine  = ldl_le_p(auxbuf + 12);
         uint32_t sub = 0;
         for (int i = 0; i < s->m2_devvas_n; i++) {
             if (s->m2_devvas[i].client == hClient && s->m2_devvas[i].dev == hParent) {
@@ -3517,13 +3549,34 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                 break;                       /* first VASpace under this device */
             }
         }
-        if (sub) {
+        /* M5.28 PER-CHANNEL VAS: a GR/compute TSG (engineType GRAPHICS=1) gets a FRESH
+         * nvkvm-owned VAS, ALWAYS — replacing whatever VAS libcuda passed (the compute TSGs
+         * reference the guest's forwarded VAS explicitly, the one the host RM self-promotes GR
+         * ctx into -> st=0x51 collisions / Xid 32). cvas is keyed by the TSG handle (hObject);
+         * the ctxshare + channel below inherit/reference it. Other engine TSGs keep the legacy
+         * forwarded VAS — NOTE: extending this to COPY engines (0x9..0x12) was tried and HUNG
+         * the guest (it redirects the copy channels off the main guest VAS 0xcaf00005, which the
+         * guest driver relies on; faulted -> PMC_BOOT_0 reset spin). Copy-channel collisions
+         * (18, no Xid) need a different approach. */
+        if (engine == 1u) {
+            int ci = nvkvm_m2_cvas_get(s, hClient, hObject);
+            if (ci >= 0) {
+                stl_le_p(auxbuf + 8, s->m2_cvas[ci].fvas);
+                qemu_log("nvkvm-gpu[%s] M5.28 a06c GR TSG hVASpace 0x%08x -> 0x%08x "
+                         "[per-chan fresh] (engineType=%u tsg=0x%08x)\n", s->chip->name,
+                         cur_vas, s->m2_cvas[ci].fvas, engine, hObject);
+            } else if (cur_vas == 0u && sub) {
+                stl_le_p(auxbuf + 8, sub);
+                qemu_log("nvkvm-gpu[%s] M5.28 a06c GR TSG cvas alloc FAILED; fallback "
+                         "forwarded VAS 0x%08x (engineType=%u)\n", s->chip->name, sub, engine);
+            } else {
+                qemu_log("nvkvm-gpu[%s] M5.28 a06c GR TSG cvas FAILED + no fallback "
+                         "(cur_vas=0x%08x client=0x%08x)\n", s->chip->name, cur_vas, hClient);
+            }
+        } else if (cur_vas == 0u && sub) {
             stl_le_p(auxbuf + 8, sub);
-            qemu_log("nvkvm-gpu[%s] M5.3 a06c GR TSG hVASpace 0 -> 0x%08x "
-                     "(engineType=%u)\n", s->chip->name, sub, ldl_le_p(auxbuf + 12));
-        } else {
-            qemu_log("nvkvm-gpu[%s] M5.3 a06c GR TSG hVASpace=0 but no VAS tracked "
-                     "for client=0x%08x dev=0x%08x\n", s->chip->name, hClient, hParent);
+            qemu_log("nvkvm-gpu[%s] M5.3 a06c non-GR TSG hVASpace 0 -> 0x%08x "
+                     "(engineType=%u)\n", s->chip->name, sub, engine);
         }
     }
     /* M5.3: record TSG (0xa06c) handle -> engineType@12 for the channel engineType fix. */
@@ -3543,9 +3596,24 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         for (int i = 0; i < s->m2_devvas_n; i++) {
             if (s->m2_devvas[i].client == hClient) { sub = s->m2_devvas[i].vas; break; }
         }
-        qemu_log("nvkvm-gpu[%s] M5.3 DIAG 9067 ctxshare hVASpace@0=0x%08x flags@4=0x%x "
-                 "subctxId@8=0x%x hClient=0x%08x trackedVAS=0x%08x (devvas_n=%d)\n",
-                 s->chip->name, cvas, cfl, csub, hClient, sub, s->m2_devvas_n);
+        /* M5.28: the ctxshare is parented to the GR TSG (hParent). If that TSG was given a
+         * per-channel fresh VAS above, the ctxshare's hVASpace@0 must reference the SAME
+         * fresh VAS (RM requires the share's VAS == the TSG's VAS), else the host channel
+         * runs in a different VAS than the one we populate. */
+        int ci = -1;
+        for (int i = 0; i < s->m2_cvas_n; i++) {
+            if (s->m2_cvas[i].client == hClient && s->m2_cvas[i].tsg == hParent) { ci = i; break; }
+        }
+        if (ci >= 0) {
+            stl_le_p(auxbuf, s->m2_cvas[ci].fvas);
+            qemu_log("nvkvm-gpu[%s] M5.28 9067 ctxshare hVASpace@0 0x%08x -> 0x%08x "
+                     "[per-chan fresh, tsg=0x%08x]\n", s->chip->name, cvas,
+                     s->m2_cvas[ci].fvas, hParent);
+        } else {
+            qemu_log("nvkvm-gpu[%s] M5.3 DIAG 9067 ctxshare hVASpace@0=0x%08x flags@4=0x%x "
+                     "subctxId@8=0x%x hClient=0x%08x trackedVAS=0x%08x (devvas_n=%d cvas=%d)\n",
+                     s->chip->name, cvas, cfl, csub, hClient, sub, s->m2_devvas_n, ci);
+        }
     }
     /* M5.1c experiment: for channel classes, drop hObjectError (params+0) — its
      * error-notifier memory object isn't forwarded yet, so RM's notifier lookup
@@ -4147,11 +4215,63 @@ static int nvkvm_m2_alloc_virtmem(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hD
     return nvkvm_m2_alloc1(s, hClient, hDevice, hVirt, 0x0070u, p, sizeof(p), st);
 }
 
+/* M5.28 PER-CHANNEL VAS: get (allocating on first use) the fresh nvkvm-owned VAS context
+ * for a (client, tsg). The fresh FERMI_VASPACE_A is allocated under the channel's FORWARDED
+ * device (the TSG is parented to it, so RM requires the VAS share that device); a virtmem
+ * mapper (NV01_MEMORY_VIRTUAL) spans it for FIXED map_dma. We substitute fvas into the GR
+ * TSG's hVASpace (and its ctxshare) in shadow_fwd, and route the channel's working-set maps
+ * here (m2_cur_cvas) instead of the guest's forwarded VAS — so every guest VA places into a
+ * VAS WE fully control, killing the host-RM-self-promote collision (st=0x51 / Xid 32).
+ * Returns index into m2_cvas[], or -1. */
+static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg)
+{
+    for (int i = 0; i < s->m2_cvas_n; i++) {
+        if (s->m2_cvas[i].client == client && s->m2_cvas[i].tsg == tsg) { return i; }
+    }
+    if (s->m2_cvas_n >= 16) { return -1; }
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+    }
+    if (!hDev) {
+        qemu_log("nvkvm-gpu[%s] M5.28 cvas_get: no forwarded device for client 0x%08x\n",
+                 s->chip->name, client);
+        return -1;
+    }
+    uint32_t fVas  = 0xce200000u | (s->m2_databuf_next++ & 0xffffu);
+    uint32_t fVirt = 0xce300000u | (s->m2_databuf_next++ & 0xffffu);
+    uint8_t vasp[56]; memset(vasp, 0, sizeof(vasp));
+    uint32_t vst = 0xffff, vmst = 0xffff;
+    nvkvm_m2_alloc1(s, client, hDev, fVas, 0x90f1u, vasp, sizeof(vasp), &vst);
+    if (vst == 0) {
+        nvkvm_m2_alloc_virtmem(s, client, hDev, fVirt, fVas, &vmst);
+    }
+    qemu_log("nvkvm-gpu[%s] M5.28 cvas_get: client=0x%08x tsg=0x%08x dev=0x%08x -> "
+             "fresh vas=0x%08x(st=0x%x) virtmem=0x%08x(st=0x%x)%s\n", s->chip->name,
+             client, tsg, hDev, fVas, vst, fVirt, vmst,
+             (vst == 0 && vmst == 0) ? "  OK" : "  <-- ERR");
+    if (vst != 0 || vmst != 0) { return -1; }
+    int idx = s->m2_cvas_n++;
+    s->m2_cvas[idx].client    = client;
+    s->m2_cvas[idx].tsg       = tsg;
+    s->m2_cvas[idx].hdev      = hDev;
+    s->m2_cvas[idx].fvas      = fVas;
+    s->m2_cvas[idx].fvirt     = fVirt;
+    s->m2_cvas[idx].populated = false;
+    return idx;
+}
+
 /* M5.7 EXECUTION PLANE: get (allocating once) the NV01_MEMORY_VIRTUAL mapper spanning a
  * client's GR VASpace. Returns the virtmem handle (0 on failure). The mapper is the hDma
  * for all FIXED map_dma into that vaspace. */
 static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
 {
+    /* M5.28: when a per-channel VAS is active for this client, route ALL FIXED map_dma
+     * into ITS fresh nvkvm-owned virtmem mapper (not the guest's forwarded VAS). */
+    if (s->m2_cur_cvas >= 0 && s->m2_cur_cvas < s->m2_cvas_n &&
+        s->m2_cvas[s->m2_cur_cvas].client == client) {
+        return s->m2_cvas[s->m2_cur_cvas].fvirt;
+    }
     for (int i = 0; i < s->m2_grmap_n; i++) {
         if (s->m2_grmap[i].client == client) {
             return s->m2_grmap[i].hvirt;
@@ -4624,6 +4744,37 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
                  (unsigned long long)a.sysbytes, (unsigned long long)a.vidbytes,
                  a.backed, budget);
     }
+}
+
+/* M5.28 PER-CHANNEL VAS population: mirror the guest channel's ENTIRE address space into its
+ * fresh nvkvm-owned VAS. Walk the channel's OWN guest PDB (chan_own_pdb, derived from the
+ * channel's client -> forwarded VAS -> snooped PDB), enumerate every valid leaf, and FIXED
+ * map_dma each into the fresh VAS at the same GPU VA (sysmem -> OS_DESCRIPTOR guest RAM WB;
+ * vidmem -> blank host vidmem object via the GPGA table). m2_cur_cvas MUST be set by the caller
+ * so grmapper routes the maps into THIS channel's fvas (not the guest forwarded VAS). Because
+ * the VAS is one WE own (no host-RM ctx self-promote), every guest VA places without st=0x51 —
+ * the Xid-32 collision class. Idempotent via the global m2_va_seen dedup. */
+static void nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c)
+{
+    uint64_t pdb = nvkvm_chan_own_pdb(s);          /* uses s->chan_client (caller set it) */
+    if (!pdb) {
+        qemu_log("nvkvm-gpu[%s] M5.28 populate_cvas: client=0x%08x tsg=0x%08x — no own PDB "
+                 "(VAS not snooped yet); reactive map only\n", s->chip->name,
+                 c->client, c->tsg);
+        return;
+    }
+    int budget = 300000;
+    struct nvkvm_leaf_acc a; memset(&a, 0, sizeof(a));
+    a.s = s; a.client = c->client;
+    nvkvm_m2_pt_enum(s, pdb, false, 0, 0, &a, &budget);
+    nvkvm_m2_leaf_flush(&a);
+    qemu_log("nvkvm-gpu[%s] M5.28 populate_cvas: client=0x%08x tsg=0x%08x pdb=0x%llx -> "
+             "cvas[%d] fvas=0x%08x runs=%d sysbytes=0x%llx vidbytes=0x%llx backed=%d "
+             "(budget_left=%d)\n", s->chip->name, c->client, c->tsg,
+             (unsigned long long)pdb, s->m2_cur_cvas,
+             s->m2_cur_cvas >= 0 ? s->m2_cvas[s->m2_cur_cvas].fvas : 0,
+             a.runs, (unsigned long long)a.sysbytes, (unsigned long long)a.vidbytes,
+             a.backed, budget);
 }
 
 /* M5.13 DRY-RUN: locate which page-directory maps a target guest-phys (the completion
