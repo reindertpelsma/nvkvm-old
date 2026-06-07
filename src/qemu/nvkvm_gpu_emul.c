@@ -220,6 +220,9 @@ struct NvkvmGpuEmul {
         uint32_t host_token;    /* M5.12: host channel work-submit token (0xc36f0108), for the
                                  * GP_PUT-driven doorbell demux: ring THIS channel's token */
         bool     token_valid;
+        uint32_t tsg;           /* M5.25: parent TSG (a06c) handle — must be GPFIFO_SCHEDULE'd
+                                 * before a ring runs (guest's schedule control isn't forwarded) */
+        bool     scheduled;     /* M5.25: TSG GPFIFO_SCHEDULE'd on the host once */
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -1315,6 +1318,8 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         s->chans[cslot].hvaspace   = s->chan_hvaspace;
                         s->chans[cslot].client     = ldl_le_p(cmd + 80); /* hClient */
                         s->chans[cslot].hobject    = ldl_le_p(cmd + 88); /* channel handle */
+                        s->chans[cslot].tsg        = ldl_le_p(cmd + 84); /* M5.25: parent TSG */
+                        s->chans[cslot].scheduled  = false;
                         s->chans[cslot].gp_get     = 0;
                         s->chans[cslot].payload    = 0;
                         s->chans[cslot].token_valid = false;
@@ -2138,6 +2143,22 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
              * is the real submission.  The Phase-B sema write below still runs as a
              * fallback. */
             if (s->m2_usermode_qva && c->token_valid) {
+                /* M5.25: the host channel's TSG must be GPFIFO_SCHEDULE'd (on a runlist)
+                 * before a ring runs — the guest's schedule control isn't forwarded, so an
+                 * unscheduled host TSG is idle and the ring is a no-op (GPU stays 0%).
+                 * Schedule once, per channel's parent TSG. NVA06C_CTRL_CMD_GPFIFO_SCHEDULE
+                 * (0xa06c0101), params {bEnable=1,bSkipSubmit,bSkipEnable}. */
+                if (c->tsg && !c->scheduled) {
+                    uint8_t sp[3]; memset(sp, 0, sizeof(sp)); sp[0] = 1;
+                    uint32_t sst = 0xffff;
+                    int src = nvkvm_m2_control1(s, c->client, c->tsg, 0xa06c0101u,
+                                                sp, sizeof(sp), &sst);
+                    c->scheduled = true;
+                    qemu_log("nvkvm-gpu[%s] M5.25 GPFIFO_SCHEDULE ch[%d] TSG=0x%08x "
+                             "client=0x%08x -> rc=%d st=0x%x%s\n", s->chip->name, i,
+                             c->tsg, c->client, src, sst,
+                             (src == 0 && sst == 0) ? "  OK SCHEDULED" : "  <-- ERR");
+                }
                 stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, c->host_token);
                 qemu_log("nvkvm-gpu[%s] M5.22 RANG host doorbell ch[%d] token=0x%08x "
                          "(client=0x%08x gpfifo=0x%llx)\n", s->chip->name, i,
