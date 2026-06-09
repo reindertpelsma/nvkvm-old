@@ -1,5 +1,6 @@
 /* Mode-2 CUDA dataplane probe with pauses around the CE round-trip. */
 #include <cuda.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -63,7 +64,15 @@ int main(void)
     CK(cuMemcpyHtoD(dp, &hv, 4));
     printf("HTOD OK dp=0x%llx sleeping-before-dtoh\n", (unsigned long long)dp);
     fflush(stdout);
-    sleep(60);
+    unsigned sleep_secs = 60;
+    const char *sleep_env = getenv("NVKVM_CUP2_DTOH_SLEEP_SECS");
+    if (sleep_env && *sleep_env) {
+        unsigned v = (unsigned)strtoul(sleep_env, NULL, 0);
+        if (v) {
+            sleep_secs = v;
+        }
+    }
+    sleep(sleep_secs);
 
     CK(cuMemcpyDtoH(&rv, dp, 4));
     printf("CE rv=0x%x want=0x%x -> %s\n", rv, hv, rv == hv ? "PASS" : "MISMATCH");

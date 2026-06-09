@@ -18,6 +18,21 @@ static int (*real_ioctl)(int, unsigned long, ...);
 static FILE *lg;
 typedef unsigned long long CUdeviceptr;
 typedef int CUresult;
+
+static uint32_t rd32(const void *p)
+{
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static uint64_t rd64(const void *p)
+{
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
 static int hexval(int c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -208,24 +223,49 @@ int ioctl(int fd, unsigned long req, ...){
         }
     }
     if (type == 0 && nr == 33 && arg && lg) { /* UVM_MAP_EXTERNAL_ALLOCATION */
-        uint64_t base = *(uint64_t *)((char *)arg + 0);
-        uint64_t len  = *(uint64_t *)((char *)arg + 8);
-        uint64_t off  = *(uint64_t *)((char *)arg + 16);
-        int32_t rmfd  = *(int32_t *)((char *)arg + 9248);
-        uint32_t hcli = *(uint32_t *)((char *)arg + 9252);
-        uint32_t hmem = *(uint32_t *)((char *)arg + 9256);
-        uint32_t st   = *(uint32_t *)((char *)arg + 9260);
+        uint64_t base = rd64((char *)arg + 0);
+        uint64_t len  = rd64((char *)arg + 8);
+        uint64_t off  = rd64((char *)arg + 16);
+        int32_t rmfd  = (int32_t)rd32((char *)arg + 9248);
+        uint32_t hcli = rd32((char *)arg + 9252);
+        uint32_t hmem = rd32((char *)arg + 9256);
+        uint32_t st   = rd32((char *)arg + 9260);
         fprintf(lg, "UVM_MAP_EXTERNAL base=0x%llx len=0x%llx off=0x%llx "
                     "rmfd=%d hClient=0x%08x hMemory=0x%08x rm_status=0x%x ret=%d req=0x%lx\n",
                 (unsigned long long)base, (unsigned long long)len,
                 (unsigned long long)off, rmfd, hcli, hmem, st, r, req);
         fflush(lg);
     }
+    if (type == 0x46 && nr == 0x57 && arg && lg) { /* NV_ESC_RM_MAP_MEMORY_DMA */
+        unsigned iosz = (unsigned)((req >> 16) & 0x3fffu);
+        unsigned status_off = iosz >= 64 ? 56u : 48u;
+        unsigned dma_off = iosz >= 64 ? 48u : 40u;
+        uint32_t hcli = rd32((char *)arg + 0);
+        uint32_t hdev = rd32((char *)arg + 4);
+        uint32_t hdma = rd32((char *)arg + 8);
+        uint32_t hmem = rd32((char *)arg + 12);
+        uint64_t off = rd64((char *)arg + 16);
+        uint64_t len = rd64((char *)arg + 24);
+        uint32_t flags = rd32((char *)arg + 32);
+        uint32_t flags2 = iosz >= 64 ? rd32((char *)arg + 36) : 0;
+        uint32_t kind = iosz >= 64 ? rd32((char *)arg + 40) : 0;
+        uint64_t dma = rd64((char *)arg + dma_off);
+        uint32_t st = rd32((char *)arg + status_off);
+        fprintf(lg, "MAPDMA iosz=%u hClient=0x%08x hDevice=0x%08x "
+                    "hDma=0x%08x hMemory=0x%08x off=0x%llx len=0x%llx "
+                    "flags=0x%08x flags2=0x%08x kind=0x%08x dmaOffset=0x%llx "
+                    "status=0x%x ret=%d req=0x%lx\n",
+                iosz, hcli, hdev, hdma, hmem, (unsigned long long)off,
+                (unsigned long long)len, flags, flags2, kind,
+                (unsigned long long)dma, st, r, req);
+        fflush(lg);
+        return r;
+    }
     if (type == 0x46 && lg) {
         if (nr == 0x2A) fprintf(lg, "CTRL  cmd=0x%08x psz=%-6u status=0x%-4x params=0x%llx",
-                                cmd, psz, *(uint32_t*)((char*)arg+28), (unsigned long long)pptr);
+                                cmd, psz, rd32((char*)arg+28), (unsigned long long)pptr);
         else if (nr == 0x2B) fprintf(lg, "ALLOC class=0x%08x psz=%-6u status=0x%-4x params=0x%llx",
-                                hcls, psz, *(uint32_t*)((char*)arg+28), (unsigned long long)pptr);
+                                hcls, psz, rd32((char*)arg+28), (unsigned long long)pptr);
         else { fprintf(lg, "IOCTL nr=0x%02x ret=%d\n", nr, r); fflush(lg); return r; }
         /* dump first N bytes of the params buffer (post-call) so guest vs host CONTENT can be
          * diffed: a control returning real data on the host but NV_OK+zeros on the guest shows up
