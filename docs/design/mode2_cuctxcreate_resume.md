@@ -154,6 +154,8 @@ Tracked local changes:
     synthetic `<device VA> <shadow guest GPA> <size>` rows.
   - For the new uprobe-bridge PASS, pbmap is still used for ordinary guest staging pages, but not for
     HtoD shadow rows.
+  - This is diagnostic-only plumbing. Production Mode-2 must not rely on QEMU reading guest userspace
+    VAs, `/proc/$pid/pagemap`, or `/tmp/m2_pbmap.txt`.
 
 - `scripts/mode2_diag/cup2_pause.c`
   - Paused CUDA probe that sleeps after HtoD so the live pbmap exporter can catch shadow/staging pages
@@ -178,20 +180,28 @@ backing is the missing piece.
 
 ## 5. Active Next Step
 
-Replace the debug guest-kernel uprobe proof with a real Mode-2 UVM external-allocation bridge.
+Replace the debug guest-kernel uprobe proof with the real Mode-2 UVM external-allocation path.
+The production rule is documented in `docs/design/mode2_dataplane_architecture.md`: QEMU must track
+guest GR VA, GPGA/GPA, PDB leaves, and isolate-owned host mappings. Guest userspace VAs are opaque
+except for debug probes, and CR3 is only an isolate/process key.
 
 Concrete path:
 
-1. Capture `UVM_MAP_EXTERNAL_ALLOCATION` information through a guest-kernel or VMM-visible reporting
-   path:
-   `<base, len, hClient, hMemory, offset>`.
-2. Add a QEMU side table for UVM external ranges. The table must associate guest device VA ranges
-   with coherent backing that the CE resolver can read/write.
-3. Populate that backing from the real UVM/RM migration/copy operation. The M8.14 bridge currently
-   proves the shape by mirroring `cuMemcpyHtoD` bytes into guest kernel pages on uprobe entry.
-4. Make CE resolution use the UVM side table before falling back to pbmap/channel translation, or map
-   the backing into the forwarded host channel VAS if the operation must execute on the host GPU.
-5. Investigate the remaining high-UVM CE packets that still cause host `dmaAllocMapping_GM107` spam
+1. Capture `UVM_MAP_EXTERNAL_ALLOCATION` identity through a guest-kernel or VMM-visible reporting
+   path: `<base, len, hClient, hMemory, offset>`. Treat `base` as a GPU VA/range identity, not as
+   an invitation for QEMU to read the guest process address space.
+2. Ensure guest-visible UVM residency is system-memory/host-RAM resident. In-guest UVM migration is
+   not a valid Mode-2 boundary because unprivileged QEMU cannot observe host GPU-vs-CPU residency and
+   does not receive the host NVIDIA driver's migration interrupts.
+3. For UVM sysmem leaves, map the guest-RAM GPA backing into the owning host isolate/context VAS at
+   the same GPU VA using OS_DESCRIPTOR/RM_MAP_MEMORY_DMA, as in Mode 1. For GPGA leaves, use the GPGA
+   range table and host-backed `gpu_memory_object`.
+4. Let the host NVIDIA kernel own any later GPU faults and page migration. If the host migrates a
+   page for GPU access, the guest is not notified; a later guest CPU access reaches the same GPA
+   through KVM and must be resolved by host-side UVM/fault handling below QEMU.
+5. Remove or hard-gate the local CE copy parser from the production path. Host CE/GR work should run
+   on the host channel; QEMU parsing is bring-up diagnostics only.
+6. Investigate the remaining high-UVM CE packets that still cause host `dmaAllocMapping_GM107` spam
    and Xid 32. They are not required for the 4-byte debug PASS, but they are not production-clean.
 
 ## 6. Repro Recipe

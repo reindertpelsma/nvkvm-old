@@ -98,6 +98,39 @@ Inherent in the PDB layer: a channel's GPU-VA -> sysmem leaf is forwarded as a h
 RM_MAP_MEMORY_DMA into the host channel's VAS at the same GPU VA, backed by the guest-RAM
 GPA (KVM/GPA-window). The host GPU then DMAs to the same memory the guest CPU sees.
 
+## UVM residency rule
+
+Production Mode-2 must not depend on reading guest userspace VAs from QEMU. Guest
+userspace mappings, `/proc/$pid/pagemap`, and `/tmp/m2_pbmap.txt` are diagnostic
+only. The production interface is the same as the rest of the data plane:
+
+- guest GR VA installed in a channel/context PDB;
+- GPGA for vidmem-like leaves, or guest-RAM GPA for sysmem leaves;
+- host RM objects and host RM_MAP_MEMORY_DMA mappings created by the owning isolate.
+
+UVM pages need a specific rule because normal in-guest UVM migration is not a
+valid passthrough boundary. An unprivileged QEMU process cannot reliably know
+whether a UVM page is currently resident in host CPU memory or host GPU memory,
+and QEMU is not the recipient of the host NVIDIA driver's GPU-fault/migration
+interrupts. Therefore the guest driver's UVM state must be steered so UVM ranges
+are guest-visible as system-memory/host-RAM resident. When the guest GPU wants
+access, Mode-2 maps the corresponding guest-RAM GPA pages into the host context
+VAS at the same GPU VA using the unprivileged host ioctl path. Host-side page
+faults and migration are then entirely the host NVIDIA kernel's problem.
+
+This means:
+
+- QEMU records UVM external ranges as GPU-VA ranges plus RM/UVM identity and
+  backing GPA/GPGA facts, not as guest process VAs to dereference.
+- The host channel executes CE/GR work. QEMU may parse pushbuffers for bring-up
+  diagnostics, but it must not emulate CE/GR data movement in the production path.
+- If the host driver migrates a page for GPU access, the guest is not notified.
+  Later CPU access by the guest reaches the same guest-RAM GPA through KVM; any
+  host-side migration/fault handling must be resolved below QEMU by the host
+  kernel and its UVM state.
+- CR3 is only an isolate/process key. Treat the address space it names as opaque;
+  do not use CR3 as permission to interpret guest userspace mappings.
+
 ## Build order
 
 1. Stand up the forward backend in gpu_emul (isolate/handle/mmap from VirtIONvgpu) — M5.0.
