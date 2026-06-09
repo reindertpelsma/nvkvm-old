@@ -31,14 +31,24 @@ Current broad compute status:
 
 - The 4-byte `cup2_pause` UVM proof still passes with the normal service-interrupt mask, no
   `LD_PRELOAD`, and no `NVUVM_SHADOW`, using the debug guest-kernel UVM bridge.
-- A direct CUDA-driver repro, `scripts/mode2_diag/ctx_probe.c`, now passes in the guest when the
-  debug guest-kernel UVM bridge is loaded before the CUDA process. The passing run prints
-  `ok cuInit(0)`, `ok cuDeviceGet(&d, 0)`, `ok cuCtxCreate(&ctx, 0, d)`, and `CTX OK`.
-- This run validates that the latest local event/host completion work gets libcuda through the
-  native second OS-event group (`0x30000001`, `0x30000003`, `0x30000004`, `0x30000002`) instead of
-  looping forever on the first event group.
-- `matmul_pause 64` is the next target. It has not been re-run after the `ctx_probe` pass in this
-  checkpoint.
+- A previous direct CUDA-driver repro, `scripts/mode2_diag/ctx_probe.c minimal`, passed in the guest
+  with the debug UVM bridge loaded. Treat that as a narrow completion proof, not as broad
+  `cuCtxCreate` coverage.
+- The current fresh-boot `ctx_probe full` run times out in `cuCtxCreate` after device query and
+  `cuDeviceTotalMem`. The syscall trace loops on `NV2080_CTRL_CMD_MC_SERVICE_INTERRUPTS`
+  (`0x20801702`) with returned content `ffffffff`.
+- The latest local event/host completion diagnostics are active: duplicate local event posts remain
+  suppressed, but a duplicate real local completion now re-arms the one-shot
+  `MC_SERVICE_INTERRUPTS -> 0` bridge. QEMU logs show `service-zero rearmed` and then one local and
+  one host `SERVICE_ZERO` consumption. That is not sufficient for `ctx_probe full`.
+- A fresh-boot `NVKVM_M2_EVENT34_MASK=0` experiment forces the host completion events through the
+  0x3c direct POST_EVENT path. QEMU posts 0x3c events/tokens, but `ctx_probe full` still times out on
+  the same `0x20801702 -> ffffffff` loop. Event tag selection alone is ruled out for the current
+  ctx blocker.
+- `matmul_pause 8` previously reached `cuLaunchKernel` and then timed out in `cuCtxSynchronize`,
+  with QEMU logging plausible host-ring output words for C. After the latest selftest gate/CVAS
+  routing changes, revalidate `ctx_probe minimal`, `ctx_probe full`, and then `matmul_pause 8` from
+  separate fresh boots before chasing matmul output again.
 - `NVKVM_M2_SERVICE_INTERRUPTS_ZERO=1` was tried as a diagnostic and made the path worse; it is not a
   fix.
 - `NVKVM_M2_POST_EVENT_PACKED_DATA=1` was tried as a diagnostic. It did not make `cuCtxCreate`
@@ -66,11 +76,16 @@ Clean passing `ctx_probe minimal` trace fingerprint:
   up` and an `osinit.c:2363` assert. Treat those as follow-up unless they block matmul.
 
 Active lead after this checkpoint: run `matmul_pause 64` from a fresh VM boot with the debug UVM
-bridge loaded. If it fails, compare the guest syscall/MMAP/poll trace to a native host run using the
-same `libcuda` and test binary. For Mode-2 production, keep the UVM rule strict: QEMU must not read
-guest userspace VAs; `/tmp/m2_pbmap.txt`, pagemap export, and the uprobe bridge are debug-only.
-Production should consume GPA/GPGA/GR-VA state and host RM mappings, with CR3 only as an opaque
-isolate identity.
+bridge loaded only after the `ctx_probe full` regression is understood. First compare fresh-boot
+`ctx_probe minimal` and `ctx_probe full`; if minimal still passes and full fails, diff the extra
+device-query/full-preamble RM/MMAP/poll traffic against a native host run using the same `libcuda`
+and test binary. The visible current suspects are forwarded `PROMOTE_CTX` failures (`st=0x1b`),
+high-UVM forwarded mappings that still fall back to local/debug backing, and hidden side effects from
+the now-gated mapdma/osdesc selftests.
+
+For Mode-2 production, keep the UVM rule strict: QEMU must not read guest userspace VAs;
+`/tmp/m2_pbmap.txt`, pagemap export, and the uprobe bridge are debug-only. Production should consume
+GPA/GPGA/GR-VA state and host RM mappings, with CR3 only as an opaque isolate identity.
 
 ## 1. 4-Byte UVM Proof Status
 
@@ -96,9 +111,11 @@ CE rv=0xabcd1234 want=0xabcd1234 -> PASS
 DONE
 ```
 
-The important reframe: the old active blocker was `cuCtxCreate` crashing after `c7c0`. That is no
-longer the current blocker. With the live `m2pbmap` bridge, `cuCtxCreate` gets through and the next
-real blocker is UVM external-allocation backing for CE data movement.
+The important reframe: the old active blocker was `cuCtxCreate` crashing after `c7c0`. That crash is
+not the current signature. The narrow bridge-backed `cup2_pause`/`ctx_probe minimal` path can get
+through `cuCtxCreate`, but `ctx_probe full` currently times out in `cuCtxCreate` on the
+`MC_SERVICE_INTERRUPTS` poll path. Do not treat general `cuCtxCreate` as solved until `full` passes
+from a fresh boot.
 
 Before the uprobe bridge, a no-shadow control run narrowed the final DtoH failure to:
 
@@ -190,6 +207,17 @@ Tracked local changes:
     legacy/default mapper.
   - M8.107: suppresses duplicate local completion posts for the same work-submit token and OS-event
     set. This is the change that made the bridge-backed `ctx_probe minimal` run return `CTX OK`.
+  - M8.108/M8.31 diagnostics: optionally force one `MC_SERVICE_INTERRUPTS` zero result after local
+    and/or host completion delivery. Use `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_LOCAL`,
+    `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_HOST`, or
+    `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_COMPLETION`; the default host budget is one and can be
+    capped with `NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET`.
+  - M8.112: gates the old mapdma/osdesc sentinel selftests behind
+    `NVKVM_M2_RUN_MAPDMA_SELFTEST=1`. They were diagnostic probes after `0xc7c0`, not production
+    mapping work.
+  - M8.113: routes CVAS creation and UVM/working-set maps through the active CVAS host device handle
+    instead of always picking the first forwarded device for the RM client. This prevents maps for a
+    guest TSG from silently landing under the wrong host `hDev`.
 
 - `scripts/mode2_diag/nvkvm_uvm_uprobe_bridge.c`
   - Guest kernel debug module.
@@ -229,8 +257,11 @@ backing is the missing piece.
 
 ## 4. What Is Ruled Out
 
-- The old `c7c0` / rbp SIGSEGV line is no longer the live failure. `cuCtxCreate` now completes on
-  the current branch.
+- The old `c7c0` / rbp SIGSEGV line is no longer the live failure. The current failing full-ctx
+  signature is a timeout in `MC_SERVICE_INTERRUPTS` polling, not a libcuda SIGSEGV.
+- The 0x34-vs-0x3c host completion event tag is not sufficient to explain the current full-ctx
+  timeout. Forcing `NVKVM_M2_EVENT34_MASK=0` posts 0x3c events and still loops on
+  `0x20801702 -> ffffffff`.
 - The NV0000 gpuId divergence and `0x20800102` high bit lead were already mostly ruled out after
   root-slot `addr=0x7` and response normalization.
 - The final DtoH mismatch was not a destination staging problem. `/dev/zero` and command-window pbmap
@@ -256,16 +287,22 @@ Concrete path:
    an invitation for QEMU to read the guest process address space.
 2. Ensure guest-visible UVM residency is system-memory/host-RAM resident. In-guest UVM migration is
    not a valid Mode-2 boundary because unprivileged QEMU cannot observe host GPU-vs-CPU residency and
-   does not receive the host NVIDIA driver's migration interrupts.
+   does not receive the host NVIDIA driver's migration interrupts. The guest may believe the page is
+   sysmem-resident while the host NVIDIA kernel migrates it for GPU access; a later guest CPU access
+   should resolve through the same GPA and host-side UVM/fault handling, not through a QEMU
+   userspace-VA read.
 3. For UVM sysmem leaves, map the guest-RAM GPA backing into the owning host isolate/context VAS at
    the same GPU VA using OS_DESCRIPTOR/RM_MAP_MEMORY_DMA, as in Mode 1. For GPGA leaves, use the GPGA
    range table and host-backed `gpu_memory_object`.
 4. Let the host NVIDIA kernel own any later GPU faults and page migration. If the host migrates a
    page for GPU access, the guest is not notified; a later guest CPU access reaches the same GPA
    through KVM and must be resolved by host-side UVM/fault handling below QEMU.
-5. Remove or hard-gate the local CE copy parser from the production path. Host CE/GR work should run
+5. Treat `/tmp/m2_pbmap.txt` and its `/dev/zero` staging rows as debug-only. Those rows are a
+   proc/pagemap-derived way to locate anonymous CUDA staging pages during bring-up; they are not a
+   production data source and do not justify reading guest userspace VAs from QEMU.
+6. Remove or hard-gate the local CE copy parser from the production path. Host CE/GR work should run
    on the host channel; QEMU parsing is bring-up diagnostics only.
-6. Investigate the remaining high-UVM CE packets that still cause host `dmaAllocMapping_GM107` spam
+7. Investigate the remaining high-UVM CE packets that still cause host `dmaAllocMapping_GM107` spam
    and Xid 32. They are not required for the 4-byte debug PASS, but they are not production-clean.
 
 ## 6. Repro Recipe

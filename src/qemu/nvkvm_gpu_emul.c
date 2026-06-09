@@ -343,6 +343,11 @@ struct NvkvmGpuEmul {
     uint32_t m2_local_completion_posted_token;   /* M8.107: last local token posted to current os-event set */
     bool     m2_local_completion_posted_valid;
     int      m2_local_completion_posted_osevent_n;
+    bool     m2_local_completion_service_zero_pending;
+    uint32_t m2_local_completion_service_zero_token;
+    bool     m2_host_completion_service_zero_pending;
+    uint32_t m2_host_completion_service_zero_token;
+    uint32_t m2_host_completion_service_zero_budget;
     bool     gsp_swgen0_pending;                 /* GSP falcon IRQSTAT SWGEN0 latched */
     /* VAS root page-dir bases snooped from VASPACE_COPY_SERVER_RESERVED_PDES
      * (0x90f10106): levels[0].physAddress roots the WHOLE VAS (the params' VA
@@ -1451,6 +1456,122 @@ static bool nvkvm_m2_service_interrupts_zero(void)
     return zero;
 }
 
+static bool nvkvm_m2_run_mapdma_selftests(void)
+{
+    static bool init;
+    static bool enabled;
+
+    if (!init) {
+        const char *env = getenv("NVKVM_M2_RUN_MAPDMA_SELFTEST");
+        enabled = env && *env && strcmp(env, "0") != 0;
+        init = true;
+    }
+    return enabled;
+}
+
+static bool nvkvm_m2_service_interrupts_zero_after_local(void)
+{
+    static bool init;
+    static bool zero;
+
+    if (!init) {
+        const char *env = getenv("NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_COMPLETION");
+        if (!env) {
+            env = getenv("NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_LOCAL");
+        }
+        zero = env && *env && strcmp(env, "0") != 0;
+        init = true;
+    }
+    return zero;
+}
+
+static bool nvkvm_m2_service_interrupts_zero_after_host(void)
+{
+    static bool init;
+    static bool zero;
+
+    if (!init) {
+        const char *env = getenv("NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_COMPLETION");
+        if (!env) {
+            env = getenv("NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_HOST");
+        }
+        zero = env && *env && strcmp(env, "0") != 0;
+        init = true;
+    }
+    return zero;
+}
+
+static uint32_t nvkvm_m2_service_interrupts_host_zero_budget(void)
+{
+    static bool init;
+    static uint32_t budget = 1;
+
+    if (!init) {
+        const char *env = getenv("NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET");
+        if (env && *env) {
+            char *end = NULL;
+            unsigned long val = strtoul(env, &end, 0);
+            if (end && *end == '\0' && val <= 1024ul) {
+                budget = (uint32_t)val;
+            }
+        }
+        init = true;
+    }
+    return budget;
+}
+
+static void nvkvm_m2_arm_local_completion_service_zero(NvkvmGpuEmul *s,
+                                                       uint32_t token)
+{
+    s->m2_local_completion_service_zero_pending = true;
+    s->m2_local_completion_service_zero_token = token;
+}
+
+static void nvkvm_m2_arm_host_completion_service_zero(NvkvmGpuEmul *s,
+                                                      uint32_t token)
+{
+    uint32_t budget = nvkvm_m2_service_interrupts_host_zero_budget();
+
+    s->m2_host_completion_service_zero_pending = budget > 0;
+    s->m2_host_completion_service_zero_token = token;
+    if (s->m2_host_completion_service_zero_budget < budget) {
+        s->m2_host_completion_service_zero_budget = budget;
+    }
+}
+
+static bool nvkvm_m2_take_completion_service_zero(NvkvmGpuEmul *s,
+                                                  uint32_t *token,
+                                                  const char **source)
+{
+    if (nvkvm_m2_service_interrupts_zero_after_local() &&
+        s->m2_local_completion_service_zero_pending) {
+        s->m2_local_completion_service_zero_pending = false;
+        if (token) {
+            *token = s->m2_local_completion_service_zero_token;
+        }
+        if (source) {
+            *source = "local";
+        }
+        return true;
+    }
+    if (nvkvm_m2_service_interrupts_zero_after_host() &&
+        s->m2_host_completion_service_zero_pending &&
+        s->m2_host_completion_service_zero_budget > 0) {
+        s->m2_host_completion_service_zero_budget--;
+        if (s->m2_host_completion_service_zero_budget == 0) {
+            s->m2_host_completion_service_zero_pending = false;
+        }
+        if (token) {
+            *token = s->m2_host_completion_service_zero_token;
+        }
+        if (source) {
+            *source = "host";
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool nvkvm_m2_broad_notify_block(void)
 {
     static bool init;
@@ -1822,9 +1943,13 @@ static void nvkvm_m2_try_deliver_host_completion(NvkvmGpuEmul *s,
                      nvkvm_m2_host_completion_count(s),
                      token_valid ? "" : "!", token);
         }
-        if (nvkvm_gsp_deliver_events(s, token, token_valid,
-                                     NVKVM_M2_EVENT_HOST_GR) <= 0) {
+        int posted = nvkvm_gsp_deliver_events(s, token, token_valid,
+                                              NVKVM_M2_EVENT_HOST_GR);
+        if (posted <= 0) {
             return;
+        }
+        if (token_valid) {
+            nvkvm_m2_arm_host_completion_service_zero(s, token);
         }
         s->m2_host_completion_head =
             (s->m2_host_completion_head + 1u) % NVKVM_M2_HOST_COMPLETION_Q;
@@ -1842,9 +1967,18 @@ static void nvkvm_m2_try_deliver_local_completion(NvkvmGpuEmul *s,
         s->m2_local_completion_token == s->m2_local_completion_posted_token &&
         s->osevent_n <= s->m2_local_completion_posted_osevent_n) {
         static uint32_t dup_logs;
+        /*
+         * Do not post another GSP event for the same CUDA work-submit token;
+         * that can overflow the shared status queue.  Still arm the diagnostic
+         * service-zero bridge once per real local completion so the guest's
+         * MC_SERVICE_INTERRUPTS poll can observe semaphore progress.
+         */
+        nvkvm_m2_arm_local_completion_service_zero(
+            s, s->m2_local_completion_token);
         if (s->trace && dup_logs++ < 128) {
             qemu_log("nvkvm-gpu[%s] M8.107 LOCAL_EVENT skip duplicate "
-                     "via %s token=0x%08x osevents=%d posted_osevents=%d\n",
+                     "via %s token=0x%08x osevents=%d posted_osevents=%d "
+                     "service-zero rearmed\n",
                      s->chip->name, why ? why : "?",
                      s->m2_local_completion_token, s->osevent_n,
                      s->m2_local_completion_posted_osevent_n);
@@ -1886,6 +2020,7 @@ static void nvkvm_m2_try_deliver_local_completion(NvkvmGpuEmul *s,
             s->m2_local_completion_posted_token = token;
             s->m2_local_completion_posted_valid = true;
             s->m2_local_completion_posted_osevent_n = s->osevent_n;
+            nvkvm_m2_arm_local_completion_service_zero(s, token);
         }
         s->m2_local_completion_pending = false;
         s->m2_local_completion_token_valid = false;
@@ -2089,7 +2224,8 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
                                   uint32_t *st); /* M6.2 fwd-decl */
 static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
 static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client); /* M5.7 fwd-decl */
-static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg); /* M5.28 fwd-decl */
+static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg,
+                             uint32_t hDev_hint); /* M5.28 fwd-decl */
 static void nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c); /* M5.28 fwd-decl */
 static int nvkvm_m2_map_dma(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
                             uint32_t hVas, uint32_t hMemory, uint64_t offset,
@@ -2503,6 +2639,9 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     int rc = -1;
                     uint8_t cbuf[4] = {0};
                     uint32_t cn = ps < sizeof(cbuf) ? ps : (uint32_t)sizeof(cbuf);
+                    bool zero_after_completion = false;
+                    uint32_t zero_token = 0;
+                    const char *zero_source = NULL;
                     if (cn) {
                         memcpy(cbuf, resp + 120, cn);
                     }
@@ -2521,7 +2660,10 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                          * forces an all-zero serviced mask as a diagnostic for
                          * the cuCtxSynchronize poll path.
                          */
-                        if (nvkvm_m2_service_interrupts_zero() && cn) {
+                        zero_after_completion =
+                            nvkvm_m2_take_completion_service_zero(s, &zero_token,
+                                                                  &zero_source);
+                        if ((nvkvm_m2_service_interrupts_zero() || zero_after_completion) && cn) {
                             memset(cbuf, 0, cn);
                         }
                         rc = 0;
@@ -2544,10 +2686,26 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                                      ps >= 4 ? ldl_le_p(resp + 120) : 0, ps, rc, st,
                                      guest_only ?
                                      (nvkvm_m2_service_interrupts_zero() ?
-                                      "  GUEST-ONLY-ZERO" : "  GUEST-ONLY-MASK") : "",
+                                      "  GUEST-ONLY-ZERO" :
+                                      (zero_after_completion ?
+                                       (zero_source && strcmp(zero_source, "host") == 0 ?
+                                        "  GUEST-ONLY-HOST-ZERO" :
+                                        "  GUEST-ONLY-LOCAL-ZERO") :
+                                       "  GUEST-ONLY-MASK")) : "",
                                      (!guest_only && rc == 0 && st == 0) ? "  HOST-SERVICED" :
                                      (!guest_only ? "  guest-visible OK fallback" : ""),
                                      log_idx + 1);
+                        }
+                        if (s->trace && zero_after_completion) {
+                            qemu_log("nvkvm-gpu[%s] M8.31 SERVICE_ZERO source=%s "
+                                     "token=0x%08x pending_local=%d "
+                                     "pending_host=%d host_budget=%u\n",
+                                     s->chip->name,
+                                     zero_source ? zero_source : "completion",
+                                     zero_token,
+                                     s->m2_local_completion_service_zero_pending ? 1 : 0,
+                                     s->m2_host_completion_service_zero_pending ? 1 : 0,
+                                     s->m2_host_completion_service_zero_budget);
                         }
                     }
                     /* M8.11/M8.30: cuCtxCreate now loops through SERVICE_INTERRUPTS after the
@@ -6263,7 +6421,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
          * guest driver relies on; faulted -> PMC_BOOT_0 reset spin). Copy-channel collisions
          * (18, no Xid) need a different approach. */
         if (engine == 1u) {
-            int ci = nvkvm_m2_cvas_get(s, hClient, hObject);
+            int ci = nvkvm_m2_cvas_get(s, hClient, hObject, hParent);
             if (ci >= 0) {
                 stl_le_p(auxbuf + 8, s->m2_cvas[ci].fvas);
                 qemu_log("nvkvm-gpu[%s] M5.28 a06c GR TSG hVASpace 0x%08x -> 0x%08x "
@@ -6517,8 +6675,14 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
          * irreducible step for forwarding the guest's working set into the host VAS. */
         if (!s->m2_mapdma_tested) {
             s->m2_mapdma_tested = true;
-            nvkvm_m2_mapdma_selftest(s, hClient);
-            nvkvm_m2_osdesc_selftest(s, hClient);   /* M6.2: OS_DESCRIPTOR guest RAM (item-4 step 3) */
+            if (nvkvm_m2_run_mapdma_selftests()) {
+                nvkvm_m2_mapdma_selftest(s, hClient);
+                nvkvm_m2_osdesc_selftest(s, hClient);   /* M6.2: OS_DESCRIPTOR guest RAM (item-4 step 3) */
+            } else {
+                qemu_log("nvkvm-gpu[%s] M8.112 skip mapdma/osdesc selftests "
+                         "after 0xc7c0 (set NVKVM_M2_RUN_MAPDMA_SELFTEST=1 "
+                         "to re-enable diagnostics)\n", s->chip->name);
+            }
         }
         /* M6.5 (item-4 step 4): DISCOVERY sweep — walk the GR VAS page tables, enumerate every
          * sysmem leaf, and OS_DESCRIPTOR+map_dma each into the host GR VASpace so the host GPU
@@ -7041,15 +7205,18 @@ static int nvkvm_m2_alloc_virtmem(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hD
  * here (m2_cur_cvas) instead of the guest's forwarded VAS — so every guest VA places into a
  * VAS WE fully control, killing the host-RM-self-promote collision (st=0x51 / Xid 32).
  * Returns index into m2_cvas[], or -1. */
-static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg)
+static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg,
+                             uint32_t hDev_hint)
 {
     for (int i = 0; i < s->m2_cvas_n; i++) {
         if (s->m2_cvas[i].client == client && s->m2_cvas[i].tsg == tsg) { return i; }
     }
     if (s->m2_cvas_n >= 16) { return -1; }
-    uint32_t hDev = 0;
-    for (int i = 0; i < s->m2_devvas_n; i++) {
-        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+    uint32_t hDev = hDev_hint;
+    if (!hDev) {
+        for (int i = 0; i < s->m2_devvas_n; i++) {
+            if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+        }
     }
     if (!hDev) {
         qemu_log("nvkvm-gpu[%s] M5.28 cvas_get: no forwarded device for client 0x%08x\n",
@@ -7077,6 +7244,25 @@ static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg)
     s->m2_cvas[idx].fvirt     = fVirt;
     s->m2_cvas[idx].populated = false;
     return idx;
+}
+
+static uint32_t nvkvm_m2_active_hdev(NvkvmGpuEmul *s, uint32_t client)
+{
+    if (s->m2_cur_cvas >= 0 && s->m2_cur_cvas < s->m2_cvas_n &&
+        s->m2_cvas[s->m2_cur_cvas].client == client) {
+        return s->m2_cvas[s->m2_cur_cvas].hdev;
+    }
+    for (int i = 0; i < s->m2_grmap_n; i++) {
+        if (s->m2_grmap[i].client == client && s->m2_grmap[i].hdev) {
+            return s->m2_grmap[i].hdev;
+        }
+    }
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == client) {
+            return s->m2_devvas[i].dev;
+        }
+    }
+    return 0;
 }
 
 /* M5.7 EXECUTION PLANE: get (allocating once) the NV01_MEMORY_VIRTUAL mapper spanning a
@@ -7170,19 +7356,7 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     if (!hVirt) {
         return false;
     }
-    uint32_t hDev = 0;
-    if (s->m2_cur_cvas >= 0 && s->m2_cur_cvas < s->m2_cvas_n &&
-        s->m2_cvas[s->m2_cur_cvas].client == client) {
-        hDev = s->m2_cvas[s->m2_cur_cvas].hdev;
-    }
-    if (!hDev) {
-        for (int i = 0; i < s->m2_grmap_n; i++) {
-            if (s->m2_grmap[i].client == client) {
-                hDev = s->m2_grmap[i].hdev;
-                break;
-            }
-        }
-    }
+    uint32_t hDev = nvkvm_m2_active_hdev(s, client);
     uint64_t map_va = va & ~0xffffull;
     uint64_t va_delta = va - map_va;
     uint64_t asize = (va_delta + size + 0xffffull) & ~0xffffull;
@@ -8553,13 +8727,7 @@ static bool nvkvm_m2_uvm_ext_ensure_obj(NvkvmGpuEmul *s, uint32_t client, int id
         }
         return false;
     }
-    uint32_t hDev = 0;
-    for (int i = 0; i < s->m2_devvas_n; i++) {
-        if (s->m2_devvas[i].client == client) {
-            hDev = s->m2_devvas[i].dev;
-            break;
-        }
-    }
+    uint32_t hDev = nvkvm_m2_active_hdev(s, client);
     if (!hDev) {
         if (nvkvm_m2_uvm_ext_trace_range(s->m2_uvm_ext[idx].va,
                                          s->m2_uvm_ext[idx].size)) {
@@ -8588,13 +8756,7 @@ static bool nvkvm_m2_uvm_ext_ensure_obj(NvkvmGpuEmul *s, uint32_t client, int id
 
     if (hMem && s->m2_uvm_ext[idx].hClient &&
         s->m2_uvm_ext[idx].hClient != client) {
-        hMemDev = 0;
-        for (int i = 0; i < s->m2_devvas_n; i++) {
-            if (s->m2_devvas[i].client == s->m2_uvm_ext[idx].hClient) {
-                hMemDev = s->m2_devvas[i].dev;
-                break;
-            }
-        }
+        hMemDev = nvkvm_m2_active_hdev(s, s->m2_uvm_ext[idx].hClient);
     }
 
     if (hMem && hMemDev) {
@@ -8731,7 +8893,8 @@ static bool nvkvm_m2_uvm_ext_map_one(NvkvmGpuEmul *s, uint32_t client, int idx,
         return true;
     }
     int cvas = s->m2_cur_cvas;
-    if (cvas < 0 || cvas >= 16) {
+    if (cvas < 0 || cvas >= s->m2_cvas_n ||
+        s->m2_cvas[cvas].client != client) {
         if (nvkvm_m2_uvm_ext_trace_range(s->m2_uvm_ext[idx].va,
                                          s->m2_uvm_ext[idx].size)) {
             static uint32_t cvas_fail_logs;
@@ -8748,13 +8911,7 @@ static bool nvkvm_m2_uvm_ext_map_one(NvkvmGpuEmul *s, uint32_t client, int idx,
     if (s->m2_uvm_ext[idx].mapped_cvas_mask & (1u << cvas)) {
         return true;
     }
-    uint32_t hDev = 0;
-    for (int i = 0; i < s->m2_devvas_n; i++) {
-        if (s->m2_devvas[i].client == client) {
-            hDev = s->m2_devvas[i].dev;
-            break;
-        }
-    }
+    uint32_t hDev = nvkvm_m2_active_hdev(s, client);
     uint32_t hVirt = nvkvm_m2_grmapper(s, client);
     int oi = s->m2_uvm_ext[idx].obj_idx;
     if (!hDev || !hVirt || oi < 0 || oi >= s->m2_objs_n) {
@@ -8789,9 +8946,10 @@ static bool nvkvm_m2_uvm_ext_map_one(NvkvmGpuEmul *s, uint32_t client, int idx,
     if (s->m2_uvm_map_logs++ < 256 ||
         (high_va && high_map_logs++ < 128)) {
         qemu_log("nvkvm-gpu[%s] M8.15 UVM-EXT map VA=0x%llx size=0x%llx "
-                 "obj=%d cvas=%d hVirt=0x%08x -> rc=%d st=0x%x out=0x%llx %s\n",
+                 "obj=%d cvas=%d hDev=0x%08x hVirt=0x%08x -> rc=%d "
+                 "st=0x%x out=0x%llx %s\n",
                  s->chip->name, (unsigned long long)va, (unsigned long long)len,
-                 oi, cvas, hVirt, mrc, mst, (unsigned long long)outva,
+                 oi, cvas, hDev, hVirt, mrc, mst, (unsigned long long)outva,
                  ok ? "PLACED" : already ? "ALREADY" : "FAILED");
     }
     return ok || already;
@@ -8905,7 +9063,8 @@ static bool nvkvm_m2_uvm_ext_map_span(NvkvmGpuEmul *s, uint32_t client,
         return false;
     }
     int cvas = s->m2_cur_cvas;
-    if (cvas < 0 || cvas >= 16) {
+    if (cvas < 0 || cvas >= s->m2_cvas_n ||
+        s->m2_cvas[cvas].client != client) {
         return false;
     }
     uint64_t base = s->m2_uvm_ext[idx].va;
@@ -8921,13 +9080,7 @@ static bool nvkvm_m2_uvm_ext_map_span(NvkvmGpuEmul *s, uint32_t client,
     if (obj_end < base || req_end > obj_end) {
         return false;
     }
-    uint32_t hDev = 0;
-    for (int i = 0; i < s->m2_devvas_n; i++) {
-        if (s->m2_devvas[i].client == client) {
-            hDev = s->m2_devvas[i].dev;
-            break;
-        }
-    }
+    uint32_t hDev = nvkvm_m2_active_hdev(s, client);
     uint32_t hVirt = nvkvm_m2_grmapper(s, client);
     if (!hDev || !hVirt) {
         return false;
@@ -8964,10 +9117,10 @@ static bool nvkvm_m2_uvm_ext_map_span(NvkvmGpuEmul *s, uint32_t client,
         if (fail_logs++ < 128) {
             qemu_log("nvkvm-gpu[%s] M8.25 UVM-EXT span map FAIL %s "
                      "VA=0x%llx chunk=0x%llx idx=%d obj=%d cvas=%d "
-                     "hVirt=0x%08x rc=%d st=0x%x out=0x%llx\n",
+                     "hDev=0x%08x hVirt=0x%08x rc=%d st=0x%x out=0x%llx\n",
                      s->chip->name, why ? why : "span",
                      (unsigned long long)va, (unsigned long long)cur,
-                     idx, oi, cvas, hVirt, mrc, mst,
+                     idx, oi, cvas, hDev, hVirt, mrc, mst,
                      (unsigned long long)outva);
         }
         return false;
@@ -8979,11 +9132,12 @@ static bool nvkvm_m2_uvm_ext_map_span(NvkvmGpuEmul *s, uint32_t client,
     if (span_logs++ < 256 || (high_va && high_span_logs++ < 128)) {
         qemu_log("nvkvm-gpu[%s] M8.25 UVM-EXT span map %s "
                  "VA=0x%llx size=0x%llx span=0x%llx..0x%llx "
-                 "idx=%d obj=%d cvas=%d hVirt=0x%08x mapped=%d already=%d\n",
+                 "idx=%d obj=%d cvas=%d hDev=0x%08x hVirt=0x%08x "
+                 "mapped=%d already=%d\n",
                  s->chip->name, why ? why : "span",
                  (unsigned long long)va, (unsigned long long)size,
                  (unsigned long long)start, (unsigned long long)end,
-                 idx, oi, cvas, hVirt, mapped, already_count);
+                 idx, oi, cvas, hDev, hVirt, mapped, already_count);
     }
     nvkvm_m2_uvm_ext_flush_span(s, idx, va, size, why);
     return true;
@@ -10748,10 +10902,7 @@ static bool nvkvm_m2_prefix_compute_set_object(NvkvmGpuEmul *s, uint64_t pb,
 static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                       uint64_t gpa, uint64_t size)
 {
-    uint32_t hDev = 0;
-    for (int i = 0; i < s->m2_devvas_n; i++) {
-        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
-    }
+    uint32_t hDev = nvkvm_m2_active_hdev(s, client);
     if (!hDev || !size) { return false; }
     uint64_t sva = nvkvm_m2_gpa_to_stub_va(s, gpa);
     if (!sva) { return false; }
@@ -10788,10 +10939,7 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     if (s->m2_objs_n >= 128 || s->m2_gpga_n >= 256) {
         return -1;
     }
-    uint32_t hDev = 0;
-    for (int i = 0; i < s->m2_devvas_n; i++) {
-        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
-    }
+    uint32_t hDev = nvkvm_m2_active_hdev(s, client);
     if (!hDev || !size) {
         return -1;
     }
