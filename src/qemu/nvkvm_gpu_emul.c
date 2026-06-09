@@ -448,6 +448,7 @@ struct NvkvmGpuEmul {
                                  * (~0=none), so the CRASHWIN probe can report the guest GPU
                                  * VA that maps to a polled FB address. */
     bool     m2_mapdma_tested;  /* M5.5: one-shot RM_MAP_MEMORY_DMA-FIXED primitive validation */
+    int      m2_legacy_gr_sysmem_primed_n; /* M8.114: va_map cursor for legacy GR sysmem prime */
     bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
     bool     m2_sem_probe_done; /* M5.13: one-shot DRY-RUN locate of the completion semaphore PDB */
     struct { uint64_t page; uint32_t reads; bool probed; } m2_hotzero[8]; /* M8.8 diag */
@@ -1532,10 +1533,16 @@ static void nvkvm_m2_arm_host_completion_service_zero(NvkvmGpuEmul *s,
 {
     uint32_t budget = nvkvm_m2_service_interrupts_host_zero_budget();
 
-    s->m2_host_completion_service_zero_pending = budget > 0;
+    if (!budget) {
+        return;
+    }
+    s->m2_host_completion_service_zero_pending = true;
     s->m2_host_completion_service_zero_token = token;
-    if (s->m2_host_completion_service_zero_budget < budget) {
-        s->m2_host_completion_service_zero_budget = budget;
+    if (s->m2_host_completion_service_zero_budget >
+        UINT32_MAX - budget) {
+        s->m2_host_completion_service_zero_budget = UINT32_MAX;
+    } else {
+        s->m2_host_completion_service_zero_budget += budget;
     }
 }
 
@@ -2223,6 +2230,8 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
                                   uint32_t hMem, uint64_t stub_va, uint64_t size,
                                   uint32_t *st); /* M6.2 fwd-decl */
 static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
+static void nvkvm_m2_prime_legacy_gr_sysmem(NvkvmGpuEmul *s,
+                                            uint32_t hClient); /* M8.114 fwd-decl */
 static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client); /* M5.7 fwd-decl */
 static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg,
                              uint32_t hDev_hint); /* M5.28 fwd-decl */
@@ -6684,6 +6693,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                          "to re-enable diagnostics)\n", s->chip->name);
             }
         }
+        nvkvm_m2_prime_legacy_gr_sysmem(s, hClient);
         /* M6.5 (item-4 step 4): DISCOVERY sweep — walk the GR VAS page tables, enumerate every
          * sysmem leaf, and OS_DESCRIPTOR+map_dma each into the host GR VASpace so the host GPU
          * can DMA into the guest's actual NVOS32-local sysmem GR buffers (the crash buffers).
@@ -7036,6 +7046,48 @@ static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient)
                          : (fst == 0x51u ? "  ALREADY-MAPPED (pick another VA)" : "  <-- ERR"));
         }
     }
+}
+
+/* M8.114: production version of the one useful osdesc-selftest side effect.
+ * PROMOTE_CTX can describe sysmem context buffers under sibling RM clients that
+ * still need to be host-visible through the GR compute client's legacy VAS.
+ * Map newly snooped va_map sysmem ranges there using OS_DESCRIPTOR, without the
+ * private mapdma P1/P2 validation probes. */
+static void nvkvm_m2_prime_legacy_gr_sysmem(NvkvmGpuEmul *s, uint32_t hClient)
+{
+    if (!s->m2exec) {
+        return;
+    }
+    if (s->m2_legacy_gr_sysmem_primed_n < 0 ||
+        s->m2_legacy_gr_sysmem_primed_n > s->va_map_n) {
+        s->m2_legacy_gr_sysmem_primed_n = 0;
+    }
+
+    int old_cvas = s->m2_cur_cvas;
+    s->m2_cur_cvas = -1;          /* force the legacy per-client GR VAS */
+    uint32_t hVirt = nvkvm_m2_grmapper(s, hClient);
+    int mapped = 0;
+    int sys = 0;
+
+    if (hVirt) {
+        for (int i = s->m2_legacy_gr_sysmem_primed_n; i < s->va_map_n; i++) {
+            struct nvkvm_va_map *m = &s->va_map[i];
+            if (!m->sys || !m->size) {
+                continue;
+            }
+            sys++;
+            if (nvkvm_m2_back_and_map_sys(s, hClient, m->va, m->phys, m->size)) {
+                mapped++;
+            }
+        }
+        s->m2_legacy_gr_sysmem_primed_n = s->va_map_n;
+    }
+
+    qemu_log("nvkvm-gpu[%s] M8.114 legacy GR sysmem prime client=0x%08x "
+             "hVirt=0x%08x scanned=%d sys=%d mapped=%d next=%d\n",
+             s->chip->name, hClient, hVirt, s->va_map_n, sys, mapped,
+             s->m2_legacy_gr_sysmem_primed_n);
+    s->m2_cur_cvas = old_cvas;
 }
 
 /* M6.4 (item-4): forward the guest's PROMOTE_CTX to the host with each sysmem buffer's
@@ -7979,6 +8031,16 @@ static void nvkvm_m2_ring_host_channel(NvkvmGpuEmul *s, int ch_index,
 static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client)
 {
     if (s->m2_doorbell_ready || !s->m2_gr_channel) {
+        return;
+    }
+    /*
+     * The old mapdma/osdesc selftest used to allocate the per-client GR mapper as
+     * a side effect.  Doorbell setup is the production dependency: it needs the
+     * owning host hDev for AMPERE_USERMODE_A and must not rely on diagnostics.
+     */
+    if (!nvkvm_m2_grmapper(s, client)) {
+        qemu_log("nvkvm-gpu[%s] M5.8 doorbell: grmapper setup failed for "
+                 "client 0x%08x\n", s->chip->name, client);
         return;
     }
     uint32_t hDev = 0, subdev = 0;

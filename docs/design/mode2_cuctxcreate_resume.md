@@ -31,24 +31,39 @@ Current broad compute status:
 
 - The 4-byte `cup2_pause` UVM proof still passes with the normal service-interrupt mask, no
   `LD_PRELOAD`, and no `NVUVM_SHADOW`, using the debug guest-kernel UVM bridge.
-- A previous direct CUDA-driver repro, `scripts/mode2_diag/ctx_probe.c minimal`, passed in the guest
-  with the debug UVM bridge loaded. Treat that as a narrow completion proof, not as broad
-  `cuCtxCreate` coverage.
-- The current fresh-boot `ctx_probe full` run times out in `cuCtxCreate` after device query and
-  `cuDeviceTotalMem`. The syscall trace loops on `NV2080_CTRL_CMD_MC_SERVICE_INTERRUPTS`
+- Fresh-boot `scripts/mode2_diag/ctx_probe.c minimal` and `ctx_probe full` both pass in the guest
+  with the debug UVM bridge loaded, default service-interrupt settings, and
+  `NVKVM_M2_RUN_MAPDMA_SELFTEST` left off. The current `ctx_probe full` proof returns through
+  `cuDeviceTotalMem` and `cuCtxCreate`:
+
+```text
+ok   cuDeviceTotalMem(&total, d)
+totalMem=11909 MiB
+ok   cuCtxCreate(&ctx, 0, d)
+CTX OK
+```
+
+- The previous `ctx_probe full` blocker was a timeout in `cuCtxCreate` after device query and
+  `cuDeviceTotalMem`. The syscall trace looped on `NV2080_CTRL_CMD_MC_SERVICE_INTERRUPTS`
   (`0x20801702`) with returned content `ffffffff`.
-- The latest local event/host completion diagnostics are active: duplicate local event posts remain
-  suppressed, but a duplicate real local completion now re-arms the one-shot
-  `MC_SERVICE_INTERRUPTS -> 0` bridge. QEMU logs show `service-zero rearmed` and then one local and
-  one host `SERVICE_ZERO` consumption. That is not sufficient for `ctx_probe full`.
-- A fresh-boot `NVKVM_M2_EVENT34_MASK=0` experiment forces the host completion events through the
-  0x3c direct POST_EVENT path. QEMU posts 0x3c events/tokens, but `ctx_probe full` still times out on
-  the same `0x20801702 -> ffffffff` loop. Event tag selection alone is ruled out for the current
-  ctx blocker.
+- Root cause of that full-ctx timeout was missing completion-drain credits after a burst of host
+  completions. A diagnostic fresh boot with
+  `NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET=16` made `ctx_probe full` pass. The code now
+  accumulates the host zero-service budget per delivered host completion, so the default path passes
+  without the override.
+- Gating the old mapdma/osdesc selftests exposed two production dependencies that used to happen as
+  diagnostic side effects: doorbell setup needed the per-client GR mapper, and legacy per-client GR
+  VAS still needed sysmem context buffers mapped there. The current code explicitly creates the GR
+  mapper during doorbell setup and runs `M8.114 legacy GR sysmem prime` over newly snooped sysmem
+  `va_map` rows without running the old sentinel selftests.
+- A fresh-boot `NVKVM_M2_EVENT34_MASK=0` experiment forced host completion events through the 0x3c
+  direct POST_EVENT path. QEMU posted 0x3c events/tokens, but `ctx_probe full` still timed out on the
+  same `0x20801702 -> ffffffff` loop. Event tag selection alone is ruled out for the old ctx
+  blocker.
 - `matmul_pause 8` previously reached `cuLaunchKernel` and then timed out in `cuCtxSynchronize`,
   with QEMU logging plausible host-ring output words for C. After the latest selftest gate/CVAS
-  routing changes, revalidate `ctx_probe minimal`, `ctx_probe full`, and then `matmul_pause 8` from
-  separate fresh boots before chasing matmul output again.
+  routing and ctx-completion changes, the next target is a fresh-boot `matmul_pause 8`, then
+  `matmul_pause 64`, then a real small LLM workload.
 - `NVKVM_M2_SERVICE_INTERRUPTS_ZERO=1` was tried as a diagnostic and made the path worse; it is not a
   fix.
 - `NVKVM_M2_POST_EVENT_PACKED_DATA=1` was tried as a diagnostic. It did not make `cuCtxCreate`
@@ -75,13 +90,13 @@ Clean passing `ctx_probe minimal` trace fingerprint:
   including `kgspExecuteBooterUnloadIfNeeded_TU102: failed to execute Booter Unload: WPR2 is still
   up` and an `osinit.c:2363` assert. Treat those as follow-up unless they block matmul.
 
-Active lead after this checkpoint: run `matmul_pause 64` from a fresh VM boot with the debug UVM
-bridge loaded only after the `ctx_probe full` regression is understood. First compare fresh-boot
-`ctx_probe minimal` and `ctx_probe full`; if minimal still passes and full fails, diff the extra
-device-query/full-preamble RM/MMAP/poll traffic against a native host run using the same `libcuda`
-and test binary. The visible current suspects are forwarded `PROMOTE_CTX` failures (`st=0x1b`),
-high-UVM forwarded mappings that still fall back to local/debug backing, and hidden side effects from
-the now-gated mapdma/osdesc selftests.
+Active lead after this checkpoint: run `matmul_pause 8` from a fresh VM boot with the debug UVM
+bridge loaded, then scale to `matmul_pause 64`, then a real small LLM workload. If matmul fails,
+compare the full host run to the guest run using the same `libcuda` and test binary, including
+non-ioctl syscalls (`mmap`, `poll`, BAR/userd mappings), not only RM ioctls. The visible current
+suspects are forwarded `PROMOTE_CTX` failures (`st=0x1b`), high-UVM forwarded mappings that still
+fall back to local/debug backing, and residual host `dmaAllocMapping_GM107` / Xid 32 from high-UVM CE
+packets.
 
 For Mode-2 production, keep the UVM rule strict: QEMU must not read guest userspace VAs;
 `/tmp/m2_pbmap.txt`, pagemap export, and the uprobe bridge are debug-only. Production should consume
@@ -112,10 +127,9 @@ DONE
 ```
 
 The important reframe: the old active blocker was `cuCtxCreate` crashing after `c7c0`. That crash is
-not the current signature. The narrow bridge-backed `cup2_pause`/`ctx_probe minimal` path can get
-through `cuCtxCreate`, but `ctx_probe full` currently times out in `cuCtxCreate` on the
-`MC_SERVICE_INTERRUPTS` poll path. Do not treat general `cuCtxCreate` as solved until `full` passes
-from a fresh boot.
+not the current signature, and fresh-boot bridge-backed `ctx_probe minimal` and `ctx_probe full` now
+both pass. Treat `cuCtxCreate` as sufficiently unblocked for the matmul loop, but not as
+production-clean until the debug UVM bridge and residual high-UVM Xid path are removed.
 
 Before the uprobe bridge, a no-shadow control run narrowed the final DtoH failure to:
 
@@ -210,14 +224,19 @@ Tracked local changes:
   - M8.108/M8.31 diagnostics: optionally force one `MC_SERVICE_INTERRUPTS` zero result after local
     and/or host completion delivery. Use `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_LOCAL`,
     `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_HOST`, or
-    `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_COMPLETION`; the default host budget is one and can be
-    capped with `NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET`.
+    `NVKVM_M2_SERVICE_INTERRUPTS_ZERO_AFTER_COMPLETION`; the default host budget is one per
+    delivered host completion and can be capped with `NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET`.
   - M8.112: gates the old mapdma/osdesc sentinel selftests behind
     `NVKVM_M2_RUN_MAPDMA_SELFTEST=1`. They were diagnostic probes after `0xc7c0`, not production
     mapping work.
   - M8.113: routes CVAS creation and UVM/working-set maps through the active CVAS host device handle
     instead of always picking the first forwarded device for the RM client. This prevents maps for a
     guest TSG from silently landing under the wrong host `hDev`.
+  - M5.8/M8.114: makes the doorbell GR mapper a production dependency instead of a mapdma-selftest
+    side effect, and primes newly snooped sysmem `va_map` rows into the legacy per-client GR VAS via
+    OS_DESCRIPTOR/RM_MAP_MEMORY_DMA. This is the production-form subset of the old osdesc selftest
+    side effect and is what lets default-path `ctx_probe minimal` keep passing with
+    `NVKVM_M2_RUN_MAPDMA_SELFTEST` left off.
 
 - `scripts/mode2_diag/nvkvm_uvm_uprobe_bridge.c`
   - Guest kernel debug module.
@@ -257,10 +276,11 @@ backing is the missing piece.
 
 ## 4. What Is Ruled Out
 
-- The old `c7c0` / rbp SIGSEGV line is no longer the live failure. The current failing full-ctx
-  signature is a timeout in `MC_SERVICE_INTERRUPTS` polling, not a libcuda SIGSEGV.
-- The 0x34-vs-0x3c host completion event tag is not sufficient to explain the current full-ctx
-  timeout. Forcing `NVKVM_M2_EVENT34_MASK=0` posts 0x3c events and still loops on
+- The old `c7c0` / rbp SIGSEGV line is no longer the live failure. The later full-ctx failure was a
+  timeout in `MC_SERVICE_INTERRUPTS` polling, not a libcuda SIGSEGV, and is now fixed on the default
+  path by counted host completion service-zero credits.
+- The 0x34-vs-0x3c host completion event tag was not sufficient to explain the old full-ctx timeout.
+  Forcing `NVKVM_M2_EVENT34_MASK=0` posted 0x3c events and still looped on
   `0x20801702 -> ffffffff`.
 - The NV0000 gpuId divergence and `0x20800102` high bit lead were already mostly ruled out after
   root-slot `addr=0x7` and response normalization.
