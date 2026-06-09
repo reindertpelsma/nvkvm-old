@@ -557,6 +557,7 @@ struct NvkvmGpuEmul {
         uint32_t client;      /* host RM client (nvkvm-tracked) */
         uint32_t hMemory;     /* host RM object handle = the 'real' backing */
         uint64_t gr_va;       /* host GR-VAS VA where map_dma'd (0=not GPU-mapped) */
+        bool     forwarded;   /* real forwarded guest RM/UVM object, not scratch */
     } m2_objs[128];
     int      m2_objs_n;
     struct {                  /* GPGA page-range -> (object, offset_in_target) */
@@ -7950,6 +7951,15 @@ static int nvkvm_m2_uvm_ext_find(NvkvmGpuEmul *s, uint64_t va, uint64_t size)
     return -1;
 }
 
+static bool nvkvm_m2_uvm_ext_is_forwarded(NvkvmGpuEmul *s, int idx)
+{
+    if (idx < 0 || idx >= s->m2_uvm_ext_n) {
+        return false;
+    }
+    int oi = s->m2_uvm_ext[idx].obj_idx;
+    return oi >= 0 && oi < s->m2_objs_n && s->m2_objs[oi].forwarded;
+}
+
 static bool nvkvm_m2_uvm_ext_lookup(NvkvmGpuEmul *s, uint64_t va, uint64_t size,
                                     uint64_t *out_phys)
 {
@@ -8287,7 +8297,15 @@ static bool nvkvm_m2_uvm_ext_ensure_obj(NvkvmGpuEmul *s, uint32_t client, int id
         }
         return false;
     }
-    memset(hm.qva, 0, obj_size);
+    /*
+     * Synthetic fallback objects are blank scratch backing owned by QEMU, but a
+     * forwarded UVM hMemory is the guest/host driver's real allocation.  Do not
+     * clear forwarded memory here; doing so erases the bytes that UVM or CE work
+     * has already placed in the backing object.
+     */
+    if (!forwarded) {
+        memset(hm.qva, 0, obj_size);
+    }
     int oi = s->m2_objs_n++;
     s->m2_objs[oi].mode = 0;
     s->m2_objs[oi].cpu_qva = hm.qva;
@@ -8295,6 +8313,7 @@ static bool nvkvm_m2_uvm_ext_ensure_obj(NvkvmGpuEmul *s, uint32_t client, int id
     s->m2_objs[oi].client = client;
     s->m2_objs[oi].hMemory = hm.h_mem;
     s->m2_objs[oi].gr_va = 0;
+    s->m2_objs[oi].forwarded = forwarded;
 
     int gi = s->m2_gpga_n++;
     s->m2_gpga[gi].gpga_base = s->m2_uvm_ext[idx].va;
@@ -8467,6 +8486,34 @@ static void nvkvm_m2_uvm_ext_flush_span(NvkvmGpuEmul *s, int idx,
     static uint32_t flush_logs;
     if (flush_logs++ < 256 || nvkvm_m2_uvm_ext_trace_range(va, size)) {
         qemu_log("nvkvm-gpu[%s] M8.65 UVM-EXT flush %s "
+                 "VA=0x%llx size=0x%llx idx=%d obj=%d qva=%p\n",
+                 s->chip->name, why ? why : "span",
+                 (unsigned long long)va, (unsigned long long)size,
+                 idx, oi, qva);
+    }
+}
+
+static void nvkvm_m2_uvm_ext_invalidate_span(NvkvmGpuEmul *s, int idx,
+                                             uint64_t va, uint64_t size,
+                                             const char *why)
+{
+    if (idx < 0 || idx >= s->m2_uvm_ext_n || !size) {
+        return;
+    }
+    int oi = s->m2_uvm_ext[idx].obj_idx;
+    uint64_t base = s->m2_uvm_ext[idx].va;
+    if (oi < 0 || oi >= s->m2_objs_n || !s->m2_objs[oi].cpu_qva ||
+        va < base || va + size < va ||
+        va + size > base + s->m2_objs[oi].size) {
+        return;
+    }
+
+    uint8_t *qva = (uint8_t *)s->m2_objs[oi].cpu_qva + (va - base);
+    nvkvm_m2_invalidate_host_cpu_range(qva, size);
+
+    static uint32_t inv_logs;
+    if (inv_logs++ < 256 || nvkvm_m2_uvm_ext_trace_range(va, size)) {
+        qemu_log("nvkvm-gpu[%s] M8.105 UVM-EXT invalidate %s "
                  "VA=0x%llx size=0x%llx idx=%d obj=%d qva=%p\n",
                  s->chip->name, why ? why : "span",
                  (unsigned long long)va, (unsigned long long)size,
@@ -10372,6 +10419,7 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     s->m2_objs[oi].client = client;
     s->m2_objs[oi].hMemory = hm.h_mem;
     s->m2_objs[oi].gr_va = gpu_mapped ? va : 0;
+    s->m2_objs[oi].forwarded = false;
     int gi = s->m2_gpga_n++;
     s->m2_gpga[gi].gpga_base = gpga;
     s->m2_gpga[gi].size = asize;
@@ -10809,7 +10857,14 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
                     }
                     continue;
                 }
-                pok = nvkvm_m2_uvm_ext_copy_from_pbmap(s, pbbase, sz, "pushbuf");
+                bool forwarded_pb = nvkvm_m2_uvm_ext_is_forwarded(s, uvm_ext_idx);
+                if (forwarded_pb) {
+                    nvkvm_m2_uvm_ext_invalidate_span(s, uvm_ext_idx, pbbase, sz,
+                                                     "pushbuf-forwarded");
+                    pok = true;
+                } else {
+                    pok = nvkvm_m2_uvm_ext_copy_from_pbmap(s, pbbase, sz, "pushbuf");
+                }
                 if (!pok) {
                     unresolved++;
                     if (unresolved <= 8) {
@@ -10822,9 +10877,10 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
                 }
                 if (s->m2_uvm_map_logs++ < 256) {
                     qemu_log("nvkvm-gpu[%s] M8.15 UVM-EXT pushbuf ch[%d] idx=%u "
-                             "VA=0x%llx sz=0x%llx cvas=%d seeded\n",
+                             "VA=0x%llx sz=0x%llx cvas=%d %s\n",
                              s->chip->name, i, idx, (unsigned long long)pbbase,
-                             (unsigned long long)sz, s->m2_cur_cvas);
+                             (unsigned long long)sz, s->m2_cur_cvas,
+                             forwarded_pb ? "forwarded" : "seeded");
                 }
                 newmaps += nvkvm_m2_map_pbmap_sem_targets(s, c->client, pb, pblen);
                 if (nvkvm_m2_try_soft_complete_uvm_gr(s, c->client, pb, pblen,
