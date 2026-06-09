@@ -1,4 +1,4 @@
-# Mode-2 cuCtxCreate / UVM Dataplane Resume (2026-06-07)
+# Mode-2 cuCtxCreate / UVM Dataplane Resume (2026-06-09)
 
 This is the current handoff for branch `mode-2`. A fresh session with repo access and the `vh`/`vg`
 SSH aliases can resume from this document alone.
@@ -20,9 +20,53 @@ Standing constraints:
   trusted guest userspace. Debug code should eventually be gated behind `NVKVM_MODE2_DEBUG`.
 - If committing another milestone, update this file first.
 
-## 1. Current Status
+## 0.1 Latest Checkpoint (2026-06-09)
 
-Guest CUDA now reaches:
+Vast status: the scheduled VM host is usable. `ssh vh` reaches the RTX 3060 host
+(`77.104.167.149:58385` at the time of this checkpoint), `/dev/kvm` is present, and the host driver
+is `580.159.04`. `ssh vg` reaches the QEMU guest through the host proxy. No replacement instance is
+needed unless this host disappears.
+
+Current broad compute status:
+
+- The 4-byte `cup2_pause` UVM proof still passes with the normal service-interrupt mask, no
+  `LD_PRELOAD`, and no `NVUVM_SHADOW`, using the debug guest-kernel UVM bridge.
+- A new direct CUDA-driver repro, `scripts/mode2_diag/ctx_probe.c`, now isolates the broader blocker:
+  `ctx_probe minimal` prints `ok cuInit(0)` and `ok cuDeviceGet(&d, 0)`, then hangs in
+  `cuCtxCreate(&ctx, 0, d)`.
+- `matmul_pause 64` fails at the same point, before any matmul launch.
+- `NVKVM_M2_SERVICE_INTERRUPTS_ZERO=1` was tried as a diagnostic and made the path worse; it is not a
+  fix.
+- `NVKVM_M2_POST_EVENT_PACKED_DATA=1` was tried as a diagnostic. It did not make `cuCtxCreate`
+  return, and guest `nv_post_event` still saw `data_valid=0`, `info32=0`, `info16=0`.
+
+Clean `ctx_probe minimal` trace fingerprint:
+
+- The final useful guest ioctl is `UVM_MAP_EXTERNAL_ALLOCATION` over the high-UVM range around
+  `0x204a00000` with length `0x200000`.
+- After that, userspace repeats `NV2080_CTRL_CMD_MC_SERVICE_INTERRUPTS` (`0x20801702`) roughly once
+  per second.
+- QEMU posts GSP `POST_EVENT` messages for the registered OS events (`0x5c00003a`,
+  `0x5c000048`, `0x5c000056`), but the guest kernel currently receives them as dataless wakeups:
+  `nv_post_event ... info32=0x0 info16=0x0 dv=0`.
+- The repeated `0x120064000` GPFIFO lookahead rows are not all-zero work. The lookahead dumps entries
+  after `GP_PUT`; the actual current entries are valid CE memset/scrub packets and QEMU releases
+  `0x12006c004` payloads. A new `M8.102` guard prevents genuinely empty entries from advancing
+  `GP_GET`, but it did not trigger in the latest `ctx_probe` run.
+- Host dmesg during the same repro still shows the production-relevant failures:
+  `rpcRmApiAlloc_GSP ... hClass=0x90f1 status=0x40`,
+  `kchannelConstruct_IMPL: Only kernel priv clients can skip scrubber`,
+  `kfifoChidMgrAllocChid_IMPL: Failed to allocate Channel ID on heap`, and many
+  `dmaAllocMapping_GM107: can't alloc VA space for mapping`.
+
+Active lead after this checkpoint: compare a native host `ctx_probe` run to the guest repro with
+matching `libcuda`/binary as closely as possible, then fix the host RM mapping/channel failure that
+produces the `dmaAllocMapping_GM107` and channel allocation errors. The event payload issue remains
+suspicious, but the simple packed/unpacked POST_EVENT layout toggle is ruled out.
+
+## 1. 4-Byte UVM Proof Status
+
+The narrow `cup2_pause` CUDA proof reaches:
 
 - `cuInit(0)` PASS.
 - Device query path PASS (`RTX 3060`, compute 8.6, 11909 MiB).

@@ -3,9 +3,9 @@
 # open nvidia.ko from the 9p DKMS source (/mnt/ogkm) with:
 #   1. GR-allocparams-null shim (nv.c) — past the cuCtxCreate SIGSEGV
 #   2. CE-caps inject shim (nv.c)      — past cuCtxCreate=999
-#   3. nv_post_event printk (nv.c)     — log every os-event fd wakeup (handle,
-#      index, data_valid) so we see whether POST_EVENT->osNotifyEvent->postEvent
-#      actually reaches nv_post_event for libcuda's events (3a/48/56).
+#   3. nvidia_poll/nv_post_event printk (nv.c) — log os-event fd wakeups and
+#      poll-ready transitions so we see whether POST_EVENT reaches libcuda's
+#      waitable fds (3a/48/56).
 # Stashes to ~/nvmods-dbg2 and loads it.  Fast: links the precompiled RM core.
 set -u
 NVVER=580.159.04
@@ -47,18 +47,23 @@ ce='''            if (arg_cmd == 0x2a && arg_copy != NULL && arg_size >= 32 &&
 '''
 assert a2 in s, "CE anchor not found"; s=s.replace(a2, a2+ce, 1)
 # 3. nv_post_event printk
+a0='    if ((nvlfp->event_data_head != NULL) || nvlfp->dataless_event_pending)\n    {\n        mask = (POLLPRI | POLLIN);\n        nvlfp->dataless_event_pending = NV_FALSE;\n'
+pl='    if ((nvlfp->event_data_head != NULL) || nvlfp->dataless_event_pending)\n    {\n        mask = (POLLPRI | POLLIN);\n        printk(KERN_INFO "NVKVMDBG nvidia_poll ready nvlfp=%p head=%p dataless=%d mask=0x%x\\n", nvlfp, nvlfp->event_data_head, nvlfp->dataless_event_pending, mask);\n        nvlfp->dataless_event_pending = NV_FALSE;\n'
+assert a0 in s, "nvidia_poll anchor not found"; s=s.replace(a0, pl, 1)
 a3='    nv_linux_file_private_t *nvlfp = nv_get_nvlfp_from_nvfp(event->nvfp);\n    unsigned long eflags;\n    nvidia_event_t *nvet;\n'
-pe='    printk(KERN_INFO "NVKVMDBG nv_post_event handle=0x%x index=0x%x info32=0x%x dv=%d\\n", handle, index, info32, data_valid);\n'
+pe='    printk(KERN_INFO "NVKVMDBG nv_post_event nvlfp=%p handle=0x%x index=0x%x info32=0x%x info16=0x%x dv=%d\\n", nvlfp, handle, index, info32, info16, data_valid);\n'
 assert a3 in s, "nv_post_event anchor not found"; s=s.replace(a3, a3+pe, 1)
 open(f,"w").write(s)
 print("patched nv.c OK")
 PYEOF
 
-echo "building (links precompiled core)..."
-( cd /mnt/build2 && sudo make modules -j2 >/tmp/dbg2_build.log 2>&1 )
+echo "building nvidia.ko only (links precompiled core)..."
+( cd /mnt/build2 && sudo make modules NV_KERNEL_MODULES=nvidia -j2 >/tmp/dbg2_build.log 2>&1 )
 KO=$(find /mnt/build2 -name nvidia.ko | head -1)
 if [ -z "$KO" ]; then echo "BUILD FAILED:"; tail -25 /tmp/dbg2_build.log; exit 1; fi
 mkdir -p "$DST"; cp "$KO" "$DST/nvidia.ko"
-# uvm from the existing dbg stash (unchanged)
+# Keep the newest UVM bridge/PTE-shadow module when available; older dbg stashes
+# predate the external-PTE shadow instrumentation used by current mode-2 tests.
+cp /home/ubuntu/nvmods/nvidia-uvm.ko "$DST/" 2>/dev/null || \
 cp /home/ubuntu/nvmods-dbg/nvidia-uvm.ko "$DST/" 2>/dev/null
 echo "built + stashed $(ls -la $DST/nvidia.ko)"

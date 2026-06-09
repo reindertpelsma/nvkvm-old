@@ -1,0 +1,104 @@
+--- uvm_map_external.c.nvkvmorig	2026-06-09 13:35:00.000000000 +0000
++++ uvm_map_external.c	2026-06-09 13:35:00.000000000 +0000
+@@ -40,6 +40,16 @@
+ // Assume almost all of the push space can be used for PTEs leaving 1K of margin.
+ #define MAX_COPY_SIZE_PER_PUSH ((size_t)(UVM_MAX_PUSH_SIZE - 1024))
+ 
++#define NVKVM_BAR0_UVM_VA_LO      0xFFF520ul
++#define NVKVM_BAR0_UVM_VA_HI      0xFFF524ul
++#define NVKVM_BAR0_UVM_GPA_LO     0xFFF528ul
++#define NVKVM_BAR0_UVM_GPA_HI     0xFFF52cul
++#define NVKVM_BAR0_UVM_SIZE_LO    0xFFF530ul
++#define NVKVM_BAR0_UVM_SIZE_HI    0xFFF534ul
++#define NVKVM_BAR0_UVM_COMMIT     0xFFF538ul
++#define NVKVM_UVM_SHADOW_COMMIT_PTE 0x40000000u
++#define NVKVM_UVM_SHADOW_APERTURE_SYS_COHERENT 2u
++
+ typedef struct
+ {
+     // The VA range the buffer is for
+@@ -276,6 +286,60 @@ static NV_STATUS copy_ptes(uvm_page_tree_t *tree,
+     return NV_OK;
+ }
+ 
++static void nvkvm_mode2_report_external_sysmem_pte(uvm_gpu_t *gpu,
++                                                   NvU64 va,
++                                                   NvU64 pte,
++                                                   NvU64 size)
++{
++    static void __iomem *nvkvm_bd;
++    static unsigned int commit_seq;
++    static unsigned int log_count;
++    NvU32 aperture;
++    NvU64 gpa;
++    struct pci_dev *pdev;
++
++    if (!(pte & 1))
++        return;
++
++    aperture = (NvU32)((pte >> 1) & 0x3);
++    if (aperture != NVKVM_UVM_SHADOW_APERTURE_SYS_COHERENT &&
++        aperture != 3)
++        return;
++
++    gpa = ((pte >> 8) & ((1ULL << 46) - 1)) << 12;
++    if (!gpa || !size)
++        return;
++
++    if (!nvkvm_bd) {
++        if (!gpu || !gpu->parent)
++            return;
++
++        pdev = gpu->parent->pci_dev;
++        if (!pdev)
++            return;
++
++        nvkvm_bd = ioremap(pci_resource_start(pdev, 0) +
++                           NVKVM_BAR0_UVM_VA_LO, 0x20);
++    }
++
++    if (!nvkvm_bd)
++        return;
++
++    writel((NvU32)va, nvkvm_bd + (NVKVM_BAR0_UVM_VA_LO - NVKVM_BAR0_UVM_VA_LO));
++    writel((NvU32)(va >> 32), nvkvm_bd + (NVKVM_BAR0_UVM_VA_HI - NVKVM_BAR0_UVM_VA_LO));
++    writel((NvU32)gpa, nvkvm_bd + (NVKVM_BAR0_UVM_GPA_LO - NVKVM_BAR0_UVM_VA_LO));
++    writel((NvU32)(gpa >> 32), nvkvm_bd + (NVKVM_BAR0_UVM_GPA_HI - NVKVM_BAR0_UVM_VA_LO));
++    writel((NvU32)size, nvkvm_bd + (NVKVM_BAR0_UVM_SIZE_LO - NVKVM_BAR0_UVM_VA_LO));
++    writel((NvU32)(size >> 32), nvkvm_bd + (NVKVM_BAR0_UVM_SIZE_HI - NVKVM_BAR0_UVM_VA_LO));
++    writel(NVKVM_UVM_SHADOW_COMMIT_PTE | ((aperture & 0x3) << 16) |
++           (++commit_seq & 0xffff), nvkvm_bd + (NVKVM_BAR0_UVM_COMMIT - NVKVM_BAR0_UVM_VA_LO));
++
++    if (log_count++ < 64)
++        printk(KERN_ERR "NVKVM-DIAG uvm-ext-pte va=0x%llx gpa=0x%llx size=0x%llx pte=0x%llx aperture=%u\n",
++               (unsigned long long)va, (unsigned long long)gpa,
++               (unsigned long long)size, (unsigned long long)pte, aperture);
++}
++
+ // Map all of pt_range, which is contained with the va_range and begins at
+ // virtual address map_start. The PTE values are queried from RM and the pushed
+ // writes are added to the input tracker.
+@@ -320,6 +384,23 @@ static NV_STATUS map_rm_pt_range(uvm_page_tree_t *tree,
+         if (need_l2_invalidate)
+             *need_l2_invalidate_out = true;
+ 
++        if (pte_size >= sizeof(NvU64) &&
++            pte_buffer->va_range->type == UVM_VA_RANGE_TYPE_EXTERNAL) {
++            size_t pte_index;
++
++            for (pte_index = 0; pte_index < num_ptes; pte_index++) {
++                NvU64 pte;
++                NvU64 pte_va = addr + pte_index * page_size;
++
++                memcpy(&pte,
++                       (char *)pte_bits + pte_index * pte_size,
++                       sizeof(pte));
++                nvkvm_mode2_report_external_sysmem_pte(pte_buffer->gpu,
++                                                       pte_va, pte,
++                                                       page_size);
++            }
++        }
++
+         last_mapping = (addr + map_size - 1 == range_node->end);
+ 
+         // These copies are technically independent, except for the last one
