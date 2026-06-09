@@ -116,9 +116,17 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
 #define NVKVM_M2_ADDR_SYSMEM                  1u
 #define NVKVM_M2_ADDR_FBMEM                   2u
 #define NVKVM_M2_WORK_SUBMIT_NOTIFY_INDEX     1u
+#define NVKVM_M2_CHAN_INTERNAL_FLAGS_OFF      20u
+#define NVKVM_M2_GSP_SWGEN0_VECTOR            155u
+#define NVKVM_M2_GSP_SWGEN0_BIT               (1u << 6)
 #define NVKVM_M2_UVM_SHADOW_CAP               262144u
 #define NVKVM_M2_GPFIFO_LARGE_RING_ENTRIES    64u
 #define NVKVM_M2_GPFIFO_EMPTY_LOG_LIMIT       128u
+
+static inline bool nvkvm_m2_is_gpfifo_channel_class(uint32_t hclass)
+{
+    return (hclass & 0xffu) == 0x6fu && (hclass & 0xf000u) == 0xc000u;
+}
 
 static inline void nvkvm_m2_host_gpu_store_fence(void)
 {
@@ -257,6 +265,10 @@ struct NvkvmGpuEmul {
         uint32_t tsg;           /* M5.25: parent TSG (a06c) handle — must be GPFIFO_SCHEDULE'd
                                  * before a ring runs (guest's schedule control isn't forwarded) */
         bool     scheduled;     /* M5.25: TSG GPFIFO_SCHEDULE'd on the host once */
+        bool     host_inflight; /* host GR has been rung for [host_inflight_get, host_inflight_put) */
+        uint32_t host_inflight_get;
+        uint32_t host_inflight_put;
+        uint32_t host_inflight_polls;
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -328,6 +340,9 @@ struct NvkvmGpuEmul {
     bool     m2_local_completion_pending;        /* local CE/setup completion happened before an os-event existed */
     uint32_t m2_local_completion_token;          /* guest work-submit token that caused the local completion */
     bool     m2_local_completion_token_valid;
+    uint32_t m2_local_completion_posted_token;   /* M8.107: last local token posted to current os-event set */
+    bool     m2_local_completion_posted_valid;
+    int      m2_local_completion_posted_osevent_n;
     bool     gsp_swgen0_pending;                 /* GSP falcon IRQSTAT SWGEN0 latched */
     /* VAS root page-dir bases snooped from VASPACE_COPY_SERVER_RESERVED_PDES
      * (0x90f10106): levels[0].physAddress roots the WHOLE VAS (the params' VA
@@ -470,6 +485,9 @@ struct NvkvmGpuEmul {
     uint32_t m2_gr_reply_obj;   /* hObject this reply belongs to (match in the reply builder) */
     uint32_t m2_gr_reply_psize; /* host's RETURNED alloc_parms_size (paramsSize the real RM wrote) */
     bool     m2_gr_reply_valid;
+    uint32_t m2_chan_reply_obj; /* hObject whose forwarded channel reply was captured */
+    uint32_t m2_chan_reply_internal_flags;
+    bool     m2_chan_reply_valid;
     void    *m2_usermode_qva;   /* M5.8: mmap of host AMPERE_USERMODE_A doorbell page */
     uint32_t m2_gr_token;       /* M5.8: host GR channel work-submit token (doorbell value) */
     bool     m2_doorbell_ready; /* M5.8: usermode mapped + token fetched */
@@ -1118,11 +1136,11 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
      * IRQSTAT when an event is pending; cleared via IRQSCLR write.  Offsets:
      * NV_PGSP base 0x110000; FALCON IRQSTAT +0x08, IRQMASK +0x18, IRQDEST +0x1c;
      * RISCV base 0x111000; RISCV_IRQMASK +0x528, RISCV_IRQDEST +0x52c. */
-    case 0x00110008u: return s->gsp_swgen0_pending ? (1u << 6) : 0; /* FALCON IRQSTAT */
-    case 0x00110018u: return (1u << 6);                             /* FALCON IRQMASK */
-    case 0x0011001cu: return (1u << 6);                             /* FALCON IRQDEST */
-    case 0x00111528u: return (1u << 6);                             /* RISCV  IRQMASK */
-    case 0x0011152cu: return (1u << 6);                             /* RISCV  IRQDEST */
+    case 0x00110008u: return s->gsp_swgen0_pending ? NVKVM_M2_GSP_SWGEN0_BIT : 0; /* FALCON IRQSTAT */
+    case 0x00110018u: return NVKVM_M2_GSP_SWGEN0_BIT;                             /* FALCON IRQMASK */
+    case 0x0011001cu: return NVKVM_M2_GSP_SWGEN0_BIT;                             /* FALCON IRQDEST */
+    case 0x00111528u: return NVKVM_M2_GSP_SWGEN0_BIT;                             /* RISCV  IRQMASK */
+    case 0x0011152cu: return NVKVM_M2_GSP_SWGEN0_BIT;                             /* RISCV  IRQDEST */
 
     /* NV_VIRTUAL_FUNCTION_PRIV_ACCESS_COUNTER_NOTIFY_BUFFER_SIZE (VF 0xB80000 +
      * 0x3110): UVM_REGISTER_GPU's uvmGetAccessCounterBufferSize reads this and
@@ -1340,6 +1358,44 @@ static void nvkvm_m3_post_event(NvkvmGpuEmul *s, uint32_t hclient,
     nvkvm_m3_post_status(s, el, 0x1003u /* NV_VGPU_MSG_EVENT_POST_EVENT */, 0);
 }
 
+static void nvkvm_m2_deassert_legacy_irq_if_idle(NvkvmGpuEmul *s)
+{
+    if (s->intr_top == 0 && !msix_enabled(&s->parent_obj)) {
+        pci_set_irq(&s->parent_obj, 0);
+    }
+}
+
+static void nvkvm_m2_clear_intr_vector(NvkvmGpuEmul *s, uint32_t vec,
+                                       const char *why)
+{
+    uint32_t leaf = vec / 32u;
+    uint32_t bit = vec % 32u;
+    uint32_t subtree = leaf / 2u;
+
+    if (leaf >= NVKVM_VF_INTR_NLEAF) {
+        return;
+    }
+
+    bool had_leaf = (s->intr_leaf[leaf] & (1u << bit)) != 0;
+    s->intr_leaf[leaf] &= ~(1u << bit);
+    if (s->intr_leaf[subtree * 2u] == 0 &&
+        (subtree * 2u + 1u >= NVKVM_VF_INTR_NLEAF ||
+         s->intr_leaf[subtree * 2u + 1u] == 0)) {
+        s->intr_top &= ~(1u << subtree);
+    }
+    nvkvm_m2_deassert_legacy_irq_if_idle(s);
+
+    if (s->trace && had_leaf) {
+        static uint32_t clear_logs;
+        if (clear_logs++ < 128) {
+            qemu_log("nvkvm-gpu[%s] M8.104 INTR_VECTOR_CLEAR vec=%u via %s "
+                     "leaf=%u bit=%u intr_top=0x%08x\n",
+                     s->chip->name, vec, why ? why : "clear", leaf, bit,
+                     s->intr_top);
+        }
+    }
+}
+
 /* M5/M7 — latch the GSP falcon SWGEN0 interrupt and raise the GSP engine's
  * stall vector (155 = 0x9b for MC_ENGINE_IDX_GSP=50 on GA106, from the captured
  * INTERNAL_INTR_GET_KERNEL_TABLE).  Mirrors the INTR_LEAF_TRIGGER path: set the
@@ -1348,7 +1404,8 @@ static void nvkvm_m3_post_event(NvkvmGpuEmul *s, uint32_t hclient,
 static void nvkvm_gsp_raise_swgen0(NvkvmGpuEmul *s)
 {
     s->gsp_swgen0_pending = true;
-    uint32_t vec = 155u, leaf = vec / 32u, bit = vec % 32u, subtree = leaf / 2u;
+    uint32_t vec = NVKVM_M2_GSP_SWGEN0_VECTOR;
+    uint32_t leaf = vec / 32u, bit = vec % 32u, subtree = leaf / 2u;
     if (leaf < NVKVM_VF_INTR_NLEAF) {
         s->intr_leaf[leaf] |= (1u << bit);
         s->intr_top        |= (1u << subtree);
@@ -1780,6 +1837,22 @@ static void nvkvm_m2_try_deliver_local_completion(NvkvmGpuEmul *s,
     if (!s->m2_local_completion_pending || s->osevent_n <= 0) {
         return;
     }
+    if (s->m2_local_completion_token_valid &&
+        s->m2_local_completion_posted_valid &&
+        s->m2_local_completion_token == s->m2_local_completion_posted_token &&
+        s->osevent_n <= s->m2_local_completion_posted_osevent_n) {
+        static uint32_t dup_logs;
+        if (s->trace && dup_logs++ < 128) {
+            qemu_log("nvkvm-gpu[%s] M8.107 LOCAL_EVENT skip duplicate "
+                     "via %s token=0x%08x osevents=%d posted_osevents=%d\n",
+                     s->chip->name, why ? why : "?",
+                     s->m2_local_completion_token, s->osevent_n,
+                     s->m2_local_completion_posted_osevent_n);
+        }
+        s->m2_local_completion_pending = false;
+        s->m2_local_completion_token_valid = false;
+        return;
+    }
     if (nvkvm_m2_host_completion_queued(s)) {
         static uint32_t host_first_logs;
         if (s->trace && host_first_logs++ < 64) {
@@ -1805,8 +1878,15 @@ static void nvkvm_m2_try_deliver_local_completion(NvkvmGpuEmul *s,
                  "osevents=%d\n", s->chip->name, why ? why : "?",
                  s->osevent_n);
     }
+    bool token_valid = s->m2_local_completion_token_valid;
+    uint32_t token = s->m2_local_completion_token;
     if (nvkvm_gsp_deliver_events(s, 0, false,
                                  NVKVM_M2_EVENT_LOCAL_UVM) > 0) {
+        if (token_valid) {
+            s->m2_local_completion_posted_token = token;
+            s->m2_local_completion_posted_valid = true;
+            s->m2_local_completion_posted_osevent_n = s->osevent_n;
+        }
         s->m2_local_completion_pending = false;
         s->m2_local_completion_token_valid = false;
     }
@@ -2255,8 +2335,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      */
                 }
             }
-            if ((hclass & 0xFFFFu) >= 0xC06Fu && (hclass & 0xFFu) == 0x6Fu &&
-                (hclass & 0xF000u) == 0xC000u) {
+            if (nvkvm_m2_is_gpfifo_channel_class(hclass)) {
                 const uint8_t *params = cmd + 112;
                 uint64_t err_base = 0;
                 uint64_t err_size = 0;
@@ -2351,6 +2430,21 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                  * exceeds libcuda's request (the overflow) — esp. the c56f channel alloc. */
                 qemu_log("nvkvm-gpu[%s] M8.2 alloc-reply class=0x%04x obj=0x%08x "
                          "reply_paramsSize=%u\n", s->chip->name, hc, robj, opsize);
+                if (nvkvm_m2_is_gpfifo_channel_class(hc) &&
+                    opsize >= NVKVM_M2_CHAN_INTERNAL_FLAGS_OFF + 4u &&
+                    s->m2_chan_reply_valid &&
+                    s->m2_chan_reply_obj == robj) {
+                    uint32_t old_flags =
+                        ldl_le_p(resp + 112 + NVKVM_M2_CHAN_INTERNAL_FLAGS_OFF);
+                    stl_le_p(resp + 112 + NVKVM_M2_CHAN_INTERNAL_FLAGS_OFF,
+                             s->m2_chan_reply_internal_flags);
+                    s->m2_chan_reply_valid = false;
+                    qemu_log("nvkvm-gpu[%s] M8.103 channel alloc reply "
+                             "class=0x%04x obj=0x%08x internalFlags "
+                             "0x%08x->0x%08x\n",
+                             s->chip->name, hc, robj, old_flags,
+                             s->m2_chan_reply_internal_flags);
+                }
                 if (fam >= 0xb0u && (lb == 0xc0u || lb == 0x97u)) {
                     uint32_t cap_psize = (s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj)
                                              ? s->m2_gr_reply_psize : 0u;
@@ -3696,9 +3790,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             s->intr_leaf[st*2+1] == 0)) {
             s->intr_top &= ~(1u << st);
         }
-        if (s->intr_top == 0 && !msix_enabled(&s->parent_obj)) {
-            pci_set_irq(&s->parent_obj, 0);
-        }
+        nvkvm_m2_deassert_legacy_irq_if_idle(s);
         return;
     }
     if (off >= NVKVM_VF_INTR_LEAF_EN_SET0 && off < NVKVM_VF_INTR_LEAF_EN_SET0 + NVKVM_VF_INTR_NLEAF*4) {
@@ -3729,19 +3821,21 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     /* M5/M7 — GSP falcon IRQSCLR (0x110004): write-1-to-clear SWGEN0 (bit6).
      * kgspService clears the edge before draining the queue. */
     if (off == 0x00110004u) {
-        if (val & (1u << 6)) {
+        if (val & NVKVM_M2_GSP_SWGEN0_BIT) {
             bool was_pending = s->gsp_swgen0_pending;
             s->gsp_swgen0_pending = false;
-                static uint32_t clr_logs;
-                if (s->trace && clr_logs++ < 64) {
-                    qemu_log("nvkvm-gpu[%s] M8.33 SWGEN0_CLEAR val=0x%llx "
-                             "was_pending=%d\n",
-                             s->chip->name, (unsigned long long)val, was_pending);
-                }
-                nvkvm_m2_try_deliver_host_completion(s, "swgen0-clear");
-                nvkvm_m2_try_deliver_local_completion(s, "swgen0-clear");
+            nvkvm_m2_clear_intr_vector(s, NVKVM_M2_GSP_SWGEN0_VECTOR,
+                                       "swgen0-clear");
+            static uint32_t clr_logs;
+            if (s->trace && clr_logs++ < 64) {
+                qemu_log("nvkvm-gpu[%s] M8.33 SWGEN0_CLEAR val=0x%llx "
+                         "was_pending=%d\n",
+                         s->chip->name, (unsigned long long)val, was_pending);
             }
-            return;
+            nvkvm_m2_try_deliver_host_completion(s, "swgen0-clear");
+            nvkvm_m2_try_deliver_local_completion(s, "swgen0-clear");
+        }
+        return;
     }
 
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
@@ -4263,7 +4357,8 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * host GR VAS so the REAL host GPU writes the payload here (guest GPA -> shared
      * memfd -> OS_DESCRIPTOR WB -> FIXED map at the matching VA).  Guest then reads
      * the host GPU's write coherently (WB snooped).  Idempotent; m2exec-gated. */
-    if (s->m2exec && p != NVKVM_GMMU_FAULT && sy &&
+    if (s->m2exec && s->m2_cur_cvas >= 0 &&
+        p != NVKVM_GMMU_FAULT && sy &&
         !nvkvm_m2_va_seen(s, s->chan_client, va & ~0xfffull)) {
         uint64_t gbase = p & ~0xfffull;
         bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, va & ~0xfffull, gbase, 0x1000);
@@ -5447,6 +5542,24 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s, bool prepare_only)
         if (!nvkvm_m2_gpfifo_entry_valid(e0, e1, &pb, &pblen)) {
             static uint32_t empty_entry_logs;
 
+            if (gp_wrapped && guard > 0) {
+                static uint32_t wrap_tail_empty_logs;
+                if (s->trace &&
+                    wrap_tail_empty_logs++ < NVKVM_M2_GPFIFO_EMPTY_LOG_LIMIT) {
+                    qemu_log("nvkvm-gpu[%s] M8.102 GPFIFO wrap-tail empty "
+                             "gpfifo=0x%llx idx=%u gp_get=%u gp_put=%u "
+                             "phys=0x%llx e0=0x%08x e1=0x%08x; advance to "
+                             "wrapped put\n",
+                             s->chip->name,
+                             (unsigned long long)s->chan_gpfifo_va, idx,
+                             s->chan_gp_get, gp_put,
+                             (unsigned long long)s->chan_gpfifo_phys, e0, e1);
+                }
+                if (!prepare_only) {
+                    s->chan_gp_get = gp_put;
+                }
+                return;
+            }
             s->chan_unresolved = true;
             if (s->trace &&
                 empty_entry_logs++ < NVKVM_M2_GPFIFO_EMPTY_LOG_LIMIT) {
@@ -6210,7 +6323,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
      * error-notifier memory object isn't forwarded yet, so RM's notifier lookup
      * fails (kchannelGetNotifierInfo OBJECT_NOT_FOUND). Zeroing it lets the
      * channel construct without a notifier; revisit when memory objects forward. */
-    if ((hClass == 0xc56fu || hClass == 0xc36fu) && psize >= 4) {
+    if (nvkvm_m2_is_gpfifo_channel_class(hClass) && psize >= 4) {
         stl_le_p(auxbuf, 0u);                        /* hObjectError = 0 */
         /* hUserdMemory[0] @ params+32: "ignored if 0" -> the host CPU-RM allocates
          * USERD itself (kernel_channel.c:309); instance memory is RM-allocated on
@@ -6325,6 +6438,22 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
              "hObj=0x%08x -> rc=%d status=0x%x%s\n", s->chip->name, s->m2_fwd_n,
              hClass, hParent, hObject, rc, p.status,
              (rc == 0 && p.status == 0) ? "  OK" : "  <-- ERR/MISMATCH");
+    if (nvkvm_m2_is_gpfifo_channel_class(hClass) &&
+        psize >= NVKVM_M2_CHAN_INTERNAL_FLAGS_OFF + 4u) {
+        if (rc == 0 && p.status == 0) {
+            s->m2_chan_reply_obj = hObject;
+            s->m2_chan_reply_internal_flags =
+                ldl_le_p(auxbuf + NVKVM_M2_CHAN_INTERNAL_FLAGS_OFF);
+            s->m2_chan_reply_valid = true;
+            qemu_log("nvkvm-gpu[%s] M8.103 captured channel alloc reply "
+                     "class=0x%04x obj=0x%08x internalFlags=0x%08x\n",
+                     s->chip->name, hClass, hObject,
+                     s->m2_chan_reply_internal_flags);
+        } else if (s->m2_chan_reply_valid &&
+                   s->m2_chan_reply_obj == hObject) {
+            s->m2_chan_reply_valid = false;
+        }
+    }
     if (hClass == 0x83deu && rc == 0 && p.status == 0) {
         bool seen = false;
         for (int i = 0; i < s->m2_debug_n; i++) {
@@ -7523,6 +7652,57 @@ static void nvkvm_m2_log_host_channel_state(NvkvmGpuEmul *s,
              have_err ? "ok" : "miss", err[0], err[1], err[2], err[3],
              c->work_submit_notifier_index,
              have_work ? "ok" : "miss", work[0], work[1], work[2], work[3]);
+}
+
+static bool nvkvm_m2_finish_host_gr_get(NvkvmGpuEmul *s, int ch_index,
+                                        struct nvkvm_chan_entry *c,
+                                        uint32_t hget, uint32_t token,
+                                        bool token_valid, const char *why)
+{
+    if (!c || hget == c->gp_get || hget > c->gpfifo_ent) {
+        return false;
+    }
+    if (hget < c->gp_get) {
+        static uint32_t wrap_logs;
+        if (s->trace && wrap_logs++ < 64) {
+            qemu_log("nvkvm-gpu[%s] M8.105 HOSTGR complete-wrap-defer ch[%d] "
+                     "chan=0x%08x gp_get=%u host_get=%u ent=%u via %s\n",
+                     s->chip->name, ch_index, c->hobject, c->gp_get, hget,
+                     c->gpfifo_ent, why ? why : "host-get");
+        }
+        return false;
+    }
+
+    uint32_t old_get = c->gp_get;
+    s->chan_gpfifo_va  = c->gpfifo_va;
+    s->chan_userd      = c->userd;
+    s->chan_gpfifo_ent = c->gpfifo_ent;
+    s->chan_userd_sys  = c->userd_sys;
+    s->chan_hvaspace   = c->hvaspace;
+    s->chan_client     = c->client;
+    s->chan_gp_get     = c->gp_get;
+    s->chan_gpfifo_phys = c->gpfifo_phys;
+    s->chan_pdb        = c->pdb;
+    nvkvm_m2_release_gr_reports_for_gpfifo(s, c->gpfifo_phys, old_get, hget,
+                                           c->gpfifo_ent, why);
+    c->gp_get = hget;
+    c->host_inflight = false;
+    c->host_inflight_get = 0;
+    c->host_inflight_put = 0;
+    c->host_inflight_polls = 0;
+
+    if (token_valid) {
+        nvkvm_m2_write_work_submit_notifier(s, c, token, why);
+    }
+    nvkvm_m2_repair_guest_userd_gp_put(s, c, hget, why);
+    nvkvm_m2_write_guest_userd_gp_get(s, c, hget, why);
+    nvkvm_m2_queue_host_completion(s, token, token_valid, why);
+
+    qemu_log("nvkvm-gpu[%s] M8.105 HOSTGR complete ch[%d] "
+             "chan=0x%08x gp_get=%u->%u token=%s0x%08x via %s\n",
+             s->chip->name, ch_index, c->hobject, old_get, hget,
+             token_valid ? "" : "!", token, why ? why : "host-get");
+    return true;
 }
 
 static void nvkvm_m2_ring_host_channel(NvkvmGpuEmul *s, int ch_index,
@@ -9464,6 +9644,9 @@ static bool nvkvm_m2_map_pbmap_page(NvkvmGpuEmul *s, uint32_t client, uint64_t v
                                     const char *why)
 {
     uint64_t base = va & ~0xfffull;
+    if (nvkvm_m2_va_is_seen(s, client, base)) {
+        return true;
+    }
     int uvm_idx = nvkvm_m2_uvm_ext_find(s, base, 0x1000);
     if (uvm_idx >= 0) {
         bool ok = nvkvm_m2_uvm_ext_map_span(s, client, uvm_idx, base,
@@ -9483,7 +9666,30 @@ static bool nvkvm_m2_map_pbmap_page(NvkvmGpuEmul *s, uint32_t client, uint64_t v
         uint64_t phys = 0;
         bool sys = false;
         if (!nvkvm_m2_uvm_shadow_resolve(s, base, 0x1000, &phys, &sys)) {
-            return false;
+            phys = nvkvm_chan_translate(s, base, &sys);
+            if (phys == NVKVM_GMMU_FAULT) {
+                return false;
+            }
+            if (nvkvm_m2_va_seen(s, client, base)) {
+                return true;
+            }
+            bool ok = sys ?
+                nvkvm_m2_back_and_map_sys(s, client, base, phys, 0x1000) :
+                nvkvm_m2_back_and_map(s, client, base, phys, 0x1000,
+                                      true, why ? why : "chan-target");
+            if (!ok) {
+                nvkvm_m2_va_forget(s, client, base);
+            }
+            static uint32_t chan_logs;
+            if (chan_logs++ < 160) {
+                qemu_log("nvkvm-gpu[%s] M8.106 CHAN target map %s "
+                         "VA=0x%llx phys=0x%llx sys=%d cvas=%d -> %s\n",
+                         s->chip->name, why ? why : "target",
+                         (unsigned long long)base, (unsigned long long)phys,
+                         sys ? 1 : 0, s->m2_cur_cvas,
+                         ok ? "MAPPED" : "FAILED");
+            }
+            return ok;
         }
         if (nvkvm_m2_va_seen(s, client, base)) {
             return true;
@@ -10927,10 +11133,12 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             if (uqva) {
                 uint32_t hget = ldl_le_p((uint8_t *)uqva + 0x88);
                 if (hget > c->gp_get && hget <= c->gpfifo_ent) {
-                    qemu_log("nvkvm-gpu[%s] M8.19 HOSTGR sync ch[%d] "
-                             "gp_get=%u -> host_get=%u before map/ring\n",
-                             s->chip->name, i, c->gp_get, hget);
-                    c->gp_get = hget;
+                    uint32_t tok = c->token_valid ? c->host_token : s->m2_gr_token;
+                    bool tok_valid = c->token_valid || s->m2_doorbell_ready;
+                    if (nvkvm_m2_finish_host_gr_get(s, i, c, hget, tok,
+                                                    tok_valid, "host-sync")) {
+                        host_completed = true;
+                    }
                 }
             }
         }
@@ -11001,6 +11209,35 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
                          s->chan_gp_put_seen, c->gp_get);
             }
             gp_put = s->chan_gp_put_seen;
+        }
+        if (engine == 1u && c->host_inflight) {
+            void *uqva = nvkvm_m2_host_userd_qva(s, c->client, c->hobject);
+            uint32_t hget = uqva ? ldl_le_p((uint8_t *)uqva + 0x88) :
+                            0xffffffffu;
+            if (hget > c->gp_get && hget <= c->gpfifo_ent) {
+                uint32_t tok = c->token_valid ? c->host_token : s->m2_gr_token;
+                bool tok_valid = c->token_valid || s->m2_doorbell_ready;
+                if (nvkvm_m2_finish_host_gr_get(s, i, c, hget, tok,
+                                                tok_valid, "host-inflight")) {
+                    host_completed = true;
+                }
+            } else {
+                c->host_inflight_polls++;
+                static uint32_t inflight_logs;
+                if (s->trace && (inflight_logs++ < 128 ||
+                    (c->host_inflight_polls & 0x3ffu) == 0)) {
+                    uint32_t hput = uqva ? ldl_le_p((uint8_t *)uqva + 0x8C) :
+                                    0xffffffffu;
+                    qemu_log("nvkvm-gpu[%s] M8.105 HOSTGR inflight wait ch[%d] "
+                             "chan=0x%08x gp_get=%u gp_put=%u "
+                             "inflight=%u->%u polls=%u host_get=%u host_put=%u\n",
+                             s->chip->name, i, c->hobject, c->gp_get,
+                             gp_put, c->host_inflight_get,
+                             c->host_inflight_put, c->host_inflight_polls,
+                             hget, hput);
+                }
+                goto restore_next_chan;
+            }
         }
         uint32_t pending_count = 0;
         if (!nvkvm_m2_gpfifo_pending_count(c->gp_get, gp_put, c->gpfifo_ent,
@@ -11267,6 +11504,10 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
                      s->m2_cur_cvas, payload, notify_writes,
                      (unsigned long long)notify_redir);
             c->gp_get = gp_put;
+            c->host_inflight = false;
+            c->host_inflight_get = 0;
+            c->host_inflight_put = 0;
+            c->host_inflight_polls = 0;
             host_completed = true;
             nvkvm_m2_queue_host_completion(s,
                                             c->token_valid ? c->host_token :
@@ -11286,52 +11527,33 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
          * for the GR channel whose USERD is double-mmapped (M5.4). */
         if (s->m2_usermode_qva && engine == 1u && s->m2_cur_cvas >= 0) {
             uint32_t tok = c->token_valid ? c->host_token : s->m2_gr_token;
+            bool tok_valid = c->token_valid || s->m2_doorbell_ready;
             nvkvm_m2_ring_host_channel(s, i, c, tok, "M5.9", gp_put, true);
+            c->host_inflight = true;
+            c->host_inflight_get = c->gp_get;
+            c->host_inflight_put = gp_put;
+            c->host_inflight_polls = 0;
             void *uqva = nvkvm_m2_host_userd_qva(s, c->client, c->hobject);
             if (uqva) {
                 uint32_t hget = ldl_le_p((uint8_t *)uqva + 0x88);
-	                if (hget > c->gp_get && hget <= c->gpfifo_ent) {
-	                    qemu_log("nvkvm-gpu[%s] M8.19 HOSTGR complete ch[%d] "
-	                             "gp_get=%u -> host_get=%u after ring\n",
-	                             s->chip->name, i, c->gp_get, hget);
-	                    s->chan_gpfifo_va  = c->gpfifo_va;
-	                    s->chan_userd      = c->userd;
-	                    s->chan_gpfifo_ent = c->gpfifo_ent;
-	                    s->chan_userd_sys  = c->userd_sys;
-	                    s->chan_hvaspace   = c->hvaspace;
-	                    s->chan_client     = c->client;
-	                    s->chan_gp_get     = c->gp_get;
-	                    s->chan_gpfifo_phys = c->gpfifo_phys;
-	                    s->chan_pdb        = c->pdb;
-		                    nvkvm_m2_release_gr_reports_for_gpfifo(s, c->gpfifo_phys,
-		                                                           c->gp_get, hget,
-		                                                           c->gpfifo_ent,
-		                                                           "host-ring");
-			                    if (host_work_pb && host_work_pblen) {
-			                        bool qmd_launch =
-			                            nvkvm_m2_has_inline_qmd_launch(s,
-			                                                           host_work_pb,
-			                                                           host_work_pblen);
-			                        nvkvm_m2_dump_launch_uvm_result(s, host_work_pb,
-			                                                         host_work_pblen,
-			                                                         "host-ring");
-			                        nvkvm_m2_log_host_channel_state(s, c,
-			                                                         "host-ring");
-			                        if (qmd_launch) {
-			                            nvkvm_m2_log_post_launch_rm_state(s, c,
-			                                                               "host-qmd");
-			                        }
-			                    }
-		                    c->gp_get = hget;
-		                    nvkvm_m2_write_work_submit_notifier(s, c, tok,
-		                                                        "host-ring");
-                            nvkvm_m2_repair_guest_userd_gp_put(s, c, hget,
-                                                               "host-ring");
-		                    nvkvm_m2_write_guest_userd_gp_get(s, c, hget, "host-ring");
-		                    host_completed = true;
-		                    nvkvm_m2_queue_host_completion(s, tok, true,
-		                                                    "host-ring");
-		                }
+                if (hget > c->gp_get && hget <= c->gpfifo_ent) {
+                    if (host_work_pb && host_work_pblen) {
+                        bool qmd_launch =
+                            nvkvm_m2_has_inline_qmd_launch(s, host_work_pb,
+                                                           host_work_pblen);
+                        nvkvm_m2_dump_launch_uvm_result(s, host_work_pb,
+                                                        host_work_pblen,
+                                                        "host-ring");
+                        nvkvm_m2_log_host_channel_state(s, c, "host-ring");
+                        if (qmd_launch) {
+                            nvkvm_m2_log_post_launch_rm_state(s, c, "host-qmd");
+                        }
+                    }
+                    if (nvkvm_m2_finish_host_gr_get(s, i, c, hget, tok,
+                                                    tok_valid, "host-ring")) {
+                        host_completed = true;
+                    }
+                }
             }
         } else if (engine != 1u) {
             static uint32_t skip_cnt;
@@ -11710,6 +11932,13 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
      * (Mode-2's "display for free" rides on this.) */
     pci_set_word(cfg + PCI_SUBSYSTEM_VENDOR_ID, chip->sub_vendor_id);
     pci_set_word(cfg + PCI_SUBSYSTEM_ID,        chip->sub_device_id);
+    /*
+     * The guest driver currently leaves our MSI-X table disabled, so GSP/event
+     * delivery falls back to pci_set_irq().  Advertise INTA# or Linux routes no
+     * legacy IRQ at all (/proc/driver/nvidia/... reports IRQ: 0), making those
+     * fallback interrupts invisible to the guest.
+     */
+    pci_set_byte(cfg + PCI_INTERRUPT_PIN, 1);
 
     /* BAR0: REGS, 32-bit non-prefetchable MMIO (matches real GA10x). */
     memory_region_init_io(&s->bar0, OBJECT(s), &nvkvm_bar0_ops, s,

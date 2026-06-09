@@ -31,38 +31,46 @@ Current broad compute status:
 
 - The 4-byte `cup2_pause` UVM proof still passes with the normal service-interrupt mask, no
   `LD_PRELOAD`, and no `NVUVM_SHADOW`, using the debug guest-kernel UVM bridge.
-- A new direct CUDA-driver repro, `scripts/mode2_diag/ctx_probe.c`, now isolates the broader blocker:
-  `ctx_probe minimal` prints `ok cuInit(0)` and `ok cuDeviceGet(&d, 0)`, then hangs in
-  `cuCtxCreate(&ctx, 0, d)`.
-- `matmul_pause 64` fails at the same point, before any matmul launch.
+- A direct CUDA-driver repro, `scripts/mode2_diag/ctx_probe.c`, now passes in the guest when the
+  debug guest-kernel UVM bridge is loaded before the CUDA process. The passing run prints
+  `ok cuInit(0)`, `ok cuDeviceGet(&d, 0)`, `ok cuCtxCreate(&ctx, 0, d)`, and `CTX OK`.
+- This run validates that the latest local event/host completion work gets libcuda through the
+  native second OS-event group (`0x30000001`, `0x30000003`, `0x30000004`, `0x30000002`) instead of
+  looping forever on the first event group.
+- `matmul_pause 64` is the next target. It has not been re-run after the `ctx_probe` pass in this
+  checkpoint.
 - `NVKVM_M2_SERVICE_INTERRUPTS_ZERO=1` was tried as a diagnostic and made the path worse; it is not a
   fix.
 - `NVKVM_M2_POST_EVENT_PACKED_DATA=1` was tried as a diagnostic. It did not make `cuCtxCreate`
   return, and guest `nv_post_event` still saw `data_valid=0`, `info32=0`, `info16=0`.
 
-Clean `ctx_probe minimal` trace fingerprint:
+Clean passing `ctx_probe minimal` trace fingerprint:
 
-- The final useful guest ioctl is `UVM_MAP_EXTERNAL_ALLOCATION` over the high-UVM range around
-  `0x204a00000` with length `0x200000`.
-- After that, userspace repeats `NV2080_CTRL_CMD_MC_SERVICE_INTERRUPTS` (`0x20801702`) roughly once
-  per second.
-- QEMU posts GSP `POST_EVENT` messages for the registered OS events (`0x5c00003a`,
-  `0x5c000048`, `0x5c000056`), but the guest kernel currently receives them as dataless wakeups:
-  `nv_post_event ... info32=0x0 info16=0x0 dv=0`.
-- The repeated `0x120064000` GPFIFO lookahead rows are not all-zero work. The lookahead dumps entries
-  after `GP_PUT`; the actual current entries are valid CE memset/scrub packets and QEMU releases
-  `0x12006c004` payloads. A new `M8.102` guard prevents genuinely empty entries from advancing
-  `GP_GET`, but it did not trigger in the latest `ctx_probe` run.
-- Host dmesg during the same repro still shows the production-relevant failures:
-  `rpcRmApiAlloc_GSP ... hClass=0x90f1 status=0x40`,
-  `kchannelConstruct_IMPL: Only kernel priv clients can skip scrubber`,
-  `kfifoChidMgrAllocChid_IMPL: Failed to allocate Channel ID on heap`, and many
-  `dmaAllocMapping_GM107: can't alloc VA space for mapping`.
+- The debug UVM bridge must be loaded. A no-bridge run is not a valid UVM dataplane test because QEMU
+  never receives `UVM_MAP_EXTERNAL_ALLOCATION` backing records.
+- The run records the initial UVM external ranges (`0x200000000`, `0x10000000000`,
+  `0x10002000000`, high process VAs, `0x200200000`, and the `0x200400000` command ring), then gets
+  past the previous stop around `0x204600000`/`0x204a00000`.
+- The passing run continues through later UVM external allocations including `0x204c00000`,
+  `0x204e00000`, high process VA ranges, and a larger high range before returning from
+  `cuCtxCreate`.
+- QEMU posts the first OS-event group (`0x3800000c`, `0x38000019`, `0x3800001a`) and then the
+  native second group (`0x30000001`, `0x30000003`, `0x30000004`, `0x30000002`). `M8.107` suppresses
+  duplicate local completion posts for the same token/event set while still allowing posts after new
+  OS events are allocated.
+- The repeated `0x120064000` GPFIFO lookahead rows were not all-zero work. The lookahead dumped
+  entries after `GP_PUT`; the actual current entries were valid CE memset/scrub packets and QEMU
+  released `0x12006c004` payloads. `M8.102` guards genuinely empty wrap-tail entries.
+- Host dmesg still shows residual production debt around host RM/channel cleanup after process exit,
+  including `kgspExecuteBooterUnloadIfNeeded_TU102: failed to execute Booter Unload: WPR2 is still
+  up` and an `osinit.c:2363` assert. Treat those as follow-up unless they block matmul.
 
-Active lead after this checkpoint: compare a native host `ctx_probe` run to the guest repro with
-matching `libcuda`/binary as closely as possible, then fix the host RM mapping/channel failure that
-produces the `dmaAllocMapping_GM107` and channel allocation errors. The event payload issue remains
-suspicious, but the simple packed/unpacked POST_EVENT layout toggle is ruled out.
+Active lead after this checkpoint: run `matmul_pause 64` from a fresh VM boot with the debug UVM
+bridge loaded. If it fails, compare the guest syscall/MMAP/poll trace to a native host run using the
+same `libcuda` and test binary. For Mode-2 production, keep the UVM rule strict: QEMU must not read
+guest userspace VAs; `/tmp/m2_pbmap.txt`, pagemap export, and the uprobe bridge are debug-only.
+Production should consume GPA/GPGA/GR-VA state and host RM mappings, with CR3 only as an opaque
+isolate identity.
 
 ## 1. 4-Byte UVM Proof Status
 
@@ -171,6 +179,17 @@ Tracked local changes:
     - `0xFFF538`: commit token.
   - CE write, read, and resolve paths check the M8.14 shadow table before falling back to channel
     page-table translation.
+  - M8.102: guards empty wrapped GPFIFO tail entries instead of advancing through unresolved work.
+  - M8.103: captures forwarded GPFIFO channel allocation `internalFlags` and patches the guest fake
+    reply to match the host RM reply.
+  - M8.104: advertises legacy INTA#, clears the GSP SWGEN0 interrupt vector, and deasserts legacy IRQ
+    when the interrupt tree becomes idle.
+  - M8.105: tracks per-channel host GR work in flight and completes `GP_GET` from host USERD before
+    delivering host completion events.
+  - M8.106: maps pbmap/channel target pages into the current CVAS instead of falling back to the
+    legacy/default mapper.
+  - M8.107: suppresses duplicate local completion posts for the same work-submit token and OS-event
+    set. This is the change that made the bridge-backed `ctx_probe minimal` run return `CTX OK`.
 
 - `scripts/mode2_diag/nvkvm_uvm_uprobe_bridge.c`
   - Guest kernel debug module.
@@ -222,9 +241,10 @@ backing is the missing piece.
   shadow-forwarded host object for it, so "map the existing hMemory on the host" is not currently a
   valid fix path.
 
-## 5. Active Next Step
+## 5. Production UVM Path
 
-Replace the debug guest-kernel uprobe proof with the real Mode-2 UVM external-allocation path.
+After the matmul/LLM bring-up loop, replace the debug guest-kernel uprobe proof with the real Mode-2
+UVM external-allocation path.
 The production rule is documented in `docs/design/mode2_dataplane_architecture.md`: QEMU must track
 guest GR VA, GPGA/GPA, PDB leaves, and isolate-owned host mappings. Guest userspace VAs are opaque
 except for debug probes, and CR3 is only an isolate/process key.
@@ -333,9 +353,16 @@ Build and load the no-`LD_PRELOAD` debug UVM bridge:
 ```bash
 ssh vg 'bash -s' <<'SH'
 set -euo pipefail
-chmod +x /tmp/build_uvm_uprobe_bridge.sh
-SRC=/tmp/nvkvm_uvm_uprobe_bridge.c /tmp/build_uvm_uprobe_bridge.sh
+bash /tmp/build_uvm_uprobe_bridge.sh
 SH
+```
+
+When using the 9p-mounted repo instead of copied files, do not `chmod` files under `/mnt/nvkvm_src`;
+9p may reject it. Run the helper through `bash`:
+
+```bash
+SRC=/mnt/nvkvm_src/scripts/mode2_diag/nvkvm_uvm_uprobe_bridge.c \
+  bash /mnt/nvkvm_src/scripts/mode2_diag/build_uvm_uprobe_bridge.sh
 ```
 
 Launch the no-`LD_PRELOAD` run:
