@@ -426,7 +426,12 @@ struct NvkvmGpuEmul {
      * exhaustion -> legitimate buffer maps then failed -> the host GPU stalled mid-channel
      * (GP_GET stuck). Size it well past any cuCtxCreate/matmul working set. */
 #define NVKVM_MAX_MAPPED_VA 65536
-    uint64_t m2_mapped_va[NVKVM_MAX_MAPPED_VA];
+    /* M5.34: dedup key is (client, va) NOT va alone.  Host VASpaces are PER-CLIENT
+     * (m2_devvas[] selects {dev,vas} by client), so a VA placed into client A's VAS
+     * is NOT present in client B's VAS.  A va-only dedup wrongly skipped placing a
+     * shared pushbuffer (e.g. 0x120000000) into the CE-scrubber's VAS after another
+     * client claimed the slot first -> host GR0_PBDMA0 MMU FAULT_PTE -> channel halt. */
+    struct { uint32_t client; uint64_t va; } m2_mapped_va[NVKVM_MAX_MAPPED_VA];
     int      m2_mapped_va_n;
     /* M6.0 (item-4 prereq): guest RAM as a shared memfd, so the STUB can mmap any guest GPA
      * and OS_DESCRIPTOR-register it -> the host GPU can DMA into the guest's sysmem GR buffers
@@ -1205,7 +1210,7 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client); /* M6.5 f
 static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s); /* M14 fwd-decl */
 static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                                 uint64_t *out_redir); /* M5.18 fwd-decl */
-static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint64_t va); /* M5.19 fwd-decl */
+static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint32_t client, uint64_t va); /* M5.19 fwd-decl */
 
 static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
 {
@@ -2971,7 +2976,8 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * host GR VAS so the REAL host GPU writes the payload here (guest GPA -> shared
      * memfd -> OS_DESCRIPTOR WB -> FIXED map at the matching VA).  Guest then reads
      * the host GPU's write coherently (WB snooped).  Idempotent; m2exec-gated. */
-    if (s->m2exec && p != NVKVM_GMMU_FAULT && sy && !nvkvm_m2_va_seen(s, va & ~0xfffull)) {
+    if (s->m2exec && p != NVKVM_GMMU_FAULT && sy &&
+        !nvkvm_m2_va_seen(s, s->chan_client, va & ~0xfffull)) {
         uint64_t gbase = p & ~0xfffull;
         bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, va & ~0xfffull, gbase, 0x1000);
         qemu_log("nvkvm-gpu[%s] M5.19 fwd-map sema VA=0x%llx gpa=0x%llx -> %s\n",
@@ -3186,7 +3192,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
      * (already zero-copy-mapped, M5.19) -> runs + writes the completion.  Gated on
      * m2exec + a resolved GSP-managed ring (chan_gpfifo_phys); idempotent per VA. */
     if (s->m2exec && s->chan_gpfifo_phys && s->chan_gpfifo_va &&
-        !nvkvm_m2_va_seen(s, s->chan_gpfifo_va)) {
+        !nvkvm_m2_va_seen(s, s->chan_client, s->chan_gpfifo_va)) {
         uint64_t gsz = ((uint64_t)s->chan_gpfifo_ent * 8 + 0xfffull) & ~0xfffull;
         if (gsz == 0 || gsz > 0x10000) { gsz = 0x10000; }
         bool gok = nvkvm_m2_back_and_map(s, s->chan_client, s->chan_gpfifo_va,
@@ -3259,7 +3265,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 uint64_t pbbase = pb & ~0xfffull;
                 uint64_t gbase  = pgpa - (pb - pbbase);   /* GPA of the page base */
                 uint64_t msz    = (((pb + (uint64_t)pblen * 4) - pbbase) + 0xfffull) & ~0xfffull;
-                if (!nvkvm_m2_va_seen(s, pbbase)) {
+                if (!nvkvm_m2_va_seen(s, s->chan_client, pbbase)) {
                     bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, pbbase, gbase, msz);
                     qemu_log("nvkvm-gpu[%s] M5.19 fwd-map pushbuffer VA=0x%llx gpa=0x%llx "
                              "sz=0x%llx client=0x%08x -> %s\n", s->chip->name,
@@ -4670,12 +4676,18 @@ static uint64_t nvkvm_m2_resolve_fb(NvkvmGpuEmul *s, uint64_t va)
     return 0;
 }
 /* M5.9: has this VA already been backed+mapped? (dedup repeated pushbuffers). Adds if new. */
-static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint64_t va)
+static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
 {
     for (int i = 0; i < s->m2_mapped_va_n; i++) {
-        if (s->m2_mapped_va[i] == va) { return true; }
+        if (s->m2_mapped_va[i].va == va && s->m2_mapped_va[i].client == client) {
+            return true;
+        }
     }
-    if (s->m2_mapped_va_n < NVKVM_MAX_MAPPED_VA) { s->m2_mapped_va[s->m2_mapped_va_n++] = va; }
+    if (s->m2_mapped_va_n < NVKVM_MAX_MAPPED_VA) {
+        s->m2_mapped_va[s->m2_mapped_va_n].client = client;
+        s->m2_mapped_va[s->m2_mapped_va_n].va     = va;
+        s->m2_mapped_va_n++;
+    }
     return false;
 }
 
@@ -4799,7 +4811,7 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
     }
     if (a->sys) {
         a->sysbytes += a->len;
-        if (!nvkvm_m2_va_seen(a->s, a->va0) &&
+        if (!nvkvm_m2_va_seen(a->s, a->client, a->va0) &&
             nvkvm_m2_back_and_map_sys(a->s, a->client, a->va0, a->gpa0, a->len)) {
             a->backed++;
         }
@@ -4813,7 +4825,7 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
          * 0x51 from map_dma = the host self-promoted its own object at this VA (no overlay;
          * needs the avoid-self-promotion path). copy_content=false (blank). */
         a->vidbytes += a->len;
-        if (!nvkvm_m2_va_seen(a->s, a->va0) &&
+        if (!nvkvm_m2_va_seen(a->s, a->client, a->va0) &&
             nvkvm_m2_gpga_obj(a->s, a->client, a->va0, a->gpa0, a->len) >= 0) {
             a->backed++;          /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
         }
@@ -5058,7 +5070,7 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
             if (!pb) { continue; }
             uint64_t pbbase = pb & ~0xfffull;
-            if (nvkvm_m2_va_seen(s, pbbase)) { continue; }
+            if (nvkvm_m2_va_seen(s, grc, pbbase)) { continue; }
             uint64_t pbphys = nvkvm_m2_resolve_fb(s, pbbase);
             uint64_t sz = ((pb - pbbase) + (uint64_t)pblen * 4 + 0xfff) & ~0xfffull;
             if (!sz) { sz = 0x1000; }

@@ -174,6 +174,13 @@ work, so if the host runs it, `get` advances + util>0 + host writes its sem. Rin
 nvidia_modeset nvidia; modprobe nvidia` on vh, or `vastai reboot instance <id>` (key in memory
 vastai_credentials; find instance id via `vastai show instances`).
 
+## Escalation rule (user, 2026-06-10)
+**Never report "stuck" until Fable is also stuck on it.** When you reach the point where you'd stop
+and ask the user / declare a blocker, FIRST hand the problem to a Fable subagent (`model: fable`) —
+the precise source-trace or byte/fault correlation. Only surface a blocker to the user once Fable has
+also failed to crack it. (Fable's grounded byte/fault analyses are reliable; verify its output vs
+hardware. Its open-ended source-traces can over-commit — anchor every Fable task in concrete data.)
+
 ## Stop-and-report forks
 - Step 4 ring wedges repeatedly / needs `vastai reboot` → report.
 - A required completion turns out NOT to come from a host-pollable fd (host wouldn't interrupt) →
