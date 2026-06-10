@@ -35,9 +35,21 @@
 #define NVKVM_BAR0_UVM_SIZE_LO    0xFFF530ul
 #define NVKVM_BAR0_UVM_SIZE_HI    0xFFF534ul
 #define NVKVM_BAR0_UVM_COMMIT     0xFFF538ul
-#define NVKVM_BAR0_UVM_SPAN       0x20ul
+#define NVKVM_BAR0_RMALLOC_HCLIENT      0xFFF540ul
+#define NVKVM_BAR0_RMALLOC_HPARENT      0xFFF544ul
+#define NVKVM_BAR0_RMALLOC_HOBJECT      0xFFF548ul
+#define NVKVM_BAR0_RMALLOC_HCLASS       0xFFF54cul
+#define NVKVM_BAR0_RMALLOC_PARAM_GPA_LO 0xFFF550ul
+#define NVKVM_BAR0_RMALLOC_PARAM_GPA_HI 0xFFF554ul
+#define NVKVM_BAR0_RMALLOC_PARAM_SIZE   0xFFF558ul
+#define NVKVM_BAR0_RMALLOC_COMMIT       0xFFF55cul
+#define NVKVM_BAR0_UVM_SPAN       0x40ul
 
 #define NVKVM_BRIDGE_SLOTS        1024
+#define NVKVM_RMALLOC_REPORT_TOKEN 0x40000000u
+#define NVKVM_RMALLOC_MEM_CLASS    0x0000003eu
+#define NVKVM_RMALLOC_LOCAL_USER_CLASS 0x00000040u
+#define NVKVM_RMALLOC_MEM_PARAMS_SIZE 128u
 
 static char *libcuda_path = "/usr/local/nvidia-guest/lib/libcuda.so.580.159.04";
 module_param(libcuda_path, charp, 0444);
@@ -150,6 +162,13 @@ struct nvkvm_ioctl_slot {
     pid_t pid;
     unsigned long req;
     unsigned long arg;
+    u32 h_client;
+    u32 h_parent;
+    u32 h_object;
+    u32 h_class;
+    u32 param_size;
+    int param_slot;
+    bool rm_alloc;
 };
 
 static struct nvkvm_ioctl_slot ioctl_slots[NVKVM_IOCTL_SLOTS];
@@ -197,6 +216,24 @@ static void nvkvm_report_shadow(u64 va, u64 gpa, u64 size, u32 token)
     iowrite32((u32)(size >> 32), bar + (NVKVM_BAR0_UVM_SIZE_HI - NVKVM_BAR0_UVM_VA_LO));
     wmb();
     iowrite32(token,         bar + (NVKVM_BAR0_UVM_COMMIT  - NVKVM_BAR0_UVM_VA_LO));
+}
+
+static void nvkvm_report_rmalloc(u32 h_client, u32 h_parent, u32 h_object,
+                                 u32 h_class, u64 param_gpa, u32 param_size,
+                                 u32 token)
+{
+    if (!bar)
+        return;
+
+    iowrite32(h_client,  bar + (NVKVM_BAR0_RMALLOC_HCLIENT - NVKVM_BAR0_UVM_VA_LO));
+    iowrite32(h_parent,  bar + (NVKVM_BAR0_RMALLOC_HPARENT - NVKVM_BAR0_UVM_VA_LO));
+    iowrite32(h_object,  bar + (NVKVM_BAR0_RMALLOC_HOBJECT - NVKVM_BAR0_UVM_VA_LO));
+    iowrite32(h_class,   bar + (NVKVM_BAR0_RMALLOC_HCLASS - NVKVM_BAR0_UVM_VA_LO));
+    iowrite32((u32)param_gpa, bar + (NVKVM_BAR0_RMALLOC_PARAM_GPA_LO - NVKVM_BAR0_UVM_VA_LO));
+    iowrite32((u32)(param_gpa >> 32), bar + (NVKVM_BAR0_RMALLOC_PARAM_GPA_HI - NVKVM_BAR0_UVM_VA_LO));
+    iowrite32(param_size, bar + (NVKVM_BAR0_RMALLOC_PARAM_SIZE - NVKVM_BAR0_UVM_VA_LO));
+    wmb();
+    iowrite32(token,     bar + (NVKVM_BAR0_RMALLOC_COMMIT - NVKVM_BAR0_UVM_VA_LO));
 }
 
 static bool nvkvm_cmd_seen_update(pid_t tgid, u64 va, u64 gpa,
@@ -670,16 +707,55 @@ static int nvkvm_ioctl_handler(struct uprobe_consumer *self, struct pt_regs *reg
 #ifdef CONFIG_X86_64
     unsigned long req = regs->si;
     unsigned long arg = regs->dx;
+    unsigned long type = (req >> 8) & 0xfful;
+    unsigned long nr = req & 0xfful;
     int slot = -1;
+    struct nvkvm_ioctl_slot rec = { 0 };
     unsigned long flags;
 
     nvkvm_scan_task_cmd_ranges(current, current->tgid, cmd_scan_pages);
 
-    if (((req >> 8) & 0xfful) != 0 ||
-        (req & 0xfful) != NVKVM_UVM_MAP_EXTERNAL_ALLOCATION ||
-        !arg) {
+    if (!arg)
+        return 0;
+
+    if (type == 0 && nr == NVKVM_UVM_MAP_EXTERNAL_ALLOCATION) {
+        /* existing UVM_MAP_EXTERNAL tracking */
+    } else if (type == 'F' && nr == 0x2bul) {
+        u64 pptr = 0;
+        u32 h_class = 0;
+
+        if (copy_from_user(&h_class, (void __user *)(arg + 12), sizeof(h_class)) != 0 ||
+            (h_class != NVKVM_RMALLOC_MEM_CLASS &&
+             h_class != NVKVM_RMALLOC_LOCAL_USER_CLASS) ||
+            copy_from_user(&pptr, (void __user *)(arg + 16), sizeof(pptr)) != 0 ||
+            !pptr) {
+            return 0;
+        }
+
+        rec.param_slot = atomic_inc_return(&next_slot) % NVKVM_BRIDGE_SLOTS;
+        if (!slots[rec.param_slot].page)
+            return 0;
+        memset(slots[rec.param_slot].page, 0, PAGE_SIZE);
+        if (copy_from_user(slots[rec.param_slot].page,
+                           (void __user *)pptr,
+                           NVKVM_RMALLOC_MEM_PARAMS_SIZE) != 0) {
+            return 0;
+        }
+        if (copy_from_user(&rec.h_client, (void __user *)(arg + 0), sizeof(rec.h_client)) != 0 ||
+            copy_from_user(&rec.h_parent, (void __user *)(arg + 4), sizeof(rec.h_parent)) != 0 ||
+            copy_from_user(&rec.h_object, (void __user *)(arg + 8), sizeof(rec.h_object)) != 0) {
+            return 0;
+        }
+        rec.h_class = h_class;
+        rec.param_size = NVKVM_RMALLOC_MEM_PARAMS_SIZE;
+        rec.rm_alloc = true;
+    } else {
         return 0;
     }
+
+    rec.pid = current->pid;
+    rec.req = req;
+    rec.arg = arg;
 
     spin_lock_irqsave(&ioctl_lock, flags);
     for (int i = 0; i < NVKVM_IOCTL_SLOTS; i++) {
@@ -691,9 +767,7 @@ static int nvkvm_ioctl_handler(struct uprobe_consumer *self, struct pt_regs *reg
             slot = i;
     }
     if (slot >= 0) {
-        ioctl_slots[slot].pid = current->pid;
-        ioctl_slots[slot].req = req;
-        ioctl_slots[slot].arg = arg;
+        ioctl_slots[slot] = rec;
     }
     spin_unlock_irqrestore(&ioctl_lock, flags);
 #endif
@@ -716,9 +790,7 @@ static int nvkvm_ioctl_ret_handler(struct uprobe_consumer *self,
     for (int i = 0; i < NVKVM_IOCTL_SLOTS; i++) {
         if (ioctl_slots[i].pid == current->pid) {
             saved = ioctl_slots[i];
-            ioctl_slots[i].pid = 0;
-            ioctl_slots[i].req = 0;
-            ioctl_slots[i].arg = 0;
+            memset(&ioctl_slots[i], 0, sizeof(ioctl_slots[i]));
             break;
         }
     }
@@ -726,6 +798,32 @@ static int nvkvm_ioctl_ret_handler(struct uprobe_consumer *self,
 
     if (!saved.arg || ret != 0)
         return 0;
+
+    if (saved.rm_alloc) {
+        u32 status = 0xffffffffu;
+
+        if (saved.param_slot < 0 || saved.param_slot >= NVKVM_BRIDGE_SLOTS ||
+            !slots[saved.param_slot].page ||
+            copy_from_user(&status, (void __user *)(saved.arg + 28),
+                           sizeof(status)) != 0 ||
+            status != 0) {
+            return 0;
+        }
+
+        token = (u32)atomic_inc_return(&report_count) |
+                NVKVM_RMALLOC_REPORT_TOKEN;
+        nvkvm_report_rmalloc(saved.h_client, saved.h_parent, saved.h_object,
+                             saved.h_class, slots[saved.param_slot].gpa,
+                             saved.param_size, token);
+        if ((token & ~NVKVM_RMALLOC_REPORT_TOKEN) <= 96) {
+            pr_info("nvkvm_uvm_bridge: RMALLOC hClient=0x%08x hParent=0x%08x hObject=0x%08x hClass=0x%08x gpa=0x%llx size=%u token=0x%08x\n",
+                    saved.h_client, saved.h_parent, saved.h_object,
+                    saved.h_class,
+                    (unsigned long long)slots[saved.param_slot].gpa,
+                    saved.param_size, token);
+        }
+        return 0;
+    }
 
     if (copy_from_user(&base, (void __user *)saved.arg, sizeof(base)) != 0 ||
         copy_from_user(&len, (void __user *)(saved.arg + 8), sizeof(len)) != 0 ||
@@ -816,7 +914,7 @@ static int nvkvm_map_bar(void)
         resource_size_t start = pci_resource_start(pdev, 0);
         resource_size_t len = pci_resource_len(pdev, 0);
 
-        if (!start || len <= NVKVM_BAR0_UVM_COMMIT)
+        if (!start || len <= NVKVM_BAR0_RMALLOC_COMMIT)
             continue;
 
         bar = ioremap(start + NVKVM_BAR0_UVM_VA_LO, NVKVM_BAR0_UVM_SPAN);
