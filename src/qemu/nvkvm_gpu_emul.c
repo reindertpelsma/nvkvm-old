@@ -2295,7 +2295,11 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                  * unscheduled host TSG is idle and the ring is a no-op (GPU stays 0%).
                  * Schedule once, per channel's parent TSG. NVA06C_CTRL_CMD_GPFIFO_SCHEDULE
                  * (0xa06c0101), params {bEnable=1,bSkipSubmit,bSkipEnable}. */
-                if (c->tsg && !c->scheduled) {
+                if (c->tsg && !c->scheduled && c->tsg != s->m2_gr_tsg) {
+                    /* M5.33: the GR TSG is already GPFIFO_SCHEDULE'd once by M5.8
+                     * doorbell_setup; re-scheduling it here (per-channel) re-binds it
+                     * with the transient/freed init channels in the TSG -> st=0x57
+                     * OBJECT_NOT_FOUND (8x noise). Skip the GR TSG. */
                     uint8_t sp[3]; memset(sp, 0, sizeof(sp)); sp[0] = 1;
                     uint32_t sst = 0xffff;
                     int src = nvkvm_m2_control1(s, c->client, c->tsg, 0xa06c0101u,
@@ -2319,6 +2323,18 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 }
                 uint32_t hput = uqva ? ldl_le_p((uint8_t *)uqva + 0x8C) : 0xffffffffu;
                 uint32_t hget = uqva ? ldl_le_p((uint8_t *)uqva + 0x88) : 0xffffffffu;
+                /* M5.33 (Step-4 GP_PUT BRIDGE — load-bearing): propagate the guest
+                 * channel's GP_PUT into the HOST USERD (0x8C) so the host GPU sees
+                 * put>get and fetches the GPFIFO entries.  The GPFIFO is the SAME
+                 * double-mmapped buffer for guest+host (no-copy back_and_map), so the
+                 * entry indices are identical — write c->gp_get verbatim.  Host owns
+                 * GP_GET (0x88) and advances it as it consumes; do NOT touch it.  Must
+                 * precede the doorbell write below so the host sees work the moment it
+                 * services the ring.  This is what makes the host channel actually run
+                 * the forwarded compute (host USERD was put=0 before this). */
+                if (uqva) {
+                    stl_le_p((uint8_t *)uqva + 0x8C, c->gp_get);
+                }
                 stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, c->host_token);
                 qemu_log("nvkvm-gpu[%s] M5.22 RANG host doorbell ch[%d] token=0x%08x "
                          "(client=0x%08x gpfifo=0x%llx) hostUSERD put=%u get=%u%s\n",
