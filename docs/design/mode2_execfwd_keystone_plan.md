@@ -270,6 +270,35 @@ Method: fresh boot (m2hostsem=off), capture the exact Xid 32 (host dmesg) + for 
 channel dump the GP entry + the pushbuffer bytes the host reads (host VA content) vs the bytes the
 guest wrote (guest gpa). A content mismatch confirms candidate 1. Hand the precise trace to Fable.
 
+## PROGRESS LOG 7 (2026-06-10) — DECISION + cuCtxCreate blocker PINNED
+
+User principle (decisive): "if it's forwardable from host userspace unprivileged, use that; otherwise
+simulate, especially if it's kernel-only." → The CE scrubber is the guest KERNEL's internal vidmem
+zeroing (CeUtils), NOT host-userspace-forwardable, and forwarding it is what fails (Xid 32). So
+**SIMULATE it (QEMU's Phase-B stub already does — cuInit passes) and STOP chasing Xid 32.** The
+forwardable workload is the compute channel (matmul); forward THAT for real. Dropped: the Xid-32
+host-execute rabbit hole.
+
+**cuCtxCreate blocker PINNED with fresh data (m2hostsem=off, default):** cuInit + all device queries
+pass; cuCtxCreate hangs. The control histogram during the hang: **28× `0x20801702`
+MC_SERVICE_INTERRUPTS** (top), 18× `0x2080012b` PROMOTE_CTX, interleaved — then timeout → teardown
+(`fn=47 UNLOAD → WPR2 down → GSP restart`; the tail SEC_CPUCTL/PMC_BOOT_0 falcon spin is the
+post-reset reboot, not the hang itself).
+
+Root mechanism: the guest poll-loops MC_SERVICE_INTERRUPTS waiting for a GSP completion event (GR
+ctx-init / PROMOTE_CTX completion) that we never post. The event machinery EXISTS
+(`nvkvm_m3_post_event` 0x1003 + `nvkvm_gsp_deliver_events` + SWGEN0 raise + osevents[] registered on
+class-0x0079 alloc) but only fires on `any_completed` (a channel's gp_get advanced). During
+cuCtxCreate the GR/compute channel submits NO sustained GPFIFO work (Layer 1 — golden ctx is
+GSP/FECS-internal), so `any_completed` is false → no event → infinite wait. Per the principle we ARE
+the GSP, so we must SIMULATE posting the completion event the guest's cuCtxCreate wait needs.
+
+The current branch's `0x20801702` default reply (echo mask, status=0, no forward) is already the
+oracle's clean guest-only behavior; the oracle's M8.108 env-knob maze (ZERO/_AFTER_LOCAL/_AFTER_HOST/
+HOST_ZERO_BUDGET) is SLOP — do NOT port it. The real task = pin WHICH GSP event/notifier the guest's
+cuCtxCreate wait drains, and post it at the right trigger (cleanly). Oracle solved this only flakily
+(2/4). NEXT: Fable reverse-engineers the precise wait + clean post-trigger; I implement + verify.
+
 ## Escalation rule (user, 2026-06-10)
 **Never report "stuck" until Fable is also stuck on it.** When you reach the point where you'd stop
 and ask the user / declare a blocker, FIRST hand the problem to a Fable subagent (`model: fable`) —
