@@ -378,6 +378,11 @@ struct NvkvmGpuEmul {
     bool     m2_inventory_done; /* M5.6: one-shot GR working-set inventory dump at doorbell */
     bool     m2_sem_probe_done; /* M5.13: one-shot DRY-RUN locate of the completion semaphore PDB */
     bool     m2exec;            /* M5.7 prop: execution-plane backing (default ON; debug-only off) */
+    bool     m2hostsem;         /* M5.35 prop: host GPU owns the completion semaphore — suppress
+                                 * QEMU's Phase-B stub sema writes (CE_SEM_RELEASE / NVC56F
+                                 * SEM_RELEASE / +0x8004 fallback) so the real host release is the
+                                 * SOLE writer.  Fixes the double-writer 2^32 UVM jump once M5.34
+                                 * makes the host actually execute the channel.  Default OFF (A/B). */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
     uint32_t m2_last_db_token;  /* M5.11: last guest work-submit token seen at the doorbell (dedup log) */
@@ -2350,7 +2355,11 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (s->chan_sem_released) {
                 continue;                        /* explicit release already done */
             }
-            /* Fallback: implicit finish-payload semaphore. */
+            /* Fallback: implicit finish-payload semaphore. M5.35: skip when the host owns
+             * the completion sema (it wrote the real value via its own release). */
+            if (s->m2hostsem) {
+                continue;
+            }
             uint64_t sema_va = c->gpfifo_va + 0x8004ull;
             bool is_sys = false;
             uint64_t phys = nvkvm_chan_translate(s, sema_va, &is_sys);
@@ -3405,7 +3414,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                      * scrub pushbuffer ALSO emits an NVC56F SEM_EXECUTE (host
                      * sema at semaOffset), so honoring only that left this one
                      * unwritten and the scrubber timed out (ce_utils.c:349). */
-                    if (sem_type != 0 && ce_sem_addr) {
+                    if (sem_type != 0 && ce_sem_addr && !s->m2hostsem) {
                         uint64_t redir = 0;                    /* M5.18: also write the BAR1 page libcuda polls */
                         if (nvkvm_chan_sem_wr32(s, ce_sem_addr, ce_sem_pay, &redir)) {
                             s->chan_sem_released = true;
@@ -3423,7 +3432,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 case 0x64: sem_pay_lo = d; break;                                            /* SEM_PAYLOAD_LO */
                 case 0x68: sem_pay_hi = d; break;                                            /* SEM_PAYLOAD_HI */
                 case 0x6c: {                                                                 /* SEM_EXECUTE */
-                    if ((d & 0x7u) == 0x1u && sem_addr) {   /* OPERATION == RELEASE */
+                    if ((d & 0x7u) == 0x1u && sem_addr && !s->m2hostsem) {   /* OPERATION == RELEASE */
                         bool sz64 = (d >> 24) & 1;           /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
                         uint64_t redir = 0;                  /* M5.18: also write the BAR1 page libcuda polls */
                         if (nvkvm_chan_sem_wr32(s, sem_addr, sem_pay_lo, &redir)) {
@@ -5530,6 +5539,7 @@ static Property nvkvm_gpu_emul_props[] = {
      * DEBUG off-switch for the no-host-GPU fake-the-boot bring-up (M0-M3). */
     DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, true), /* M5: host-GPU forwarding (always on) */
     DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, true), /* M5.7: execution-plane backing (always on) */
+    DEFINE_PROP_BOOL("m2hostsem", NvkvmGpuEmul, m2hostsem, false), /* M5.35: host owns completion sema */
     DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
     DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),

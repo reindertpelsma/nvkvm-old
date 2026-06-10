@@ -240,6 +240,36 @@ verified its load-bearing claims against the live host trace:
    M8.108 service-interrupt credits). The real cuCtxCreate gate.
 3. COPY2/COPY3 `0x57` (only if matmul HtoD/DtoH needs those copy TSGs).
 
+## PROGRESS LOG 6 (2026-06-10) — CORRECTION: keystone only HALF-cracked; host does NOT execute yet
+
+Ran the m2hostsem A/B experiment (M5.35: gate OFF QEMU's Phase-B completion-sema stub writes so the
+host would be the sole writer). RESULT **disproved the double-write hypothesis and corrected an
+over-claim**:
+- With `m2hostsem=on`, the CE scrubber wait **TIMES OUT** (`NV_ERR_TIMEOUT memmgrMemSet PREFER_CE @
+  mem_mgr.c:463`; `pCeUtils->lastCompletedPayload == lastSubmittedPayload @ ce_utils.c:349`) →
+  `RmInitAdapter failed` → **cuInit 999**. So the **host GPU is NOT writing the completion semaphore**
+  — QEMU's Phase-B stub write was the ONLY thing satisfying the scrubber wait. The `0x1_00000054` seen
+  earlier was QEMU's OWN buggy write (NVC56F `sem_pay_hi=1` + `lo=0x54`), not a host completion.
+- Therefore M5.34 fixed the MMU fault (real — page now mapped) but the host then hits **Xid 32
+  (corrupted/invalid pushbuffer stream)** on the CE channel and does NOT execute the work. The
+  keystone advanced `Xid 31 MMU-fault → Xid 32 parse-error` but is **NOT** "host runs forwarded work".
+
+**M5.35 kept as a default-OFF diagnostic toggle** (NVKVM_M2HOSTSEM=1) — it cleanly proves whether the
+host writes completions; it is NOT a fix. Normal boots stay m2hostsem=off (QEMU stub load-bearing).
+
+### THE REAL KEYSTONE WALL = Xid 32 (host can't execute the forwarded pushbuffer)
+Why does the host GPU read the (now-mapped) pushbuffer and reject it as corrupt? Candidates:
+1. **Wrong backing content** (most likely): M5.19 maps VA→gpa via the per-client PDB walk
+   (nvkvm_chan_translate). If that walk resolves the WRONG gpa (the M5.16/M5.17 "VAS-walk gave wrong
+   page" aliasing), the host reads garbage as methods → Xid 32. The forwarded pushbuffer must be the
+   guest's EXACT bytes.
+2. GP-entry LENGTH/encoding mismatch (host reads wrong # method words from the double-mmapped GPFIFO).
+3. A method-referenced VA (copy src/dst, sema) not mapped in the host VAS (would more likely be Xid
+   31, but check).
+Method: fresh boot (m2hostsem=off), capture the exact Xid 32 (host dmesg) + for the faulting CE
+channel dump the GP entry + the pushbuffer bytes the host reads (host VA content) vs the bytes the
+guest wrote (guest gpa). A content mismatch confirms candidate 1. Hand the precise trace to Fable.
+
 ## Escalation rule (user, 2026-06-10)
 **Never report "stuck" until Fable is also stuck on it.** When you reach the point where you'd stop
 and ask the user / declare a blocker, FIRST hand the problem to a Fable subagent (`model: fable`) —
