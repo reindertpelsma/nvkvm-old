@@ -139,6 +139,41 @@ wrong/idle = something was faked → revert per §0.3. COMMIT the milestone.
 - **Headline unchanged:** M8.4 crash fix verified; the rest is now a precisely-localized execution-
   forward problem (TSG schedule + GP_PUT bridge), not a fog.
 
+## PROGRESS LOG 3 (2026-06-10) — GP_PUT bridge done; LAYER-2 is the real keystone (RESUME HERE)
+
+Done this run (committed): M5.32 Step-1b (deterministic populate_cvas), M5.33 (GP_PUT bridge:
+guest `c->gp_get` → host USERD `+0x8C` before the doorbell; + skip redundant GR-TSG reschedule).
+Host-VERIFIED SAFE (no wedge). But two layers remain:
+
+- **Layer 1 (cuCtxCreate-specific):** the compute channel submits NO sustained guest GPFIFO work
+  during cuCtxCreate (`gp_put` transient 1→0) — the golden ctx is GSP/FECS-internal. So the GP_PUT
+  bridge is for MATMUL, not ctx. cuCtxCreate's `MC_SERVICE_INTERRUPTS` wait is a GSP-side completion
+  (handle later: simulate-per-rule, or poll a host equivalent per the interrupt principle).
+- **Layer 2 (THE KEYSTONE — do this first, plan item A):** even the CE scrubbers, which DO have work
+  (`hostUSERD put=30`, TSG scheduled `st=0x0`), show `get=1` and **0% GPU util** — the host GPU is
+  **not executing a scheduled channel that has queued work**. This is beneath the GP_PUT bridge and
+  is the load-bearing nut: nothing real runs until the host executes forwarded work.
+
+### LAYER-2 investigation plan (A) — resume here, hand tracing/precise-code to Fable, keep oversight
+Suspects, in priority order (each cheap to check, mostly one boot + host dmesg):
+1. **USERD identity mismatch:** is the host USERD page the GPU actually reads the SAME page we write
+   via `m2_chanbuf[].qva` (+0x8C)? Verify the double-mmap target equals the host channel's real
+   instance-block USERD pointer (not a stale/duplicate mapping). Fable: trace `nvkvm_m2_back_channel_userd`
+   (M5.23) — does the qva map the host channel's RAMFC/USERD that the host GPU's runlist reads?
+2. **Pushbuffer faults:** the GPFIFO entries point to pushbuffer VAs — are they all mapped+valid in
+   the HOST channel's VAS? A bad pushbuffer VA → host MMU fault → channel stalls (get frozen). Check
+   host `dmesg` for Xid 13/31/etc. right after a ring. (We map via M6.5/M7 R2/M5.24 — verify coverage
+   of the CE scrubber's pushbuffers specifically, since those have real work.)
+3. **Channel not actually runnable:** TSG bound to a runlist? channel in error/disabled state? Check
+   host dmesg + read host channel state. The schedule returned st=0x0 but binding may be incomplete.
+4. **Wrong doorbell token:** is `c->host_token` the correct work-submit token for THIS host channel
+   (NVC36F GET_WORK_SUBMIT_TOKEN per channel), or are we ringing one token for all?
+Method: pick the CE scrubber channel (gpfifo 0x121010000, has put=30) as the test case — it has real
+work, so if the host runs it, `get` advances + util>0 + host writes its sem. Ring it, watch host
+`dmesg` (Xid?) + host USERD `get` + nvidia-smi util. Wedge recovery: `rmmod nvidia_uvm nvidia_drm
+nvidia_modeset nvidia; modprobe nvidia` on vh, or `vastai reboot instance <id>` (key in memory
+vastai_credentials; find instance id via `vastai show instances`).
+
 ## Stop-and-report forks
 - Step 4 ring wedges repeatedly / needs `vastai reboot` → report.
 - A required completion turns out NOT to come from a host-pollable fd (host wouldn't interrupt) →
