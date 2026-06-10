@@ -102,6 +102,52 @@ For Mode-2 production, keep the UVM rule strict: QEMU must not read guest usersp
 `/tmp/m2_pbmap.txt`, pagemap export, and the uprobe bridge are debug-only. Production should consume
 GPA/GPGA/GR-VA state and host RM mappings, with CR3 only as an opaque isolate identity.
 
+## 0.2 consolidation-branch checkpoint (2026-06-10, Fable5/Opus session)
+
+Restructure underway on branch `consolidation` (from clean base 41bd25c). Findings from
+fresh-boot runs of the clean base (no uprobe bridge) on the RTX 3060 host:
+
+- **M5.30 (committed, HW-validated):** capture the UVM vaspace page-directory root from
+  `NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY` (0x801813) — previously echoed+discarded — into
+  `chan_vas[]` with a `root_sys` flag, and extend the GMMU VER2 walker to accept a sysmem-rooted
+  PDB (`nvkvm_walk_pdb_root`). This is the **production replacement for the uprobe-bridge UVM
+  shadow**: a UVM device pointer now resolves VA→guest-GPA by walking the guest's own page tables
+  (in guest RAM, via the GPA window), no guest-userspace read. Captured roots on hardware:
+  hVASpace 0xcaf00005 PDB 0x3400000, 0xcaf00062 PDB 0x3401000 (both FB-rooted). NOTE: 0xcaf00005
+  has a *different* root from RESERVED_PDES (0x3114000) vs SET_PAGE_DIRECTORY (0x3400000) — M5.30
+  APPENDS the SET_PAGE_DIRECTORY root as an extra resolver candidate (non-destructive).
+
+- **cuCtxCreate blocker PINNED (corrects §4 and the kickoff-doc "unbacked UVM" premise):** the
+  clean base reaches cuCtxCreate and dies with `rbp=0` SIGSEGV at libcuda+0x300560 — but that is
+  *downstream*. CRASHWIN (auto-armed at 0xc7c0) shows the guest RM busy-looping a GR-VAS page-table
+  walk via BAR2 (`0x2f3392000→0x2efbc3000→4000→5000`, dual-PDE big→`0x2efbc6000`, PTE 0x2efbc61a0
+  = 0x...2efa6201) to **FB 0x2efa62000** and polling it (100k-capped same-chain reads). This is the
+  GR **golden-context content poll = §X Poll #2**. The M9 (CTRL-CLAMP) and M10 (ECC/NVLink
+  NV_ERR_NOT_SUPPORTED 0x56) rbp-clobber fixes are ALREADY present on the clean base, so they are
+  not the cause — the guest correctly reaches the golden-ctx poll and dies there.
+
+- **Why it never clears on the clean base:** `nvkvm_m2_exec_doorbell` (M5.9, the real GR
+  doorbell-forward that would map the GR ctx vidmem leaf into the host GR VAS so the host FECS
+  fills the golden context) **fires 0 times**. The clean base instead runs the `chan_execute`
+  *faking* path (38 DOORBELL / CE_SEM_RELEASE) which satisfies the **CE scrubber** sems
+  (0x121xxxxx) by writing them itself — but the GR golden-ctx page is never written → poll spins →
+  crash. The machinery to fix it (populate_cvas / leaf_flush GPGA double-mmap / exec_doorbell)
+  EXISTS on the clean base but is not engaging for the GR channel.
+
+- **Oracle mechanism map (from 7fb47f1, how it cleared this):** primary = **M7 R2 GPGA**
+  (`nvkvm_m2_gpga_obj` + `populate_cvas` + `leaf_flush`): blank host vidmem object, double-mmapped
+  (CPU overlay for the guest BAR2 read + FIXED map_dma into host GR VAS) so the real host FECS DMA-
+  writes the golden ctx; triggered at the first GR doorbell. Fallback = **M8.45 reactive sempage
+  release** (forge the captured GR report-sem payload into the poll page on first read). Neither
+  depends on the uprobe bridge. The bridge (BAR0 0xFFF500-508) only serves the UVM CE-channel
+  completion, NOT this GR poll.
+
+- **NEXT (bounded keystone entry):** root-cause why `exec_doorbell`/`populate_cvas` does not engage
+  for the GR channel during cuCtxCreate (m2_gr_client unset? doorbell_ready gate? GR doorbell not
+  routed to exec_doorbell? per-channel CVAS not allocated for the GR TSG?). Then the host FECS
+  fills the golden ctx via the existing GPGA double-mmap and the poll clears. This is the genuine
+  multi-week keystone, now precisely scoped.
+
 ## 1. 4-Byte UVM Proof Status
 
 The narrow `cup2_pause` CUDA proof reaches:
