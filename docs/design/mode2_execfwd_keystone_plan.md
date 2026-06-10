@@ -91,6 +91,26 @@ wrong/idle = something was faked → revert per §0.3. COMMIT the milestone.
 - Use Fable 5 for bounded byte/ABI/race analysis; verify its output against hardware before building
   (its byte-diff was right; its open-ended source-trace once over-committed to a wrong theory).
 
+## PROGRESS LOG (2026-06-10, autonomous run)
+
+- **Step 1 DONE (with caveats):** M5.32 — `chan_own_pdb` now also tries the channel's own
+  `hVASpace` vs `chan_vas[]` (M5.30-populated) + the instblk PDB. HW: `populate_cvas` resolves
+  `pdb=0x3114000` and walks **26 leaves** (was `no own PDB` bail). Two caveats:
+  - **Flaky:** resolution is timing-dependent — some boots the VAS isn't captured before
+    `populate_cvas` runs → `no own PDB` again. **TODO: make deterministic** by having fake-GSP write
+    the captured SET_PAGE_DIRECTORY root into the channel instance block (`PAGE_DIR_BASE`, RAMIN+0x200)
+    so `chan_pdb` is always authoritative (Step 1b, not yet done).
+  - **`backed=0` is BENIGN:** the GR working set is **already mapped** at `0xc7c0`-alloc time
+    (M6.5 sysmem leaves return `st=0x51 ALREADY-MAPPED`; M7 R2 vidmem `gpu_mapped=1 st=0x0`). So
+    Step 2 (map the working set) is effectively already satisfied — NOT the blocker.
+- **Real frontier = Step 4 (the RING).** The host GPU has the buffers mapped but is **never told to
+  run the work** — `exec_doorbell` doesn't ring → `nvidia-smi` shows **0% util** → no real GR
+  completion → `MC_SERVICE_INTERRUPTS` hangs (or flakily self-terminates into a HOLLOW `CTX OK` with
+  no compute). cuCtxCreate "passing" today is a hollow pass; the real proof is matmul, which needs
+  the host to actually execute. So the next move is Steps 3+4: poll the completion (reuse #127) and
+  **ring the host doorbell** (wedge-risk — gate on working-set-mapped, keep `chan_execute` faking OFF).
+- **M8.4 (crash fix) remains solid + verified.** M5.30 + M5.32 committed.
+
 ## Stop-and-report forks
 - Step 4 ring wedges repeatedly / needs `vastai reboot` → report.
 - A required completion turns out NOT to come from a host-pollable fd (host wouldn't interrupt) →
