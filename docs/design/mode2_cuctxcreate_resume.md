@@ -291,6 +291,35 @@ guest-userspace-observable) — if so it's a legitimate simulate per §0.3 rule-
 matmul-correctness gate downstream. (oracle also has env overrides
 NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET for diagnosis.)
 
+## 0.7 MC_SERVICE_INTERRUPTS direction DECIDED (2026-06-10): real completion via reused Mode-1 poll
+
+User principle (governing): guest userspace does NOT use interrupts — it POLLS (eventfd / nvidia fd).
+So for any op where a REAL host GPU would raise an interrupt, QEMU must POLL the corresponding host fd
+and forward it; only skip polling if a real host GPU also wouldn't interrupt. Guard the race
+(host-event-happened → poll-missed → guest-not-woken).
+
+Investigation conclusions (confirmed against code):
+- **Mode-1 #127 poll ABI is reusable as-is** for the polling half. Per isolate: ONE reader thread,
+  ONE `ppoll()` over {control socket + armed os-event fds} (`nvkvm_stub.c:2780`), NOT thread-per-fd.
+  Add-fd-while-polling works via control-socket wakeup (ISOLATE_CMD_POLL rebuilds pfds). One-shot
+  re-arm. QEMU `nvkvm_virtio_push_evt` (`virtio_nvgpu.c:733`) serializes delivery via a BH; has
+  level-triggered re-fire recovery if the evt queue is full. `nvkvm_isolate_poll`/`_unpoll`
+  (`nvkvm_isolate.c:1991/2013`) is the hook. Mode-2 already uses isolates → can call these directly.
+- **Mode-2-specific:** reuse the POLL half (arm host eventfds, ppoll, ISOLATE_RESP_POLL_EVENT), but
+  the DELIVERY hop is the emulated GSP POST_EVENT (nvkvm_gpu_emul.c M8.38), NOT VQ_EVT (the stock
+  guest has no nvkvm module). TODO: Fable-verify the host eventfd stays level-readable until consumed
+  in the Mode-2 path (race-freedom).
+- **Decision: route B (real completion), NOT the M8.108 credit-shortcut.** The shortcut fakes the
+  completion without running the work = the oracle's dead end (green poll, no matmul). Per the rule,
+  forward the real GR execution so the host raises the real interrupt.
+
+**Keystone reduces to: engage execution-forward for the GR channel.** The missing links (resume §6,
+0.2): `nvkvm_m2_exec_doorbell` (M5.9) fires 0x for GR because `nvkvm_m2_populate_cvas` bails
+(`chan_own_pdb` returns 0 for GR client 0xc1d00003 — GR VAS PDB unresolved; M5.30 SET_PAGE_DIRECTORY
+capture is the PDB source to wire in). Once exec-forward runs: host runs GR ctx-init → raises
+completion on a host os-event eventfd → reuse #127 poll → POST_EVENT to guest → MC_SERVICE_INTERRUPTS
+returns serviced for real → cuCtxCreate proceeds. Verify end-to-end with the matmul-correctness gate.
+
 ## 1. 4-Byte UVM Proof Status
 
 The narrow `cup2_pause` CUDA proof reaches:
