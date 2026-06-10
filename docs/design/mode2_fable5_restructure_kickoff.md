@@ -127,7 +127,39 @@ what a uprobe intercepts) + correct GPGA/GR-VAS placement — not by widening th
 - This restructure **is** task **#128** (consolidation): the file doubled to ~14k; de-bloating is
   part of the job, not a separate step. Split `gpu_emul.c` into modules if practical.
 
+## 7b. Clean-base cuCtxCreate blocker — PINNED with fresh ground truth (2026-06-10)
+
+Built the `consolidation` branch (clean base + M5.30), fresh boot, ran `cup2` with **no
+uprobe bridge**. cuCtxCreate crashes (`rbp=0` SIGSEGV, stack destroyed at the libcuda
+epilogue — backtrace unrecoverable). The CRASHWIN FB-read probe (auto-armed at the 0xc7c0
+compute-obj alloc) shows the *real* blocker: the guest RM busy-loops walking its GR-VAS page
+tables via BAR2 —
+`0x2f3392000(BAR2 root) → 0x2efbc3000 → 0x2efbc4000 → 0x2efbc5000(dual PDE: small=0, big→0x2efbc6000) → PTE 0x2efbc61a0 = 0x60000002efa6201`
+— which resolves to **FB `0x2efa62000`**, and polls that page repeatedly (100k-capped reads,
+all the same 5-read chain). The `rbp=0` crash is *downstream* of this poll never satisfying.
+
+**This is the GR golden-context content poll = dataplane doc §X "Poll #2"**, not "un-backed UVM
+data" (the §1/§6 framing) and not the rbp/gpuId red herring. The guest waits on a GR ctx page
+(FB `0x2efa6xxx`) that the real GPU's FECS fills with the golden image; our fake-GSP path never
+writes it. Per dataplane doc §X.1 this is the privileged golden-context coherence wall — the
+known multi-week keystone. **The oracle (7fb47f1) cleared cuCtxCreate, so its source contains the
+mechanism that satisfies this poll** — pin that mechanism (M8.114 GR-VAS prime? doorbell-time
+host-GPU GR-init fill? a forged poll value?) and port it. That is the immediate next step, ahead
+of the UVM *data*-plane backing (which only matters after cuMemAlloc, post-ctx).
+
+M5.30 (SET_PAGE_DIRECTORY UVM-VAS capture) is committed + HW-validated and is correct/foundational
+regardless — it's the production resolver for UVM device pointers once ctx is unblocked.
+
 ## 8. Model / effort guidance (for the Fable 5 session)
+
+Role split that worked well this session (record for future sessions):
+- **Haiku** — bulk reading / log analysis / diffing (cheap fan-out).
+- **Sonnet** — running tests, mechanical oracle-diff/extraction, build/deploy orchestration.
+- **Opus 4.8** — the grind: diagnosis, driver/MMU reasoning, writing the port, the serial GPU loop.
+- **Fable 5** — hardcore bug fixing / tracing on a *bounded* puzzle. NOTE: Fable's safety filter
+  flags this repo's security-adjacent content (hypervisor boundary, OOB/TOCTOU audits, closed-driver
+  RE, uprobe injection) — frame any Fable subagent task as pure systems/MMU mechanics, or it bounces.
+
 
 - Use **Fable 5 at top effort** on the genuinely hard turns: the RM-stream UVM-capture + GPGA
   re-implementation, and the copy-channel Xid-32 / PROMOTE_CTX root cause. (Fable 5 is the strongest
