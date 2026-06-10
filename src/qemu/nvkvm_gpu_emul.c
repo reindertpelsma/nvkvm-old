@@ -358,6 +358,7 @@ struct NvkvmGpuEmul {
      * empty => libcuda reads it via the UVM mmap to guest-RAM (needs memslot). */
     bool     m2_crashwin;
     uint32_t m2_crashwin_reads;
+    uint32_t m2_own_pdb_diag;   /* M5.32 Step-1: bounded diag count for chan_own_pdb misses */
     bool     m2_in_walk;     /* true while reading a GMMU PDE/PTE — excludes page-walk
                               * noise from the CRASHWIN probe so only LEAF data reads
                               * (the buffer values libcuda actually consumes) are logged */
@@ -2814,6 +2815,7 @@ static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
     if (!s->chan_client) {
         return 0;
     }
+    /* (a) Existing: client's device VASpace (m2_devvas[client] -> vas -> chan_vas pdb). */
     uint32_t hvas = 0;
     for (int i = 0; i < s->m2_devvas_n; i++) {
         if (s->m2_devvas[i].client == s->chan_client) {
@@ -2821,12 +2823,46 @@ static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
             break;
         }
     }
-    if (!hvas) {
-        return 0;
+    if (hvas) {
+        for (int i = 0; i < s->chan_vas_n; i++) {
+            if (s->chan_vas[i].hvas == hvas) {
+                return s->chan_vas[i].pdb;
+            }
+        }
     }
-    for (int i = 0; i < s->chan_vas_n; i++) {
-        if (s->chan_vas[i].hvas == hvas) {
-            return s->chan_vas[i].pdb;
+    /* M5.32 (Step 1): the GR compute channel commonly uses a context-share VAS NOT
+     * allocated under its own client (so m2_devvas[client] misses).  Fall back to the
+     * channel's OWN hVASpace handle directly against chan_vas[] — which M5.30 now
+     * populates from SET_PAGE_DIRECTORY (0x801813) as well as RESERVED_PDES.  This is
+     * the same authoritative key nvkvm_chan_translate prefers; chan_own_pdb just never
+     * tried it.  Then fall back to the instblk PDB (RAMIN+0x200) if fake-GSP has
+     * written it (chan_pdb).  This is what un-bails populate_cvas for the GR channel. */
+    if (s->chan_hvaspace) {
+        for (int i = 0; i < s->chan_vas_n; i++) {
+            if (s->chan_vas[i].hvas == s->chan_hvaspace && s->chan_vas[i].pdb) {
+                return s->chan_vas[i].pdb;
+            }
+        }
+    }
+    if (s->chan_pdb) {
+        return s->chan_pdb;             /* authoritative instblk root (RAMIN+0x200) */
+    }
+    /* Step-1 DIAG: dump what's available so we can see WHY no root resolved
+     * (bounded to avoid spam). */
+    if (s->m2_own_pdb_diag++ < 8) {
+        qemu_log("nvkvm-gpu[%s] M5.32 own_pdb MISS: chan_client=0x%08x chan_hvas=0x%08x "
+                 "chan_pdb=0x%llx devvas_n=%d chan_vas_n=%d\n", s->chip->name,
+                 s->chan_client, s->chan_hvaspace, (unsigned long long)s->chan_pdb,
+                 s->m2_devvas_n, s->chan_vas_n);
+        for (int i = 0; i < s->m2_devvas_n; i++) {
+            qemu_log("nvkvm-gpu[%s] M5.32   devvas[%d] client=0x%08x dev=0x%08x vas=0x%08x\n",
+                     s->chip->name, i, s->m2_devvas[i].client, s->m2_devvas[i].dev,
+                     s->m2_devvas[i].vas);
+        }
+        for (int i = 0; i < s->chan_vas_n; i++) {
+            qemu_log("nvkvm-gpu[%s] M5.32   chan_vas[%d] hvas=0x%08x pdb=0x%llx root_sys=%d\n",
+                     s->chip->name, i, s->chan_vas[i].hvas,
+                     (unsigned long long)s->chan_vas[i].pdb, s->chan_vas[i].root_sys);
         }
     }
     return 0;
