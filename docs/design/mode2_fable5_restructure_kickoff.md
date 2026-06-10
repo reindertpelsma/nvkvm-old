@@ -59,6 +59,26 @@ Before trusting the oracle, build `7fb47f1`, fresh QEMU boot, and run `cup2_paus
 trip) + `ctx_probe`. Confirm it still passes, and confirm **it requires the uprobe bridge loaded**
 (the resume doc says it does). This both validates the oracle and re-confirms the clean-base path.
 
+### Step 0 RESULT (2026-06-10, 4 fresh-boot attempts at `7fb47f1`)
+
+- **cuCtxCreate: 2/4 PASS, 2/4 hang** in the documented `MC_SERVICE_INTERRUPTS 0x20801702` poll
+  loop, both hangs frozen at exactly UVM-EXT record #12. So **M8.108 credit accounting is racy,
+  not a complete fix** — when porting, root-cause the lost-credit race (host completion arriving
+  outside a poll window?) instead of copying it verbatim.
+- **Source UVM backing verified live on both CTX-OK runs**: the bridge shadow row reached QEMU via
+  BAR0, and the CE copy read `0xabcd1234` from the shadow GPA. The load-bearing mechanism is real.
+- **The 4-byte DtoH never went green here**: both CTX-OK runs MISMATCHed with `rv=0x0` because the
+  **pbmap dst staging row pointed at a page the guest never read back** (QEMU wrote `abcd1234` to
+  the pbmap-resolved GPA; suspected `/dev/zero` MAP_PRIVATE pre-CoW pfn export —
+  `NVKVM_PBMAP_FAULT_ZERO_WRITE=1` pause-phase flags exist in `gcup2_pbmap.sh` for exactly this but
+  are not in the documented recipe). Not worth more serial GPU cycles: production replaces pbmap.
+- **Port-map agent confirmed: the oracle has NO production UVM-capture entry path at all** — the
+  only writer of `m2_uvm_ext[]` is the BAR0 debug aperture (0xFFF520..538) fed by the uprobe bridge.
+  There is no RM/GSP-RPC snoop to migrate; the production capture is a fresh design.
+- Verdict: the oracle is a **per-mechanism behavioral reference, not a green-bar reference**. Both
+  flaky pieces (ctx completion credits, dst staging) are exactly what the clean-base port replaces.
+  This strengthens the §3 decision.
+
 ## 5. The plan (ordered)
 
 1. **Branch** `consolidation` (or similar) from `41bd25c`.
