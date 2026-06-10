@@ -1305,19 +1305,28 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             uint32_t flags  = ldl_le_p(cmd + 132);
             uint32_t hvas   = ldl_le_p(cmd + 136);
             bool     rsys   = (flags & 0x3u) != 0u;   /* non-VIDMEM aperture => sysmem root */
-            /* Update an existing chan_vas row for this hVASpace, else append. */
-            int k = -1;
+            /* APPEND a candidate root (do NOT overwrite the RESERVED_PDES root for
+             * the same hVASpace — they can differ: e.g. hVASpace 0xcaf00005 has
+             * 0x3114000 from RESERVED_PDES vs 0x3400000 from SET_PAGE_DIRECTORY.
+             * The chan_translate resolver tries every VAS candidate and uses the
+             * first that yields a valid leaf, so adding the SET_PAGE_DIRECTORY root
+             * as an extra candidate is non-destructive.  Dedup exact (hvas,pdb)
+             * repeats so the 16-slot table doesn't fill on re-sets. */
+            bool dup = false;
             for (int i = 0; i < s->chan_vas_n; i++) {
-                if (s->chan_vas[i].hvas == hvas) { k = i; break; }
+                if (s->chan_vas[i].hvas == hvas && s->chan_vas[i].pdb == phys) {
+                    dup = true; break;
+                }
             }
-            if (k < 0 && s->chan_vas_n < 16) { k = s->chan_vas_n++; }
-            if (k >= 0 && phys) {
+            if (!dup && phys && s->chan_vas_n < 16) {
+                int k = s->chan_vas_n++;
                 s->chan_vas[k].hvas = hvas;
                 s->chan_vas[k].pdb = phys;
                 s->chan_vas[k].root_sys = rsys;
                 qemu_log("nvkvm-gpu[%s] M5.30 SET_PAGE_DIR UVM-VAS hVASpace=0x%08x "
-                         "PDB=0x%llx aperture=%u root=%s\n", s->chip->name, hvas,
-                         (unsigned long long)phys, flags & 0x3u, rsys ? "SYS" : "FB");
+                         "PDB=0x%llx aperture=%u root=%s (candidate %d)\n",
+                         s->chip->name, hvas, (unsigned long long)phys,
+                         flags & 0x3u, rsys ? "SYS" : "FB", k);
             }
         }
         if (fn == 103) {
