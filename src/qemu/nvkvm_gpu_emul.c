@@ -2843,12 +2843,16 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
  * wrong-channel bug: the compute channel's working set resolved through the
  * probe client 0xc1d0000a's VAS 0x2efa4c000 instead of its own 0x3114000).
  * Returns 0 if the client's VAS or its PDB isn't known yet (caller falls back). */
-static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
+static uint64_t nvkvm_chan_own_pdb_rs(NvkvmGpuEmul *s, bool *out_root_sys)
 {
+    if (out_root_sys) {
+        *out_root_sys = false;       /* default: FB-rooted (GSP-client common case) */
+    }
     if (!s->chan_client) {
         return 0;
     }
-    /* (a) Existing: client's device VASpace (m2_devvas[client] -> vas -> chan_vas pdb). */
+    /* (a) Existing: client's device VASpace (m2_devvas[client] -> vas -> chan_vas pdb).
+     * These are GSP-client device VASes -> FB-rooted (root_sys stays false). */
     uint32_t hvas = 0;
     for (int i = 0; i < s->m2_devvas_n; i++) {
         if (s->m2_devvas[i].client == s->chan_client) {
@@ -2859,6 +2863,7 @@ static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
     if (hvas) {
         for (int i = 0; i < s->chan_vas_n; i++) {
             if (s->chan_vas[i].hvas == hvas) {
+                if (out_root_sys) { *out_root_sys = s->chan_vas[i].root_sys; }
                 return s->chan_vas[i].pdb;
             }
         }
@@ -2873,12 +2878,42 @@ static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
     if (s->chan_hvaspace) {
         for (int i = 0; i < s->chan_vas_n; i++) {
             if (s->chan_vas[i].hvas == s->chan_hvaspace && s->chan_vas[i].pdb) {
+                if (out_root_sys) { *out_root_sys = s->chan_vas[i].root_sys; }
                 return s->chan_vas[i].pdb;
             }
         }
     }
     if (s->chan_pdb) {
-        return s->chan_pdb;             /* authoritative instblk root (RAMIN+0x200) */
+        return s->chan_pdb;             /* authoritative instblk root (RAMIN+0x200), FB */
+    }
+    /* (d) M5.36: PROBE every captured root against the channel's OWN GPFIFO VA — the one
+     * VA guaranteed mapped in the channel's VAS. Handle-keyed lookups (a)/(b) MISS when the
+     * channel's true root was captured only under UVM's dup handle (e.g. 0xcaf00005) and is
+     * unlinkable to the channel's RM client (libcuda's compute channels: chan_hvas=0,
+     * gpfifo in the UVM-managed 0x200200000 region). Content-validate instead: the first
+     * captured root whose walk resolves the gpfifo VA IS the channel's VAS. Returns its
+     * root_sys so populate_cvas enumerates with the correct root aperture (UVM roots are
+     * sys-rooted; the hardcoded false mis-walked them even when the PDB was found). */
+    if (s->chan_gpfifo_va) {
+        for (int i = 0; i < s->chan_vas_n; i++) {
+            if (!s->chan_vas[i].pdb) {
+                continue;
+            }
+            bool sy = false;
+            if (nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, s->chan_gpfifo_va,
+                                    s->chan_vas[i].root_sys, &sy) != NVKVM_GMMU_FAULT) {
+                if (out_root_sys) { *out_root_sys = s->chan_vas[i].root_sys; }
+                if (s->m2_own_pdb_diag < 8) {
+                    qemu_log("nvkvm-gpu[%s] M5.36 own_pdb PROBE hit: client=0x%08x "
+                             "hvas=0x%08x pdb=0x%llx root_sys=%d maps gpfifo=0x%llx\n",
+                             s->chip->name, s->chan_client, s->chan_vas[i].hvas,
+                             (unsigned long long)s->chan_vas[i].pdb,
+                             s->chan_vas[i].root_sys,
+                             (unsigned long long)s->chan_gpfifo_va);
+                }
+                return s->chan_vas[i].pdb;
+            }
+        }
     }
     /* Step-1 DIAG: dump what's available so we can see WHY no root resolved
      * (bounded to avoid spam). */
@@ -2899,6 +2934,12 @@ static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
         }
     }
     return 0;
+}
+
+/* Back-compat wrapper: callers that don't need the root aperture. */
+static uint64_t nvkvm_chan_own_pdb(NvkvmGpuEmul *s)
+{
+    return nvkvm_chan_own_pdb_rs(s, NULL);
 }
 
 /* Translate a channel GPU VA by trying every snooped VAS PDB (from
@@ -4953,7 +4994,8 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
  * the Xid-32 collision class. Idempotent via the global m2_va_seen dedup. */
 static bool nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c)
 {
-    uint64_t pdb = nvkvm_chan_own_pdb(s);          /* uses s->chan_client (caller set it) */
+    bool root_sys = false;                         /* M5.36: walk with the resolved root aperture */
+    uint64_t pdb = nvkvm_chan_own_pdb_rs(s, &root_sys); /* uses s->chan_client (caller set it) */
     if (!pdb) {
         /* M5.32 Step-1b: return FALSE so the caller does NOT mark this CVAS populated —
          * the GR-VAS root is captured asynchronously (RESERVED_PDES / SET_PAGE_DIRECTORY)
@@ -4967,7 +5009,9 @@ static bool nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c)
     int budget = 300000;
     struct nvkvm_leaf_acc a; memset(&a, 0, sizeof(a));
     a.s = s; a.client = c->client;
-    nvkvm_m2_pt_enum(s, pdb, false, 0, 0, &a, &budget);
+    /* M5.36: pass the resolved root aperture — UVM-managed roots are sys-rooted; the
+     * previously-hardcoded false mis-walked them (enumerated 0 leaves) even when found. */
+    nvkvm_m2_pt_enum(s, pdb, root_sys, 0, 0, &a, &budget);
     nvkvm_m2_leaf_flush(&a);
     qemu_log("nvkvm-gpu[%s] M5.28 populate_cvas: client=0x%08x tsg=0x%08x pdb=0x%llx -> "
              "cvas[%d] fvas=0x%08x runs=%d sysbytes=0x%llx vidbytes=0x%llx backed=%d "
