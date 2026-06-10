@@ -111,6 +111,34 @@ wrong/idle = something was faked → revert per §0.3. COMMIT the milestone.
   **ring the host doorbell** (wedge-risk — gate on working-set-mapped, keep `chan_execute` faking OFF).
 - **M8.4 (crash fix) remains solid + verified.** M5.30 + M5.32 committed.
 
+## PROGRESS LOG 2 (2026-06-10, autonomous run cont'd)
+
+- **Step 1b DONE:** `populate_cvas` now returns success; the caller only latches `.populated` on
+  success, so it retries across doorbells until the async-captured GR-VAS root arrives. HW: resolves
+  `pdb=0x3114000` deterministically (no more flaky `no own PDB`). Committed.
+- **Step 4 frontier LOCALIZED (the real keystone):** the ring (M5.22) fires, but the host GR channel
+  cannot run:
+  - `M5.25 GPFIFO_SCHEDULE` on the GR TSG `0x5c000049` (client 0xc1d00003) → **st=0x57 =
+    NV_ERR_OBJECT_NOT_FOUND** — the host TSG handle isn't found (never forwarded/created, or wrong
+    handle translation). CE scrubber TSGs schedule fine; the GR compute TSG does not.
+  - GR channel **host USERD `put=0 get=0`** — no guest work is bridged to the host channel (the
+    GP_PUT work-submit bridge is missing), so even a successful schedule + ring would be a no-op.
+  - Net: 0% GPU util, no real completion, cuCtxCreate hangs (or flaky hollow pass).
+- **Two concrete sub-problems for the next session (both required for real execution):**
+  1. **TSG-handle forwarding/translation** so `GPFIFO_SCHEDULE` on the GR TSG resolves (no
+     OBJECT_NOT_FOUND). Investigate: is `c->tsg` (0x5c000049) a guest handle passed without
+     translation, or a host handle that was never allocated? Cross-check against the per-channel CVAS
+     TSG (0x5c000012) — the schedule may be targeting the wrong TSG. (Good Fable/source task once the
+     handle lineage is dumped.)
+  2. **GP_PUT work-bridge:** propagate the guest channel's GP_PUT into the host channel's USERD
+     (0x8C) so the host GPU sees `put>get` and fetches the (already-mapped) GPFIFO entries. The
+     GPFIFO/pushbuffers are mapped (M6.5/M7 R2); the doorbell rings; only the USERD GP_PUT propagation
+     is missing.
+  Then: host runs GR work → real completion on a host eventfd → reuse #127 poll → POST_EVENT →
+  MC_SERVICE_INTERRUPTS satisfied → cuCtxCreate for real → matmul gate.
+- **Headline unchanged:** M8.4 crash fix verified; the rest is now a precisely-localized execution-
+  forward problem (TSG schedule + GP_PUT bridge), not a fog.
+
 ## Stop-and-report forks
 - Step 4 ring wedges repeatedly / needs `vastai reboot` → report.
 - A required completion turns out NOT to come from a host-pollable fd (host wouldn't interrupt) →
