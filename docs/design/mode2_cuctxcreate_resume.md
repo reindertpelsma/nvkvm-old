@@ -262,6 +262,35 @@ a native cup2_host run and the guest run; the divergent reply size is the clobbe
 capture remains correct/useful for later (UVM device-ptr resolution post-ctx); it just isn't the
 ctx blocker.
 
+## 0.6 MILESTONE (2026-06-10): cuCtxCreate CRASH FIXED + VERIFIED (M8.4), next = MC_SERVICE_INTERRUPTS hang
+
+The weeks-old cuCtxCreate `rbp=0` crash is **fixed and hardware-verified** on the `consolidation`
+branch. Method that found it (no slop, all hardware-grounded):
+- Captured RM_ALLOC reply bytes host (native cup2_host, real GPU, cuCtxCreate succeeds) vs guest
+  (cup2 under nvioctl_trace) — `apre`/`areply`/`outer` dumps.
+- Fable-5 byte-diff: the guest's `0xc7c0` (AMPERE_COMPUTE_B) alloc reply zeroes pAllocParms bytes
+  8-15; the host preserves them. Those bytes held libcuda's saved rbp → `pop %rbp`=0 → SIGSEGV at
+  libcuda+0x300560. Exact match to the gdb signature.
+- Root mechanism: M8.1 set reply `paramsSize=0` but left the rpc element SHORT, so the guest
+  GSP-client deserialize zero-padded its local params buffer and the guest RM's class-size (16B)
+  copy_to_user wrote those zeros over libcuda's stack.
+- **FIX = M8.4 (ported from oracle 7fb47f1):** keep the request params bytes in the response payload
+  (`memcpy(resp+112, cmd+112, req_psize)`) AND extend the element length (`stl_le_p(resp+56,
+  64+req_psize)`) so the copyout restores libcuda's stack; still report semantic paramsSize=0.
+- **VERIFIED:** cup2 no longer segfaults during cuCtxCreate (`CUP2-ALIVE-HUNG`, no segfault, no
+  FREE-storm teardown). Committed.
+
+**NEXT BLOCKER (confirmed, expected):** cuCtxCreate now HANGS in the `MC_SERVICE_INTERRUPTS`
+(0x20801702) poll loop — QEMU echoes `NV_OK+zeros` and the guest polls forever (118 occurrences).
+This is the documented gate the oracle's **M8.108** (service-interrupt completion-credit accounting)
+fixed: arm a "service-zero" credit per delivered completion, return it from the 0x20801702 handler
+so the poll terminates. PORT M8.108 (oracle lines ~346-350 fields, ~1505-1580 arm/take helpers, +
+the 0x20801702 handler), wired into the completion-delivery path. RULE CHECK before porting: confirm
+the guest only POLLS the MC_SERVICE_INTERRUPTS result (kernel-internal interrupt bookkeeping, not
+guest-userspace-observable) — if so it's a legitimate simulate per §0.3 rule-2/3; verify with the
+matmul-correctness gate downstream. (oracle also has env overrides
+NVKVM_M2_SERVICE_INTERRUPTS_HOST_ZERO_BUDGET for diagnosis.)
+
 ## 1. 4-Byte UVM Proof Status
 
 The narrow `cup2_pause` CUDA proof reaches:
