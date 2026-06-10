@@ -142,11 +142,24 @@ fresh-boot runs of the clean base (no uprobe bridge) on the RTX 3060 host:
   depends on the uprobe bridge. The bridge (BAR0 0xFFF500-508) only serves the UVM CE-channel
   completion, NOT this GR poll.
 
-- **NEXT (bounded keystone entry):** root-cause why `exec_doorbell`/`populate_cvas` does not engage
-  for the GR channel during cuCtxCreate (m2_gr_client unset? doorbell_ready gate? GR doorbell not
-  routed to exec_doorbell? per-channel CVAS not allocated for the GR TSG?). Then the host FECS
-  fills the golden ctx via the existing GPGA double-mmap and the poll clears. This is the genuine
-  multi-week keystone, now precisely scoped.
+- **ROOT CAUSE PINNED to one line:** `nvkvm_m2_populate_cvas` bails:
+  `M5.28 populate_cvas: client=0xc1d00003 tsg=0x5c000012 — no own PDB (VAS not snooped yet);
+  reactive map only`. `nvkvm_chan_own_pdb()` returns 0 for the **GR compute client 0xc1d00003**
+  (its guest GR VAS→PDB linkage `chan_client → m2_devvas[].vas → chan_vas[].pdb` doesn't resolve),
+  so the GR context leaves — including the golden-ctx page (FB 0x2efa6xxx) — are never enumerated
+  and never GPGA-double-mmapped, so the host FECS never fills them. Everything ELSE is in place:
+  M5.28 made the fresh per-channel VAS 0xce20002d, M5.8 allocated AMPERE_USERMODE_A + got GR
+  work-submit token 0xc + GPFIFO_SCHEDULE'd TSG 0x5c000012 (ring deferred until pushbuffers mapped).
+  M5.7 EXEC backed 3/6 FB working-set buffers. So the SINGLE missing piece is the GR client's
+  own-PDB resolution feeding populate_cvas.
+
+- **THE FIX (next increment):** make `nvkvm_chan_own_pdb` resolve the GR client 0xc1d00003's PDB —
+  **M5.30 now captures SET_PAGE_DIRECTORY roots, which is exactly the missing PDB source**. Need to
+  (a) confirm which captured root is the GR ctx VAS (the GR client's hVASpace; grmapper showed
+  0xcaf00005 is client 0xc1d00001's VAS, so identify 0xc1d00003's), and (b) wire that PDB into
+  chan_own_pdb / populate_cvas so the golden-ctx leaf gets enumerated + backed. Then the host FECS
+  fills it via the existing GPGA double-mmap and the §X Poll #2 clears. This converts the
+  "multi-week keystone" into a specific, bounded VAS→PDB-linkage fix.
 
 ## 1. 4-Byte UVM Proof Status
 
