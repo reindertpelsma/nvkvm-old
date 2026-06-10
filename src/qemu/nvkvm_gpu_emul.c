@@ -1188,7 +1188,7 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
 static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
 static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client); /* M5.7 fwd-decl */
 static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg); /* M5.28 fwd-decl */
-static void nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c); /* M5.28 fwd-decl */
+static bool nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c); /* M5.28 fwd-decl */
 static int nvkvm_m2_map_dma(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
                             uint32_t hVas, uint32_t hMemory, uint64_t offset,
                             uint64_t length, bool fixed, uint64_t va,
@@ -2268,8 +2268,11 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 }
             }
             if (s->m2_cur_cvas >= 0 && !s->m2_cvas[s->m2_cur_cvas].populated) {
-                nvkvm_m2_populate_cvas(s, c);
-                s->m2_cvas[s->m2_cur_cvas].populated = true;
+                /* M5.32 Step-1b: only latch populated when the walk actually resolved the
+                 * PDB + ran; else retry on the next doorbell (deterministic, not one-shot). */
+                if (nvkvm_m2_populate_cvas(s, c)) {
+                    s->m2_cvas[s->m2_cur_cvas].populated = true;
+                }
             }
             uint32_t before = c->gp_get;
             nvkvm_chan_execute(s);
@@ -4911,14 +4914,18 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
  * so grmapper routes the maps into THIS channel's fvas (not the guest forwarded VAS). Because
  * the VAS is one WE own (no host-RM ctx self-promote), every guest VA places without st=0x51 —
  * the Xid-32 collision class. Idempotent via the global m2_va_seen dedup. */
-static void nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c)
+static bool nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c)
 {
     uint64_t pdb = nvkvm_chan_own_pdb(s);          /* uses s->chan_client (caller set it) */
     if (!pdb) {
+        /* M5.32 Step-1b: return FALSE so the caller does NOT mark this CVAS populated —
+         * the GR-VAS root is captured asynchronously (RESERVED_PDES / SET_PAGE_DIRECTORY)
+         * and may not have arrived by the first doorbell.  Retrying on subsequent doorbells
+         * makes resolution deterministic instead of one-shot-flaky. */
         qemu_log("nvkvm-gpu[%s] M5.28 populate_cvas: client=0x%08x tsg=0x%08x — no own PDB "
-                 "(VAS not snooped yet); reactive map only\n", s->chip->name,
+                 "(VAS not snooped yet); will retry next doorbell\n", s->chip->name,
                  c->client, c->tsg);
-        return;
+        return false;
     }
     int budget = 300000;
     struct nvkvm_leaf_acc a; memset(&a, 0, sizeof(a));
@@ -4932,6 +4939,7 @@ static void nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c)
              s->m2_cur_cvas >= 0 ? s->m2_cvas[s->m2_cur_cvas].fvas : 0,
              a.runs, (unsigned long long)a.sysbytes, (unsigned long long)a.vidbytes,
              a.backed, budget);
+    return true;
 }
 
 /* M5.13 DRY-RUN: locate which page-directory maps a target guest-phys (the completion
