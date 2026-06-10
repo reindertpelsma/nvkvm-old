@@ -161,6 +161,42 @@ fresh-boot runs of the clean base (no uprobe bridge) on the RTX 3060 host:
   fills it via the existing GPGA double-mmap and the §X Poll #2 clears. This converts the
   "multi-week keystone" into a specific, bounded VAS→PDB-linkage fix.
 
+## 0.3 GOVERNING RULE for map-vs-stub (user-set, 2026-06-10) — binding
+
+Decide every emulated buffer/field by these rules, in order:
+1. **Observable from guest userspace?** → MAP/forward the real host resource so observations match
+   (this is the Mode-1 "forward, don't emulate" default). Applies *especially* to **completion data**
+   (semaphores/fences/USERD GP_GET that libcuda reads to know work finished) — those MUST be
+   host-written via the forwarded execution/semaphore path, never stubbed.
+2. **Kernel↔hardware only (incl. GSP-managed), invisible to host AND guest userspace?** → may
+   SIMULATE/stub, but ONLY if BOTH hold:
+   - (a) the buffer is observable *only* from the guest NVIDIA kernel module (never exposed to host,
+     never to guest userspace), AND
+   - (b) whatever value is stubbed, the guest kernel module does not compute/process/propagate it in
+     any way that reaches guest userspace.
+   If either (a) or (b) fails, fall back to rule 1 (map the real thing).
+3. **Context-switch / scheduling state** → always report "our task is scheduled/running/ready" — guest
+   userspace cannot observe GPU scheduling (same as a vCPU thread's placement), and transparent
+   pause/resume must not break apps.
+
+Verification gate (proves rule-2(b) empirically): a stubbed value is only legitimate if a real
+end-to-end matmul through the forwarded path returns the **numerically correct** result with real
+host GR utilization. Correct result = the stub was content-irrelevant (legitimate). Wrong/idle =
+content mattered → revert to map. Never accept a green guest log alone.
+
+### Application to the cuCtxCreate poll (GR-VAS page-table population)
+The clean-base blocker is the guest RM busy-walking its GR-VAS page tables waiting for the GR
+ctx-buffer mappings GSP installs in GSP-client mode (small-page PDE at FB 0x2efbc5000 stuck at 0;
+the target page 0x2efa62000 is NEVER read — only the PDEs/PTEs that map it). Per the rules:
+- The **page tables / ctx-buffer content** are kernel↔hardware↔GSP, not host- or guest-userspace-
+  observable, and the guest only checks the mapping *exists* (never reads the content behind it) →
+  rule 2 applies: install/stub the missing guest GR-VAS PTEs so the walk stops. Use the **real**
+  guest-phys from the PROMOTE_CTX snoop (VA→phys→bufferId) — i.e. write exactly the mapping GSP would
+  have written — so it's correct-by-construction, not arbitrary.
+- The **completion semaphores** (0x2efbaf000) and **USERD GP_GET** (0x420208c) the guest also reads
+  are completion data → rule 1: keep them on the host-written/forwarded path, never stub.
+- Verify with the matmul-correctness gate before declaring the ctx-buffer stub legitimate.
+
 ## 1. 4-Byte UVM Proof Status
 
 The narrow `cup2_pause` CUDA proof reaches:
