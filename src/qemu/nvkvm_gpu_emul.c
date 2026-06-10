@@ -623,6 +623,15 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
                            unsigned size)
 {
+    /* M5.31 DIAG: log guest writes into the GR-VAS page-table region the cuCtxCreate
+     * poll re-walks (the stuck small-page PDE @0x2efbc5000 + its PTE table @0x2efbc6xxx).
+     * Tells us whether the CPU-RM WRITES these (per gmmu_walk.c memmgrMemWrite -> a
+     * read/write-aperture asymmetry if they read back 0) or never writes them (the
+     * mapping is awaited from elsewhere). Gated on crashwin so it only fires post-0xc7c0. */
+    if (s->m2_crashwin && fb_addr >= 0x2efbc0000ull && fb_addr < 0x2efbd0000ull) {
+        qemu_log("nvkvm-gpu[GA106] M5.31 GRPT-WR fb=0x%llx sz=%u val=0x%llx\n",
+                 (unsigned long long)fb_addr, size, (unsigned long long)val);
+    }
     uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: written through to real host GPU memory */
         switch (size) {
@@ -1145,7 +1154,14 @@ static void nvkvm_snoop_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
         const uint8_t *e = p + 48 + (uint64_t)i * 32;
         uint64_t phys = ldq_le_p(e + 0), va = ldq_le_p(e + 8), sz = ldq_le_p(e + 16);
         uint32_t physAttr = ldl_le_p(e + 24);
+        uint32_t bufferId = ldl_le_p(e + 28);   /* NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_* */
         uint8_t  bNonmapped = e[31];
+        /* M5.31 DIAG: name each PROMOTE_CTX buffer (MAIN=0/PM/PATCH/.. per ctx0080) so the
+         * page the cuCtxCreate poll walks to (FB ~0x2efa6xxx) is identified by type. */
+        qemu_log("nvkvm-gpu[GA106] M5.31 PROMOTE entry client=0x%08x bufId=%u va=0x%llx "
+                 "phys=0x%llx sz=0x%llx %s%s\n", client, bufferId,
+                 (unsigned long long)va, (unsigned long long)phys, (unsigned long long)sz,
+                 (physAttr & 0x3u) ? "SYS" : "FB", bNonmapped ? " NONMAPPED" : "");
         if (!va || !sz || bNonmapped) {
             continue;           /* unmapped/phys-only entries don't enter the VAS */
         }

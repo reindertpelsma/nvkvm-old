@@ -197,6 +197,40 @@ the target page 0x2efa62000 is NEVER read — only the PDEs/PTEs that map it). P
   are completion data → rule 1: keep them on the host-written/forwarded path, never stub.
 - Verify with the matmul-correctness gate before declaring the ctx-buffer stub legitimate.
 
+## 0.4 Source + instrumented determination (2026-06-10) — map vs stub for the GR poll
+
+Read the open guest kernel (research_clones/ogkm) + one instrumented boot (M5.31 logging):
+
+- **gmmu_walk.c:633** — for `IS_GSP_CLIENT`, the root-PDB update callback is a **noop** ("Noop
+  inside a guest or CPU RM"); GSP/instance-block owns the root. The PDE/PTE *leaf* callbacks
+  (`_gmmuWalkCBUpdatePde`, memmgrMemWrite) are CPU-side for *client* ctx-buffer maps
+  (`kgraphicsMapCtxBuffer → dmaMapBuffer_HAL`, runs for GSP clients). So there are TWO populators:
+  CPU-RM for client maps, GSP for the **golden-image channel** (`kernel_graphics.c:368`: "GSP_CLIENT
+  creates the golden context channel GR post load").
+- **PROMOTE_CTX bufferIds decoded** (low byte = type; `0x0001xxxx`=mapped, `0x0101xxxx`=NONMAPPED):
+  the GR compute client `0xc1d00003` (the one that crashes) promotes its ctx buffers **NONMAPPED /
+  va=0** (MAIN at phys 0x3e00000, sz 0xea000). The polled page `0x2efa62000` is **NOT** any client's
+  PROMOTE buffer.
+- **Instrumented GR-PT writes (M5.31):** post-0xc7c0 the guest writes **only zeros** (10310 writes,
+  zero non-zero) into the polled page-table region (0x2efbc0000-0x2efbd000) — it CLEARS and then
+  polls (~12k reads of the PDE/PTE chain). It DID write valid PTEs earlier (pre-probe, during VAS
+  setup), proving it writes via the logged path when it intends to. So post-0xc7c0 it deliberately
+  clears + **awaits an external fill**.
+
+**CONCLUSION (map-vs-stub, per §0.3 rule):** the polled GR-VAS entries are **GSP-populated,
+kernel-only vidmem page tables** — invisible to host and guest userspace; the guest only checks the
+mapping exists (target page `0x2efa62000` never read). Condition (1) holds. → **legitimate stub/fill:
+we (fake GSP) write the page-table entries GSP would populate for the golden-image/GR-init path.**
+Verify condition (2) with the matmul-correctness gate. NOTE this is distinct from the *client* ctx
+maps (CPU-RM-written, must be backed for real, not stubbed) and from the completion semaphore
+0x2efbaf000 + USERD 0x420208c (completion data → forwarded/host-written, never stubbed).
+
+**NEXT:** implement the GMMU VER2 page-table FILLER (write valid PDE/PTE entries into the guest's
+GR-VAS that GSP would install) — bounded MMU-mechanics, the existing `nvkvm_walk_pdb_root` is the
+read-side reference. Determine the exact awaited VA range/entries (the stuck small-page PDE
+0x2efbc5000 + sub-table), fill them, boot, confirm the poll-spin stops, then drive matmul + verify
+numeric correctness + host GR util. Instrumentation committed: M5.31 (GRPT-WR + PROMOTE bufId logs).
+
 ## 1. 4-Byte UVM Proof Status
 
 The narrow `cup2_pause` CUDA proof reaches:
