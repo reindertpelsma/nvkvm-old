@@ -231,6 +231,37 @@ read-side reference. Determine the exact awaited VA range/entries (the stuck sma
 0x2efbc5000 + sub-table), fill them, boot, confirm the poll-spin stops, then drive matmul + verify
 numeric correctness + host GR util. Instrumentation committed: M5.31 (GRPT-WR + PROMOTE bufId logs).
 
+## 0.5 MAJOR CORRECTION (2026-06-10) — the "GR-VAS page-table poll" is POST-CRASH TEARDOWN
+
+Verifying the Fable subagent's RPC-poll theory against the trace overturned BOTH it and the
+long-standing "Poll #2 / GR-VAS page-table population" diagnosis (§0.2/0.4 and dataplane-doc §X):
+
+- cup2 **segfaults DURING cuCtxCreate** (never prints CTX OK; rbp=0 at libcuda+0x300560).
+- Immediately after the 0xc7c0 alloc echo (crashwin arm), the trace shows: `0x801814`
+  **UNSET_PAGE_DIRECTORY** → a **storm of fn=10 RPCs** (fn=10 = NV_VGPU_MSG_FUNCTION_FREE; the clean
+  base forwards it as RM_FREE @ gpu_emul.c:3565) → 100k GR-VAS page-table reads.
+- That sequence (unset page dir + free-everything + walk-to-free page tables) is the guest kernel
+  **tearing down the crashed process's resources** when its /dev/nvidia* fds close — NOT a poll the
+  guest is blocked on. The 100k page-table reads are the teardown walk; the value-stability check
+  (0x2efbaf000/0x2efbc5000/0x420208c all constant 0) is consistent with teardown, not a live poll.
+
+**Consequence:** the real blocker is the **rbp=0 stack clobber DURING cuCtxCreate**, upstream of all
+the page-table activity. The "install GR-VAS PTEs / golden-ctx fill / stub the poll" plan (§0.3-0.4)
+targets the teardown and would do nothing. DEPRIORITIZE the page-table-fill path.
+
+- The crash is a STACK CORRUPTION (gdb: crash at a function epilogue, saved-rbp popped as 0, a
+  zero-run over the frame) — i.e. some control/alloc **reply copyout writes more zeros than
+  libcuda's stack buffer holds**, clobbering the saved rbp. This is the M9/M10 family (CTRL-CLAMP +
+  ECC/NVLink NOT_SUPPORTED) — those fixed two specific over-copies, but a **residual one remains**.
+
+**NEXT (re-scoped, tractable):** find the specific RM control/alloc whose reply over-copies onto
+libcuda's stack during cuCtxCreate (after the ECC/NVLink ones M10 already fixed). Method: host-vs-
+guest diff of RM_ALLOC/RM_CONTROL reply sizes+bytes with nvioctl_trace (NVALLOC/NVCTRL dump) across
+a native cup2_host run and the guest run; the divergent reply size is the clobber. Family:
+[[abi_struct_truncation]] / [[nvos64_abi_fix]] / [[writeback_bug_pattern]]. NOTE: the M5.30 UVM-VAS
+capture remains correct/useful for later (UVM device-ptr resolution post-ctx); it just isn't the
+ctx blocker.
+
 ## 1. 4-Byte UVM Proof Status
 
 The narrow `cup2_pause` CUDA proof reaches:
