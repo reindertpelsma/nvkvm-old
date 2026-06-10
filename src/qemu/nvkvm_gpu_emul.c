@@ -283,7 +283,11 @@ struct NvkvmGpuEmul {
      * VASpace handle (control hObject).  Matched to a channel via the channel's
      * hVASpace.  This is the channel PDB source (the GSP-managed instblk is empty
      * in our FB). */
-    struct { uint32_t hvas; uint64_t pdb; } chan_vas[16];
+    /* root_sys: the page-directory ROOT lives in sysmem (guest RAM) rather than
+     * FB.  False for the FB-rooted VASes snooped from VASPACE_COPY_SERVER_RESERVED
+     * _PDES; set true for UVM-managed VASes whose root we learn from
+     * NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY (0x801813) with a SYSMEM aperture. */
+    struct { uint32_t hvas; uint64_t pdb; bool root_sys; } chan_vas[16];
     int      chan_vas_n;
     uint32_t chan_hvaspace;    /* the tracked channel's hVASpace handle */
 
@@ -1277,9 +1281,43 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 int k = s->chan_vas_n++;
                 s->chan_vas[k].hvas = ldl_le_p(cmd + 84);   /* control hObject = VASpace */
                 s->chan_vas[k].pdb  = ldq_le_p(cmd + 160);  /* levels[0].physAddress */
+                s->chan_vas[k].root_sys = false;            /* FB-rooted (GSP-client) */
                 qemu_log("nvkvm-gpu[%s] M5: VAS hObject=0x%08x PDB=0x%llx\n",
                          s->chip->name, s->chan_vas[k].hvas,
                          (unsigned long long)s->chan_vas[k].pdb);
+            }
+        }
+        /* M5.30 PRODUCTION UVM CAPTURE: snoop NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY
+         * (0x801813).  This is how the guest's UVM driver (nvUvmInterfaceSetPage
+         * Directory) hands RM/GSP the page-directory ROOT of a UVM-managed VAS — the
+         * VAS that backs cuMemAlloc device pointers.  Unlike the GSP-client GR VASes
+         * (FB-rooted, snooped above from 0x90f10106), the UVM root is typically in
+         * SYSMEM (guest RAM).  Capturing {physAddress, aperture, hVASpace} lets the
+         * doorbell/CE resolver WALK the guest's own UVM page tables to resolve a UVM
+         * device VA -> guest GPA, with NO uprobe bridge and NO guest-userspace read
+         * (the tables live in guest RAM, reachable via the GPA window).  This is the
+         * production replacement for the debug uprobe-bridge UVM-shadow path.
+         * NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS @ params(cmd+120):
+         *   physAddress u64 @+0 (cmd+120); numEntries @+8; flags @+12 (cmd+132);
+         *   hVASpace @+16 (cmd+136).  flags[1:0] aperture: 0=VIDMEM,1=SYS_COH,2=SYS_NONCOH. */
+        if (fn == 76 && ldl_le_p(cmd + 88) == 0x00801813u) {
+            uint64_t phys   = ldq_le_p(cmd + 120);
+            uint32_t flags  = ldl_le_p(cmd + 132);
+            uint32_t hvas   = ldl_le_p(cmd + 136);
+            bool     rsys   = (flags & 0x3u) != 0u;   /* non-VIDMEM aperture => sysmem root */
+            /* Update an existing chan_vas row for this hVASpace, else append. */
+            int k = -1;
+            for (int i = 0; i < s->chan_vas_n; i++) {
+                if (s->chan_vas[i].hvas == hvas) { k = i; break; }
+            }
+            if (k < 0 && s->chan_vas_n < 16) { k = s->chan_vas_n++; }
+            if (k >= 0 && phys) {
+                s->chan_vas[k].hvas = hvas;
+                s->chan_vas[k].pdb = phys;
+                s->chan_vas[k].root_sys = rsys;
+                qemu_log("nvkvm-gpu[%s] M5.30 SET_PAGE_DIR UVM-VAS hVASpace=0x%08x "
+                         "PDB=0x%llx aperture=%u root=%s\n", s->chip->name, hvas,
+                         (unsigned long long)phys, flags & 0x3u, rsys ? "SYS" : "FB");
             }
         }
         if (fn == 103) {
@@ -1988,6 +2026,8 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
 static void nvkvm_chan_execute(NvkvmGpuEmul *s);
 static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
                                bool *out_sys);
+static uint64_t nvkvm_walk_pdb_root(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
+                                    bool root_sys, bool *out_sys);
 
 static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
@@ -2628,10 +2668,13 @@ static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
  * itself is assumed to live in FB (the GSP-client RM allocates the page directory
  * from FB, as for BAR2) — read via the PRAMIN/FB backing.  Returns
  * NVKVM_GMMU_FAULT on any miss (caller then does nothing — safe). */
-/* Walk VER2 from an explicit page-directory base `pdb`.  Returns the physical
+/* Walk VER2 from an explicit page-directory base `pdb`.  `root_sys` selects the
+ * aperture of the page-directory ROOT (false = FB/vidmem, true = sysmem/guest
+ * RAM, as for a UVM-managed VAS rooted via SET_PAGE_DIRECTORY); each PDE/PTE
+ * aperture bit then selects where the next level lives.  Returns the physical
  * address (and *out_sys = leaf in sysmem) or NVKVM_GMMU_FAULT. */
-static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
-                               bool *out_sys)
+static uint64_t nvkvm_walk_pdb_root(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
+                                    bool root_sys, bool *out_sys)
 {
     *out_sys = false;
     uint64_t tbl = pdb;
@@ -2639,7 +2682,7 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
         return NVKVM_GMMU_FAULT;
     }
     /* PD3->PD2->PD1 (8B PDEs), then PD0 (16B dual PDE or 2 MiB PTE); aperture per level. */
-    bool tsys = false;     /* PDB in FB; each PDE aperture says where next lives */
+    bool tsys = root_sys;  /* root aperture; each PDE aperture says where next lives */
     static const struct { int hi, lo; } lvl[3] = { {48,47}, {46,38}, {37,29} };
     for (int i = 0; i < 3; i++) {
         uint32_t idx = (uint32_t)((va >> lvl[i].lo) &
@@ -2705,6 +2748,14 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
     return page + (va & ((1ull << pgshift) - 1));
 }
 
+/* FB-rooted convenience wrapper (the common case: GSP-client RM allocates the
+ * page directory from FB).  UVM-managed VASes use nvkvm_walk_pdb_root(...,true). */
+static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
+                               bool *out_sys)
+{
+    return nvkvm_walk_pdb_root(s, pdb, va, false, out_sys);
+}
+
 /* M5.21: the executing channel's OWN VAS PDB, derived from its client's GR
  * VASpace (chan_client -> m2_devvas vas handle -> chan_vas pdb).  This is the
  * AUTHORITATIVE address space for the channel's pushbuffer/sema — unlike the
@@ -2764,13 +2815,15 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
     /* Prefer the channel's own hVASpace first (fast path / disambiguation). */
     for (int i = 0; i < s->chan_vas_n; i++) {
         if (s->chan_vas[i].hvas == s->chan_hvaspace) {
-            uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, va, out_sys);
+            uint64_t p = nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, va,
+                                             s->chan_vas[i].root_sys, out_sys);
             if (p != NVKVM_GMMU_FAULT) { return p; }
             break;
         }
     }
     for (int i = 0; i < s->chan_vas_n; i++) {
-        uint64_t p = nvkvm_walk_pdb(s, s->chan_vas[i].pdb, va, out_sys);
+        uint64_t p = nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, va,
+                                         s->chan_vas[i].root_sys, out_sys);
         if (p != NVKVM_GMMU_FAULT) { return p; }
     }
     *out_sys = false;
