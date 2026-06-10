@@ -174,6 +174,72 @@ work, so if the host runs it, `get` advances + util>0 + host writes its sem. Rin
 nvidia_modeset nvidia; modprobe nvidia` on vh, or `vastai reboot instance <id>` (key in memory
 vastai_credentials; find instance id via `vastai show instances`).
 
+## PROGRESS LOG 4 (2026-06-10) — LAYER-2 KEYSTONE CRACKED (M5.34 per-client VA dedup)
+
+Found the keystone root cause with fresh HW data + fixed it. **`m2_va_seen()` deduped on VA
+alone, but host VASpaces are PER-CLIENT** (`m2_devvas[]` → {dev,vas} by client). A pushbuffer VA
+(`0x120000000`) mapped into client `0xc1d0000a`'s VAS was marked "seen" and SKIPPED for the CE
+scrubber's client `0xc1d00001` → the scrubber's host VAS lacked that page → **Xid 31 MMU FAULT_PTE
+@ 0x120000000 on GR0_PBDMA0** → channel halt (get frozen at 1, 0% util). That IS the "host won't
+run a scheduled+queued channel" keystone.
+
+**Fix M5.34 (committed 1d5d6af):** key the dedup on `(client, va)`. All 6 call sites thread the
+client (`s->chan_client` ×3, `a->client` ×2, `grc`). Each client allocs a fresh OS_DESCRIPTOR per
+map + has its own VAS, so placing the same guest GPA into two VASes is safe + WB-coherent.
+
+**HW-VERIFIED (fresh boot, cup2):** page `0x120000000` now PLACED into the scrubber's VAS
+(`M5.19 fwd-map ... client=0xc1d00001 -> MAPPED`, `M6.5 back_sys ... PLACED`); **host MMU fault
+GONE**; the host GPU EXECUTES the forwarded CE work — guest UVM observes the completion semaphore
+advance (`completed_value 0x100000054`, low dword `0x54` == queued ops `put=84`). The keystone
+("host runs a scheduled+queued forwarded channel") is cracked.
+
+### TWO next-layer problems surfaced (fresh data):
+- **Problem A (the matmul-critical one): GR/compute channels never become schedulable.** Host
+  dmesg, BEFORE any Xid: `NV_ERR_INVALID_OBJECT_HANDLE (0x33) from vaspaceGetByHandleOrDeviceDefault
+  (pClient, hParent, hVASpace) @ kernel_channel_group_api.c:224 ← AllocWithSecInfo(KEPLER_CHANNEL_
+  GROUP_A) @ kernel_channel.c:381`. The host **TSG (channel-group) alloc fails** because the
+  `hVASpace` we forward is invalid in the host client → TSG never created → `GPFIFO_SCHEDULE` on the
+  GR TSG returns `st=0x57 OBJECT_NOT_FOUND` (client 0xc1d00003, TSGs 0x5c00003b/0x5c000049). This is
+  the real blocker for compute. Fix path: trace shadow_fwd's KEPLER_CHANNEL_GROUP_A (fn=103) alloc —
+  is `hVASpace` a guest handle passed untranslated, or a VASpace never created in the host client?
+- **Problem B (CE scrubber residual): completion-semaphore value incoherence + Xid 32.** Host writes
+  the sema with bit-32 set (`0x1_00000054` vs guest-expected `0x54`, delta exactly 2^32) → guest UVM
+  assert (uvm_channel.c:205 / uvm_gpu_semaphore.c:776, non-fatal, guest continues). Plus Xid 32
+  (corrupted pushbuffer stream) on the CE sub-channel. Deeper semaphore-forwarding coherence; may be
+  scrubber-host-internal-specific. Revisit after Problem A (GR channel may behave differently).
+
+**NEXT: Problem A (GR TSG hVASpace).** It's the matmul path + a concrete handle-translation bug with
+an exact host-kernel call site. Hand the precise source-trace to Fable, anchored in the dmesg.
+
+## PROGRESS LOG 5 (2026-06-10) — Fable reframe of "Problem A" (VERIFIED vs HW)
+
+Handed Problem A to a Fable subagent (deep multi-file trace); it corrected my framing, and I
+verified its load-bearing claims against the live host trace:
+- **GR/compute scheduling is NOT broken.** The GR compute TSG `0x5c000012` schedules `st=0x0 OK`
+  (M5.8 doorbell). The `0x57 OBJECT_NOT_FOUND` GPFIFO_SCHEDULE failures are only on the **COPY2/COPY3**
+  engine TSGs (`0x5c00003b` eng=0xb, `0x5c000049` eng=0xc) — host physical-RM rejects those (likely
+  RTX-3060 LCE/runlist topology vs the emulated GA106; needs host RM introspection; may not matter
+  for matmul). NOT the compute path.
+- **The dmesg `kernel_channel.c:381` / `INVALID_OBJECT_HANDLE 0x33` asserts are non-fatal and not the
+  GR compute path** (RM auto-TSG for bare channels parented to a device, broken device-default VAS via
+  an untranslated NV0080 `hClientShare`). Benign for now; optional cleanup = translate hClientShare on
+  the NV0080 device alloc in shadow_fwd. So "force GR TSG hVASpace" was the WRONG fix — dropped.
+- The `status=0x33` SHADOW allocs in THIS run are classes `0xc574` + `0x0079` (NV01_EVENT_OS_EVENT),
+  i.e. the COMPLETION-EVENT registration path failing on the host — ties into MC_SERVICE_INTERRUPTS /
+  completion delivery (per the map-vs-stub rule + #127 reuse, we likely should NOT forward the host
+  NV01_EVENT_OS_EVENT alloc at all; deliver via POST_EVENT instead — revisit in Step 3).
+
+### REVISED next-thread priority (after M5.34 cracked the keystone mapping):
+1. **Problem B — CE-scrubber completion-semaphore incoherence (freshest, on live path).** M5.34 made
+   the host run the scrubber; guest UVM now asserts `completed_value 0x1_00000054 > queued 0x54`
+   (delta EXACTLY 2^32) + a `0x1e -> 0x1_00000001` jump, plus Xid 32 (corrupted pushbuffer) on the CE
+   sub-channel. Signature = host writes the sema with the HIGH dword set — host channel's own
+   semaphore progression/width differs from the guest's. Investigate the scrubber completion-sema
+   forwarding (what VA, what value the host writes, 32 vs 64-bit release).
+2. **Layer 1 — MC_SERVICE_INTERRUPTS (0x20801702)** completion (known post-M8.4 blocker; oracle
+   M8.108 service-interrupt credits). The real cuCtxCreate gate.
+3. COPY2/COPY3 `0x57` (only if matmul HtoD/DtoH needs those copy TSGs).
+
 ## Escalation rule (user, 2026-06-10)
 **Never report "stuck" until Fable is also stuck on it.** When you reach the point where you'd stop
 and ask the user / declare a blocker, FIRST hand the problem to a Fable subagent (`model: fable`) —
