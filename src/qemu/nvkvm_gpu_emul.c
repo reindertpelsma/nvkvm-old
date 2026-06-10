@@ -1482,12 +1482,32 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                      * caps are NOT needed for cuCtxCreate. Keep the M7 capture only as a diag. */
                     uint32_t cap_psize = (s->m2_gr_reply_valid && s->m2_gr_reply_obj == robj)
                                              ? s->m2_gr_reply_psize : 0u;
-                    uint32_t hp = 0;                   /* never write GR alloc params back */
-                    stl_le_p(resp + 100, hp);
+                    /* M8.4 (ported from oracle 7fb47f1 — rbp-RESTORE, supersedes M8.1):
+                     * KEEP the request params bytes in the response payload (resp+112) AND
+                     * extend the rpc element length (resp+56) so the response actually
+                     * transports them.  The guest's GSP-client deserialize then fills its
+                     * local rpc_params buffer from the element, and the guest RM's
+                     * unavoidable class-size copy_to_user (it derives the 16B
+                     * NV_GR_ALLOCATION_PARAMETERS size and ignores reply paramsSize)
+                     * writes libcuda's OWN bytes back — restoring the saved rbp on its
+                     * stack instead of zeroing it.  M8.1 set only paramsSize=0, leaving the
+                     * element short -> the deserialize zero-padded the local buffer -> the
+                     * copyout cleared rbp -> cuCtxCreate SIGSEGV (libcuda+0x300560, rbp=0).
+                     * Confirmed byte-exact host-vs-guest (host preserves c7c0 params bytes
+                     * 8-15; guest zeroed them). Report semantic paramsSize=0 like native RM. */
+                    uint32_t req_psize = opsize;
+                    if (req_psize > NVKVM_RESP_MAX - 112u) {
+                        req_psize = NVKVM_RESP_MAX - 112u;
+                    }
+                    if (req_psize) {
+                        memcpy(resp + 112, cmd + 112, req_psize);
+                        stl_le_p(resp + 56, 32u + 32u + req_psize);
+                    }
+                    stl_le_p(resp + 100, 0u);          /* semantic paramsSize=0 */
                     s->m2_gr_reply_valid = false;
-                    qemu_log("nvkvm-gpu[%s] M8.1 GR-obj 0x%04x: reply paramsSize=%u (req_echo %u, "
-                             "host_caps_psize %u dropped) [rbp-clobber fix]\n",
-                             s->chip->name, hc, hp, opsize, cap_psize);
+                    qemu_log("nvkvm-gpu[%s] M8.4 GR-obj 0x%04x: paramsSize=0 len-preserve=%u "
+                             "host_caps_psize %u dropped [rbp-restore]\n",
+                             s->chip->name, hc, req_psize, cap_psize);
                 }
             }
             uint32_t ctrl = (fn == 76) ? ldl_le_p(resp + 88) : 0;
