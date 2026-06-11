@@ -2393,6 +2393,28 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                             break;
                         }
                     }
+                    /* M5.46: fetch THIS channel's host work-submit token NOW — only
+                     * valid after the TSG is BIND+SCHEDULE'd (runlist-assigned);
+                     * 0xc36f0108 returns 0x40 INVALID_STATE before BIND. Without
+                     * this the token-fetch in exec_doorbell's M5.12 pass (which runs
+                     * BEFORE this bind) failed, token_valid stayed false, and the
+                     * ring fell back to the GR token — telling the host to fetch the
+                     * GR channel for this COPY channel's work (ESCHED never ran it).
+                     * With a valid per-channel token the M5.22(b) ring below is
+                     * correct. */
+                    if (!c->token_valid && c->hobject) {
+                        uint8_t tp[4]; memset(tp, 0, sizeof(tp)); uint32_t tst = 0xffff;
+                        int trc = nvkvm_m2_control1(s, c->client, c->hobject,
+                                                    0xc36f0108u, tp, 4, &tst);
+                        if (trc == 0 && tst == 0) {
+                            c->host_token = ldl_le_p(tp); c->token_valid = true;
+                        }
+                        qemu_log("nvkvm-gpu[%s] M5.46 post-bind token ch[%d] hObj=0x%08x "
+                                 "-> rc=%d st=0x%x token=0x%08x valid=%d (rl=%u chid=%u)\n",
+                                 s->chip->name, i, c->hobject, trc, tst, c->host_token,
+                                 c->token_valid, (c->host_token >> 16) & 0xffff,
+                                 c->host_token & 0xffff);
+                    }
                 }
             }
             uint32_t before = c->gp_get;
@@ -5371,16 +5393,30 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
         }
         qemu_log("nvkvm-gpu[%s] M5.9 exec_doorbell GR gp_get=%u->%u newpushbufs=%d\n",
                  s->chip->name, c->gp_get, gp_put, newmaps);
-        c->gp_get = gp_put;
-        /* M5.22: ring THIS channel's own host token (per-channel, unconditional —
-         * m2ring removed).  Prefer the per-channel token; fall back to the GR token
-         * for the GR channel whose USERD is double-mmapped (M5.4). */
-        if (s->m2_usermode_qva) {
+        /* M5.46: ring THIS channel's own host token. The GR channel (token from M5.8
+         * doorbell_setup) may legitimately use s->m2_gr_token; EVERY other channel
+         * must use its OWN per-channel token. NEVER fall back to the GR token for a
+         * non-GR channel — that told the host to fetch the GR channel's USERD for a
+         * COPY channel's work, so ESCHED never ran the COPY work (put=1>get=0, 0%
+         * util, no Xid; proven by the M5.45 host self-test). A non-GR channel with no
+         * token yet is not runlist-assigned (BIND happens in the per-channel loop
+         * AFTER this exec_doorbell call) — DEFER: leave gp_get unadvanced so the
+         * per-channel M5.22(b) ring (after the M5.46 post-bind token fetch) submits it
+         * correctly. Advance gp_get ONLY on a real ring. */
+        bool is_gr = (c->hobject == s->m2_gr_channel);
+        bool can_ring = c->token_valid || (is_gr && s->m2_gr_token);
+        if (!s->m2_usermode_qva || !can_ring) {
+            if (s->m2_usermode_qva) {
+                qemu_log("nvkvm-gpu[%s] M5.46 DEFER ring ch[%d] hObj=0x%08x: no per-channel "
+                         "token yet (TSG not bound) — per-channel loop will ring\n",
+                         s->chip->name, i, c->hobject);
+            }
+            continue;                            /* do NOT advance gp_get; retry path rings it */
+        }
+        c->gp_get = gp_put;                      /* consumed — advance only on a real ring */
+        {
             uint32_t tok = c->token_valid ? c->host_token : s->m2_gr_token;
-            /* M5.44: read the REAL host USERD (chanbuf qva, no overlay) at ring time.
-             * This loop consumes c->gp_get before the doorbell per-channel loop runs,
-             * so the M5.22 put/get diag never fires for the real submission — log the
-             * hardware truth HERE: put>get at the ring = host has queued work. */
+            /* M5.44: read the REAL host USERD (chanbuf qva, no overlay) at ring time. */
             uint32_t hput = 0xffffffffu, hget = 0xffffffffu;
             for (int k = 0; k < s->m2_chanbuf_n; k++) {
                 if (s->m2_chanbuf[k].client == c->client &&
@@ -5392,8 +5428,9 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             }
             stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, tok);
             qemu_log("nvkvm-gpu[%s] M5.9 *** RANG host doorbell token=0x%08x (USERMODE+0x90) "
-                     "— host GPU should now run gpfifo=0x%llx *** hostUSERD put=%u get=%u\n",
-                     s->chip->name, tok, (unsigned long long)c->gpfifo_va, hput, hget);
+                     "— host GPU should now run gpfifo=0x%llx *** hostUSERD put=%u get=%u%s\n",
+                     s->chip->name, tok, (unsigned long long)c->gpfifo_va, hput, hget,
+                     is_gr ? " [GR]" : "");
         }
     }
 }
