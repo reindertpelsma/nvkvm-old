@@ -1263,15 +1263,18 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * map op).  This is what makes GSP-managed-VAS channels (UVM) resolvable
          * without leaf PTEs in our FB. */
         if (fn == 76 && ldl_le_p(cmd + 88) == 0x2080012bu) {
+            /* Keep the side-table snoop: GPU-VA->physical capture is legitimate
+             * state recovery (makes GSP-managed/UVM VASes resolvable). */
             nvkvm_snoop_promote_ctx(s, cmd);
-            /* M6.4 (item-4 step 4, the PROMOTE_CTX experiment): forward PROMOTE_CTX to the
-             * host with each sysmem buffer's gpuPhysAddr substituted to OUR backing (the
-             * OS_DESCRIPTOR'd guest RAM), so the host GR context maps the guest's GR VAs onto
-             * the guest's actual memory -> host GPU DMA-fills what libcuda reads. Proves we
-             * own the GR VA layout (the user's "fix any GR VA" question). Gated m2exec. */
-            if (s->m2exec) {
-                nvkvm_m2_forward_promote_ctx(s, cmd);
-            }
+            /* M6.5: do NOT replay PROMOTE_CTX on the host.  It is a ROUTE_TO_PHYSICAL /
+             * GSP-internal (Case-2) control with no userspace equivalent — an unprivileged
+             * stub issuing it gets NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).  Its EFFECT (the
+             * host channel's GR context being promoted) is already achieved by the Case-1
+             * forwarding: shadow_fwd allocated the host channel + NVC7C0 compute object, and
+             * the HOST kernel-RM promoted that host channel's context itself.  So this is
+             * ack-only to the guest (the post-PROMOTE_CTX completion poll is satisfied
+             * elsewhere).  See docs/design/mode2_forwarding_model.md (the M6.4 forward was a
+             * wrong-layer replay; removed). */
         }
         /* M5.1a: shadow-forward the guest's actual RM alloc stream to the real
          * host GPU (gated; non-disruptive — guest still uses the faked response). */
@@ -4390,7 +4393,9 @@ static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient)
  * PROMOTE_CTX control (0x2080012b) on the GR subdevice. Effect: the host GR context maps the
  * guest's GR VAs onto the guest's actual sysmem -> host GPU DMA-fills what libcuda reads.
  * (Reframe: we don't replay the guest's calls — we reproduce the GR-VA->backing EFFECT.) */
-static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
+/* M6.5: retained for reference only — NOT called (PROMOTE_CTX is a Case-2
+ * privileged control we no longer replay; see mode2_forwarding_model.md). */
+G_GNUC_UNUSED static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd)
 {
     uint32_t hClient = ldl_le_p(cmd + 80), hObject = ldl_le_p(cmd + 84);
     uint32_t psize   = ldl_le_p(cmd + 96);
