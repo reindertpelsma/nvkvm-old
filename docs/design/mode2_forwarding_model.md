@@ -73,6 +73,78 @@ userspace intent" (usually Case-1 already did it, so: ack-only).
   - `hostUSERD put=0` on the compute client = the submission intent is not reaching the host
     channel; that is the live keystone, not context promotion.
 
+## DMA addressing (how the host GPU is pointed at guest memory)
+
+GPU engines never use CPU addresses directly — they issue **GPU virtual addresses**; the GPU MMU
+(GMMU) translates GPU-VA → a *bus/DMA address* via PTEs the driver builds. For a **sysmem** page
+that bus address is what the GPU puts on PCIe:
+
+- **No IOMMU (current setup):** the bus address **is the (guest) physical address**. In a KVM guest
+  with no vIOMMU, `dma_map_page` returns guest-physical, so the **addresses the guest writes into
+  its emulated GMMU PTEs are GPAs**. We translate `GPA → shared-RAM memfd offset → host VA →
+  OS_DESCRIPTOR → host RM dma_map → host bus address → host GMMU PTE`. The host kernel does the
+  host-side dma_map (incl. host IOMMU if any) — we only supply the right host pages. Verified: this
+  guest runs **without** a vIOMMU (`/sys/class/iommu` empty, no `iommu_group` on the GPU, no DMAR),
+  so GPA translation is correct as-is.
+
+- **vIOMMU present (must support for generality):** if the guest is booted with `intel-iommu` /
+  `virtio-iommu`, the guest's `dma_map` returns **IOVAs**, and the guest writes **IOVAs** (not GPAs)
+  into its GMMU PTEs. This is generic PCIe-device behavior (IOMMU security groups), not
+  NVIDIA-specific. We must then translate **IOVA → GPA** first (walk the vIOMMU's IOVA→GPA tables,
+  which QEMU's emulated IOMMU maintains) before the existing GPA path. TODO: detect an active
+  guest vIOMMU and insert the IOVA→GPA step ahead of the address-virtualization side-table.
+
+Either way the goal is identical: the host GPU's PTE must point at the **same physical page** the
+guest polls (shared memfd / KVM memslot), so a host-GPU write is seen by the guest natively. A
+host-allocated *copy* (e.g. via `shadow_fwd` re-alloc) is wrong for shared semaphores/completions.
+
+## Passthrough-except-the-doorbell (the data-plane architecture for forwarded channels)
+
+**Delineation principle (decisive):** *a page guest userspace can write to cannot, by construction,
+carry privileged content* — if it did, the driver would have made it a page userspace can't map. So:
+- **userspace-accessible pages → PASSTHROUGH-SHARE** (one physical page, both guest CPU view and the
+  host channel's GMMU view; no trap). USERD, GPFIFO ring, pushbuffers, completion semaphores.
+- **kernel-only pages → TRAP / SIMULATE** (the privileged bits live here; we never need to share them
+  with the host because we either forward the userspace op that triggers them, or simulate). e.g. the
+  CE-scrubber's kernel-internal USERD.
+
+For a **forwarded** compute channel the correct data plane is **passthrough everything except the
+doorbell**:
+- USERD/GPFIFO/pushbuffers/sema are each **one shared physical page**, mapped into the host channel's
+  VAS at the **same GPU VA** the guest uses. Guest writes GP_PUT into the shared USERD natively
+  (host GPU owns GP_GET — clean producer/consumer split, no field written by both: GP_PUT@0x8c guest,
+  GP_GET@0x88 GPU-RO, per clc56f.h); the host GPU fetches the shared GPFIFO→pushbuffers, runs, writes
+  the completion sema to the shared page; the guest polls it. **Zero QEMU mediation on the hot path.**
+- **Only the doorbell traps** (USERMODE+0x90 MMIO): translate guest `(runlist<<16)|chid` token →
+  the host channel's token (`c->host_token`, fetched via NVC36F_CTRL GET_WORK_SUBMIT_TOKEN 0xc36f0108)
+  and ring the host USERMODE. Verbatim ring is wrong — guest/host chid don't always coincide
+  (mode2_doorbell_chid.md §16.1); legacy host-allocates-chid is unreachable on the stock open driver
+  (§12), so the trap+translate is mandatory (and is also the natural per-kick demux point).
+- This DELETES, for forwarded channels: `nvkvm_chan_execute` (pushbuffer parsing), the GP_PUT
+  "bridge" (which copied the consume-cursor, not the produce-index), and all QEMU-side semaphore
+  writes. They exist only because the physical share was never finished.
+
+**Sharing/mapping status (the actual remaining work):**
+| object | guest aperture | host-VAS map | guest CPU view (untrapped) | status |
+|---|---|---|---|---|
+| pushbuffers | sysmem | FIXED map_dma @ guest VA | guest RAM (memfd) | DONE (`back_and_map_sys`, M5.19) |
+| completion/tracking sema | sysmem | FIXED map_dma @ guest VA | guest RAM | DONE (same path) — but must be placed per-(client,VA) into every owning channel's host VAS (M5.34) |
+| **USERD** | **vidmem (as=2)** | host USERD = this page | **MISSING real share** | uses `m2_fbback` overlay (trap-only) → userspace GP_PUT bypasses it → put=0 |
+| **GPFIFO ring** | **vidmem** | FIXED map_dma @ gpFifoOffset | **MISSING real share** | overlay only |
+| doorbell | BAR0 reg | host USERMODE+0x90 | trapped+translated | primitive exists (`doorbell_setup`) |
+
+**The fix:** convert the vidmem USERD/GPFIFO from the FB-overlay to a real **KVM memslot** at the guest
+GPA (reuse Mode-1 `nvkvm_mmap_create` + `nvkvm_mmap_map_to_guest`, `nvkvm_mmap_host.c`), backed by the
+host channel's real USERD/GPFIFO object the stub already allocs+mmaps (`back_channel_userd` holds the
+`qva`). Keep the **WB-coherency** fix on the shared page (`nvkvm_force_range_wb`, the #111 pattern) so
+the guest's pre-doorbell GP_PUT store is globally visible before the trapped ring returns; keep the
+**working-set-mapped ring gate** (ring only when every pushbuffer-referenced VA + the sema target is
+mapped in the host VAS, else Xid 31/32). Sysmem objects keep `back_and_map_sys`.
+
+**Two orthogonal blockers to test separately** (NOT fixed by the doorbell design): a residual GSP-event
+wait (MC_SERVICE_INTERRUPTS / POST_EVENT) for the GSP/FECS-internal ctx-init completion, and the
+copy-engine TSG `GPFIFO_SCHEDULE st=0x57` on the RTX 3060 (LCE/runlist topology) for matmul's DMA path.
+
 ## Anti-patterns (do not do these)
 
 - Replaying a ROUTE_TO_PHYSICAL / GSP-internal control on the host stub.
