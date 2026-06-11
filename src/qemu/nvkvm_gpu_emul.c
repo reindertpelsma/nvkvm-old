@@ -4955,7 +4955,25 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     if (!hDev || !size) {
         return -1;
     }
-    uint64_t asize = (size + 0xffffu) & ~0xffffull;        /* 64 KiB granular */
+    uint64_t asize = (size + 0xffffu) & ~0xffffull;        /* 64 KiB granular (host alloc/map) */
+    uint64_t tsize = (size + 0xfffu)  & ~0xfffull;          /* 4 KiB true run length (overlay) */
+    /* M5.43 OVERLAP GUARD: an m2_fbback[] entry is the AUTHORITATIVE channel-bound backing for
+     * its range (e.g. a COPY channel's real USERD registered by back_channel_userd, the page the
+     * host GPU actually reads via hUserdMemory[0]). A populate_cvas blank-shadow GPGA must NEVER
+     * cover it — because the overlay scans GPGA FIRST, a shadowing entry steals the guest's
+     * GP_PUT writes + chan_execute's GP_GET reads into a blank page the host GPU never sees, so
+     * the host channel stays put=0/get=0 and util pins at 0%. Reject any run that overlaps an
+     * existing fbback entry; that memory is already correctly backed. */
+    for (int i = 0; i < s->m2_fbback_n; i++) {
+        uint64_t fb0 = s->m2_fbback[i].fb_base, fb1 = fb0 + s->m2_fbback[i].size;
+        if (gpga < fb1 && fb0 < gpga + tsize) {
+            qemu_log("nvkvm-gpu[%s] M5.43 gpga_obj SKIP: gpga=0x%llx size=0x%llx overlaps "
+                     "fbback[%d] [0x%llx,0x%llx) (authoritative channel backing)\n",
+                     s->chip->name, (unsigned long long)gpga, (unsigned long long)tsize, i,
+                     (unsigned long long)fb0, (unsigned long long)fb1);
+            return -1;
+        }
+    }
     uint32_t hMem = 0xda000000u | (s->m2_databuf_next++ & 0xffffu);
     struct nvkvm_host_map hm;
     if (!nvkvm_m2_host_alloc_map_vidmem(s, client, hDev, hMem, asize, &hm)) {
