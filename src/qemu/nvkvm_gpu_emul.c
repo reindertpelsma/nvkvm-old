@@ -2305,6 +2305,37 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                     s->m2_cvas[s->m2_cur_cvas].populated = true;
                 }
             }
+            /* M5.41 (deterministic, moved out of the advance-gated M5.25 path): bind +
+             * GPFIFO_SCHEDULE the compute client's COPY TSGs ONCE, on first sight — NOT
+             * gated on this channel having advanced (that made it fire only flakily, the
+             * oracle's 2/4). The CE engine context must be bound to a runlist on the host
+             * before the GSP runlist-commit can resolve it (GR self-binds at its 0xc7c0
+             * alloc; CE has no equivalent we forward) — without the bind GPFIFO_SCHEDULE
+             * returns st=0x57 OBJECT_NOT_FOUND. NVA06C_CTRL_CMD_BIND (0xa06c0102,
+             * {engineType}) then GPFIFO_SCHEDULE (0xa06c0101, {bEnable=1}). Skip the GR
+             * TSG (M5.8 already scheduled it) + the guest-kernel CE scrubber (simulated). */
+            if (s->m2exec && c->tsg && !c->scheduled && c->tsg != s->m2_gr_tsg &&
+                c->client != 0xc1d00001u) {
+                uint32_t teng = 0;
+                for (int e = 0; e < s->m2_tsgeng_n; e++) {
+                    if (s->m2_tsgeng[e].tsg == c->tsg) { teng = s->m2_tsgeng[e].engine; break; }
+                }
+                if (teng >= 0x9u && teng <= 0x12u) {        /* NV2080_ENGINE_TYPE_IS_COPY */
+                    uint8_t bp[4]; stl_le_p(bp, teng);
+                    uint32_t bst = 0xffff;
+                    int brc = nvkvm_m2_control1(s, c->client, c->tsg, 0xa06c0102u,
+                                                bp, sizeof(bp), &bst);
+                    uint8_t sp[3]; memset(sp, 0, sizeof(sp)); sp[0] = 1;
+                    uint32_t sst = 0xffff;
+                    int src = nvkvm_m2_control1(s, c->client, c->tsg, 0xa06c0101u,
+                                                sp, sizeof(sp), &sst);
+                    c->scheduled = true;
+                    qemu_log("nvkvm-gpu[%s] M5.41 COPY TSG bind+sched ch[%d] TSG=0x%08x "
+                             "engineType=0x%x -> bind rc=%d st=0x%x | sched rc=%d st=0x%x%s\n",
+                             s->chip->name, i, c->tsg, teng, brc, bst, src, sst,
+                             (sst == 0) ? "  OK SCHEDULED" : "  <-- sched err");
+                }
+            }
             uint32_t before = c->gp_get;
             nvkvm_chan_execute(s);
             c->gp_get = s->chan_gp_get;          /* save consumed index */

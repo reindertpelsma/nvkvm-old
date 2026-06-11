@@ -41,7 +41,8 @@ sed -n "$((QB+1)),${QE}p" "$QLOG" > /tmp/m540_delta.txt
 
 echo ""; echo "============ M5.40 EVIDENCE ============"
 echo "--- M5.40 COPY-TSG VAS rewrites ---"; grep -E "M5.40 a06c COPY TSG" /tmp/m540_delta.txt | head
-echo "--- GPFIFO_SCHEDULE results (was st=0x57) ---"; grep -E "GPFIFO_SCHEDULE" /tmp/m540_delta.txt | sed -E "s/.*(TSG=0x[0-9a-f]+).*(client=0x[0-9a-f]+).*(st=0x[0-9a-f]+).*/\1 \2 \3/" | sort | uniq -c
+echo "--- M5.41 COPY TSG bind+sched results ---"; grep -E "M5.41 COPY TSG bind" /tmp/m540_delta.txt | sed -E "s/.*(TSG=0x[0-9a-f]+).*(engineType=0x[0-9a-f]+).*(bind rc=[0-9-]+ st=0x[0-9a-f]+).*(sched rc=[0-9-]+ st=0x[0-9a-f]+).*/\1 \2 \3 | \4/" | sort | uniq -c
+echo "--- GPFIFO_SCHEDULE results (was st=0x57) ---"; grep -E "GPFIFO_SCHEDULE" /tmp/m540_delta.txt | sed -E "s/.*(TSG=0x[0-9a-f]+).*(st=0x[0-9a-f]+).*/\1 \2/" | sort | uniq -c
 echo "--- populate_cvas for COPY TSGs ---"; grep -E "populate_cvas" /tmp/m540_delta.txt | grep -iE "5c000049|5c00003b" | head
 echo "--- compute working-set VA FAULTs (0x2002xxxxx) — should shrink/vanish ---"; grep -cE "eva=0x2002[0-9a-f]+ -> FAULT" /tmp/m540_delta.txt | sed 's/^/  fault count: /'
 echo "--- host GPU util (peak) ---"; sort -t: -k2 /tmp/m540_util.log 2>/dev/null | grep -oE "[0-9]+ %" | sort -rn | head -3; tail -3 /tmp/m540_util.log
