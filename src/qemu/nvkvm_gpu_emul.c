@@ -4144,8 +4144,10 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             uint32_t hvas      = ldl_le_p(auxbuf + 28);
             qemu_log("nvkvm-gpu[%s] M5.3 DIAG c56f obj=0x%08x hParent=0x%08x "
                      "hContextShare@24=0x%08x hVASpace@28=0x%08x gpFifoOff@8=0x%llx "
-                     "psize=%u\n", s->chip->name, hObject, hParent, hctxshare, hvas,
-                     (unsigned long long)ldq_le_p(auxbuf + 8), psize);
+                     "hUserd[0]@32=0x%08x userdOffset[0]@64=0x%llx psize=%u\n", s->chip->name,
+                     hObject, hParent, hctxshare, hvas,
+                     (unsigned long long)ldq_le_p(auxbuf + 8), ldl_le_p(auxbuf + 32),
+                     (unsigned long long)ldq_le_p(auxbuf + 64), psize);
             /* memory descriptors region (NV_MEMORY_DESC_PARAMS @144/168/192/216 for
              * instanceMem/userdMem/ramfcMem/mthdbufMem; base@+0,addrSpace@+16) — the
              * suspected two-RM reconciliation point (guest-FB bases). Dump u64s. */
@@ -5555,6 +5557,16 @@ static void nvkvm_m2_back_channel_userd(NvkvmGpuEmul *s, uint32_t hClient,
         return;
     }
     stl_le_p(auxbuf + 32, hUserd);           /* hUserdMemory[0] = host USERD handle */
+    /* M5.47 ROOT-CAUSE FIX (silent forwarded no-fetch): the guest pools all its channel
+     * USERDs into ONE memory object and addresses each via a NONZERO userdOffset[0]@64
+     * (chid * 0x3000). We replace hUserdMemory[0] with a FRESH per-channel object whose
+     * USERD belongs at offset 0, but the host channel's USERD = hUserdMemory[0] +
+     * userdOffset[0]. Left nonzero, the host GPU reads USERD at our_object + 0x2000.. (past
+     * our 0x1000 object) while the guest's GP_PUT lands (via the fbback overlay) at our
+     * object offset 0 -> host sees GP_PUT==GP_GET, never fetches the GPFIFO (zero util,
+     * zero Xid -- the exact morph-confirmed symptom). Zero userdOffset[0] so the host reads
+     * USERD where we write it. (NV_CHANNEL_ALLOC_PARAMS userdOffset[NV_MAX_SUBDEVICES]@64.) */
+    stq_le_p(auxbuf + 64, 0u);
     s->m2_fbback[s->m2_fbback_n].fb_base = ubase;
     s->m2_fbback[s->m2_fbback_n].size    = asize;
     s->m2_fbback[s->m2_fbback_n].host_qva = hm.qva;
