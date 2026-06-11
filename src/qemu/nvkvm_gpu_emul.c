@@ -223,6 +223,9 @@ struct NvkvmGpuEmul {
         uint32_t tsg;           /* M5.25: parent TSG (a06c) handle — must be GPFIFO_SCHEDULE'd
                                  * before a ring runs (guest's schedule control isn't forwarded) */
         bool     scheduled;     /* M5.25: TSG GPFIFO_SCHEDULE'd on the host once */
+        uint32_t sweep_put;     /* M5.48c: GP_PUT as of the last working-set sweep — sweep
+                                 * again only when a channel's PUT ADVANCES (new submission =
+                                 * the guest just mapped+filled new working-set leaves) */
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -468,14 +471,14 @@ struct NvkvmGpuEmul {
         uint32_t client;      /* host RM client (nvkvm-tracked) */
         uint32_t hMemory;     /* host RM object handle = the 'real' backing */
         uint64_t gr_va;       /* host GR-VAS VA where map_dma'd (0=not GPU-mapped) */
-    } m2_objs[128];
+    } m2_objs[1024];            /* M5.48d: 2-MiB chunked mirror needs headroom (was 128) */
     int      m2_objs_n;
     struct {                  /* GPGA page-range -> (object, offset_in_target) */
         uint64_t gpga_base, size;
         int      obj_idx;     /* index into m2_objs[] (-1 = none) */
         uint64_t off;         /* offset_in_target */
         bool     readable, writable;
-    } m2_gpga[256];
+    } m2_gpga[2048];            /* M5.48d: 2-MiB chunked mirror needs headroom (was 256) */
     int      m2_gpga_n;
 
     /* knobs */
@@ -4744,6 +4747,26 @@ static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
         s->m2_cvas[s->m2_cur_cvas].client == client) {
         return s->m2_cvas[s->m2_cur_cvas].fvirt;
     }
+    /* M5.48: even OUTSIDE the doorbell loop (m2_cur_cvas unset), a client whose TSGs were
+     * re-homed into an nvkvm-owned cvas (M5.28 GR / M5.40 COPY-shared) RUNS its channels in
+     * that fvas — so EVERY FIXED map for that client must target the SAME fvas. The out-of-
+     * loop map sites (M6.5 sweeps at the 0xc7c0 alloc + M5.10 re-sweeps, M5.7 ctx/gpfifo,
+     * M5.9 pushbufs) previously fell through to the per-client grmap virtmem over the guest
+     * forwarded VAS (0x5c000007): the GPFIFO pool (VA 0x200200000, GPGA 0x4200000) landed
+     * THERE while the host channel runs in fvas 0xce20002a -> host PBDMA fetch faulted
+     * Xid 31 FAULT_PDE @ the GPFIFO VA (and poisoned va_seen so populate_cvas backed=0).
+     * Prefer the GR TSG's entry; all of a client's entries share one fvas after M5.40. */
+    {
+        int any = -1;
+        for (int i = 0; i < s->m2_cvas_n; i++) {
+            if (s->m2_cvas[i].client != client) { continue; }
+            if (s->m2_cvas[i].tsg == s->m2_gr_tsg) { any = i; break; }
+            if (any < 0) { any = i; }
+        }
+        if (any >= 0) {
+            return s->m2_cvas[any].fvirt;
+        }
+    }
     for (int i = 0; i < s->m2_grmap_n; i++) {
         if (s->m2_grmap[i].client == client) {
             return s->m2_grmap[i].hvirt;
@@ -4828,6 +4851,11 @@ static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     for (int i = 0; i < s->m2_grmap_n; i++) {
         if (s->m2_grmap[i].client == client) { hDev = s->m2_grmap[i].hdev; break; }
     }
+    if (!hDev) {            /* M5.48: cvas-routed client never minted a grmap entry */
+        for (int i = 0; i < s->m2_devvas_n; i++) {
+            if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+        }
+    }
     uint64_t asize = (size + 0xffff) & ~0xffffull;     /* round to 64 KiB */
     if (s->m2_fbback_n >= 64) {
         qemu_log("nvkvm-gpu[%s] M5.7 back_and_map: m2_fbback full\n", s->chip->name);
@@ -4882,6 +4910,11 @@ static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client)
     uint32_t hDev = 0, subdev = 0;
     for (int i = 0; i < s->m2_grmap_n; i++) {
         if (s->m2_grmap[i].client == client) { hDev = s->m2_grmap[i].hdev; break; }
+    }
+    if (!hDev) {            /* M5.48: cvas-routed client never minted a grmap entry */
+        for (int i = 0; i < s->m2_devvas_n; i++) {
+            if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+        }
     }
     for (int i = 0; i < s->m2_subdev_n; i++) {
         if (s->m2_subdev[i].client == client) { subdev = s->m2_subdev[i].subdev; break; }
@@ -5026,7 +5059,7 @@ static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t
 static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                              uint64_t gpga, uint64_t size)
 {
-    if (s->m2_objs_n >= 128 || s->m2_gpga_n >= 256) {
+    if (s->m2_objs_n >= 1024 || s->m2_gpga_n >= 2048) {
         return -1;
     }
     uint32_t hDev = 0;
@@ -5108,6 +5141,10 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
 {
     if (a->len == 0) { return; }
     a->runs++;
+    /* (M5.48b "skip top-of-heap" was tried here and REVERTED: nvkprobe proved the host RM's
+     * internal allocator is BOTTOM-UP (~0x120000000) — the top region is guest-only, and the
+     * guest's high leaves (its GR-ctx pool, e.g. 0x78dd76000000) ARE referenced by the
+     * executing channel (FE faulted VIRT_WRITE at pool+0xe00000), so they MUST be mirrored. */
     if (a->dry) {
         if (a->target >= a->gpa0 && a->target < a->gpa0 + a->len) {
             uint64_t hit_va = a->va0 + (a->target - a->gpa0);
@@ -5138,9 +5175,28 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
          * 0x51 from map_dma = the host self-promoted its own object at this VA (no overlay;
          * needs the avoid-self-promotion path). copy_content=false (blank). */
         a->vidbytes += a->len;
-        if (!nvkvm_m2_va_seen(a->s, a->client, a->va0) &&
-            nvkvm_m2_gpga_obj(a->s, a->client, a->va0, a->gpa0, a->len) >= 0) {
-            a->backed++;          /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
+        /* M5.48d: dedup PER 2-MiB-ALIGNED CHUNK, not per run. The guest GROWS its vid
+         * mappings (GR-ctx pool leaves appear submission-by-submission); a grown run
+         * re-coalesces to the SAME start VA, so the old whole-run va_seen check skipped
+         * the new tail forever — the host CE then faulted VIRT_WRITE at exactly
+         * old-run-end (0x717ccc000000+0xe00000). Aligned chunk keys are stable across
+         * re-walks, so only genuinely-new chunks get backed. Giant runs (e.g. the
+         * kernel's whole-FB linear alias, 12 GiB) keep the legacy single-key skip. */
+        if (a->len < 0x40000000ull) {   /* chunk everything < 1 GiB; the 12-GiB whole-FB
+                                         * linear alias keeps the legacy single-key skip */
+            for (uint64_t off = 0; off < a->len; ) {
+                uint64_t cva  = a->va0 + off;
+                uint64_t next = (cva + 0x200000ull) & ~0x1fffffull;
+                uint64_t clen = (next - cva < a->len - off) ? next - cva : a->len - off;
+                if (!nvkvm_m2_va_seen(a->s, a->client, cva) &&
+                    nvkvm_m2_gpga_obj(a->s, a->client, cva, a->gpa0 + off, clen) >= 0) {
+                    a->backed++;  /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
+                }
+                off += clen;
+            }
+        } else if (!nvkvm_m2_va_seen(a->s, a->client, a->va0) &&
+                   nvkvm_m2_gpga_obj(a->s, a->client, a->va0, a->gpa0, a->len) >= 0) {
+            a->backed++;
         }
     }
     a->len = 0;
@@ -5336,10 +5392,27 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
      * still UNBACKED at this point. Re-sweep (idempotent: only NEW VAs backed) so the full working
      * set, incl. the semaphore the host must write, is FIXED-mapped into the host VAS before any
      * ring (else a ring faults the host GPU on the SEM_RELEASE target -> cuInit=999). Bounded. */
-    if (grc && s->m2_exec_sweeps < 8) {
+    /* M5.48c: ALSO re-sweep whenever a compute-client channel has NEW submitted work (GP_PUT
+     * advanced) — the guest maps late working-set leaves (its GR-ctx pool / local-memory
+     * backing at top-of-heap VAs, the buffers its init pushbuffer references) only right
+     * before submitting, typically AFTER the first-8 boot-time sweeps are exhausted. Without
+     * this the host GR FE faulted VIRT_WRITE at guest-pool+0xe00000 (leaf never mirrored).
+     * Bounded by a higher total cap; idempotent via va_seen. */
+    bool m548_newwork = false;
+    for (int i = 0; grc && i < s->chan_n; i++) {
+        struct nvkvm_chan_entry *nc = &s->chans[i];
+        if (nc->client != grc || !nc->gpfifo_va || !nc->userd) { continue; }
+        uint32_t np = (uint32_t)nvkvm_fb_read(s, nc->userd + 0x8C, 4);
+        if (np != nc->sweep_put && np <= nc->gpfifo_ent) {
+            m548_newwork = true;
+            nc->sweep_put = np;          /* latch: one sweep per submission, not per doorbell */
+        }
+    }
+    if (grc && (s->m2_exec_sweeps < 8 || (m548_newwork && s->m2_exec_sweeps < 1000))) {
         s->m2_exec_sweeps++;
-        qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x) — back newly-mapped "
-                 "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps, grc);
+        qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x)%s — back newly-mapped "
+                 "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps,
+                 grc, m548_newwork ? " [M5.48c new-work]" : "");
         nvkvm_m2_enum_gr_sysmem(s, grc);
     }
     /* M5.13: one-shot DRY-RUN locate of the completion semaphore (0x2efbaf000, the page the
