@@ -5654,6 +5654,211 @@ static void nvkvm_m2_memtest(NvkvmGpuEmul *s)
     munmap(hm.qva, hm.size);
 }
 
+/* M5.45 HOST-CHANNEL SELF-TEST (gated: env NVKVM_SELFTEST=1, never in normal boots).
+ * Decisively splits the open blocker — "host never fetches forwarded channels" — in half:
+ * with NO guest involvement, build a FULLY HOST-SIDE channel out of the SAME primitives the
+ * forwarding path uses (private client→device→subdevice→VAS→virtmem; GPFIFO+pushbuffer+sem
+ * in host vidmem mmapped into QEMU; client-provided USERD via hUserdMemory[0]; an
+ * AMPERE_USERMODE_A doorbell page; NVA06C BIND+GPFIFO_SCHEDULE; GP_PUT=1; ring the channel's
+ * NVC36F work-submit token), submit ONE inline NVC56F host-FIFO semaphore release (no engine
+ * object — ESCHED/PBDMA executes host methods), and poll the sem word through QEMU's mmap.
+ *   SEM LANDS (and host GP_GET -> 1): host doorbell/schedule/USERD mechanics are GOOD; the
+ *     blocker is purely the guest↔host bridging of FORWARDED channels.
+ *   SEM NEVER LANDS: the host-side schedule/doorbell sequence itself is broken — dig there.
+ * Engine = COPY0 (no GR golden-ctx dependency; mirrors the host CE scrubber pattern).
+ * Runs once from realize (stub is up, guest hasn't booted) — fully deterministic. */
+static void nvkvm_m2_channel_selftest(NvkvmGpuEmul *s)
+{
+    if (!nvkvm_m2_iso_ensure(s)) {
+        qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST: no isolate — abort\n", s->chip->name);
+        return;
+    }
+    const uint32_t C = 0xc1ee0077u, DEV = 0xde770001u, SUB = 0xde770002u,
+                   VAS = 0xde770003u, VIRT = 0xde770004u, BUF = 0xde770005u,
+                   USERD = 0xde770006u, TSG = 0xde770007u, CHAN = 0xde770008u,
+                   UM = 0xde770009u;
+    const uint64_t VAB = 0x500000000ull;          /* private VAS layout base          */
+    const uint64_t PB_VA  = VAB + 0x0000;         /* pushbuffer                       */
+    const uint64_t GPF_VA = VAB + 0x1000;         /* GPFIFO ring                      */
+    const uint64_t SEM_VA = VAB + 0x2000;         /* semaphore word the GPU writes    */
+    const uint32_t PAYLOAD = 0xCAFEF00Du;
+    uint32_t st = 0xffff;
+
+    /* 1) private hierarchy: client -> device -> subdevice -> VAS -> virtmem mapper */
+    uint32_t c0 = C;
+    nvkvm_m2_alloc1(s, C, 0, 0, 0x0u, &c0, sizeof(c0), &st);
+    uint32_t cst = st;
+    uint8_t devp[56]; memset(devp, 0, sizeof(devp));
+    nvkvm_m2_alloc1(s, C, C, DEV, 0x0080u, devp, sizeof(devp), &st);
+    uint32_t dst = st;
+    uint32_t sub0 = 0;
+    nvkvm_m2_alloc1(s, C, DEV, SUB, 0x2080u, &sub0, sizeof(sub0), &st);
+    uint32_t sst = st;
+    uint8_t vasp[56]; memset(vasp, 0, sizeof(vasp));
+    nvkvm_m2_alloc1(s, C, DEV, VAS, 0x90f1u, vasp, sizeof(vasp), &st);
+    uint32_t vst = st;
+    uint32_t vmst = 0xffff;
+    nvkvm_m2_alloc_virtmem(s, C, DEV, VIRT, VAS, &vmst);
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST hierarchy: client=0x%x dev=0x%x subdev=0x%x "
+             "vas=0x%x virtmem=0x%x\n", s->chip->name, cst, dst, sst, vst, vmst);
+    if (cst | dst | sst | vst | vmst) {
+        return;
+    }
+
+    /* 2) host vidmem: one 64 KiB working buffer (pushbuf+GPFIFO+sem) FIXED-mapped at VAB
+     *    in the private VAS, plus a 64 KiB USERD object handed to the channel. */
+    struct nvkvm_host_map buf, ud;
+    if (!nvkvm_m2_host_alloc_map_vidmem(s, C, DEV, BUF, 0x10000, &buf) ||
+        !nvkvm_m2_host_alloc_map_vidmem(s, C, DEV, USERD, 0x10000, &ud)) {
+        qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST: vidmem alloc/map failed\n", s->chip->name);
+        return;
+    }
+    uint32_t mst = 0xffff; uint64_t outva = 0;
+    int mrc = nvkvm_m2_map_dma(s, C, DEV, VIRT, BUF, 0, 0x10000, true, VAB, &mst, &outva);
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST map buf FIXED@0x%llx -> rc=%d st=0x%x va=0x%llx\n",
+             s->chip->name, (unsigned long long)VAB, mrc, mst, (unsigned long long)outva);
+    if (mrc != 0 || mst != 0 || outva != VAB) {
+        return;
+    }
+
+    /* 3) TSG (KEPLER_CHANNEL_GROUP_A): engineType COPY0, our VAS.
+     *    NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS {hObjectError,hObjectEccError,
+     *    hVASpace@8,engineType@12,bIsCallingContextVgpuPlugin@16}. */
+    uint8_t tsgp[20]; memset(tsgp, 0, sizeof(tsgp));
+    stl_le_p(tsgp + 8, VAS);
+    stl_le_p(tsgp + 12, 9u);                      /* NV2080_ENGINE_TYPE_COPY0 */
+    nvkvm_m2_alloc1(s, C, DEV, TSG, 0xa06cu, tsgp, sizeof(tsgp), &st);
+    uint32_t tst = st;
+
+    /* 4) channel (AMPERE_CHANNEL_GPFIFO_A 0xc56f) under the TSG. 368B = the 580 guest's
+     *    exact NV_CHANNEL_ALLOC_PARAMS size (psize=368 in the c56f DIAG): gpFifoOffset@8,
+     *    gpFifoEntries@16, hUserdMemory[0]@32, userdOffset[0]@64, engineType@128.
+     *    hContextShare=0/hVASpace=0 (TSG channel inherits; matches the forwarded allocs). */
+    uint8_t cp[368]; memset(cp, 0, sizeof(cp));
+    stq_le_p(cp + 8, GPF_VA);
+    stl_le_p(cp + 16, 64u);                       /* gpFifoEntries */
+    stl_le_p(cp + 32, USERD);                     /* hUserdMemory[0] */
+    stl_le_p(cp + 128, 9u);                       /* engineType = COPY0 */
+    nvkvm_m2_alloc1(s, C, TSG, CHAN, 0xc56fu, cp, sizeof(cp), &st);
+    uint32_t chst = st;
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST tsg(a06c)=0x%x chan(c56f)=0x%x\n",
+             s->chip->name, tst, chst);
+    if (tst || chst) {
+        return;
+    }
+
+    /* 5) AMPERE_USERMODE_A doorbell page under OUR subdevice, mmapped (mirror M5.8). */
+    nvkvm_m2_alloc1(s, C, SUB, UM, 0xc561u, NULL, 0, &st);
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST: usermode alloc st=0x%x\n", s->chip->name, st);
+        return;
+    }
+    if (s->m2_maph_next < 16) { s->m2_maph_next = 16; }
+    uint32_t maph = s->m2_maph_next++;
+    int mapfd = -1;
+    if (nvkvm_isolate_open_device(&s->m2_iso, s->m2_iso_id, maph, NVKVM_DEV_GPU(0),
+                                  O_RDWR, &mapfd) != 0 || mapfd < 0) {
+        qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST: usermode map-fd open failed\n", s->chip->name);
+        return;
+    }
+    struct nv_ioctl_nvos33_parameters_with_fd mm;
+    memset(&mm, 0, sizeof(mm));
+    mm.h_client = nvkvm_m2_client(s, C);
+    mm.h_device = DEV;
+    mm.h_memory = UM;
+    mm.length   = 0x10000;
+    mm.fd       = (int32_t)maph;
+    unsigned int mc = (3u << 30) | ((unsigned int)sizeof(mm) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_MAP_MEMORY;
+    uint32_t mnv = 0; uint64_t mf = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, mc,
+                                 &mm, sizeof(mm), NULL, 0, 0, &mnv, &mf);
+    if (rc != 0 || mm.status != 0) {
+        qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST: usermode RM_MAP_MEMORY rc=%d st=0x%x\n",
+                 s->chip->name, rc, mm.status);
+        return;
+    }
+    void *um_qva = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mapfd, 0);
+    if (um_qva == MAP_FAILED) {
+        qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST: usermode mmap failed: %s\n",
+                 s->chip->name, strerror(errno));
+        return;
+    }
+
+    /* 6) BIND(engineType) + GPFIFO_SCHEDULE(bEnable=1) on the TSG (mirrors M5.41/M5.8).
+     *    BIND must precede the token fetch: kfifoGenerateWorkSubmitTokenHal_GA100 returns
+     *    NV_ERR_INVALID_STATE (0x40) until the channel is assigned a runlist, which is
+     *    what NVA06C_CTRL_CMD_BIND does (ogkm kernel_fifo_ga100.c "not assigned to
+     *    runlist yet"). */
+    uint32_t bp = 9u; uint32_t bst = 0xffff;
+    int brc = nvkvm_m2_control1(s, C, TSG, 0xa06c0102u, &bp, sizeof(bp), &bst);
+    uint8_t sp[3]; memset(sp, 0, sizeof(sp)); sp[0] = 1;
+    uint32_t scst = 0xffff;
+    int src = nvkvm_m2_control1(s, C, TSG, 0xa06c0101u, sp, sizeof(sp), &scst);
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST BIND rc=%d st=0x%x | SCHEDULE rc=%d st=0x%x\n",
+             s->chip->name, brc, bst, src, scst);
+    if (brc != 0 || bst != 0 || src != 0 || scst != 0) {
+        return;
+    }
+
+    /* 7) the channel's host work-submit token (NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN). */
+    uint8_t tp[4]; memset(tp, 0, sizeof(tp));
+    uint32_t tkst = 0xffff;
+    int trc = nvkvm_m2_control1(s, C, CHAN, 0xc36f0108u, tp, 4, &tkst);
+    uint32_t token = ldl_le_p(tp);
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST token rc=%d st=0x%x token=0x%08x (rl=%u chid=%u)\n",
+             s->chip->name, trc, tkst, token, (token >> 16) & 0xffff, token & 0xffff);
+    if (trc != 0 || tkst != 0) {
+        return;
+    }
+
+    /* 8) pushbuffer: ONE incrementing method run SEM_ADDR_LO(0x5c)..SEM_EXECUTE(0x6c) =
+     *    inline FIFO semaphore RELEASE of PAYLOAD to SEM_VA (32-bit, no WFI, no timestamp).
+     *    GPFIFO entry 0 points at it (entry0=addr[31:2], entry1=addr[39:32]|len_dwords<<10). */
+    uint32_t *pb = (uint32_t *)((uint8_t *)buf.qva + (PB_VA - VAB));
+    pb[0] = (1u << 29) | (5u << 16) | (0u << 13) | (0x5cu >> 2);  /* INC, count=5, subch=0 */
+    pb[1] = (uint32_t)(SEM_VA & 0xfffffffcu);                     /* SEM_ADDR_LO            */
+    pb[2] = (uint32_t)((SEM_VA >> 32) & 0xffu);                   /* SEM_ADDR_HI            */
+    pb[3] = PAYLOAD;                                              /* SEM_PAYLOAD_LO         */
+    pb[4] = 0;                                                    /* SEM_PAYLOAD_HI         */
+    pb[5] = 0x1u;                                                 /* SEM_EXECUTE: RELEASE   */
+    volatile uint32_t *sem = (volatile uint32_t *)((uint8_t *)buf.qva + (SEM_VA - VAB));
+    *sem = 0;                                                     /* sentinel               */
+    uint8_t *gpf = (uint8_t *)buf.qva + (GPF_VA - VAB);
+    stl_le_p(gpf + 0, (uint32_t)(PB_VA & 0xfffffffcu));
+    stl_le_p(gpf + 4, (uint32_t)((PB_VA >> 32) & 0xffu) | (6u << 10));
+    __sync_synchronize();
+    (void)*(volatile uint32_t *)gpf;                              /* flush WC writes        */
+
+    /* 9) submit: GP_PUT=1 in OUR host USERD, then ring the doorbell with the token. */
+    stl_le_p((uint8_t *)ud.qva + 0x8C, 1u);                       /* USERD GP_PUT = 1       */
+    __sync_synchronize();
+    (void)ldl_le_p((uint8_t *)ud.qva + 0x8C);
+    stl_le_p((uint8_t *)um_qva + 0x90, token);                    /* NOTIFY_CHANNEL_PENDING */
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST *** RANG token=0x%08x GP_PUT=1 — polling sem ***\n",
+             s->chip->name, token);
+
+    /* 10) poll the sem word (host GPU writes it) + host GP_GET, up to 5 s. */
+    uint32_t semv = 0, gpget = 0;
+    int ms = 0;
+    for (ms = 0; ms <= 5000; ms += 50) {
+        semv  = *sem;
+        gpget = ldl_le_p((uint8_t *)ud.qva + 0x88);
+        if (semv == PAYLOAD) {
+            break;
+        }
+        g_usleep(50 * 1000);
+    }
+    qemu_log("nvkvm-gpu[%s] M5.45 SELFTEST VERDICT after %dms: sem=0x%08x (want 0x%08x) "
+             "hostUSERD get=%u put=%u -> %s\n", s->chip->name, ms, semv, PAYLOAD, gpget,
+             ldl_le_p((uint8_t *)ud.qva + 0x8C),
+             (semv == PAYLOAD)
+                 ? "*** SEM LANDED — host doorbell+schedule+USERD mechanics GOOD; blocker "
+                   "is forwarded-channel guest<->host bridging ***"
+                 : "*** SEM NEVER LANDED — host-side schedule/doorbell sequence itself is "
+                   "broken (token/usermode/runlist/enable) ***");
+}
+
 /* M6.0: RAMBlock iterator — record the largest fd-backed (memfd) block as guest RAM. */
 static int nvkvm_m2_find_guest_ram(RAMBlock *rb, void *opaque)
 {
@@ -5812,6 +6017,12 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     /* M5.3: one-shot data-plane proof (QEMU mmaps real host GPU vidmem). */
     if (s->m2fwd) {
         nvkvm_m2_memtest(s);
+        /* M5.45: host-channel self-test — OFF unless NVKVM_SELFTEST=1 in the env
+         * (diagnostic only; never runs in normal boots). */
+        const char *selftest = getenv("NVKVM_SELFTEST");
+        if (selftest && selftest[0] == '1') {
+            nvkvm_m2_channel_selftest(s);
+        }
     }
 }
 
