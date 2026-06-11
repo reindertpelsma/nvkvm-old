@@ -41,7 +41,7 @@ OVL="/opt/nvkvm-guest/mode2-overlay.qcow2"
 [ -f "$SEED" ] || { echo "ERROR: $SEED missing"; exit 1; }
 if [ "${NVKVM_FRESH:-0}" = "1" ]; then rm -f "$OVL"; fi
 if [ ! -f "$OVL" ]; then
-    qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$OVL" >/dev/null
+    /opt/qemu-nvkvm/bin/qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$OVL" >/dev/null
     echo "created overlay $OVL"
 fi
 IMG="$OVL"
