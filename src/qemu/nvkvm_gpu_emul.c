@@ -547,9 +547,23 @@ static MemTxResult nvkvm_dmaw(PCIDevice *dev, dma_addr_t gpa, const void *buf, d
 
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
-    /* M7 REFACTOR: the GPGA table (gpu_memory_object model) is consulted FIRST. fb_addr is a
-     * GPGA; resolve it to its backing gpu_memory_object's CPU mapping. Empty => fall through to
-     * the legacy m2_fbback overlay, then (in the caller) to the local fb_pages. */
+    /* M5.44: m2_fbback is consulted FIRST. An fbback entry is a channel-bound AUTHORITATIVE
+     * backing (e.g. a COPY channel's real USERD object handed to the host channel as
+     * hUserdMemory[0], or a back_and_map host placement); a populate_cvas GPGA run is a
+     * blanket blank-vidmem shadow that may legitimately COVER such pages (the 2 MiB COPY
+     * channel-pool run holds all 16 GPFIFOs+USERDs). With GPGA-first, the shadow stole the
+     * guest's GP_PUT writes into a page the host GPU never reads; with fbback-first the
+     * USERD pages stay authoritative while the rest of the GPGA run (GPFIFO entries the
+     * host GPU fetches by VA) is still served by the gpu_memory_object. */
+    for (int i = 0; i < s->m2_fbback_n; i++) {
+        if (fb_addr >= s->m2_fbback[i].fb_base &&
+            fb_addr <  s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
+            return (uint8_t *)s->m2_fbback[i].host_qva +
+                   (fb_addr - s->m2_fbback[i].fb_base);
+        }
+    }
+    /* M7 REFACTOR: fb_addr is a GPGA; resolve it to its backing gpu_memory_object's CPU
+     * mapping. Empty => fall through (in the caller) to the local fb_pages. */
     for (int i = 0; i < s->m2_gpga_n; i++) {
         if (fb_addr >= s->m2_gpga[i].gpga_base &&
             fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
@@ -559,13 +573,6 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
             }
             return (uint8_t *)s->m2_objs[oi].cpu_qva + s->m2_gpga[i].off +
                    (fb_addr - s->m2_gpga[i].gpga_base);
-        }
-    }
-    for (int i = 0; i < s->m2_fbback_n; i++) {
-        if (fb_addr >= s->m2_fbback[i].fb_base &&
-            fb_addr <  s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
-            return (uint8_t *)s->m2_fbback[i].host_qva +
-                   (fb_addr - s->m2_fbback[i].fb_base);
         }
     }
     return NULL;
@@ -642,6 +649,37 @@ static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
     if (s->m2_crashwin && fb_addr >= 0x2efbc0000ull && fb_addr < 0x2efbd0000ull) {
         qemu_log("nvkvm-gpu[GA106] M5.31 GRPT-WR fb=0x%llx sz=%u val=0x%llx\n",
                  (unsigned long long)fb_addr, size, (unsigned long long)val);
+    }
+    /* M5.44 TRACE: any write to a registered channel USERD's GP_GET(+0x88)/GP_PUT(+0x8C)
+     * word — log the value and WHICH overlay branch serves this address, so a stolen/diverted
+     * GP_PUT is directly visible. Rare (ring-control words only), unbounded is fine. */
+    if (((fb_addr & 0xfffu) == 0x88u || (fb_addr & 0xfffu) == 0x8Cu)) {
+        for (int k = 0; k < s->m2_chanbuf_n; k++) {
+            if ((fb_addr & ~0xfffull) == s->m2_chanbuf[k].fb_base) {
+                const char *br = "fb_pages"; int bi = -1;
+                for (int i = 0; i < s->m2_fbback_n; i++) {
+                    if (fb_addr >= s->m2_fbback[i].fb_base &&
+                        fb_addr < s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
+                        br = "fbback"; bi = i; break;
+                    }
+                }
+                if (bi < 0) {
+                    for (int i = 0; i < s->m2_gpga_n; i++) {
+                        if (fb_addr >= s->m2_gpga[i].gpga_base &&
+                            fb_addr < s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
+                            br = "gpga"; bi = i; break;
+                        }
+                    }
+                }
+                qemu_log("nvkvm-gpu[%s] M5.44 USERD-WR fb=0x%llx %s=0x%llx via %s[%d] "
+                         "(chan 0x%08x hostqva=%p)\n", s->chip->name,
+                         (unsigned long long)fb_addr,
+                         ((fb_addr & 0xfffu) == 0x8Cu) ? "GP_PUT" : "GP_GET",
+                         (unsigned long long)val, br, bi, s->m2_chanbuf[k].chan,
+                         s->m2_chanbuf[k].qva);
+                break;
+            }
+        }
     }
     uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: written through to real host GPU memory */
@@ -3520,6 +3558,25 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                          * write is a no-op; the completion semaphore below is
                          * what unblocks the CeUtils scrubber.  No src is set. */
                     } else if (remap) {
+                        /* M5.44 TRACE: a simulated CE fill whose PHYS dst covers a
+                         * registered channel USERD page writes THROUGH the fbback
+                         * overlay into the REAL host USERD object — i.e. a guest
+                         * free+scrub wipes GP_PUT on the host channel. Make that
+                         * visible: it explains post-mortem put=0 reads. */
+                        if (dst_phys && dst_pm == 0) {
+                            for (int k = 0; k < s->m2_chanbuf_n; k++) {
+                                if (s->m2_chanbuf[k].fb_base >= off_out &&
+                                    s->m2_chanbuf[k].fb_base < off_out + bytes) {
+                                    qemu_log("nvkvm-gpu[%s] M5.44 CE-FILL WIPES USERD "
+                                             "fb=0x%llx (chan 0x%08x) dst=0x%llx bytes=%llu "
+                                             "const=0x%x\n", s->chip->name,
+                                             (unsigned long long)s->m2_chanbuf[k].fb_base,
+                                             s->m2_chanbuf[k].chan,
+                                             (unsigned long long)off_out,
+                                             (unsigned long long)bytes, remapA);
+                                }
+                            }
+                        }
                         for (uint64_t b = 0; b + 4 <= bytes; b += 4) {
                             bool sy; uint64_t p = NVKVM_CE_RESOLVE(off_out + b, dst_phys, dst_pm, sy);
                             if (p == NVKVM_GMMU_FAULT) break;
@@ -4957,27 +5014,32 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     }
     uint64_t asize = (size + 0xffffu) & ~0xffffull;        /* 64 KiB granular (host alloc/map) */
     uint64_t tsize = (size + 0xfffu)  & ~0xfffull;          /* 4 KiB true run length (overlay) */
-    /* M5.43 OVERLAP GUARD: an m2_fbback[] entry is the AUTHORITATIVE channel-bound backing for
-     * its range (e.g. a COPY channel's real USERD registered by back_channel_userd, the page the
-     * host GPU actually reads via hUserdMemory[0]). A populate_cvas blank-shadow GPGA must NEVER
-     * cover it — because the overlay scans GPGA FIRST, a shadowing entry steals the guest's
-     * GP_PUT writes + chan_execute's GP_GET reads into a blank page the host GPU never sees, so
-     * the host channel stays put=0/get=0 and util pins at 0%. Reject any run that overlaps an
-     * existing fbback entry; that memory is already correctly backed. */
+    /* M5.44 (supersedes the M5.43 whole-run SKIP): an m2_fbback[] entry inside this run (e.g.
+     * a COPY channel's real USERD) stays authoritative because nvkvm_fb_host_overlay now scans
+     * fbback FIRST. Rejecting the whole run here was WRONG: the 2 MiB COPY channel-pool run
+     * (GPGA 0x4200000) holds all 16 GPFIFOs+USERDs, and skipping it left the GPFIFO entries
+     * with no host backing and NO GPU-view map at the guest VA — the host channel had nothing
+     * to fetch. Register the run; just log the overlap for observability. */
     for (int i = 0; i < s->m2_fbback_n; i++) {
         uint64_t fb0 = s->m2_fbback[i].fb_base, fb1 = fb0 + s->m2_fbback[i].size;
         if (gpga < fb1 && fb0 < gpga + tsize) {
-            qemu_log("nvkvm-gpu[%s] M5.43 gpga_obj SKIP: gpga=0x%llx size=0x%llx overlaps "
-                     "fbback[%d] [0x%llx,0x%llx) (authoritative channel backing)\n",
+            qemu_log("nvkvm-gpu[%s] M5.44 gpga_obj OVERLAP-OK: gpga=0x%llx size=0x%llx covers "
+                     "fbback[%d] [0x%llx,0x%llx) (fbback wins in the overlay)\n",
                      s->chip->name, (unsigned long long)gpga, (unsigned long long)tsize, i,
                      (unsigned long long)fb0, (unsigned long long)fb1);
-            return -1;
         }
     }
     uint32_t hMem = 0xda000000u | (s->m2_databuf_next++ & 0xffffu);
     struct nvkvm_host_map hm;
     if (!nvkvm_m2_host_alloc_map_vidmem(s, client, hDev, hMem, asize, &hm)) {
         return -1;
+    }
+    /* M5.44: preserve any bytes the guest already wrote to this GPGA range via the local
+     * fb_pages BEFORE this object existed (back_and_map's copy_content equivalent) — e.g.
+     * GPFIFO entries laid down pre-doorbell. Unwritten pages are sparse-zero = blank. */
+    for (uint64_t off = 0; off < tsize; off += 4096) {
+        uint8_t *gp = nvkvm_fb_page(s, gpga + off, false);
+        if (gp) { memcpy((uint8_t *)hm.qva + off, gp, 4096); }
     }
     /* GPU view: FIXED-map into the host GR VAS at the guest VA. */
     uint32_t hVirt = nvkvm_m2_grmapper(s, client);
@@ -5315,10 +5377,23 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
          * for the GR channel whose USERD is double-mmapped (M5.4). */
         if (s->m2_usermode_qva) {
             uint32_t tok = c->token_valid ? c->host_token : s->m2_gr_token;
+            /* M5.44: read the REAL host USERD (chanbuf qva, no overlay) at ring time.
+             * This loop consumes c->gp_get before the doorbell per-channel loop runs,
+             * so the M5.22 put/get diag never fires for the real submission — log the
+             * hardware truth HERE: put>get at the ring = host has queued work. */
+            uint32_t hput = 0xffffffffu, hget = 0xffffffffu;
+            for (int k = 0; k < s->m2_chanbuf_n; k++) {
+                if (s->m2_chanbuf[k].client == c->client &&
+                    s->m2_chanbuf[k].chan == c->hobject && s->m2_chanbuf[k].qva) {
+                    hput = ldl_le_p((uint8_t *)s->m2_chanbuf[k].qva + 0x8C);
+                    hget = ldl_le_p((uint8_t *)s->m2_chanbuf[k].qva + 0x88);
+                    break;
+                }
+            }
             stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, tok);
             qemu_log("nvkvm-gpu[%s] M5.9 *** RANG host doorbell token=0x%08x (USERMODE+0x90) "
-                     "— host GPU should now run gpfifo=0x%llx ***\n",
-                     s->chip->name, tok, (unsigned long long)c->gpfifo_va);
+                     "— host GPU should now run gpfifo=0x%llx *** hostUSERD put=%u get=%u\n",
+                     s->chip->name, tok, (unsigned long long)c->gpfifo_va, hput, hget);
         }
     }
 }
