@@ -3838,10 +3838,13 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
          * reference the guest's forwarded VAS explicitly, the one the host RM self-promotes GR
          * ctx into -> st=0x51 collisions / Xid 32). cvas is keyed by the TSG handle (hObject);
          * the ctxshare + channel below inherit/reference it. Other engine TSGs keep the legacy
-         * forwarded VAS — NOTE: extending this to COPY engines (0x9..0x12) was tried and HUNG
-         * the guest (it redirects the copy channels off the main guest VAS 0xcaf00005, which the
-         * guest driver relies on; faulted -> PMC_BOOT_0 reset spin). Copy-channel collisions
-         * (18, no Xid) need a different approach. */
+         * forwarded VAS — NOTE: giving COPY engines (0x9..0x12) their OWN fresh VAS via
+         * cvas_get was tried and HUNG the guest (each COPY TSG got a NEW empty VAS, redirecting
+         * the copy channels off the main guest VAS 0xcaf00005; faulted -> PMC_BOOT_0 reset
+         * spin). The M5.40 branch below is DIFFERENT: it binds the compute client's COPY TSG
+         * to the GR TSG's EXISTING, ALREADY-POPULATED fvas (the unified CUDA VAS mirror) —
+         * never allocating a new VAS — so the COPY channels see the same populated address
+         * space the GR channel runs in (fixes GPFIFO_SCHEDULE st=0x57 / 0x2002xxxxx faults). */
         if (engine == 1u) {
             int ci = nvkvm_m2_cvas_get(s, hClient, hObject);
             if (ci >= 0) {
@@ -3856,6 +3859,60 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
             } else {
                 qemu_log("nvkvm-gpu[%s] M5.28 a06c GR TSG cvas FAILED + no fallback "
                          "(cur_vas=0x%08x client=0x%08x)\n", s->chip->name, cur_vas, hClient);
+            }
+        } else if (engine >= 0x9u && engine <= 0x12u &&  /* NV2080_ENGINE_TYPE_IS_COPY */
+                   hClient != 0xc1d00001u &&             /* not the guest-RM CeUtils client */
+                   ((hObject & 0xffff0000u) != 0xbaba0000u) &&
+                   ((hObject & 0xffffff00u) != 0x31415900u) &&
+                   s->m2_gr_tsg) {
+            /* M5.40 SHARED-VAS COPY TSG: the compute client's COPY TSG must run in the SAME
+             * populated VAS as its GR TSG (libcuda's unified CUDA VAS, here mirrored into the
+             * GR fvas). Rewrite hVASpace@8 UNCONDITIONALLY (libcuda may pass 0 OR the explicit
+             * guest VAS handle) to the GR cvas entry's fvas, and register a cvas entry keyed
+             * by THIS TSG so the doorbell loop routes/populates the COPY working set into the
+             * shared fvas (va_seen dedup makes the re-populate idempotent). Do NOT cvas_get
+             * (fresh VAS) here — that was the PMC_BOOT_0 hang. */
+            int gi = -1;
+            for (int i = 0; i < s->m2_cvas_n; i++) {
+                if (s->m2_cvas[i].client == hClient && s->m2_cvas[i].tsg == s->m2_gr_tsg) {
+                    gi = i; break;               /* the GR TSG's entry (preferred) */
+                }
+            }
+            if (gi < 0) {
+                for (int i = 0; i < s->m2_cvas_n; i++) {
+                    if (s->m2_cvas[i].client == hClient) { gi = i; break; }
+                }
+            }
+            int dup = -1;
+            for (int i = 0; i < s->m2_cvas_n; i++) {
+                if (s->m2_cvas[i].client == hClient && s->m2_cvas[i].tsg == hObject) {
+                    dup = i; break;              /* already registered (replayed alloc) */
+                }
+            }
+            if (gi >= 0 && (dup >= 0 || s->m2_cvas_n < 16)) {
+                stl_le_p(auxbuf + 8, s->m2_cvas[gi].fvas);
+                if (dup < 0) {
+                    int idx = s->m2_cvas_n++;
+                    s->m2_cvas[idx].client    = hClient;
+                    s->m2_cvas[idx].tsg       = hObject;          /* the COPY TSG */
+                    s->m2_cvas[idx].hdev      = s->m2_cvas[gi].hdev;
+                    s->m2_cvas[idx].fvas      = s->m2_cvas[gi].fvas;
+                    s->m2_cvas[idx].fvirt     = s->m2_cvas[gi].fvirt;
+                    s->m2_cvas[idx].populated = false;  /* doorbell populates COPY working set */
+                }
+                qemu_log("nvkvm-gpu[%s] M5.40 a06c COPY TSG hVASpace 0x%08x -> 0x%08x "
+                         "[GR-shared fvas, gr_tsg=0x%08x] (engineType=0x%x tsg=0x%08x "
+                         "client=0x%08x)\n", s->chip->name, cur_vas, s->m2_cvas[gi].fvas,
+                         s->m2_gr_tsg, engine, hObject, hClient);
+            } else if (cur_vas == 0u && sub) {
+                stl_le_p(auxbuf + 8, sub);
+                qemu_log("nvkvm-gpu[%s] M5.40 a06c COPY TSG: no GR cvas for client 0x%08x; "
+                         "legacy fallback forwarded VAS 0x%08x (engineType=0x%x)\n",
+                         s->chip->name, hClient, sub, engine);
+            } else {
+                qemu_log("nvkvm-gpu[%s] M5.40 a06c COPY TSG: no GR cvas + no fallback "
+                         "(cur_vas=0x%08x client=0x%08x cvas_n=%d)\n", s->chip->name,
+                         cur_vas, hClient, s->m2_cvas_n);
             }
         } else if (cur_vas == 0u && sub) {
             stl_le_p(auxbuf + 8, sub);
