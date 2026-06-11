@@ -2124,6 +2124,24 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     if (off == 0xFFF500u) { s->dbg_gpa_lo = (uint32_t)val; return; }
     if (off == 0xFFF504u) { s->dbg_gpa_hi = (uint32_t)val; return; }
     if (off == 0xFFF508u) {
+        /* M5.38: AUTHORITATIVE kernel-internal CE-completion simulation.  The
+         * patched guest UVM reports its CE tracking-sema GPA (lo@0xFFF500,
+         * hi@0xFFF504) and the EXACT payload it is releasing; QEMU writes that
+         * value to the guest's sema page.  Per the governing principle this is
+         * "simulate exactly" (the CE scrubber is guest-KERNEL-internal CeUtils,
+         * never exposed to guest userspace) — NOT a guess: the guest is telling
+         * us its own release value, so the write mirrors the guest faithfully
+         * (including the legitimate low-value reset UVM does on pool-slot
+         * realloc, which resets UVM's own wrap baseline — so no false wrap).
+         *
+         * This is the RELIABLE writer: the QEMU pushbuffer parser
+         * (CE_SEM_RELEASE) flaps/faults on the UVM CE pushbuffers
+         * (pb_read=FAULT) and stalls the sema mid-climb, so it cannot carry this
+         * alone.  The DESTRUCTIVE writer was never the forge — it was the
+         * LAGGING bridged host channel writing stale entry-0/1 payloads (1,2)
+         * over the live value 0x1e ~40s late, tripping UVM's 32->64-bit wrap
+         * detector; that writer is removed separately (M5.38: sema fwd-map gated
+         * on m2hostsem in nvkvm_chan_sem_wr32). */
         uint64_t gpa = ((uint64_t)s->dbg_gpa_hi << 32) | s->dbg_gpa_lo;
         uint8_t b[4]; stl_le_p(b, (uint32_t)val);
         if (gpa) {
@@ -2299,7 +2317,15 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
              * GP_PUT==GP_GET so a stale ring is a harmless no-op; once bridged this
              * is the real submission.  The Phase-B sema write below still runs as a
              * fallback. */
-            if (s->m2_usermode_qva && c->token_valid) {
+            /* M5.39: never ring/schedule the host for the guest-KERNEL-internal CE
+             * scrubber (client 0xc1d00001 = guest-RM CeUtils).  Per the governing
+             * principle a kernel-only path is SIMULATED, not forwarded: its
+             * completion sema is already produced by the parsed CE_SEM_RELEASE +
+             * the authoritative forge.  Ringing the host only made its CE2 channel
+             * execute stale work and FAULT (Xid 31 writing the now-unmapped sema,
+             * Xid 32 corrupted pushbuffer) and exhausted its host VAS
+             * (dmaAllocMapping) — pure dead weight. */
+            if (s->m2_usermode_qva && c->token_valid && c->client != 0xc1d00001u) {
                 /* M5.25: the host channel's TSG must be GPFIFO_SCHEDULE'd (on a runlist)
                  * before a ring runs — the guest's schedule control isn't forwarded, so an
                  * unscheduled host TSG is idle and the ring is a no-op (GPU stays 0%).
@@ -2355,29 +2381,30 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (s->chan_sem_released) {
                 continue;                        /* explicit release already done */
             }
-            /* Fallback: implicit finish-payload semaphore. M5.35: skip when the host owns
-             * the completion sema (it wrote the real value via its own release). */
-            if (s->m2hostsem) {
-                continue;
-            }
-            uint64_t sema_va = c->gpfifo_va + 0x8004ull;
-            bool is_sys = false;
-            uint64_t phys = nvkvm_chan_translate(s, sema_va, &is_sys);
-            if (phys != NVKVM_GMMU_FAULT || s->chan_gpfifo_phys) {
-                uint32_t payload = ++c->payload;
-                uint64_t redir = 0;
-                nvkvm_chan_sem_wr32(s, sema_va, payload, &redir);  /* M5.18: also write the BAR1 page libcuda polls */
-                qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> completed: "
-                         "semaVA=0x%llx -> %s phys=0x%llx payload=%u redir=0x%llx\n",
-                         s->chip->name, (uint32_t)val, i,
-                         (unsigned long long)sema_va, is_sys ? "SYS" : "FB",
-                         (unsigned long long)phys, payload, (unsigned long long)redir);
-            } else {
-                qemu_log("nvkvm-gpu[%s] M5: DOORBELL tok=0x%08x ch[%d] -> sema VA "
-                         "0x%llx FAULTED; gpfifo=0x%llx\n", s->chip->name,
-                         (uint32_t)val, i, (unsigned long long)sema_va,
-                         (unsigned long long)c->gpfifo_va);
-            }
+            /* M5.37: DO NOT forge a synthetic finish-payload here.
+             *
+             * Channels reaching this point with no parsed CE_SEM_RELEASE are
+             * guest-KERNEL-internal CE/UVM channels (client 0xc1d00001) whose
+             * 64-bit completion semaphores are ALREADY advancing monotonically
+             * via their own CE_SEM_RELEASE (exact, kernel-internal -> simulated
+             * exactly per the governing principle).  The previous fallback wrote
+             * `++c->payload` (a fresh per-channel counter, =1,2,...) into
+             * gpfifo_va+0x8004, RESETTING the low dword of a live 64-bit sema
+             * (e.g. 0x1e -> 1).  UVM's uvm_gpu_semaphore wrap detector reads the
+             * backwards jump, assumes a 32-bit wrap, bumps the software upper-32
+             * counter to 1, and reconstructs completed_value = 0x1_00000001
+             * ("unexpected semaphore jump from 0x1e to 0x100000001").  That
+             * poisons `upper` permanently: every subsequent CORRECT release to
+             * 0x54 then reads back as 0x1_00000054 > queued 0x54, UVM declares
+             * the channel wedged, and cuCtxCreate's MC_SERVICE_INTERRUPTS pump
+             * spins forever.  (Oracle 7fb47f1 gated the equivalent spray off with
+             * the same warning about manufacturing 0x100000082.)  Never write a
+             * value we don't know into a semaphore the guest driver tracks; only
+             * the real parsed release (above) or real host execution may.
+             *
+             * The only correct action here is to do nothing. */
+            (void)c->payload;
+            continue;
         }
         s->m2_cur_cvas = -1;    /* M5.28: clear per-channel VAS routing after the loop */
         /* M5/M7 — a channel finished: deliver the os-event completion so
@@ -3026,7 +3053,17 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * host GR VAS so the REAL host GPU writes the payload here (guest GPA -> shared
      * memfd -> OS_DESCRIPTOR WB -> FIXED map at the matching VA).  Guest then reads
      * the host GPU's write coherently (WB snooped).  Idempotent; m2exec-gated. */
-    if (s->m2exec && p != NVKVM_GMMU_FAULT && sy &&
+    /* M5.38: gate the sema fwd-map on m2hostsem (single-writer rule).  With
+     * software completion active (!m2hostsem, the default) the LAGGING bridged
+     * host channel must NOT have write access to the guest's tracking-sema
+     * page: the host ran GPFIFO entry 0 ~40s late (hostUSERD get 0->1/2) and
+     * DMA'd its stale payload=1 over the software value 0x1e, tripping UVM's
+     * 32->64-bit wrap detector (uvm_gpu_semaphore.c:776 jump 0x1e ->
+     * 0x100000001) and wedging CE2 (completed 0x100000054 > queued 0x54) ->
+     * cuCtxCreate hang.  When m2hostsem=true the map happens and the software
+     * writers are already gated off (see !s->m2hostsem at the release sites) —
+     * exactly one writer in either mode. */
+    if (s->m2exec && s->m2hostsem && p != NVKVM_GMMU_FAULT && sy &&
         !nvkvm_m2_va_seen(s, s->chan_client, va & ~0xfffull)) {
         uint64_t gbase = p & ~0xfffull;
         bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, va & ~0xfffull, gbase, 0x1000);
@@ -3302,6 +3339,18 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
         }
         uint64_t pb   = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
         uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;   /* GP_ENTRY1_LENGTH: # method words */
+        /* M5.39: an all-zero GP entry is NOT real work.  This fires when our
+         * saved chan_gp_get (e.g. 1) is stale relative to a rezeroed/host-backed
+         * USERD whose GP_PUT reads 0: the [gp_get,gp_put) walk then wraps the
+         * entire 1023-entry ring with every entry zero, each paying a 6-level VA
+         * walk + pb_read fault ON THE vCPU's SYNCHRONOUS MMIO-exit path (this was
+         * ~45% of the QEMU log and the dominant cuCtxCreate-era stall).  A real
+         * pending entry is never all-zero (pb=0 is an invalid pushbuffer addr).
+         * Resync the cursor to gp_put and bail. */
+        if (!e0 && !e1) {
+            s->chan_gp_get = gp_put;
+            break;
+        }
         /* M5.19 — REAL forward prep: make the host GPU able to read this pushbuffer
          * DIRECTLY from guest sysmem.  The pushbuffer is SYSMEM (resolved via the
          * pinned chan_pdb -> SYS guest GPA).  Map guest VA -> GPA -> shared-memfd
