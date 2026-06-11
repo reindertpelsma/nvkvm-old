@@ -2334,6 +2334,27 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                              "engineType=0x%x -> bind rc=%d st=0x%x | sched rc=%d st=0x%x%s\n",
                              s->chip->name, i, c->tsg, teng, brc, bst, src, sst,
                              (sst == 0) ? "  OK SCHEDULED" : "  <-- sched err");
+                    /* M5.42 CURSOR ALIGNMENT (user-directed): the host channel's USERD
+                     * GP_GET was reset to 0 by the host RM at channel create, but the
+                     * guest channel is mid-stream — its real produce index (GP_PUT) is
+                     * already in the SHARED USERD page (host_qva via the m2_fbback overlay).
+                     * If the host runs with GP_GET=0 it re-fetches the already-consumed
+                     * entries [0, our-consume-cursor) -> Xid 31 (MMU fault on a stale
+                     * pushbuffer @ the scrubber region 0x121000000) / Xid 32 (corrupted
+                     * pushbuffer). ALIGN the host consume cursor ONCE at takeover to our
+                     * consumed index (c->gp_get) so the host fetches only [c->gp_get,
+                     * GP_PUT) = the genuinely-new work. The host owns GP_GET after this. */
+                    for (int k = 0; k < s->m2_chanbuf_n; k++) {
+                        if (s->m2_chanbuf[k].client == c->client &&
+                            s->m2_chanbuf[k].chan == c->hobject && s->m2_chanbuf[k].qva) {
+                            uint32_t cur = ldl_le_p((uint8_t *)s->m2_chanbuf[k].qva + 0x88);
+                            stl_le_p((uint8_t *)s->m2_chanbuf[k].qva + 0x88, c->gp_get);
+                            qemu_log("nvkvm-gpu[%s] M5.42 align host GP_GET ch[%d] "
+                                     "0x%x -> %u (USERD %p)\n", s->chip->name, i, cur,
+                                     c->gp_get, s->m2_chanbuf[k].qva);
+                            break;
+                        }
+                    }
                 }
             }
             uint32_t before = c->gp_get;
@@ -2393,18 +2414,14 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 }
                 uint32_t hput = uqva ? ldl_le_p((uint8_t *)uqva + 0x8C) : 0xffffffffu;
                 uint32_t hget = uqva ? ldl_le_p((uint8_t *)uqva + 0x88) : 0xffffffffu;
-                /* M5.33 (Step-4 GP_PUT BRIDGE — load-bearing): propagate the guest
-                 * channel's GP_PUT into the HOST USERD (0x8C) so the host GPU sees
-                 * put>get and fetches the GPFIFO entries.  The GPFIFO is the SAME
-                 * double-mmapped buffer for guest+host (no-copy back_and_map), so the
-                 * entry indices are identical — write c->gp_get verbatim.  Host owns
-                 * GP_GET (0x88) and advances it as it consumes; do NOT touch it.  Must
-                 * precede the doorbell write below so the host sees work the moment it
-                 * services the ring.  This is what makes the host channel actually run
-                 * the forwarded compute (host USERD was put=0 before this). */
-                if (uqva) {
-                    stl_le_p((uint8_t *)uqva + 0x8C, c->gp_get);
-                }
+                /* M5.42: do NOT bridge GP_PUT here. The old M5.33 wrote the CONSUME
+                 * cursor (c->gp_get) into the PRODUCE offset (+0x8C), clobbering the
+                 * guest's real GP_PUT — which is already present in the SHARED USERD
+                 * page (host_qva via the m2_fbback overlay; the guest's BAR1 write lands
+                 * there directly, proven by the STEP1 trap probe). The host consume
+                 * cursor (GP_GET @ +0x88) is aligned ONCE at takeover by M5.42 above;
+                 * the host owns it thereafter. So just ring the doorbell — the host sees
+                 * the guest's real GP_PUT > aligned GP_GET and fetches the new work. */
                 stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, c->host_token);
                 qemu_log("nvkvm-gpu[%s] M5.22 RANG host doorbell ch[%d] token=0x%08x "
                          "(client=0x%08x gpfifo=0x%llx) hostUSERD put=%u get=%u%s\n",

@@ -45,6 +45,11 @@ echo "--- M5.41 COPY TSG bind+sched results ---"; grep -E "M5.41 COPY TSG bind" 
 echo "--- GPFIFO_SCHEDULE results (was st=0x57) ---"; grep -E "GPFIFO_SCHEDULE" /tmp/m540_delta.txt | sed -E "s/.*(TSG=0x[0-9a-f]+).*(st=0x[0-9a-f]+).*/\1 \2/" | sort | uniq -c
 echo "--- populate_cvas for COPY TSGs ---"; grep -E "populate_cvas" /tmp/m540_delta.txt | grep -iE "5c000049|5c00003b" | head
 echo "--- compute working-set VA FAULTs (0x2002xxxxx) — should shrink/vanish ---"; grep -cE "eva=0x2002[0-9a-f]+ -> FAULT" /tmp/m540_delta.txt | sed 's/^/  fault count: /'
+echo "--- M5.42 cursor align (host GP_GET set to consume index) ---"; grep -E "M5.42 align host GP_GET" /tmp/m540_delta.txt | head
+echo "--- M5.22 host doorbell rings: hostUSERD put/get for COPY channels (does host FETCH?) ---"
+grep -E "M5.22 RANG" /tmp/m540_delta.txt | sed -E "s/.*(client=0x[0-9a-f]+).*(hostUSERD put=[0-9]+ get=[0-9]+).*/\1 \2/" | sort | uniq -c
+echo "  (raw last 12 M5.22 lines):"; grep -E "M5.22 RANG" /tmp/m540_delta.txt | tail -12
+echo "--- host Xid during/after this run (CE/MMU faults) ---"; sudo dmesg | grep -iE "Xid" | tail -8
 echo "--- host GPU util (peak) ---"; sort -t: -k2 /tmp/m540_util.log 2>/dev/null | grep -oE "[0-9]+ %" | sort -rn | head -3; tail -3 /tmp/m540_util.log
 echo "--- host dmesg Xid/dmaAlloc tail ---"; sudo dmesg 2>/dev/null | grep -iE "xid|dmaAllocMapping" | tail -6
 echo "============ END ============"
