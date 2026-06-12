@@ -670,3 +670,10 @@ sweep left a ~0xae000 GAP in the working set (`back_sys` ended at 0x7a20d7600000
 complete residency before any host ring** (completeness loop: re-sweep until a full pass backs zero new
 leaves and referenced runs have no gaps, then ring), plus understanding why the sweep drops sub-run gaps.
 Verify with N consecutive all-PASS cup3 runs before claiming solid.
+
+### Update 2026-06-13 — reproducible (3/3) after the sysmem poisoning fix
+With M5.51b (commit b0a8314) extending the mark-on-backing-success fix to the sysmem run path, cup3
+passes 3/3 consecutive fresh-boot runs (rv=43, rc=0, zero new Xid). The flakiness was the sysmem-run
+`va_seen` poisoning leaving a residency gap the host CE faulted in; fixing both the vid (M5.51) and sys
+(M5.51b) backing paths makes the working set reliably complete before the host runs. The Mode-2 GR
+kernel launch is now reproducible genuine host GR compute. Next: a real NxN fp32 matmul.
