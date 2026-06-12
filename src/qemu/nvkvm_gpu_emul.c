@@ -2188,9 +2188,26 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * on m2hostsem in nvkvm_chan_sem_wr32). */
         uint64_t gpa = ((uint64_t)s->dbg_gpa_hi << 32) | s->dbg_gpa_lo;
         uint8_t b[4]; stl_le_p(b, (uint32_t)val);
-        if (gpa) {
+        /* M5.49: host-only completion is PHASE-SCOPED.  Suppress the simulated
+         * writers ONLY in the compute phase (m2_crashwin = after the 0xc7c0 GR
+         * obj alloc, i.e. inside cuCtxCreate).  During RmInitAdapter/cuInit the
+         * guest-KERNEL-internal CeUtils scrubber's completion semas are NOT yet
+         * host-forwarded and ARE legitimately simulatable (kernel-only, content-
+         * irrelevant memory zeroing); silencing them there hangs init.  So init
+         * stays byte-identical to the M5.48 pass; only the user-observable
+         * compute completion (cup2's CE round-trip) is forced host-written. */
+        bool hostsem_active = s->m2hostsem && s->m2_crashwin;
+        if (gpa && !hostsem_active) {
             nvkvm_dmaw(&s->parent_obj, gpa, b, 4);
             qemu_log("nvkvm-gpu[%s] M5: DBG-FORGE uvm sema GPA=0x%llx <- payload=%u\n",
+                     s->chip->name, (unsigned long long)gpa, (uint32_t)val);
+        } else if (gpa) {
+            /* The authoritative DBG-FORGE is the LAST Phase-B simulated
+             * completion path; suppressed here so the ONLY writer of the UVM CE
+             * tracking-sema is the real host GPU (via the M5.38 fwd-map).  If the
+             * guest still unblocks, compute completion is provably host-only. */
+            qemu_log("nvkvm-gpu[%s] M5.49: DBG-FORGE SUPPRESSED (hostsem+compute) "
+                     "GPA=0x%llx payload=%u — host GPU must write this\n",
                      s->chip->name, (unsigned long long)gpa, (uint32_t)val);
         }
         return;
@@ -3175,9 +3192,11 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * 32->64-bit wrap detector (uvm_gpu_semaphore.c:776 jump 0x1e ->
      * 0x100000001) and wedging CE2 (completed 0x100000054 > queued 0x54) ->
      * cuCtxCreate hang.  When m2hostsem=true the map happens and the software
-     * writers are already gated off (see !s->m2hostsem at the release sites) —
-     * exactly one writer in either mode. */
-    if (s->m2exec && s->m2hostsem && p != NVKVM_GMMU_FAULT && sy &&
+     * writers are already gated off (see !(m2hostsem && m2_crashwin) at the
+     * release sites) — exactly one writer in either mode.  M5.49: gate on
+     * m2_crashwin too so the host-write map only arms in the compute phase,
+     * keeping init byte-identical to the software-completion default. */
+    if (s->m2exec && s->m2hostsem && s->m2_crashwin && p != NVKVM_GMMU_FAULT && sy &&
         !nvkvm_m2_va_seen(s, s->chan_client, va & ~0xfffull)) {
         uint64_t gbase = p & ~0xfffull;
         bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, va & ~0xfffull, gbase, 0x1000);
@@ -3637,7 +3656,11 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                      * scrub pushbuffer ALSO emits an NVC56F SEM_EXECUTE (host
                      * sema at semaOffset), so honoring only that left this one
                      * unwritten and the scrubber timed out (ce_utils.c:349). */
-                    if (sem_type != 0 && ce_sem_addr && !s->m2hostsem) {
+                    if (sem_type != 0 && ce_sem_addr && !(s->m2hostsem && s->m2_crashwin)) {
+                        /* M5.49: phase-scoped — init-time CeUtils scrubber finish-
+                         * payloads (m2_crashwin==false) still get written so
+                         * RmInitAdapter completes; only the compute-phase CE
+                         * completion is forced host-written. */
                         uint64_t redir = 0;                    /* M5.18: also write the BAR1 page libcuda polls */
                         if (nvkvm_chan_sem_wr32(s, ce_sem_addr, ce_sem_pay, &redir)) {
                             s->chan_sem_released = true;
@@ -3655,7 +3678,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 case 0x64: sem_pay_lo = d; break;                                            /* SEM_PAYLOAD_LO */
                 case 0x68: sem_pay_hi = d; break;                                            /* SEM_PAYLOAD_HI */
                 case 0x6c: {                                                                 /* SEM_EXECUTE */
-                    if ((d & 0x7u) == 0x1u && sem_addr && !s->m2hostsem) {   /* OPERATION == RELEASE */
+                    if ((d & 0x7u) == 0x1u && sem_addr && !(s->m2hostsem && s->m2_crashwin)) {   /* OPERATION == RELEASE (M5.49: phase-scoped, init writers stay live) */
                         bool sz64 = (d >> 24) & 1;           /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
                         uint64_t redir = 0;                  /* M5.18: also write the BAR1 page libcuda polls */
                         if (nvkvm_chan_sem_wr32(s, sem_addr, sem_pay_lo, &redir)) {
