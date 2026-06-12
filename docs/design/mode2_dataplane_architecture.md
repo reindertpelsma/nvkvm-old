@@ -646,3 +646,17 @@ host-only cup2, via the actual north-star path. The CE data transfers stay QEMU-
 (byte-exact; #128 collapses the dual backing later). **Active task: matmul kernel launch** — extend
 the pushbuffer/QMD handling for the GR compute launch, drive operand (A/B/C matrices + kernel
 code/const/param) residency into the GR channel's cvas, verify a correct result on hardware.
+
+## Addendum 2026-06-13 — ★ Mode-2 GR kernel launch PASSES (first genuine host GR compute) ★
+
+`cup3` (cuCtxCreate → cuModuleLoadData(PTX) → cuLaunchKernel `out=in*3+1` → cuCtxSynchronize →
+cuMemcpyDtoH) returns **`rv=43 want=43 PASS`** on hardware (RTX 3060 / 580.159.04), rc=0, zero new
+Xid. Un-forgeable: QEMU never parses the compute pushbuffer (forwarded raw) and the CE software path
+can only copy/memset — only the real host GR SASS engine produces 43 from 14. The forward-and-execute
+bridge (host fetches the guest GP_PUT, runs the real shader, writes the completion semaphore the guest
+polls) works end-to-end. Two fixes unblocked it (commit 196822a): the **M5.51 va_seen poisoning fix**
+(mark-on-backing-success, ending the recurring `backed=0` / coverage-ends-at-the-buffer fault that hit
+cup2-`dp` and matmul-`d_out`), and **scoping the residency sweep to the GR client in default mode**
+(the CE-copy clients were redundantly re-backing GR-owned chunks, exhausting the host GPA arena until
+`RM_MAP_MEMORY` returned `NO_MEMORY` and the kernel's `d_in`/`d_out` chunk couldn't map). Next: a real
+NxN fp32 matmul (util>0, larger working set) for a heavier proof, then performance.
