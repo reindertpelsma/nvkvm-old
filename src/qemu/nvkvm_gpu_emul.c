@@ -396,6 +396,14 @@ struct NvkvmGpuEmul {
      * channel's address space at the guest VAs (see [[mode2-mapdma-primitive]]). */
     struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[8];
     int      m2_grmap_n;
+    /* M5.49b: libcuda's CE-copy clients (the user-observable data path, e.g. the
+     * cuMemcpyHtoD/DtoH that produce rv).  Identified as the clients that hit the
+     * M5.20 grmapper FRESH-VAS fallback (their forwarded VAS is RM-rejected) — UVM/
+     * CeUtils clients take the st==0 path and are NOT recorded, the GR client returns
+     * early via its cvas.  Used to force HOST-only completion for ONLY the user CE
+     * round-trip while UVM kernel-internal scrubs keep their simulated completion. */
+    uint32_t m2_user_ce_clients[16];
+    int      m2_user_ce_n;
     /* M5.28 PER-CHANNEL VAS (user-directed): each forwarded GR channel runs in its OWN
      * fresh nvkvm-allocated VAS (FERMI_VASPACE_A under the channel's forwarded device),
      * NOT the guest's forwarded VAS (0xcaf00005) — that one the host RM auto-promoted its
@@ -1238,6 +1246,16 @@ static int nvkvm_m2_os_descriptor(NvkvmGpuEmul *s, uint32_t client, uint32_t dev
                                   uint32_t *st); /* M6.2 fwd-decl */
 static void nvkvm_m2_osdesc_selftest(NvkvmGpuEmul *s, uint32_t hClient); /* M6.2 fwd-decl */
 static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client); /* M5.7 fwd-decl */
+/* M5.49b: is `client` one of libcuda's CE-copy clients (the user-observable data
+ * path)?  These hit the grmapper FRESH-VAS fallback; UVM/init clients do not. */
+static inline bool nvkvm_m2_is_user_ce(NvkvmGpuEmul *s, uint32_t client)
+{
+    if (!client) { return false; }
+    for (int i = 0; i < s->m2_user_ce_n; i++) {
+        if (s->m2_user_ce_clients[i] == client) { return true; }
+    }
+    return false;
+}
 static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg); /* M5.28 fwd-decl */
 static bool nvkvm_m2_populate_cvas(NvkvmGpuEmul *s, struct nvkvm_chan_entry *c); /* M5.28 fwd-decl */
 static int nvkvm_m2_map_dma(NvkvmGpuEmul *s, uint32_t hClient, uint32_t hDevice,
@@ -2188,26 +2206,17 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * on m2hostsem in nvkvm_chan_sem_wr32). */
         uint64_t gpa = ((uint64_t)s->dbg_gpa_hi << 32) | s->dbg_gpa_lo;
         uint8_t b[4]; stl_le_p(b, (uint32_t)val);
-        /* M5.49: host-only completion is PHASE-SCOPED.  Suppress the simulated
-         * writers ONLY in the compute phase (m2_crashwin = after the 0xc7c0 GR
-         * obj alloc, i.e. inside cuCtxCreate).  During RmInitAdapter/cuInit the
-         * guest-KERNEL-internal CeUtils scrubber's completion semas are NOT yet
-         * host-forwarded and ARE legitimately simulatable (kernel-only, content-
-         * irrelevant memory zeroing); silencing them there hangs init.  So init
-         * stays byte-identical to the M5.48 pass; only the user-observable
-         * compute completion (cup2's CE round-trip) is forced host-written. */
-        bool hostsem_active = s->m2hostsem && s->m2_crashwin;
-        if (gpa && !hostsem_active) {
+        /* M5.49b: the 0xFFF508 backdoor is patched EXCLUSIVELY into uvm_channel.c's
+         * CE-push path (docs/kernel_patches/mode2_uvm_complete_proof.patch), so it
+         * only ever carries UVM kernel-internal tracking semas (page-table scrubs,
+         * CeUtils).  Per the governing map-vs-stub rule those are kernel-only +
+         * content-irrelevant and stay SIMULATED even under m2hostsem.  "Narrow
+         * host-only completion" forces only the USER-OBSERVABLE CE round-trip
+         * (the compute client's CE channels) host-written — handled at the
+         * CE_SEM_RELEASE / SEM_EXECUTE parser sites, NOT here.  So always forge. */
+        if (gpa) {
             nvkvm_dmaw(&s->parent_obj, gpa, b, 4);
             qemu_log("nvkvm-gpu[%s] M5: DBG-FORGE uvm sema GPA=0x%llx <- payload=%u\n",
-                     s->chip->name, (unsigned long long)gpa, (uint32_t)val);
-        } else if (gpa) {
-            /* The authoritative DBG-FORGE is the LAST Phase-B simulated
-             * completion path; suppressed here so the ONLY writer of the UVM CE
-             * tracking-sema is the real host GPU (via the M5.38 fwd-map).  If the
-             * guest still unblocks, compute completion is provably host-only. */
-            qemu_log("nvkvm-gpu[%s] M5.49: DBG-FORGE SUPPRESSED (hostsem+compute) "
-                     "GPA=0x%llx payload=%u — host GPU must write this\n",
                      s->chip->name, (unsigned long long)gpa, (uint32_t)val);
         }
         return;
@@ -3178,8 +3187,18 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                                 uint64_t *out_redir)
 {
     bool wrote = false;
+    /* M5.49b: HOST-ONLY for the user CE-copy clients — do NOT write the sema in
+     * software; instead fwd-map it so the REAL host GPU writes the completion.  The
+     * fwd-map MUST happen on this same call path (it lives here), so the parser sites
+     * always call us; we decide here whether to write locally or defer to the host. */
+    bool hostonly = s->m2exec && s->m2hostsem && nvkvm_m2_is_user_ce(s, s->chan_client);
     bool sy; uint64_t p = nvkvm_chan_translate(s, va, &sy);
-    if (p != NVKVM_GMMU_FAULT) { nvkvm_phys_wr32(s, p, sy, payload); wrote = true; }
+    if (p != NVKVM_GMMU_FAULT && !hostonly) { nvkvm_phys_wr32(s, p, sy, payload); wrote = true; }
+    if (hostonly && p != NVKVM_GMMU_FAULT) {
+        qemu_log("nvkvm-gpu[%s] M5.49b host-only sema VA=0x%llx payload=%u client=0x%08x "
+                 "— host GPU writes this (sim suppressed)\n", s->chip->name,
+                 (unsigned long long)va, payload, s->chan_client);
+    }
     /* M5.19 — REAL forward prep: if the completion sema is SYSMEM, map it into the
      * host GR VAS so the REAL host GPU writes the payload here (guest GPA -> shared
      * memfd -> OS_DESCRIPTOR WB -> FIXED map at the matching VA).  Guest then reads
@@ -3192,11 +3211,13 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * 32->64-bit wrap detector (uvm_gpu_semaphore.c:776 jump 0x1e ->
      * 0x100000001) and wedging CE2 (completed 0x100000054 > queued 0x54) ->
      * cuCtxCreate hang.  When m2hostsem=true the map happens and the software
-     * writers are already gated off (see !(m2hostsem && m2_crashwin) at the
-     * release sites) — exactly one writer in either mode.  M5.49: gate on
-     * m2_crashwin too so the host-write map only arms in the compute phase,
-     * keeping init byte-identical to the software-completion default. */
-    if (s->m2exec && s->m2hostsem && s->m2_crashwin && p != NVKVM_GMMU_FAULT && sy &&
+     * writers are already gated off (see the per-client predicate at the release
+     * sites) — exactly one writer in either mode.  M5.49b: arm the host-write map
+     * ONLY for the compute client's CE channels (chan_client == m2_gr_client) —
+     * the user-observable CE round-trip.  m2_gr_client is 0 until the 0xc7c0 GR
+     * obj alloc, so RmInitAdapter and all UVM-client (kernel-internal) scrubs keep
+     * their simulated completion; only the user round-trip is forced host-written. */
+    if (hostonly && p != NVKVM_GMMU_FAULT && sy &&
         !nvkvm_m2_va_seen(s, s->chan_client, va & ~0xfffull)) {
         uint64_t gbase = p & ~0xfffull;
         bool mok = nvkvm_m2_back_and_map_sys(s, s->chan_client, va & ~0xfffull, gbase, 0x1000);
@@ -3205,7 +3226,9 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                  (unsigned long long)gbase, mok ? "MAPPED (host GPU writes completion, WB)"
                                                 : "map-FAILED");
     }
-    if (s->chan_gpfifo_phys && va >= s->chan_gpfifo_va &&
+    /* The BAR1 redir page is libcuda's locally-polled mirror; under host-only the
+     * host GPU writes the real (fwd-mapped, WB) sema page directly, so skip it. */
+    if (!hostonly && s->chan_gpfifo_phys && va >= s->chan_gpfifo_va &&
         va <  s->chan_gpfifo_va + NVKVM_CHAN_BUF_WINDOW) {
         uint64_t rp = s->chan_gpfifo_phys + (va - s->chan_gpfifo_va);
         nvkvm_fb_write(s, rp, payload, 4);     /* the page libcuda actually polls */
@@ -3214,7 +3237,7 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
     } else if (out_redir) {
         *out_redir = 0;
     }
-    return wrote;
+    return wrote;   /* host-only => false: caller skips its sim-log + high-word write */
 }
 /* Read one 32-bit word at a CHANNEL GPU VA (translate then phys read). */
 static bool nvkvm_chan_rd32(NvkvmGpuEmul *s, uint64_t va, uint32_t *out)
@@ -3656,11 +3679,10 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                      * scrub pushbuffer ALSO emits an NVC56F SEM_EXECUTE (host
                      * sema at semaOffset), so honoring only that left this one
                      * unwritten and the scrubber timed out (ce_utils.c:349). */
-                    if (sem_type != 0 && ce_sem_addr && !(s->m2hostsem && s->m2_crashwin)) {
-                        /* M5.49: phase-scoped — init-time CeUtils scrubber finish-
-                         * payloads (m2_crashwin==false) still get written so
-                         * RmInitAdapter completes; only the compute-phase CE
-                         * completion is forced host-written. */
+                    if (sem_type != 0 && ce_sem_addr) {
+                        /* M5.49b: nvkvm_chan_sem_wr32 internally forces HOST-only for the
+                         * user CE-copy clients (fwd-maps the sema, skips the sim write,
+                         * returns false); UVM/init scrubs still write+return true here. */
                         uint64_t redir = 0;                    /* M5.18: also write the BAR1 page libcuda polls */
                         if (nvkvm_chan_sem_wr32(s, ce_sem_addr, ce_sem_pay, &redir)) {
                             s->chan_sem_released = true;
@@ -3678,9 +3700,11 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                 case 0x64: sem_pay_lo = d; break;                                            /* SEM_PAYLOAD_LO */
                 case 0x68: sem_pay_hi = d; break;                                            /* SEM_PAYLOAD_HI */
                 case 0x6c: {                                                                 /* SEM_EXECUTE */
-                    if ((d & 0x7u) == 0x1u && sem_addr && !(s->m2hostsem && s->m2_crashwin)) {   /* OPERATION == RELEASE (M5.49: phase-scoped, init writers stay live) */
+                    if ((d & 0x7u) == 0x1u && sem_addr) {   /* OPERATION == RELEASE */
                         bool sz64 = (d >> 24) & 1;           /* PAYLOAD_SIZE: 0=16B(64-bit val), 1=4B */
                         uint64_t redir = 0;                  /* M5.18: also write the BAR1 page libcuda polls */
+                        /* M5.49b: wr32 returns false for the host-only user CE-copy path
+                         * (host writes it) -> the high-word + sim-log below are skipped too. */
                         if (nvkvm_chan_sem_wr32(s, sem_addr, sem_pay_lo, &redir)) {
                             if (!sz64) {                     /* 64-bit value: high word too */
                                 bool sy2 = false;
@@ -4838,6 +4862,20 @@ static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
             return 0;
         }
         hVirt = fVirt; hVas = fVas; hDev = fDev;
+        /* M5.49b: this client hit the FRESH-VAS fallback => it is a libcuda
+         * compute-side (CE-copy) client, the user-observable data path.  Record it
+         * (dedup) so its CE completion is forced host-written under m2hostsem. */
+        if (client != s->m2_gr_client) {
+            bool known = false;
+            for (int i = 0; i < s->m2_user_ce_n; i++) {
+                if (s->m2_user_ce_clients[i] == client) { known = true; break; }
+            }
+            if (!known && s->m2_user_ce_n < (int)ARRAY_SIZE(s->m2_user_ce_clients)) {
+                s->m2_user_ce_clients[s->m2_user_ce_n++] = client;
+                qemu_log("nvkvm-gpu[%s] M5.49b USER-CE client 0x%08x recorded "
+                         "(host-only completion target)\n", s->chip->name, client);
+            }
+        }
     }
     s->m2_grmap[s->m2_grmap_n].client = client;
     s->m2_grmap[s->m2_grmap_n].hvirt  = hVirt;
