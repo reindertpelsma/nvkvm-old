@@ -4210,14 +4210,18 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                          (unsigned long long)ldq_le_p(auxbuf + 192),
                          (unsigned long long)ldq_le_p(auxbuf + 216), ldl_le_p(auxbuf + 128));
             }
-            /* NOTE: do NOT substitute the channel's hVASpace. ALL these channels are
-             * TSG channels (parented to a 0xa06c group); the host RM rejects any
-             * explicit vaspace on a TSG channel ("TSG channels can't use an explicit
-             * vaspace", kernel_channel.c) — they inherit the TSG's vaspace. The earlier
-             * substitution was a red herring that broke the libcuda COPY channels; the
-             * GR channel only needed its ctxshare to exist (the EXTERNALLY_OWNED strip).
-             * hVASpace stays 0 here. (void to silence unused.) */
+            /* NOTE: do NOT substitute hVASpace for TSG channels (parented to a 0xa06c
+             * group); the host RM rejects any explicit vaspace on a TSG channel ("TSG
+             * channels can't use an explicit vaspace", kernel_channel.c) — they inherit
+             * the TSG's vaspace. (void to silence unused.) */
             (void)hctxshare;
+            /* M5.50 (REVERTED — see mode2_dataplane_architecture.md Addendum 2026-06-12c):
+             * substituting a fresh cvas into the CE-copy client's BARE channel hVASpace@28
+             * moved its alloc 0x33->0x1f (still fails — the whole separate-client bare-channel
+             * stack needs forwarding) AND broke the M5.49b USER-CE identification (grmapper no
+             * longer hit the FRESH-VAS fallback), so cup2 passed via simulation, not host-only.
+             * The CE-copy host-only path is an orthogonal detour; pivoted to matmul (GR compute
+             * channels already construct host-side). hVASpace stays 0 for bare channels here. */
             /* M5.3: NV_CHANNEL_ALLOC_PARAMS engineType@128. The GR channel passes 0
              * (NULL/inherit); on the host give it the parent TSG's engine explicitly. */
             if (psize >= 132 && ldl_le_p(auxbuf + 128) == 0u) {

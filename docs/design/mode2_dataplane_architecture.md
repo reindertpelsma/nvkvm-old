@@ -615,3 +615,34 @@ software emulation. This is identical to the work the matmul GR-kernel north-sta
 cannot be emulated). The earlier ranked plan collapses to: **(1) real CE data plane on the cup2 testbed
 (smallest debuggable forcing function) → (2) reuse it for the matmul GR kernel.** Both retire the QEMU
 CE-emulation shortcut; neither needs the order-correct micro-fix.
+
+## Addendum 2026-06-12c — CE-copy host-only is a separate-client bare-channel detour; PIVOT to matmul (north star)
+
+Took the "real CE data plane on cup2" path one hardware iteration and learned the decisive shape:
+
+- The cup2 HtoD/DtoH runs under a **separate RM client** (0xc1e00007) with its **own** device
+  (0x0080→hObj 0xa), subdevice (0xb), VAS (0x90f1→hObj 0xc), and a **bare channel** (0xc56f,
+  hObj 0x2) parented directly to the *device* (not a TSG), with `hVASpace@28=0`. On the forwarded
+  host device that has no default VAS → channel alloc `0x33 NV_ERR_INVALID_OBJECT_HANDLE`. The
+  existing code (lines ~4213) deliberately refuses to substitute hVASpace because it assumed "ALL
+  these channels are TSG channels" — true for the GR/COPY channels, FALSE for this bare channel.
+- M5.50 experiment (gated m2hostsem): give the bare channel a fresh nvkvm cvas + substitute
+  hVASpace. Result on HW: alloc moved `0x33 → 0x1f NV_ERR_INVALID_ARGUMENT` (progress, but still
+  fails — the rest of the bare-channel param set / USERD / ctxshare / error-notifier / non-TSG
+  schedule path all need forwarding), AND it **regressed** the M5.49b host-only proof: the cvas
+  intercepted the grmapper routing so the FRESH-VAS fallback that *identifies* the USER-CE client
+  never fired → suppression didn't engage → cup2 passed via **simulation** (CE_SEM_RELEASE sim
+  writes), a false green for host-only. **Reverted.**
+- Conclusion: making the CE-copy client genuinely host-execute = forward an entire **second client's
+  bare-channel stack** (device/subdev/VAS/USERD/ctxshare/notifier) + a **non-TSG schedule+ring**
+  path + operand residency. Sizable, and **orthogonal** to the GR compute path matmul needs.
+
+**Why matmul is the better forcing function (and now the active path):** the GR/compute channels
+(client 0xc1d00003, parented to TSGs) **already construct on the host** (`status=0x0 OK`) and
+already executed in M5.48 (cuCtxCreate + CE round-trip, util>0, zero Xid). A real **matmul GR
+kernel** cannot be QEMU-emulated (it is a real shader), so a numerically-correct matmul result is
+**un-forgeable** proof of genuine host GR execution — the same first-compute proof we wanted from
+host-only cup2, via the actual north-star path. The CE data transfers stay QEMU-emulated for now
+(byte-exact; #128 collapses the dual backing later). **Active task: matmul kernel launch** — extend
+the pushbuffer/QMD handling for the GR compute launch, drive operand (A/B/C matrices + kernel
+code/const/param) residency into the GR channel's cvas, verify a correct result on hardware.
