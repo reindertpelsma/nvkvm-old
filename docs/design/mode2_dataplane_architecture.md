@@ -577,3 +577,41 @@ ioctls, never raw phys to the guest.
 M5.49b scaffolding (commits c5dae00/f3ef26b) is inert at default (`m2hostsem=off` == M5.48 pass):
 per-client host-only gate, CE-copy-client capture (FRESH-VAS), residency sweep extended to CE-copy
 clients. Harnesses: scripts/mode2_diag/m549c_hostonly_complete_host.sh + cup2_run_guest.sh.
+
+## Addendum 2026-06-12b — the "stale page-table mirror" root cause was REFUTED; real cause = emulated data plane (no executor-order fix helps)
+
+A careful read-only re-trace of the surviving host-only capture (`/tmp/m549c_delta.txt`, 352 770
+lines; Fable agent a383eb2245c5fd356) **overturns** the Addendum-2026-06-12 claim that an
+out-of-order emulated CE memset wiped a live page tree. Evidence (absolute log lines):
+
+- cup2 hangs at the **first** host-only-forced copy — `cuMemcpyHtoD(dp,&hv,4)` is the last guest
+  line; dp = `0x72e2a2200000`. The matching host fault is `Xid 31 GRAPHICS FE FAULT_PDE @
+  0x72e2_a2200000` — **no PDE for dp in the host engine VAS**.
+- dp's only host backing is a **blank gpga shadow** (line 252289 `M7 R2 gpga_obj
+  va=0x72e2a2000000 gpga=0xa000000`), i.e. QEMU vidmem the CPU fills via the emulated CE parser —
+  NOT a real host-resident buffer the host CE/GR can resolve.
+- The 2 MiB `CE MEMSET out=0x3400000 const=0` (line 266809) is a **single, genuine, in-order**
+  guest pool-scrub on the scrubber channel (monotonic gp_get 24→25), firing ~6 000 lines AFTER
+  pdb 0x3401000 was **already** empty (first `runs=0` at 261653). The tree went empty because the
+  **guest itself tore it down in order** (root-PDE clear at 260629/260630, entry[131], monotonic
+  gp 131→132) — correct guest state, not corruption. The "wipe a live tree" story conflated this
+  late teardown/scrub with the early HtoD hang.
+- The executor bugs are real but **non-causal** here: six stale re-walks (USERD read back as
+  `gp_put=0 < gp_get=1` during channel teardown — lines 260713/262021/263215/264609/265194/265907)
+  re-executed 1443 already-consumed CE ops, and 772 phys→virt double executions occurred; both
+  self-cancel in this run. Worth fixing only as hygiene (skip any channel whose USERD reads
+  gp_put<gp_get), NOT as the cup2 fix.
+
+**Conclusion:** "Order-correct PT interception + live-PDB re-resolution" (the ranked-#1 milestone in
+Addendum 2026-06-12) is built on a refuted mechanism and will NOT make cup2 pass host-only. Re-resolving
+a PDB pointer or reordering the emulated CE cannot make an **emulated-only** buffer host-resident. The
+binding blocker is the one the CRITICAL FINDING already named: the CE data plane is QEMU-emulated, so dp
+has no real host backing and the host engine FAULT_PDEs the instant we stop forging completion.
+
+**Therefore the next step is unambiguously the real data plane (no longer optional):** give dp (and the
+CE working set) a **real host-vidmem backing** mapped into the host engine's running VAS at dp's guest
+VA, and **forward the LAUNCH_DMA copy to the host CE engine** instead of QEMU's `M5: CE COPY/MEMSET`
+software emulation. This is identical to the work the matmul GR-kernel north-star forces (a real shader
+cannot be emulated). The earlier ranked plan collapses to: **(1) real CE data plane on the cup2 testbed
+(smallest debuggable forcing function) → (2) reuse it for the matmul GR kernel.** Both retire the QEMU
+CE-emulation shortcut; neither needs the order-correct micro-fix.
