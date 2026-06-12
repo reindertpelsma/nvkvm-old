@@ -5459,22 +5459,36 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
      * before submitting, typically AFTER the first-8 boot-time sweeps are exhausted. Without
      * this the host GR FE faulted VIRT_WRITE at guest-pool+0xe00000 (leaf never mirrored).
      * Bounded by a higher total cap; idempotent via va_seen. */
+    /* M5.49b: residency must cover the GR client AND libcuda's CE-copy clients.
+     * Previously the sweep was keyed ONLY on grc=m2_gr_client, so the CE-copy
+     * client's late working-set leaves (its copy/sema buffers in the high
+     * 0x78301xxxxxx band) never became resident in the host CE channel's VAS ->
+     * host CE2 FAULT_PTE on a VIRT_WRITE once the host actually had to complete
+     * (the simulated completion used to mask it).  Sweep every forwarded compute
+     * client. */
+    uint32_t sweepc[1 + (int)ARRAY_SIZE(s->m2_user_ce_clients)]; int nsweep = 0;
+    if (grc) { sweepc[nsweep++] = grc; }
+    for (int i = 0; i < s->m2_user_ce_n; i++) { sweepc[nsweep++] = s->m2_user_ce_clients[i]; }
     bool m548_newwork = false;
-    for (int i = 0; grc && i < s->chan_n; i++) {
+    for (int i = 0; i < s->chan_n; i++) {
         struct nvkvm_chan_entry *nc = &s->chans[i];
-        if (nc->client != grc || !nc->gpfifo_va || !nc->userd) { continue; }
+        bool match = false;
+        for (int k = 0; k < nsweep; k++) { if (nc->client == sweepc[k]) { match = true; break; } }
+        if (!match || !nc->gpfifo_va || !nc->userd) { continue; }
         uint32_t np = (uint32_t)nvkvm_fb_read(s, nc->userd + 0x8C, 4);
         if (np != nc->sweep_put && np <= nc->gpfifo_ent) {
             m548_newwork = true;
             nc->sweep_put = np;          /* latch: one sweep per submission, not per doorbell */
         }
     }
-    if (grc && (s->m2_exec_sweeps < 8 || (m548_newwork && s->m2_exec_sweeps < 1000))) {
+    if (nsweep && (s->m2_exec_sweeps < 8 || (m548_newwork && s->m2_exec_sweeps < 1000))) {
         s->m2_exec_sweeps++;
-        qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x)%s — back newly-mapped "
-                 "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps,
-                 grc, m548_newwork ? " [M5.48c new-work]" : "");
-        nvkvm_m2_enum_gr_sysmem(s, grc);
+        for (int k = 0; k < nsweep; k++) {
+            qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x)%s — back newly-mapped "
+                     "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps,
+                     sweepc[k], m548_newwork ? " [M5.48c new-work]" : "");
+            nvkvm_m2_enum_gr_sysmem(s, sweepc[k]);
+        }
     }
     /* M5.13: one-shot DRY-RUN locate of the completion semaphore (0x2efbaf000, the page the
      * guest RM busy-polls during cuCtxCreate) so we learn its owning PDB + GR-VA before backing.
