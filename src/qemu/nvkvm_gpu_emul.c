@@ -5079,6 +5079,30 @@ static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
     return false;
 }
 
+/* M5.51: PURE check (no mark) + explicit mark. The legacy nvkvm_m2_va_seen() above is
+ * check-AND-mark, which POISONS a VA whose backing then FAILS: it's marked seen but never
+ * backed, so every later sweep skips it (backed=0 forever, coverage ending exactly at that
+ * buffer — the recurring cup2-dp / matmul-d_out fault). For backing sites that can fail,
+ * use va_check() first and only va_mark() on SUCCESS, so a failed/transient back is retried. */
+static bool nvkvm_m2_va_check(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
+{
+    for (int i = 0; i < s->m2_mapped_va_n; i++) {
+        if (s->m2_mapped_va[i].va == va && s->m2_mapped_va[i].client == client) {
+            return true;
+        }
+    }
+    return false;
+}
+static void nvkvm_m2_va_mark(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
+{
+    if (nvkvm_m2_va_check(s, client, va)) { return; }
+    if (s->m2_mapped_va_n < NVKVM_MAX_MAPPED_VA) {
+        s->m2_mapped_va[s->m2_mapped_va_n].client = client;
+        s->m2_mapped_va[s->m2_mapped_va_n].va     = va;
+        s->m2_mapped_va_n++;
+    }
+}
+
 /* M6.5 (item-4 DISCOVERY+backing): place a contiguous guest-RAM SYSMEM run at its GR VA in
  * the host GR VASpace, so the host GPU can DMA into the guest's actual buffer. Reuses the
  * M6.2/M6.3b primitive chain: gpa->stub VA (memfd, 1:1) -> OS_DESCRIPTOR (host RM pins guest
@@ -5253,9 +5277,22 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
                 uint64_t cva  = a->va0 + off;
                 uint64_t next = (cva + 0x200000ull) & ~0x1fffffull;
                 uint64_t clen = (next - cva < a->len - off) ? next - cva : a->len - off;
-                if (!nvkvm_m2_va_seen(a->s, a->client, cva) &&
-                    nvkvm_m2_gpga_obj(a->s, a->client, cva, a->gpa0 + off, clen) >= 0) {
-                    a->backed++;  /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
+                /* M5.51: check-then-back-then-MARK-ON-SUCCESS. The old check-and-mark
+                 * va_seen() poisoned a chunk whose gpga_obj failed (marked seen, never
+                 * backed -> backed=0 forever, coverage ending exactly at it = the cup2-dp /
+                 * matmul-d_out fault). Now an unbacked chunk stays unmarked so a later
+                 * sweep retries; on persistent failure the diag below names why. */
+                if (!nvkvm_m2_va_check(a->s, a->client, cva)) {
+                    if (nvkvm_m2_gpga_obj(a->s, a->client, cva, a->gpa0 + off, clen) >= 0) {
+                        nvkvm_m2_va_mark(a->s, a->client, cva);
+                        a->backed++;  /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
+                    } else {
+                        qemu_log("nvkvm-gpu[%s] M5.51 gpga_obj FAILED (retry next sweep) "
+                                 "client=0x%08x cva=0x%llx gpa=0x%llx clen=0x%llx "
+                                 "objs_n=%d gpga_n=%d\n", a->s->chip->name, a->client,
+                                 (unsigned long long)cva, (unsigned long long)(a->gpa0 + off),
+                                 (unsigned long long)clen, a->s->m2_objs_n, a->s->m2_gpga_n);
+                    }
                 }
                 off += clen;
             }
@@ -5472,7 +5509,13 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
      * client. */
     uint32_t sweepc[1 + (int)ARRAY_SIZE(s->m2_user_ce_clients)]; int nsweep = 0;
     if (grc) { sweepc[nsweep++] = grc; }
-    for (int i = 0; i < s->m2_user_ce_n; i++) { sweepc[nsweep++] = s->m2_user_ce_clients[i]; }
+    /* M5.51: only sweep the CE-copy clients under the (abandoned) host-only CE path.
+     * In default/matmul mode they redundantly re-back regions the GR client already
+     * owns (same gpga) -> hundreds of benign gpga_obj host-alloc failures. Compute
+     * runs on the GR client; sweeping it suffices. */
+    if (s->m2hostsem) {
+        for (int i = 0; i < s->m2_user_ce_n; i++) { sweepc[nsweep++] = s->m2_user_ce_clients[i]; }
+    }
     bool m548_newwork = false;
     for (int i = 0; i < s->chan_n; i++) {
         struct nvkvm_chan_entry *nc = &s->chans[i];
