@@ -5250,9 +5250,15 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
     }
     if (a->sys) {
         a->sysbytes += a->len;
-        if (!nvkvm_m2_va_seen(a->s, a->client, a->va0) &&
-            nvkvm_m2_back_and_map_sys(a->s, a->client, a->va0, a->gpa0, a->len)) {
-            a->backed++;
+        /* M5.51: mark-on-success (was check-and-mark va_seen, which poisoned a sysmem run
+         * whose back failed -> never retried -> residency gap -> host CE FAULT_PTE there,
+         * the flaky-cup3 hang). Keyed on (client,va0); a grown run re-coalescing to the
+         * same va0 is handled by the run being re-flushed each sweep until it backs. */
+        if (!nvkvm_m2_va_check(a->s, a->client, a->va0)) {
+            if (nvkvm_m2_back_and_map_sys(a->s, a->client, a->va0, a->gpa0, a->len)) {
+                nvkvm_m2_va_mark(a->s, a->client, a->va0);
+                a->backed++;
+            }
         }
     } else {
         /* M6.6 (user direction): vidmem leaf — back with a BLANK host vidmem object,
