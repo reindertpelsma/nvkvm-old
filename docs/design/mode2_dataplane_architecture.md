@@ -504,3 +504,76 @@ ctx buffers onto the host's via a privileged path. Both weaken the unprivileged-
 decision. Candidate mitigation: B-OFFLINE — extract the deterministic golden image once via a
 privileged/kernel path and replay the bytes at runtime (runtime stays unprivileged; the PATCH buffer
 fixes context-specific fields). PARKED for user sign-off.
+
+---
+
+## Addendum 2026-06-12 — host-only completion attempt exposed the CE-emulation regression + the translating-scheduler refinement
+
+This session pushed `cuCtxCreate -> cuMemAlloc -> CE round-trip` toward **provably host-only**
+completion (suppress the simulated completion forge so the host GPU must write it) and, in doing
+so, surfaced exactly the "approach B" smell this doc warns against, plus the correct fix shape.
+
+### What we found (evidence in agent memory mode2_execfwd_layer2.md, M5.49b)
+
+- The CE round-trip's byte-exact result (`rv=0xabcd1234`) is currently produced by **QEMU
+  EMULATING the CE copies in software** (`M5: CE MEMSET/COPY` parser writing bytes to guest-FB
+  phys), not by the host CE engine. The host runs the *channels* (schedule/USERD/doorbell/sema
+  semantics — proven) but the data movement of small CE ops is QEMU's. This is the rejected
+  interpret/replay path that crept in as bring-up scaffolding. It must go.
+- It is not merely a shortcut — it is **incorrect**: the emulated CE executor replays entries and
+  runs each copy twice (`(phys)` then `(virt)`), ignoring guest submission order and the
+  inter-channel semaphores. A guest-ordered page-table *scrub* (`CE MEMSET const=0 out=PT-pool`)
+  thus lands AFTER the guest's rebuild, **wiping the live page tables in QEMU's FB mirror**. Since
+  the host VAS is built by mirroring that PDB (populate_cvas), the mirror going stale -> host VAS
+  missing the user buffer -> host engine FAULT_PDE once it actually has to complete. (Root-caused
+  by a kretprobe-free log trace: stale one-shot root snapshot + out-of-order CE PT writes.)
+
+### Sync model (so the fix is precise)
+
+GPU semaphores are **not mutexes** — they are monotonic payload values in coherent memory (a
+fence). Acquire = "block until value >= N"; release = "write value = N". The CPU analogue is a
+**futex/condvar**, not a mutex (poll fast-path + sleep/wake). Baseline notification is **polling**
+(the `uvm_spin_loop`); the wakeups exist only to allow sleeping: **GPU->CPU = interrupt** (release
+raises an IRQ -> driver ISR wakes the thread, which re-reads the value); **CPU->GPU = doorbell**
+(CPU writes the value then rings the channel doorbell so the host re-evaluates a stalled acquire).
+Asymmetric because the CPU takes interrupts while the GPU host is poked via MMIO. A correct forward
+must carry BOTH the value (WB sema fwd-map so the host write is guest-visible) AND the wakeups
+(host IRQ -> inject into emulated device for guest ISR; guest doorbell -> forward to host USERMODE).
+Today the guest *spins*, so value-landing suffices; IRQ injection is the deferred sleep-path piece.
+
+### The architecture to build (translating scheduler; reaffirms "forward, don't emulate")
+
+Security invariant: **never expose host phys (system or GPU) to the guest** — QEMU is unprivileged;
+the guest stays entirely in its virtualized address space, and QEMU/stub translate to host backings
+via ioctls only. So "make guest-phys == host-phys" is OUT; virtualized translation stays.
+
+Split by what a command's operands carry:
+- **VA-operand commands (data/compute copies, kernels):** the operands are GPU VAs the host MMU
+  resolves once the VAS is resident. **Forward to the host channel's ring; let the hardware execute
+  and honor the semaphores natively.** No per-command interception, just residency. Delete the
+  QEMU CE-copy emulation for these.
+- **Phys-operand commands (page-table writes/scrubs — the UVM/PT channels):** their payload is
+  guest-phys PTE values, which cannot be handed to hardware. **Intercept, translate guest-phys ->
+  host backing, apply into the host VAS via RM map ioctls — strictly once, in guest submission
+  order, honoring the gating semaphores.** Re-resolve the live PDB from the channel instance block
+  (RAMIN PDB_LO/HI), not a one-shot snapshot; treat "PDB had N>0 runs, now 0" as a stale-root event.
+
+Serialization is **selective, not lock-step**: free-flow forwarding everywhere, block only at the
+cross-channel sync points where a forwarded command acquires a semaphore a PT channel releases
+(ensure the PT mutation is applied to the host VAS before submitting the dependent work). The
+durable end-state collapses the dual backing (one buffer / one real host-vidmem backing, #128) and
+forwards the whole stream; QEMU's only retained job is the page-table plane, and even that is
+ioctls, never raw phys to the guest.
+
+### Fix plan (ranked) and residual risk
+
+1. (do first) Order-correct PT interception + live-PDB re-resolution -> cup2 passes host-only
+   (proves the host CE genuinely completing). 2. Collapse the dual backing so data buffers are
+   single-backed real host vidmem the host CE operates on. 3. Clean plane split + cross-channel
+   sync-point serialization. Deferred: sleep-path host->guest IRQ injection; serialization perf.
+   Named existential risk (low now — already through CE round-trip): whether the stock KMD attests
+   real silicon (fused IDs/signatures) somewhere downstream.
+
+M5.49b scaffolding (commits c5dae00/f3ef26b) is inert at default (`m2hostsem=off` == M5.48 pass):
+per-client host-only gate, CE-copy-client capture (FRESH-VAS), residency sweep extended to CE-copy
+clients. Harnesses: scripts/mode2_diag/m549c_hostonly_complete_host.sh + cup2_run_guest.sh.
