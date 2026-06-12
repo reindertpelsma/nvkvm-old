@@ -660,3 +660,13 @@ cup2-`dp` and matmul-`d_out`), and **scoping the residency sweep to the GR clien
 (the CE-copy clients were redundantly re-backing GR-owned chunks, exhausting the host GPA arena until
 `RM_MAP_MEMORY` returned `NO_MEMORY` and the kernel's `d_in`/`d_out` chunk couldn't map). Next: a real
 NxN fp32 matmul (util>0, larger working set) for a heavier proof, then performance.
+
+### Correction 2026-06-13 — the kernel-launch PASS is REAL but FLAKY (not yet reproducible)
+A confirmation run of cup3 (same binary, fresh boot) HUNG with `Xid 31 CE2 FAULT_PTE @ 0x7a20d7600000`.
+So the north-star PASS is genuine (feasibility proven, un-forgeable) but **1/2 flaky** — not production
+solid. Root cause is **incomplete/racy residency** (not arena exhaustion this run): the bounded reactive
+sweep left a ~0xae000 GAP in the working set (`back_sys` ended at 0x7a20d7600000; next run started at
+0x7a20d76ae000), and the host CE faulted in the gap. The fix for reproducibility is **deterministic,
+complete residency before any host ring** (completeness loop: re-sweep until a full pass backs zero new
+leaves and referenced runs have no gaps, then ring), plus understanding why the sweep drops sub-run gaps.
+Verify with N consecutive all-PASS cup3 runs before claiming solid.
