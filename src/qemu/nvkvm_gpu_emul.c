@@ -1350,8 +1350,20 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         if (fn == 47) {
             s->fwsec_ran = false;       /* WPR2 down (booter-unload effect)      */
             s->gsp_suspended = true;    /* MAILBOX0 -> SUSPENDED for the close poll */
-            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> WPR2 down + GSP suspended\n",
-                     s->chip->name);
+            /* Reset the GSP-RPC queue/boot state so a re-init within one QEMU lifetime
+             * (driver reload, or cudart's uvm-load + device reopen) re-runs the full
+             * bootargs -> queue-init -> GSP_INIT_DONE handshake.  Without this,
+             * bootargs_dumped stays set, nvkvm_m3_dump_bootargs is skipped on the 2nd
+             * boot, the status-queue tx header is never re-written, and the guest's
+             * GspStatusQueueInit/msgqRxLink polls until NV_ERR_TIMEOUT (kernel_gsp_tu102
+             * .c:570).  Mirrors the device-reset init (q_shmem et al. re-cache on boot). */
+            s->bootargs_dumped = false;
+            s->q_ready         = false;
+            s->stat_writeptr   = 0;
+            s->stat_seqnum     = 0;
+            s->cmd_readptr     = 0;
+            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> WPR2 down + GSP suspended + "
+                     "GSP-RPC queue reset\n", s->chip->name);
         }
         /* M5: snoop GSP_RM_ALLOC (fn 103) for a *_CHANNEL_GPFIFO_A alloc so we can
          * locate the GPFIFO ring when the doorbell rings.  rpc_gsp_rm_alloc body
@@ -2628,13 +2640,28 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
      * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
     if ((off == NV_PGSP_FALCON_CPUCTL || off == 0x00110130u) && (val & 0x2u)) {
-        s->gsp_suspended = false;       /* fresh GSP boot — no longer suspended  */
-        if (!s->fwsec_ran) {
+        /* A GSP-falcon STARTCPU here is a FRESH FWSEC/GSP boot => WPR2 comes UP — but
+         * ONLY when we are not in a teardown/suspended phase.  On driver teardown the
+         * guest sends fn=47 UNLOADING (sets gsp_suspended + WPR2 down) and then issues a
+         * trailing STARTCPU as part of the unload sequence; that one must NOT re-raise
+         * WPR2, or the NEXT adapter init reads WPR2 up, runs Booter Unload (a separate
+         * SEC2 path we don't model), finds it still up, and asserts "WPR2 still up" —
+         * which is why only the first init per QEMU lifetime used to succeed.  Gating the
+         * raise on !gsp_suspended leaves WPR2 down after teardown, so a reload / reopen
+         * boots cleanly.  The teardown STARTCPU still clears gsp_suspended, so the next
+         * genuine boot STARTCPU (suspended already false) raises WPR2 as normal. */
+        bool teardown = s->gsp_suspended;
+        s->gsp_suspended = false;       /* any STARTCPU => GSP active, not suspended */
+        if (!teardown && !s->fwsec_ran) {
             s->fwsec_ran = true;
             if (s->trace) {
                 qemu_log("nvkvm-gpu[%s] M3: GSP STARTCPU -> FWSEC ran, WPR2 up\n",
                          s->chip->name);
             }
+        } else if (s->trace) {
+            qemu_log("nvkvm-gpu[%s] M4: teardown-phase STARTCPU off=0x%llx -> WPR2 "
+                     "stays %s (no spurious re-raise)\n", s->chip->name,
+                     (unsigned long long)off, s->fwsec_ran ? "up" : "down");
         }
     }
 
