@@ -48,6 +48,8 @@ Start here: `README.md`, `PLAN.md`, `docs/ARCHITECTURE.md`, `docs/MILESTONES.md`
 - Security: `docs/SECURITY_MODEL.md`, `docs/HARDENING_PLAN.md`, `docs/audits/`.
 - Status/plans: `docs/MILESTONES.md`, `docs/PARITY_PLAN.md`, `docs/PRE_PUBLIC_CHECKLIST.md`,
   `docs/REFACTOR_PLAN.md`.
+- Agent workflow & token-cost strategy: `docs/WORKFLOW_STRATEGY.md` (serialize the bench, fan out
+  read-only analysis, keep `MEMORY.md` lean, treat each debug episode as restartable-from-disk).
 - Kernel patches applied to the guest driver for Mode-2 bring-up: `docs/kernel_patches/`.
 - Reference / RE notes: `docs/reference/`, `docs/research/`, `notes/`.
 
