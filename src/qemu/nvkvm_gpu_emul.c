@@ -1874,6 +1874,72 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     if (ps >= 1) { resp[120] = 1u; }
                     stl_le_p(resp + 92, 0);
                     stl_le_p(resp + 56, 32u + 40u + ps);
+                } else if (ctrl == 0x20809009u || ctrl == 0x20809001u ||
+                           ctrl == 0x20809064u) {
+                    /* cudart (CUDA-runtime) init gate cluster — THE LLM/cudart blocker
+                     * (memory mode2_execfwd_layer2 CORRECTION 3).  libcudart issues
+                     * 0x20809009/0x20809001/0x20809064 (NV2080 subdevice controls) near
+                     * the end of its lazy device-enumeration init; the driver API never
+                     * issues them (so cup4/dvp pass without them).  They are serviced
+                     * ENTIRELY by GSP firmware: no kernel #define in the 580/610 open
+                     * source AND absent from gVisor nvproxy's allowlist even on the 580
+                     * branch — i.e. closed libcuda<->GSP controls, no documented struct.
+                     * Our default CTRL-UNFILLED echo returned all-zeros, so cudart read 0
+                     * where it expects real data and aborted with
+                     * cudaErrorInitializationError(3) — silently (the reject is in the
+                     * reply PAYLOAD, not an errno/dmesg line).
+                     *   PRIMARY: FORWARD to the host GPU, which authoritatively services
+                     *   these (proven: native host cudart succeeds).  They are flat
+                     *   params (no embedded pointers) so a raw pass-through is safe —
+                     *   the same shape gVisor nvproxy uses for rmControlSimple controls;
+                     *   nvkvm_m2_control1 only adds guest->host hClient/hObject xlation.
+                     *   Forwarding is driver-version-robust (no hard-coded GPU values)
+                     *   and de-risks sibling cudart controls.
+                     *   FALLBACK (if the forward fails — e.g. the subdevice handle has no
+                     *   host twin yet): replay the NATIVE host capture for GA106/580.159.04
+                     *   (oracle: ioctl_trace.so on native cudart via
+                     *   scripts/mode2_diag/m555_cudart_payload_host.sh + tests/mode2/rtp.c):
+                     *     0x20809009 -> {0x00000000, 0x0000000d}  (0x0d=13 = CUDA major)
+                     *     0x20809001 -> {0x03fc007f, 0x00000000}  (capability mask)
+                     *     0x20809064 -> 520B, leading 10 u32s {0,2,1,1,1,0x64,4,0x10,1,0x64} */
+                    uint32_t ps = ldl_le_p(resp + 96);
+                    bool ok = false;
+                    if (s->m2fwd && ps && (120u + ps) <= NVKVM_RESP_MAX) {
+                        uint8_t cbuf[1024];
+                        if (ps <= sizeof(cbuf)) {
+                            uint32_t st = 0xffff;
+                            memcpy(cbuf, resp + 120, ps);
+                            int rc = nvkvm_m2_control1(s, ldl_le_p(resp + 80),
+                                                       ldl_le_p(resp + 84), ctrl,
+                                                       cbuf, ps, &st);
+                            if (rc == 0 && st == 0) {
+                                memcpy(resp + 120, cbuf, ps);
+                                ok = true;
+                            }
+                            qemu_log("nvkvm-gpu[%s] cudart-ctrl FWD 0x%08x ps=%u rc=%d "
+                                     "st=0x%x ok=%d\n", s->chip->name, ctrl, ps, rc,
+                                     st, ok);
+                        }
+                    }
+                    if (!ok) {
+                        if (ctrl == 0x20809009u && ps >= 8) {
+                            stl_le_p(resp + 120, 0u);
+                            stl_le_p(resp + 124, 0x0du);
+                        } else if (ctrl == 0x20809001u && ps >= 8) {
+                            stl_le_p(resp + 120, 0x03fc007fu);
+                            stl_le_p(resp + 124, 0u);
+                        } else if (ctrl == 0x20809064u && ps >= 40 &&
+                                   (120u + ps) <= NVKVM_RESP_MAX) {
+                            static const uint32_t v064[10] = {
+                                0u, 2u, 1u, 1u, 1u, 0x64u, 4u, 0x10u, 1u, 0x64u };
+                            memset(resp + 120, 0, ps);
+                            for (int i = 0; i < 10; i++) {
+                                stl_le_p(resp + 120 + 4 * i, v064[i]);
+                            }
+                        }
+                    }
+                    stl_le_p(resp + 92, 0);
+                    stl_le_p(resp + 56, 32u + 40u + ps);
                 } else if (ctrl == 0x20800a01u && cr) {
                     /* INTERNAL_DISPLAY_GET_STATIC_INFO: replay captured 32B but
                      * SYNTHESIZE numDispChannels (struct off 32, params+120 =>

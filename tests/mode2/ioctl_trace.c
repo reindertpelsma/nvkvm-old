@@ -53,7 +53,7 @@ static int hexcat(char *o, int cap, const uint8_t *p, int n)
  * hObject@4,cmd@8,flags@12,params@16(u64),paramsSize@24,status@28). */
 static void trace_in(unsigned nr, unsigned sz, void *arg)
 {
-    char line[1024];
+    char line[8192];
     if (nr == 0x2a && arg) {
         uint8_t *a = arg;
         uint64_t pp = *(uint64_t *)(a + 16);
@@ -62,7 +62,7 @@ static void trace_in(unsigned nr, unsigned sz, void *arg)
         int n = snprintf(line, sizeof line,
             "CTRL  cmd=0x%08x hClient=0x%08x hObject=0x%08x psize=%u IN[",
             *(uint32_t *)(a + 8), *(uint32_t *)(a + 0), *(uint32_t *)(a + 4), psize);
-        if (params && psize) n += hexcat(line + n, sizeof line - n, params, psize < 48 ? psize : 48);
+        if (params && psize) n += hexcat(line + n, sizeof line - n, params, psize < 1024 ? psize : 1024);
         n += snprintf(line + n, sizeof line - n, "]\n");
         emit(line, n);
     }
@@ -71,7 +71,7 @@ static void trace_in(unsigned nr, unsigned sz, void *arg)
 /* Log the OUT side after the real call. */
 static void trace_out(unsigned nr, unsigned sz, void *arg, long rc)
 {
-    char line[1024];
+    char line[8192];
     if (nr == 0x2a && arg) {
         uint8_t *a = arg;
         uint64_t pp = *(uint64_t *)(a + 16);
@@ -79,7 +79,7 @@ static void trace_out(unsigned nr, unsigned sz, void *arg, long rc)
         uint32_t psize = *(uint32_t *)(a + 24);
         int n = snprintf(line, sizeof line, "CTRL= cmd=0x%08x rc=%ld status=0x%x OUT[",
             *(uint32_t *)(a + 8), rc, *(uint32_t *)(a + 28));
-        if (params && psize) n += hexcat(line + n, sizeof line - n, params, psize < 48 ? psize : 48);
+        if (params && psize) n += hexcat(line + n, sizeof line - n, params, psize < 1024 ? psize : 1024);
         n += snprintf(line + n, sizeof line - n, "]\n");
         emit(line, n);
     } else if (nr == 0x2b && arg) {
