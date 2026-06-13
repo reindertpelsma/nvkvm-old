@@ -5250,11 +5250,33 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
     }
     if (a->sys) {
         a->sysbytes += a->len;
-        /* M5.51: mark-on-success (was check-and-mark va_seen, which poisoned a sysmem run
-         * whose back failed -> never retried -> residency gap -> host CE FAULT_PTE there,
-         * the flaky-cup3 hang). Keyed on (client,va0); a grown run re-coalescing to the
-         * same va0 is handled by the run being re-flushed each sweep until it backs. */
-        if (!nvkvm_m2_va_check(a->s, a->client, a->va0)) {
+        /* M5.52: dedup PER 2-MiB-ALIGNED CHUNK, not per whole-run va0 (mirrors the M5.48d
+         * vidmem fix; the sysmem path was never updated). A guest sysmem run GROWS as the
+         * app maps more of a contiguous allocation; re-coalesced it keeps the SAME va0, so
+         * the old whole-run va_check(va0) skipped the grown TAIL forever -> a residency hole
+         * at the old run end -> host CE/GR FAULT_PTE there. THIS is the cup4 cuCtxCreate hang:
+         * a backed run [0x7877074e0000,+0x120000) ending at 0x787707600000, then a 0x80000
+         * tail in the NEXT 2-MiB chunk [0x787707600000,..) that the va0-keyed skip never
+         * backed -> Xid 31 CE2 FAULT_PTE @0x787707600000. Per-chunk keys are stable across
+         * re-walks so only genuinely-new chunks back; back_and_map_sys is idempotent
+         * (st=0x51 ALREADY-MAPPED) for any head re-touch. M5.51 mark-on-success preserved:
+         * an unbacked chunk stays unmarked so a later sweep retries. (Sub-2-MiB runs back
+         * identically to before -> no regression to the cup3 path, whose sysmem runs are all
+         * <2 MiB.) The >=1 GiB single-key path is kept for any giant sysmem alias. */
+        if (a->len < 0x40000000ull) {
+            for (uint64_t off = 0; off < a->len; ) {
+                uint64_t cva  = a->va0 + off;
+                uint64_t next = (cva + 0x200000ull) & ~0x1fffffull;
+                uint64_t clen = (next - cva < a->len - off) ? next - cva : a->len - off;
+                if (!nvkvm_m2_va_check(a->s, a->client, cva)) {
+                    if (nvkvm_m2_back_and_map_sys(a->s, a->client, cva, a->gpa0 + off, clen)) {
+                        nvkvm_m2_va_mark(a->s, a->client, cva);
+                        a->backed++;
+                    }
+                }
+                off += clen;
+            }
+        } else if (!nvkvm_m2_va_check(a->s, a->client, a->va0)) {
             if (nvkvm_m2_back_and_map_sys(a->s, a->client, a->va0, a->gpa0, a->len)) {
                 nvkvm_m2_va_mark(a->s, a->client, a->va0);
                 a->backed++;
