@@ -97,6 +97,22 @@ case "${1:-setup}" in
     echo "=== cup5 rc=$? (124=timeout/hang) ==="
     echo "--- cup5 guest dmesg ---"; sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid" | tail -10
     ;;
+  cup6)
+    # DISCRIMINATOR: 3 timed HtoD to the SAME buffer + 25s hold (read pat memtype
+    # live). UC-persistent => all 3 slow; first-touch fault/residency => #2/#3 fast.
+    sudo dmesg -C || true
+    gcc -O2 -o /tmp/cup6 /tmp/cup6.c -lcuda -L"$GUESTLIB" 2>&1 | tail -3
+    [ -x /tmp/cup6 ] || { echo "CUP6 BUILD FAILED"; exit 0; }
+    echo "=== cup6 CUP6_MB=${CUP6_MB:-64} on PINNED adapter ==="
+    LD_LIBRARY_PATH="$GUESTLIB" CUP6_MB="${CUP6_MB:-64}" timeout "${CUP6_TIMEOUT:-120}" stdbuf -oL -eL /tmp/cup6 &
+    CP6=$!
+    sleep 8
+    echo "--- pat_memtype_list: UC-/WC/WB summary while buffer held ---"
+    sudo cat /sys/kernel/debug/x86/pat_memtype_list 2>/dev/null | grep -oE "uncached-minus|write-combining|write-back" | sort | uniq -c
+    wait $CP6
+    echo "=== cup6 rc=$? (124=timeout/hang) ==="
+    echo "--- cup6 guest dmesg ---"; sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid" | tail -10
+    ;;
   dmesg)
     sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid|POST_EVENT|CliGetEvent" | tail -40
     ;;

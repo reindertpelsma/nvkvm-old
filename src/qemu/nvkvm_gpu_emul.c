@@ -2531,6 +2531,45 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 continue;                        /* no new work on this channel */
             }
             any_completed = true;
+            /* RESUME-INSTR (host-CE forward, 2026-06-13): disambiguate the CE
+             * pool put=0 BEFORE coding. Fires for EVERY advanced channel (NOT
+             * gated on token_valid/usermode), so it also catches hypothesis (b)
+             * — a copy channel that advanced but never reaches the M5.22 ring.
+             *   page A = the fb-backed overlay page chan_execute + the guest's
+             *            BAR1 GP_PUT write hit (nvkvm_fb_read @ c->userd).
+             *   page B = the m2_chanbuf qva the host GPU's USERD object reads.
+             * A!=B  => page-identity divergence = the M5.44/M5.47 keystone, now
+             *          for the CE pool (extend the overlay/fbback-first guard).
+             * Also reports the gpfifo VA + whether an m2_gpga[] entry shadows
+             * c->userd (a GPGA mirror would feed reads from page B not A). */
+            {
+                uint32_t a_put = (uint32_t)nvkvm_fb_read(s, c->userd + 0x8C, 4);
+                uint32_t a_get = (uint32_t)nvkvm_fb_read(s, c->userd + 0x88, 4);
+                void *bqva = NULL;
+                for (int k = 0; k < s->m2_chanbuf_n; k++) {
+                    if (s->m2_chanbuf[k].client == c->client &&
+                        s->m2_chanbuf[k].chan == c->hobject) {
+                        bqva = s->m2_chanbuf[k].qva; break;
+                    }
+                }
+                uint32_t b_put = bqva ? ldl_le_p((uint8_t *)bqva + 0x8C) : 0xffffffffu;
+                uint32_t b_get = bqva ? ldl_le_p((uint8_t *)bqva + 0x88) : 0xffffffffu;
+                int gpga_ov = -1;
+                for (int g = 0; g < s->m2_gpga_n; g++) {
+                    if (c->userd >= s->m2_gpga[g].gpga_base &&
+                        c->userd <  s->m2_gpga[g].gpga_base + s->m2_gpga[g].size) {
+                        gpga_ov = g; break;
+                    }
+                }
+                qemu_log("nvkvm-gpu[%s] CE-INSTR ch[%d] client=0x%08x tsg=0x%08x "
+                         "userd=0x%llx%s gpfifo=0x%llx gp_get %u->%u | pageA(fb)put=%u "
+                         "get=%u | pageB(qva%s)put=%u get=%u | gpga_ov=%d%s\n",
+                         s->chip->name, i, c->client, c->tsg,
+                         (unsigned long long)c->userd, c->userd_sys ? "(sys)" : "",
+                         (unsigned long long)c->gpfifo_va, before, c->gp_get,
+                         a_put, a_get, bqva ? "" : " NONE", b_put, b_get, gpga_ov,
+                         (bqva && a_put != b_put) ? "  <-- A!=B PAGE-IDENTITY DIVERGENCE" : "");
+            }
             /* M5.22 (b): RING this channel's HOST doorbell with ITS own work-submit
              * token so the real host GPU executes the channel's work and writes the
              * real completion.  The working set is mapped into the host VAS at the
@@ -2836,6 +2875,21 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
     NvkvmGpuEmul *s = opaque;
     if (!s->bar1_pdb) {
         return;
+    }
+    /* BAR1-TRAP-INSTR (2026-06-13): settle memslot-vs-MMIO for the cup5 bulk copy.
+     * If the guest's HtoD writes route through here, BAR1 is MMIO-trapping every
+     * access (fix = install a RAM memslot/double-mmap so writes stop trapping);
+     * if this stays ~0 during a 64MB copy, dp is already a memslot (fix = WB
+     * cacheability only). Log cumulative call/byte counts each 16 MiB crossed. */
+    {
+        static uint64_t bw_calls, bw_bytes, bw_next = (16ull << 20);
+        bw_calls++; bw_bytes += size;
+        if (bw_bytes >= bw_next) {
+            qemu_log("nvkvm-gpu[GA106] BAR1-TRAP-INSTR cumulative writes: calls=%llu "
+                     "bytes=%llu (%.1f MiB)\n", (unsigned long long)bw_calls,
+                     (unsigned long long)bw_bytes, (double)bw_bytes / (1024*1024));
+            bw_next += (16ull << 20);
+        }
     }
     bool sys = false;
     uint64_t pa = nvkvm_walk_pdb(s, s->bar1_pdb, off, &sys);
@@ -3760,11 +3814,13 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                     }
                     #undef NVKVM_CE_RESOLVE
                     qemu_log("nvkvm-gpu[%s] M5: CE %s in=0x%llx(%s) out=0x%llx(%s) "
-                             "bytes=%llu const=0x%x\n", s->chip->name,
+                             "bytes=%llu const=0x%x [client=0x%08x gpfifo=0x%llx]\n",
+                             s->chip->name,
                              mscrub ? "SCRUB" : remap ? "MEMSET" : "COPY",
                              (unsigned long long)off_in,
                              src_phys ? "phys" : "virt", (unsigned long long)off_out,
-                             dst_phys ? "phys" : "virt", (unsigned long long)bytes, remapA);
+                             dst_phys ? "phys" : "virt", (unsigned long long)bytes, remapA,
+                             s->chan_client, (unsigned long long)s->chan_gpfifo_va);
                     /* CE-class completion semaphore release: LAUNCH_DMA with
                      * SEMAPHORE_TYPE != NONE writes ce_sem_pay to
                      * (pbGpuVA+finishPayloadOffset).  This is what the CeUtils
