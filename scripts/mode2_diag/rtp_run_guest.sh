@@ -87,6 +87,16 @@ case "${1:-setup}" in
     echo "=== llm exit rc=$? (124=timeout/hang) ==="
     echo "--- llm guest dmesg ---"; sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid" | tail -15
     ;;
+  cup5)
+    # Bulk data-plane forcing function on the ALREADY-pinned adapter (driver API).
+    sudo dmesg -C || true
+    gcc -O2 -o /tmp/cup5 /tmp/cup5.c -lcuda -L"$GUESTLIB" 2>&1 | tail -3
+    [ -x /tmp/cup5 ] || { echo "CUP5 BUILD FAILED"; exit 0; }
+    echo "=== cup5 CUP5_MB=${CUP5_MB:-64} on PINNED adapter ==="
+    LD_LIBRARY_PATH="$GUESTLIB" CUP5_MB="${CUP5_MB:-64}" timeout "${CUP5_TIMEOUT:-120}" stdbuf -oL -eL /tmp/cup5
+    echo "=== cup5 rc=$? (124=timeout/hang) ==="
+    echo "--- cup5 guest dmesg ---"; sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid" | tail -10
+    ;;
   dmesg)
     sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid|POST_EVENT|CliGetEvent" | tail -40
     ;;
