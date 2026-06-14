@@ -103,12 +103,18 @@ case "${1:-setup}" in
     sudo dmesg -C || true
     gcc -O2 -o /tmp/cup6 /tmp/cup6.c -lcuda -L"$GUESTLIB" 2>&1 | tail -3
     [ -x /tmp/cup6 ] || { echo "CUP6 BUILD FAILED"; exit 0; }
-    echo "=== cup6 CUP6_MB=${CUP6_MB:-64} on PINNED adapter ==="
-    LD_LIBRARY_PATH="$GUESTLIB" CUP6_MB="${CUP6_MB:-64}" timeout "${CUP6_TIMEOUT:-120}" stdbuf -oL -eL /tmp/cup6 &
+    echo "=== cup6 CUP6_MB=${CUP6_MB:-64} on PINNED adapter (root: pagemap PFNs) ==="
+    # Run as root via `sudo env` so cup6's self-introspection resolves real PFNs from
+    # /proc/self/pagemap (unprivileged reads zero the PFN). The held-fd pin keeps the
+    # single adapter init; root opening another /dev/nvidia0 fd joins the same init.
+    sudo env LD_LIBRARY_PATH="$GUESTLIB" CUP6_MB="${CUP6_MB:-64}" \
+      timeout "${CUP6_TIMEOUT:-120}" stdbuf -oL -eL /tmp/cup6 &
     CP6=$!
-    sleep 8
+    sleep 10
     echo "--- pat_memtype_list: UC-/WC/WB summary while buffer held ---"
     sudo cat /sys/kernel/debug/x86/pat_memtype_list 2>/dev/null | grep -oE "uncached-minus|write-combining|write-back" | sort | uniq -c
+    echo "--- pat_memtype_list: FULL (match dp phys0/physmid to a memtype line) ---"
+    sudo cat /sys/kernel/debug/x86/pat_memtype_list 2>/dev/null
     wait $CP6
     echo "=== cup6 rc=$? (124=timeout/hang) ==="
     echo "--- cup6 guest dmesg ---"; sudo dmesg | grep -iE "NVRM|nvidia|uvm|WPR2|Booter|assert|Xid" | tail -10

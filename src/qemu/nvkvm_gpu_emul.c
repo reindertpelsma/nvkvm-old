@@ -79,7 +79,7 @@ typedef struct NvkvmGpuChip {
     uint32_t    pmc_boot_0;       /* BAR0 + 0x000 */
     uint32_t    pmc_boot_42;      /* BAR0 + 0xA00 */
     uint64_t    bar0_size;        /* REGS aperture (16 MiB) */
-    uint64_t    bar1_size;        /* FB aperture   (256 MiB stub for M0) */
+    uint64_t    bar1_size;        /* FB aperture (16 GiB — resizable-BAR-equiv, covers full fake FB) */
     uint64_t    bar3_size;        /* usermode/IMEM aperture (32 MiB) */
 } NvkvmGpuChip;
 
@@ -93,7 +93,13 @@ static const NvkvmGpuChip nvkvm_chip_ga106 = {
     .pmc_boot_0    = 0x176000A1u,
     .pmc_boot_42   = 0x176A1000u,
     .bar0_size     = 16ull  << 20,  /* 16 MiB  */
-    .bar1_size     = 256ull << 20,  /* 256 MiB (real card is larger; stub) */
+    .bar1_size     = 16ull  << 30,  /* 16 GiB: resizable-BAR-equivalent. A 256 MiB BAR1 capped how
+                                     * much vidmem the guest CPU could aperture-map at once (a hard
+                                     * prod-correctness ceiling, independent of the host-side BAR1 /
+                                     * CE-forward work). 16 GiB covers the full GSP-advertised fake FB
+                                     * (~11.7 GiB usable). 64-bit prefetchable BAR → lands in the q35
+                                     * above-4G PCI window; aperture is sparse MMIO (no real backing),
+                                     * GMMU-walked via bar1_pdb, so only the addressable RANGE grows. */
     .bar3_size     = 32ull  << 20,  /* 32 MiB  */
 };
 
@@ -226,6 +232,7 @@ struct NvkvmGpuEmul {
         uint32_t sweep_put;     /* M5.48c: GP_PUT as of the last working-set sweep — sweep
                                  * again only when a channel's PUT ADVANCES (new submission =
                                  * the guest just mapped+filled new working-set leaves) */
+        bool     ce_route_logged; /* CE-fwd Step 0: one-shot NVKVM-CEFWD-ROUTE probe per channel */
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -353,6 +360,14 @@ struct NvkvmGpuEmul {
      * bring-up mechanism; KVM-memslot backing is the perf endpoint (see design doc). */
     struct { uint64_t fb_base, size; void *host_qva; } m2_fbback[64];
     int      m2_fbback_n;
+    /* CE-forward P1 (m2cefwd): VA windows of observed user-CE copy destinations. A vidmem
+     * leaf whose GR-VA falls inside a window is backed GPU-ONLY (real host vidmem object +
+     * map_dma, but NO RM_MAP_MEMORY/mmap -> zero host BAR1). Populated ONLY at the M5.60
+     * user-CE dst site (nvkvm_m2_is_user_ce-gated = never the kernel scrubber). Control
+     * structures (pushbuffers/USERD/GPFIFO/GR-ctx) are never in a window, so they keep their
+     * CPU view (guest writes them, host GPU fetches them) — coherency preserved. */
+    struct { uint64_t va_base, size; uint32_t client; } m2_cefwd_dst[64];
+    int      m2_cefwd_dst_n;
     /* M5.3 DIAG: crash-window FB-read probe. Set true the moment the GR compute
      * object (0xc7c0) alloc returns OK — libcuda then reads GR-context GPU memory
      * (no further ioctl per the trace) and crashes (rbp=0). Logging every FB read
@@ -386,6 +401,13 @@ struct NvkvmGpuEmul {
                                  * SEM_RELEASE / +0x8004 fallback) so the real host release is the
                                  * SOLE writer.  Fixes the double-writer 2^32 UVM jump once M5.34
                                  * makes the host actually execute the channel.  Default OFF (A/B). */
+    bool     m2cefwd;           /* CE-fwd prop. Enables: (Step 0) the NVKVM-CEFWD-ROUTE probe
+                                 * of user-CE channel routing, and (Phase A / M5.60) re-walking
+                                 * the compute VAS at a user-CE LAUNCH_DMA when the copy dst is an
+                                 * un-backed fb_page, so the full dst becomes a real host vidmem
+                                 * object in the GR fvas (prereq for the host-CE forward, Phase B).
+                                 * Does NOT change completion or the CPU copy (those stay
+                                 * authoritative) — regression-safe.  Default OFF. */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
     uint32_t m2_last_db_token;  /* M5.11: last guest work-submit token seen at the doorbell (dedup log) */
@@ -1324,6 +1346,12 @@ static void nvkvm_m2_forward_promote_ctx(NvkvmGpuEmul *s, const uint8_t *cmd); /
 static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                       uint64_t gpa, uint64_t size); /* M6.5 fwd-decl */
 static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client); /* M6.5 fwd-decl */
+static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                             uint64_t gpga, uint64_t size); /* M7 R2 fwd-decl (Phase A) */
+static int nvkvm_m2_gpga_obj_ex(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                uint64_t gpga, uint64_t size, bool gpu_only); /* CE-fwd P1 */
+static void nvkvm_m2_add_cefwd_dst(NvkvmGpuEmul *s, uint32_t client,
+                                   uint64_t va, uint64_t size); /* CE-fwd P1 fwd-decl */
 static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s); /* M14 fwd-decl */
 static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                                 uint64_t *out_redir); /* M5.18 fwd-decl */
@@ -2502,6 +2530,40 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                 if (nvkvm_m2_populate_cvas(s, c)) {
                     s->m2_cvas[s->m2_cur_cvas].populated = true;
                 }
+            }
+            /* CE-fwd STEP 0 (gated, one-shot per channel): observe how each user-CE channel
+             * is routed BEFORE we touch its data path. Reports COPY engineType, whether it
+             * shares a per-channel VAS (m2_cvas, populated?), token validity, and whether a
+             * USERD double-mmap (m2_chanbuf qva) exists for it. No side effects. */
+            if (s->m2cefwd && !c->ce_route_logged && nvkvm_m2_is_user_ce(s, c->client)) {
+                c->ce_route_logged = true;
+                uint32_t r_eng = 0; bool r_eng_found = false;
+                for (int e = 0; e < s->m2_tsgeng_n; e++) {
+                    if (s->m2_tsgeng[e].tsg == c->tsg) {
+                        r_eng = s->m2_tsgeng[e].engine; r_eng_found = true; break;
+                    }
+                }
+                int r_cvas = -1;
+                for (int ci = 0; ci < s->m2_cvas_n; ci++) {
+                    if (s->m2_cvas[ci].client == c->client && s->m2_cvas[ci].tsg == c->tsg) {
+                        r_cvas = ci; break;
+                    }
+                }
+                bool r_userd = false;
+                for (int k = 0; k < s->m2_chanbuf_n; k++) {
+                    if (s->m2_chanbuf[k].client == c->client &&
+                        s->m2_chanbuf[k].chan == c->hobject && s->m2_chanbuf[k].qva) {
+                        r_userd = true; break;
+                    }
+                }
+                bool r_is_copy = r_eng_found && r_eng >= 0x9u && r_eng <= 0x12u;
+                qemu_log("nvkvm-gpu[%s] NVKVM-CEFWD-ROUTE ch[%d] client=0x%08x chid/hObj=0x%08x "
+                         "tsg=0x%08x engineType=0x%x%s%s | cvas=%s%s token_valid=%d userd_qva=%s\n",
+                         s->chip->name, i, c->client, c->hobject, c->tsg,
+                         r_eng, r_eng_found ? "" : "(none)", r_is_copy ? " COPY" : "",
+                         r_cvas >= 0 ? "yes" : "no",
+                         r_cvas >= 0 ? (s->m2_cvas[r_cvas].populated ? "(populated)" : "(unpopulated)") : "",
+                         c->token_valid, r_userd ? "yes" : "no");
             }
             /* M5.41 (deterministic, moved out of the advance-gated M5.25 path): bind +
              * GPFIFO_SCHEDULE the compute client's COPY TSGs ONCE, on first sight — NOT
@@ -3813,6 +3875,72 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                     uint32_t sem_type = (d >> 3) & 0x3; /* SEMAPHORE_TYPE [4:3], !=0 => release */
                     uint64_t bytes = (uint64_t)llen * lcount;
                     if (bytes > (16u << 20)) bytes = 16u << 20;  /* safety cap */
+                    /* M5.60 (Phase A — user-CE dst real-backing, the cup5/LLM-hang fix
+                     * prerequisite): the copy DEST must be a REAL host vidmem object
+                     * mapped in the GR fvas (not a fake fb_page) — both so the CPU copy
+                     * writes live vidmem now, and so a real host CE can DMA it later
+                     * (Phase B). The dst buffer lives in the COMPUTE client's VAS, which
+                     * was last walked at ctx-create; a buffer allocated afterwards (e.g.
+                     * LLM weights) is missed -> verdict=fbpage. When we observe an
+                     * un-backed FB dst, re-run the proven compute-VAS backing walk ONCE
+                     * (enum_gr_sysmem is idempotent via the global m2_va_seen dedup, so it
+                     * backs only genuinely-new leaves and is cheap once the hole is filled
+                     * -> the next copy classifies gpga and skips the re-walk). Gated to the
+                     * forwarded user-CE path; never the kernel scrubber/MEMSET or a sysmem
+                     * (DtoH) dst. A total cap bounds any never-backable pathological leaf. */
+                    if (s->m2cefwd && !mscrub && !remap && s->m2_gr_client &&
+                        nvkvm_m2_is_user_ce(s, s->chan_client)) {
+                        uint64_t full = (uint64_t)llen * lcount;
+                        if (full >= 4 && dst_phys && dst_pm == 0) {
+                            /* PHYSICAL-FB dst: off_out IS the guest-FB-phys and a CE physical
+                             * copy bypasses the MMU, so the page-table walk can NEVER discover
+                             * this dst (no PTE). Back the contiguous dst range DIRECTLY as one
+                             * real host vidmem object (gpga_obj) when it still resolves to a
+                             * fake fb_page. The CPU copy then writes live vidmem, host mem.used
+                             * reflects it, and Phase B's host CE gets a real dst object.
+                             * classify-gated -> backs once; total cap bounds any failure loop. */
+                            if (nvkvm_dp_classify_fb(s, off_out) == 0 ||
+                                nvkvm_dp_classify_fb(s, off_out + full - 4) == 0) {
+                                static uint32_t m560p;
+                                if (m560p < 4096) {
+                                    m560p++;
+                                    /* CE-forward P1: back GPU-ONLY (zero host BAR1). off_out is
+                                     * a phys (=gpga) here; record it as a dst window keyed by the
+                                     * GR client so any later VIRT alias of the same range matches. */
+                                    nvkvm_m2_add_cefwd_dst(s, s->m2_gr_client, off_out, full);
+                                    int oi = nvkvm_m2_gpga_obj_ex(s, s->m2_gr_client, off_out,
+                                                                  off_out, full, true);
+                                    qemu_log("nvkvm-gpu[%s] M5.60 user-CE PHYS dst back[gpu_only] "
+                                             "gpga=0x%llx full=%llu -> obj=%d (#%u)\n",
+                                             s->chip->name, (unsigned long long)off_out,
+                                             (unsigned long long)full, oi, m560p);
+                                }
+                            }
+                        } else if (full >= 4 && !dst_phys) {
+                            /* VIRTUAL dst: it has PTEs -> re-walk the compute VAS so the proven
+                             * coalescing path backs its (possibly non-contiguous) leaves. */
+                            bool dsy = false;
+                            uint64_t dp0 = nvkvm_chan_translate(s, off_out, &dsy);
+                            if (dp0 != NVKVM_GMMU_FAULT && !dsy &&
+                                nvkvm_dp_classify_fb(s, dp0) == 0) {
+                                static uint32_t m560v;
+                                if (m560v < 4096) {
+                                    m560v++;
+                                    /* CE-forward P1: register the dst VA window FIRST so the
+                                     * re-walk backs these leaves GPU-ONLY (zero host BAR1) — the
+                                     * D2 fix. The window is keyed to the GR client; control
+                                     * structures are never in a window so keep their CPU view. */
+                                    nvkvm_m2_add_cefwd_dst(s, s->m2_gr_client, off_out, full);
+                                    qemu_log("nvkvm-gpu[%s] M5.60 user-CE VIRT dst un-backed "
+                                             "va=0x%llx dphys=0x%llx -> re-walk compute VAS "
+                                             "client=0x%08x (#%u)\n", s->chip->name,
+                                             (unsigned long long)off_out,
+                                             (unsigned long long)dp0, s->m2_gr_client, m560v);
+                                    nvkvm_m2_enum_gr_sysmem(s, s->m2_gr_client);
+                                }
+                            }
+                        }
+                    }
                     /* Resolve a CE address: PHYSICAL -> the offset IS the phys addr
                      * (aperture from PHYS_MODE: 0=FB else sysmem); VIRTUAL ->
                      * translate via the channel VAS (leaf PTE picks FB/sys). */
@@ -4723,6 +4851,39 @@ static bool nvkvm_m2_host_alloc_map_vidmem(NvkvmGpuEmul *s, uint32_t hClient,
     return true;
 }
 
+/* CE-forward P1: allocate a host GPU vidmem object WITHOUT the RM_MAP_MEMORY+mmap CPU view.
+ * The CPU mapping is what consumes the host's 256 MiB BAR1 (the proven D2 wall); a CE-forward
+ * dst is PROT_NONE to the guest CPU, so it needs only a GPU-side map_dma into a channel VAS.
+ * Returns the alloc'd object in `out` with qva=NULL/mapfd=-1 — caller does the map_dma. Zero
+ * host BAR1 consumed. Mirrors the alloc half of nvkvm_m2_host_alloc_map_vidmem. */
+static bool nvkvm_m2_host_alloc_vidmem_gpu_only(NvkvmGpuEmul *s, uint32_t hClient,
+                                                uint32_t hDevice, uint32_t hMem,
+                                                uint64_t size, struct nvkvm_host_map *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->mapfd = -1;
+    if (!nvkvm_m2_iso_ensure(s)) {
+        return false;
+    }
+    struct nv_memory_allocation_params_v545 mp;
+    memset(&mp, 0, sizeof(mp));
+    mp.owner     = hClient;
+    mp.type      = 0;                            /* NVOS32_TYPE_IMAGE */
+    mp.attr      = (2u << 27) | (0u << 25);      /* CONTIGUOUS | LOCATION_VIDMEM */
+    mp.size      = size;
+    mp.alignment = 0x10000;
+    uint32_t st = 0xffff;
+    nvkvm_m2_alloc1(s, hClient, hDevice, hMem, 0x0040u, &mp, sizeof(mp), &st);
+    if (st != 0) {
+        qemu_log("nvkvm-gpu[%s] CE-fwd: gpu_only vidmem alloc 0x%x size=0x%llx failed st=0x%x\n",
+                 s->chip->name, hMem, (unsigned long long)size, st);
+        return false;
+    }
+    out->qva = NULL; out->mapfd = -1; out->h_mem = hMem; out->maph = 0;
+    out->size = size;
+    return true;
+}
+
 /* M6.2 (item-4 step 3): translate a guest GPA to the stub VA where the guest-RAM memfd is
  * MAP_FIXED'd. Uses pci_dma_map to get QEMU's host VA for the GPA (hole-safe across the q35
  * PCI hole), then stub_va = stub_base + (hva - ram_base_hva) since the stub mmapped the SAME
@@ -5381,8 +5542,8 @@ static bool nvkvm_m2_back_and_map_sys(NvkvmGpuEmul *s, uint32_t client, uint64_t
  *               view isn't placed (gr_va=0); R3 makes the host adopt OURS instead.
  * One nvkvm/RM handle backs both views = coherent. Returns obj_idx, or -1. Idempotent caller
  * (dedup by va via m2_va_seen). */
-static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
-                             uint64_t gpga, uint64_t size)
+static int nvkvm_m2_gpga_obj_ex(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                uint64_t gpga, uint64_t size, bool gpu_only)
 {
     if (s->m2_objs_n >= 1024 || s->m2_gpga_n >= 2048) {
         return -1;
@@ -5413,15 +5574,24 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     }
     uint32_t hMem = 0xda000000u | (s->m2_databuf_next++ & 0xffffu);
     struct nvkvm_host_map hm;
-    if (!nvkvm_m2_host_alloc_map_vidmem(s, client, hDev, hMem, asize, &hm)) {
+    if (gpu_only) {
+        /* CE-forward P1: real host vidmem object, NO CPU view (zero host BAR1). The dst is a
+         * user-CE copy destination the guest CPU never reads through the GPA window. */
+        if (!nvkvm_m2_host_alloc_vidmem_gpu_only(s, client, hDev, hMem, asize, &hm)) {
+            return -1;
+        }
+    } else if (!nvkvm_m2_host_alloc_map_vidmem(s, client, hDev, hMem, asize, &hm)) {
         return -1;
     }
     /* M5.44: preserve any bytes the guest already wrote to this GPGA range via the local
      * fb_pages BEFORE this object existed (back_and_map's copy_content equivalent) — e.g.
-     * GPFIFO entries laid down pre-doorbell. Unwritten pages are sparse-zero = blank. */
-    for (uint64_t off = 0; off < tsize; off += 4096) {
-        uint8_t *gp = nvkvm_fb_page(s, gpga + off, false);
-        if (gp) { memcpy((uint8_t *)hm.qva + off, gp, 4096); }
+     * GPFIFO entries laid down pre-doorbell. Unwritten pages are sparse-zero = blank.
+     * Skipped for gpu_only (no CPU view to copy into; the host CE writes it in Phase B). */
+    if (!gpu_only) {
+        for (uint64_t off = 0; off < tsize; off += 4096) {
+            uint8_t *gp = nvkvm_fb_page(s, gpga + off, false);
+            if (gp) { memcpy((uint8_t *)hm.qva + off, gp, 4096); }
+        }
     }
     /* GPU view: FIXED-map into the host GR VAS at the guest VA. */
     uint32_t hVirt = nvkvm_m2_grmapper(s, client);
@@ -5444,11 +5614,58 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     s->m2_gpga[gi].off = 0;
     s->m2_gpga[gi].readable = true;
     s->m2_gpga[gi].writable = true;
-    qemu_log("nvkvm-gpu[%s] M7 R2 gpga_obj: va=0x%llx gpga=0x%llx size=0x%llx hMem=0x%08x "
+    qemu_log("nvkvm-gpu[%s] M7 R2 gpga_obj%s: va=0x%llx gpga=0x%llx size=0x%llx hMem=0x%08x "
              "cpu_qva=%p gpu_mapped=%d(st=0x%x) obj=%d gpga_n=%d\n", s->chip->name,
-             (unsigned long long)va, (unsigned long long)gpga, (unsigned long long)asize,
-             hm.h_mem, hm.qva, gpu_mapped, mst, oi, s->m2_gpga_n);
+             gpu_only ? "[gpu_only]" : "", (unsigned long long)va, (unsigned long long)gpga,
+             (unsigned long long)asize, hm.h_mem, hm.qva, gpu_mapped, mst, oi, s->m2_gpga_n);
     return oi;
+}
+
+/* Default (CPU-mapped) gpga_obj — the working-milestone path. */
+static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                             uint64_t gpga, uint64_t size)
+{
+    return nvkvm_m2_gpga_obj_ex(s, client, va, gpga, size, false);
+}
+
+/* CE-forward P1: is `va` (in `client`'s VAS) inside an observed user-CE copy-dst window?
+ * Such leaves get GPU-ONLY backing (zero host BAR1). Only ever true under m2cefwd. */
+static bool nvkvm_m2_in_cefwd_dst(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
+{
+    for (int i = 0; i < s->m2_cefwd_dst_n; i++) {
+        if (s->m2_cefwd_dst[i].client == client &&
+            va >= s->m2_cefwd_dst[i].va_base &&
+            va <  s->m2_cefwd_dst[i].va_base + s->m2_cefwd_dst[i].size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* CE-forward P1: record a user-CE copy-dst VA window (dedup/extend by overlap). Called ONLY
+ * from the M5.60 user-CE dst site (nvkvm_m2_is_user_ce-gated). */
+static void nvkvm_m2_add_cefwd_dst(NvkvmGpuEmul *s, uint32_t client, uint64_t va, uint64_t size)
+{
+    uint64_t v0 = va & ~0x1fffffull;                       /* 2-MiB align the window */
+    uint64_t v1 = (va + size + 0x1fffffull) & ~0x1fffffull;
+    for (int i = 0; i < s->m2_cefwd_dst_n; i++) {
+        if (s->m2_cefwd_dst[i].client != client) { continue; }
+        uint64_t e0 = s->m2_cefwd_dst[i].va_base;
+        uint64_t e1 = e0 + s->m2_cefwd_dst[i].size;
+        if (v0 <= e1 && e0 <= v1) {                        /* overlap/adjacent -> coalesce */
+            uint64_t n0 = v0 < e0 ? v0 : e0, n1 = v1 > e1 ? v1 : e1;
+            s->m2_cefwd_dst[i].va_base = n0;
+            s->m2_cefwd_dst[i].size    = n1 - n0;
+            return;
+        }
+    }
+    if (s->m2_cefwd_dst_n >= 64) { return; }
+    int k = s->m2_cefwd_dst_n++;
+    s->m2_cefwd_dst[k].client  = client;
+    s->m2_cefwd_dst[k].va_base = v0;
+    s->m2_cefwd_dst[k].size    = v1 - v0;
+    qemu_log("nvkvm-gpu[%s] CE-fwd P1: user-CE dst window client=0x%08x [0x%llx,0x%llx)\n",
+             s->chip->name, client, (unsigned long long)v0, (unsigned long long)v1);
 }
 
 /* M6.5 leaf accumulator: coalesce contiguous (VA,GPA,sys) leaf pages into runs, back each
@@ -5547,7 +5764,11 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
                  * matmul-d_out fault). Now an unbacked chunk stays unmarked so a later
                  * sweep retries; on persistent failure the diag below names why. */
                 if (!nvkvm_m2_va_check(a->s, a->client, cva)) {
-                    if (nvkvm_m2_gpga_obj(a->s, a->client, cva, a->gpa0 + off, clen) >= 0) {
+                    /* CE-forward P1: a leaf inside an observed user-CE copy-dst window is
+                     * backed GPU-ONLY (real host vidmem + map_dma, no CPU view -> zero host
+                     * BAR1). Everything else keeps its CPU view. Only ever true under m2cefwd. */
+                    bool go = a->s->m2cefwd && nvkvm_m2_in_cefwd_dst(a->s, a->client, cva);
+                    if (nvkvm_m2_gpga_obj_ex(a->s, a->client, cva, a->gpa0 + off, clen, go) >= 0) {
                         nvkvm_m2_va_mark(a->s, a->client, cva);
                         a->backed++;  /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
                     } else {
@@ -6555,6 +6776,7 @@ static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("m2fwd", NvkvmGpuEmul, m2fwd, true), /* M5: host-GPU forwarding (always on) */
     DEFINE_PROP_BOOL("m2exec", NvkvmGpuEmul, m2exec, true), /* M5.7: execution-plane backing (always on) */
     DEFINE_PROP_BOOL("m2hostsem", NvkvmGpuEmul, m2hostsem, false), /* M5.35: host owns completion sema */
+    DEFINE_PROP_BOOL("m2cefwd", NvkvmGpuEmul, m2cefwd, false), /* CE-fwd: Step-0 route probe + Phase-A (M5.60) real-back the user-CE copy dst in the GR fvas (completion/CPU-copy unchanged) */
     DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
     DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),

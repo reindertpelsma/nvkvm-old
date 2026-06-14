@@ -130,3 +130,313 @@ backing is wired.
   patch); boot via `OGKM=research_clones/open-580-guest`. Placement printks in
   `open-580/src/nvidia/src/kernel/{gpu/mem_mgr/mem_mgr_gsp_client.c (NVKVM-FBREG), mem_mgr/video_mem.c (NVKVM-PLACE)}`.
 - QEMU probes: `CE-INSTR` (~:2534), tagged `M5: CE COPY` (:3762), `BAR1-TRAP-INSTR` (`nvkvm_baraperture_write`, :2876).
+
+---
+
+## Consolidation ledger (2026-06-14) — STOP, read before writing more reactive code
+
+Written after a long back-and-forth (a dozen hypotheses) so the next person — possibly the
+maintainer debugging this by hand — starts from settled ground, not a re-guess. **The headline:
+the "reactive re-walk" hardening one would naively add ALREADY EXISTS at maximal coverage. Adding
+more reactive special-cases is the slop trap. The real open question is an *observation*, not a
+patch.**
+
+### A. ESTABLISHED (high confidence, with evidence)
+
+1. **Placement is correct.** The 64 MB user `cuMemAlloc` lands FBMEM-via-PMA in the guest RM,
+   identical to bare metal (open-580-from-source printks: `pmaInit=1 bIsPmaAlloc=1`,
+   `numFBRegions=5`, ~11.7 GiB). Not a placement bug.
+2. **libcuda picks CE/DMA, like host.** `dp` is `PROT_NONE` — no guest-userspace `memcpy`. Same
+   copy path as the host oracle (cup6 maps×pagemap).
+3. **The data plane is fake-backed where it slips.** Host `nvidia-smi` during the copy: util 0%,
+   `memory.used` flat (~19 MiB peak, never +64 MB). The guest's "vidmem" bytes the host GPU can't
+   see land in emulated FB / `g_malloc0` `fb_page` / the guest-RAM memslot.
+4. **The bulk 64 MB does NOT flow through the emulated CE.** Max CE COPY = 4 KB, CE total ~1.36 MB
+   (the CE carries only the MEMSET buffer-zeroing ~79 MB + tiny copies). The 64 MB DATA moves via
+   the **CPU-write / GPA-window path**, not a `LAUNCH_DMA`. ⇒ "forward the CE to the host" would
+   speed MEMSET, not the weight HtoD.
+5. **`gpga_obj` is the real-backing primitive and it works.** `nvkvm_m2_gpga_obj()` allocs a real
+   host vidmem object, copies pre-existing `fb_page` bytes in, FIXED-maps it into the host GR VAS
+   at the guest VA, and registers the gpga→obj range so `nvkvm_fb_host_overlay()` resolves all
+   CPU/BAR1/PRAMIN access to it. cup4 NxN fp32 matmul is byte-exact **because** its buffers happen
+   to be caught by the walk and `gpga_obj`-backed.
+
+### B. The reactive machinery THAT ALREADY EXISTS (do not re-implement)
+
+- **Per-doorbell compute-VAS re-walk** — `nvkvm_m2_exec_doorbell()` (`:5851`), M5.10 + M5.48c:
+  re-runs `enum_gr_sysmem(grc)` on **every doorbell with new work** (GP_PUT advanced), idempotent
+  via `va_seen`, capped 1000 sweeps. This is "back newly-mapped user buffers before the host GPU
+  touches them" — already maximal for the GR client.
+- **Walk-driven vidmem backing** — `nvkvm_m2_leaf_flush()` vidmem branch (`:5622`), per-2-MiB-chunk
+  dedup, calls `gpga_obj` for each new vidmem leaf.
+- **Copy-time dst backing (Phase A / M5.60, gated `m2cefwd`)** — at `LAUNCH_DMA` (`:3873`): PHYS-FB
+  dst → `gpga_obj` directly (covers MMU-bypassing physical copies that have no PTE); VIRT dst →
+  re-walk. Regression-clean, OFF by default.
+
+### C. Hypotheses TRIED and KILLED (the back-and-forth, so we don't relitigate)
+
+| # | Hypothesis | Verdict | Why killed |
+|---|---|---|---|
+| 1 | Enlarge BAR1 / **resizable BAR** so the CPU can map big vidmem through | **NO-OP for THIS gate; REAL for prod (deferred, NOT dead)** | No-op *now*: emulated BAR1 is 256 MB *MMIO* and today the guest CPU never reaches user vidmem through it (vidmem mmaps are 8 GiB+ guest-RAM/GPA-window VAs, `dp` PROT_NONE; `mode2_dataplane_architecture.md:242-260`). BUT for **prod** the 256 MB hardcode (`bar1_size`) is a genuine ceiling — once >256 MB of gpga objects are CPU-mapped through BAR1 it must grow / become resizable. Keep as a prod-scale task. |
+| 2 | **Eager-snoop the `cuMemAlloc`** at alloc time → back full range | **NOT FEASIBLE as imagined** | User vidmem is NVOS32/VidHeapControl, allocated guest-RM-locally via PMA with **no GSP-RPC** → no QEMU-visible alloc event, no observable guest-FB-phys until map (PT walk) or copy (LAUNCH_DMA dst). That's *why* backing is reactive. |
+| 3 | UC / non-WB userspace mapping forces a slow CPU `memcpy` | **DEAD** | `dp` has no CPU mapping at all (PROT_NONE); cacheability is irrelevant to this copy. |
+| 4 | libcuda chose CPU instead of CE (a heuristic gap) | **DEAD** | It chose CE, same as host. |
+| 5 | The kernel `memmgrGetMemTransferType` picks memcpy on *coherency* | **DEAD** | It branches on **aperture** (SYSMEM↔SYSMEM → CPU; else CE), not coherency (ogkm `mem_utils.c:73-81`). And the bulk isn't the kernel path anyway. |
+| 6 | Simulation/emulation strap makes RM take a slow path | **DEAD** | `SIM=0 EMU=0 FMODEL=0 RTLSIM=0` (NVKVM-EAS printk). |
+| 7 | FBMEM aperture mis-reported as SYSMEM to libcuda | **DEAD** | FBMEM resolves to VIDMEM correctly (`kbusGetEffectiveAddressSpace`). |
+| 8 | "Forward the CE to the host GPU" is the fix | **MOSTLY MOOT** | The 64 MB isn't a CE copy (fact A4). CE-forward only helps MEMSET. |
+| 9 | Add a per-doorbell re-walk to catch late buffers | **ALREADY DONE** | M5.48c (section B). Re-adding = slop. |
+
+### D. The ONE remaining unknown — it is an OBSERVATION, not a patch
+
+The m563/Phase-A boot showed the bulk dst is **mostly already real-backed** (`verdict=gpga`
+≈ 75 MB) yet host `memory.used` stays ~19 MB. Two mutually-exclusive readings, and **we have not
+disambiguated them**:
+
+- **(D1) backed-but-churned** — the dst IS real host vidmem, but `gpga_obj` allocates *small*
+  objects that get *reused/overwritten* (staging/scratch), so residency never accretes to 64 MB.
+  If so, **correctness may already hold** (every byte the host GPU reads is real at read time) and
+  the flat `memory.used` is an accounting artifact, not garbage. → then there is no correctness
+  bug here, only the perf one (deferred).
+- **(D2) truly-unbacked tail** — some fraction (the ~8.6 MB `verdict=fbpage` + 785 virtual copies,
+  or a physical-addressed buffer in a non-`grc` VAS the sweep never visits) is fake, and a real
+  compute READ of it returns garbage. → then *that specific slice* is the correctness gap, and the
+  fix is to make exactly that slice resolve to `gpga`.
+
+**The decisive experiment (one boot, no new code):** run a *compute* workload that READS a large
+user buffer the guest wrote (not matmul, whose buffers are walk-caught) and byte-verify the GPU's
+output. Byte-exact ⇒ (D1), correctness already holds, move to perf. Wrong bytes ⇒ (D2); then dump
+the verdict tally for *that* buffer's leaves to see which classify `fbpage`/untranslated and back
+*only* those. Either way the next move is **measure, then target** — not another blanket sweep.
+
+**The stronger invariant (do not lose sight of it even if D1).** Per `mode2_memory_model.md`, guest
+*userspace* should see **~no fake pages at all** — anything guest userspace can obtain as a page is
+also obtainable by QEMU/isolate via host ioctls/mmap, so it must be real passthrough. A workload
+passing (D1) only proves *that* workload's reads happened to hit real-backed bytes; it does NOT
+prove the invariant holds. So the experiment should ALSO audit: after the run, does **any** leaf in
+a user (non-kernel) VAS still classify `fbpage` (fake)? Any such leaf is a latent correctness/
+security bug — a different workload could read it as garbage. D2 is just the case where the tested
+workload already trips it. The end-state is "zero user-visible fake pages," not "this test passes."
+
+### E. Why no code was written this round
+
+The authorized "reactive hardening" already exists (B). Until (D1) vs (D2) is resolved by the
+experiment in (D), any new backing code is a guess layered on a working milestone — the slop risk
+the maintainer flagged. Working milestone (`90271e8`, default path, cup4 byte-exact) is **untouched**;
+the only diff is the gated `m2cefwd` Phase-A (+102 lines, OFF by default).
+
+---
+
+## VERDICT (2026-06-14, m564/cup7): D2 — ROOT CAUSE = HOST GPU BAR1 (256 MiB) EXHAUSTION
+
+The decisive experiment ran. `tests/mode2/cup7.c` (host GR kernel `out[i]=in[i]+1` over a 64 MiB
+user `cuMemAlloc`, byte-verified) on the **default path** (working milestone, no `m2cefwd`):
+
+- cup7 **hung** (rc=124) — not garbage-read, worse: a hard host fault mid-copy.
+- **`nvkvm_m2_gpga_obj` failed 232×** after **148 successful objects**; cap NOT hit (148 ≪ 1024).
+- Inner failure (M5.3 log): **`RM_MAP_MEMORY ... st=0x51`** (insufficient resources) — the *CPU
+  mapping* step, not the vidmem `RM_ALLOC`.
+- Sum of successfully CPU-mapped host vidmem at the failure point = **248.2 MiB**.
+- Host GPU **BAR1 = 256 MiB** (`nvidia-smi`: Total 256 / Used 1 / Free 255 at idle), **not
+  runtime-resizable** (no `/sys/.../resource1_resize` → BIOS never exposed ReBAR).
+- Host **Xid 31 — CE2 MMU FAULT_PDE ACCESS_TYPE_VIRT_WRITE @ `0x77c7_1d800000`** = *exactly* the
+  first leaf `gpga_obj` failed to back (`cva=0x77c71d800000`). The host CE faulted on the unbacked
+  leaf → channel wedge → cup7 hang.
+
+**Mechanism:** `nvkvm_m2_host_alloc_map_vidmem()` (`:4765`) CPU-maps **every** backing object via
+`RM_MAP_MEMORY` + `mmap`, which consumes the **host GPU's 256 MiB BAR1**. We are profligate — all
+148 backings (GR-ctx, sysmem mirrors, pushbuffers, vidmem leaves) burn BAR1 — so a large user
+buffer's tail pushes cumulative mapped vidmem past 256 MiB and the maps fail. The backing logic is
+otherwise CORRECT (the first 248 MiB mapped fine, `gpu_mapped=1 st=0x0`); the only wall is the
+host BAR1 budget. `st=0x51` = the host RM refusing a BAR1 mapping it has no aperture for.
+
+### Fix options (this CONVERGES the "perf" path with the correctness gate)
+
+1. **Host resizable BAR (your instinct — vindicated, but HW-blocked here).** Full 12 GiB host BAR1
+   would let all objects CPU-map. NOT available on this vast.ai box (no BIOS ReBAR / no runtime
+   resize). Could try a vast.ai instance with ReBAR enabled. This is the clean PROD answer (task #5).
+2. **Shrink the host-BAR1 footprint — stop CPU-mapping objects the GUEST CPU never touches.** Many
+   of the 148 are GPU-only (golden GR-ctx, pushbuffers the host fetches via its own VAS) and don't
+   need a `qva`/`m2_fbback` CPU view at all — back them with `map_dma` into the GR VAS WITHOUT the
+   `RM_MAP_MEMORY`+`mmap`. Frees BAR1 for the buffers that genuinely need a guest-CPU view. Buildable,
+   milestone-safe (gated), buys headroom up to ~256 MiB total — fixes moderate buffers, NOT multi-GB.
+3. **Forward the CE to the host GPU (the "deferred perf" path — turns out to be load-bearing for
+   correctness).** If the bulk HtoD runs as a real host CE copy, the source is SYSMEM staging
+   (host-DMA-able via the guest-RAM memfd, **no BAR1**) and the vidmem dst needs only a GPU-side
+   `map_dma` — **never CPU-mapped, so zero host BAR1**. This is the ONLY option that scales to GB
+   LLM weights on a 256 MiB-BAR1 host. ⇒ un-defer #2 (CE-forward); it is not merely perf.
+
+**Why this is not slop:** the backing code is correct; the bug is a *resource budget* (host BAR1),
+proven by byte-count (248/256 MiB) + error code (st=0x51) + fault address match. The fix is to stop
+spending BAR1 we don't need (opt 2) and/or move bulk data off BAR1 entirely (opt 3), not to bolt on
+another reactive sweep.
+
+### Confirmation (m564b, cup7 @ 8 MiB): D1-within-budget — backing logic is CORRECT
+
+Re-ran cup7 at **8 MiB** (under the 256 MiB BAR1 budget). Result: **PASS=D1**, `bad=0`, **gpga_obj
+FAILED = 0**, host BAR1 peak 138 MiB. The host GR engine read the user buffer byte-exact. This
+isolates the variable cleanly: same code, same path — small buffer passes, large buffer fails only
+because cumulative CPU-mapped vidmem crosses 256 MiB. ⇒ the backing is correct; the bug is purely
+the host-BAR1 budget. (Boot/ctx vidmem overhead ≈ 80 objs ≈ 130 MiB, so today only ~126 MiB of BAR1
+is left for user buffers — footprint-shrink (#6) widens that; multi-GB still needs CE-forward (#3).)
+(Harness note: m564 greps host `dmesg` which is NOT cleared across QEMU restarts → a stale Xid from a
+prior boot can appear; trust the per-run `gpga FAILED` count + VERDICT, not raw dmesg Xid.)
+
+---
+
+## CE-FORWARD BUILD PLAN (2026-06-14) — the off-BAR1 fix, phased + gated
+
+Chosen fix (user, 2026-06-14): forward the bulk user-CE `LAUNCH_DMA` to the **host** GPU so the
+vidmem dst is **never CPU-mapped** (zero host BAR1) and the src rides the guest-RAM memfd (zero
+BAR1). This is the only path that scales past the host's 256 MiB BAR1 wall (proven D2 root cause).
+
+### What ALREADY exists (reuse, do not rebuild)
+
+- **Host channel forwarding infra** — `shadow_fwd` (`:4252`) creates host channels mirroring the
+  guest's; `exec_doorbell` (`:2580+`) rings each channel's own `host_token` (M5.22), schedules its
+  TSG (M5.25 `GPFIFO_SCHEDULE`), aligns the host GP_GET cursor. The user-CE channel (0xc56f) is
+  already shadow-forwarded and its doorbell already rings — today a **no-op** because its work
+  (pushbuffer + src/dst mappings) isn't bridged, so the emulated 4-byte loop does the copy instead.
+- **GR pushbuffer bridge** — `exec_doorbell` M5.9 (`:5931+`) maps each GR GPFIFO entry's pushbuffer
+  into the host VAS (`back_and_map`) so the host GR fetches real work. **CE needs the same.**
+- **Sysmem src mapping (no BAR1)** — `back_and_map_sys` (`:5448`) OS_DESCRIPTORs guest sysmem into a
+  host VAS. The HtoD src (guest staging) is guest-RAM, host-DMA-able via the shared memfd.
+- **Real vidmem dst object** — `gpga_obj` (`:5485`) / `host_alloc_map_vidmem` (`:4765`). **The one
+  change:** a GPU-only variant that SKIPS `RM_MAP_MEMORY`+`mmap` (the BAR1 consumer) — the CE dst is
+  PROT_NONE to the guest CPU, so it needs only a GPU-side `map_dma` into the CE channel's VAS.
+- **Completion sema** — already host-gated for user-CE clients (`nvkvm_chan_sem_wr32`, M5.49b).
+
+### The exact gaps (this is the whole build)
+
+1. **Off-BAR1 dst backing.** New `host_alloc_map_vidmem` flag `gpu_only` → skip the CPU map; in
+   `gpga_obj`, when backing a CE-forward dst, use it (no `cpu_qva`, no `m2_fbback`, no host BAR1).
+   The dst still gets a real host vidmem object + `map_dma` FIXED into the CE channel's host VAS.
+2. **Bridge the CE pushbuffer + GPFIFO** to the host CE channel (mirror M5.9 for the 0xc56f CE chan):
+   map each pushbuffer the guest's CE GPFIFO entry points at into the host VAS so the host CE fetches
+   the real `LAUNCH_DMA`.
+3. **Map src + dst into the CE channel's host VAS** at the guest VAs (src via `back_and_map_sys`,
+   dst via the gpu_only vidmem map_dma) so the host CE's MMU resolves both operands.
+4. **Stop emulating** the 4-byte loop for the forwarded user-CE channel (gate the `:3953` COPY loop
+   off when the channel is host-forwarded) — let the host doorbell ring (already wired) do the copy.
+
+### Guardrails to PRESERVE (breaking these = regression)
+
+- M5.39: never ring/forward the guest-KERNEL CE scrubber (client `0xc1d00001`). CE-forward applies
+  ONLY to user-CE clients (`nvkvm_m2_is_user_ce`).
+- The MEMSET/SCRUB paths (`mscrub`/`remap`) stay emulated (they zero fake-FB / wipe USERD; not user data).
+- Default path (no `m2cefwd`) must stay byte-identical — everything gated.
+
+### Phased rollout (each phase = one bench boot, observable signal)
+
+- **P1** off-BAR1 dst object: log `gpu_only vidmem obj st=0` + confirm `gpga_obj` no longer fails at
+  148 (BAR1 usage flat). Metric: cup7@64MiB gets ALL leaves backed (gpga FAILED=0), even if the copy
+  is still emulated.
+- **P2** bridge CE pushbuffer + map src/dst into the CE VAS: log host CE GP_GET advancing + no Xid.
+- **P3** disable emulated loop for the forwarded chan; verify the host CE actually moved bytes:
+  **host `memory.used` rises ~64 MiB, util>0**, cup7@64MiB byte-exact (hang→PASS).
+- **P4** scale: cup7 at 256 MiB+ (past BAR1) byte-exact; then llama (`m557`).
+
+Success = cup7@64MiB flips hang→PASS=D1 WITH host mem.used+util reflecting a real host-GPU copy
+(un-forgeable). Gate: extend `m2cefwd` (OFF by default); working milestone 90271e8 stays the default.
+
+### P1 ORDERING FINDING (2026-06-15) — the window arrives too late for single-shot copies
+
+Implementing P1 surfaced a real ordering constraint that the build plan above missed. The intended
+design — observe the user-CE dst at `LAUNCH_DMA` (M5.60 in `nvkvm_chan_execute`), register a dst VA
+window, then have the re-walk back those leaves GPU-only — **cannot reduce host BAR1 for a single
+copy**, because the doorbell handler runs the backing walk BEFORE it decodes the copy:
+
+- `nvkvm_chan_io_write` doorbell path: `nvkvm_m2_exec_doorbell(s)` (`:2491`, contains the M5.10 /
+  M5.48c GR-VAS re-sweep that backs every newly-mapped leaf via the **CPU-mapped** `gpga_obj` and
+  marks it `va_seen`) runs FIRST; only THEN does the `nvkvm_chan_execute(s)` loop (`:2641`) decode
+  the channel's `LAUNCH_DMA` and reach M5.60 where the window would be registered.
+- So by the time the window exists, the dst leaves are already CPU-mapped + `va_seen` (idempotent
+  dedup → the M5.60 re-walk won't redo them GPU-only). Corroborated by m564: gpga_obj count went
+  89 (8 MiB cup7) → 148 (64 MiB cup7), i.e. the **doorbell walk itself** backed the ~59 user-buffer
+  leaves CPU-mapped, before any copy decode.
+
+The window code IS built, compiles, gated behind `m2cefwd`, and is reusable — it just needs the dst
+VA known BEFORE the walk. Two clean redesigns (a decision, recorded for the next session):
+
+- **(A) Pre-walk window** — in `exec_doorbell`, BEFORE the M5.10 sweep, peek the pending user-CE
+  channel's GPFIFO/pushbuffer for `LAUNCH_DMA` OUT addresses, register the window, then walk →
+  those leaves back GPU-only. Localized to `exec_doorbell`; pulls a slice of P2 (pushbuffer decode)
+  forward. Smallest change; reuses all P1 code.
+- **(B) Lazy GPU-only-by-default + promote-on-CPU-touch** — back EVERY vidmem leaf GPU-only (zero
+  BAR1) at walk time; promote a leaf to a CPU map only when the guest CPU actually touches its GPGA
+  through the overlay (the trap point). No window/heuristic; correct by construction; this IS
+  rewrite Pillar 3 ("trap only what has a side-effect; back the rest lazily"). Bigger: adds a
+  promotion path to the overlay hot path (alloc CPU map + copy + redirect on first guest write).
+  Pushbuffers/USERD/GPFIFO (guest-written, host-fetched) are exactly the leaves that get promoted.
+- Note: the as-built window ALREADY helps a MULTI-copy workload (LLM streaming many weight tiles):
+  copy #1's window guides copies #2..N. It only fails the single-shot cup7 microbench. So (A) is
+  the targeted fix for the benchmark; (B) is the architecturally-right model.
+
+### P1 EMPIRICAL CONFIRMATION (m565, 2026-06-15) — ordering defeats the window; M5.60 doesn't fire
+
+Ran cup7@64 MiB with `NVKVM_M2CEFWD=1` and the new window/gpu_only code (compiles, gated). Result:
+- **windows registered: 0, gpu_only objs: 0, M5.60 events: 0** — the window code never ran.
+- **gpga_obj count: 149, gpga FAILED count: 232** (all `client=0xc1d00003`, st=0x51), **Xid 31 CE2
+  FAULT_PDE @0x71ae9b800000** = first un-backed leaf, **cup7 rc=124 (HANG)** — identical D2 wall to
+  m564. (Harness `RC=$?` captured ssh's rc=0, not cup7's; inline `exit rc=124` is authoritative.)
+- Sharper finding: the EXISTING Phase-A hook M5.60 fired **0×** despite `chan_execute` decoding 727
+  LAUNCH_DMA COPYs. Dominant CE client = `0xc1d00001` (kernel scrubber, correctly M5.39-excluded);
+  the user buffer is `0xc1d00003`. M5.60's gating (`m2_gr_client` set + `is_user_ce` + un-backed)
+  does NOT catch cup7's HtoD — most likely the HtoD runs before any GR kernel sets `m2_gr_client`.
+  The forwarded host CE still ran and faulted on the un-backed dst (the CE2 Xid) → wedge.
+
+Bearing on the A/B fork: **(A) pre-walk window inherits M5.60's gating fragility** (it must identify
+the dst at doorbell time — exactly what fired 0× here) so (A) = fix the gating + move it pre-walk.
+**(B) lazy gpu_only-by-default + promote-on-touch is robust to mis-identification** (backs every
+vidmem leaf off-BAR1 unconditionally; the host CE never faults because every dst is real-backed) and
+is rewrite Pillar 3. Tradeoff: (B)'s failure mode is SILENT (a missed CPU-touch promotion → stale
+bytes), (A)/today's is LOUD (fault→hang). Decision pending (user chose "confirm empirically" → done).
+
+### CHOSEN DESIGN (2026-06-15, user): MAP-ON-TOUCH promotion (B's model over the existing trap path)
+
+Supersedes the window/pre-walk P1 above. User direction: "not pure A, a bit of B … map-on-touch is
+the most correct setup as in that case ORDER no longer matters." Correct — every failure this
+session was an ordering race; map-on-touch dissolves it. The design:
+
+- **Default = GPU-only.** The doorbell walk backs compute-client user-vidmem leaves `gpu_only` (real
+  host vidmem object + `map_dma` into the host VAS, NO `RM_MAP_MEMORY`/mmap → zero host BAR1), in
+  ANY order. The `fbback`/control-channel paths stay as-is (protect the milestone).
+- **Promote on CPU touch.** The guest's CPU access to vidmem already TRAPS to QEMU (GPA-window path,
+  `nvkvm_fb_read/write`, PROT_NONE mmaps — the ~100 MB/s path). On the first trap to a `gpu_only`
+  object: `RM_MAP_MEMORY` the SAME host object (coherent — identical bytes), **replay any pre-
+  promotion `fb_pages` writes into it** (the existing M5.44 copy-preserve loop, which `gpu_only`
+  currently skips), store `cpu_qva`, redirect. BAR1 is consumed ONLY for pages the CPU actually
+  touches. The dst buffer (CE-written, CPU-never-touched) stays `gpu_only` forever → off BAR1 → past
+  the 256 MiB wall.
+- **Why ordering no longer matters:** produce-then-consume holds — the guest WRITES a control page
+  (traps → promotes → copies) BEFORE it rings the doorbell, so the host fetch sees real bytes; the
+  bulk dst is written by the host CE (GPU side) and read back via CE DtoH, so the CPU never touches
+  it and it never promotes. No window, no `m2_gr_client` gating (which fired 0× in m565), no race.
+- **Refinements over the raw brainstorm:** (1) a READ trap must serve the object's REAL bytes, not a
+  zero page (zero-RO is only a *usage tripwire* for the perf path, not the correctness path); (2) we
+  do NOT need page-protection (PROT_NONE/RO-then-write-trap) in C — we already trap every FB access;
+  the userfaultfd/mprotect tripwire + 16 MiB batching is the REWRITE's fast-path job; (3) "silent
+  stale read" (B's classic risk) is MITIGATED in C precisely because all FB access traps → no missed
+  touch; that risk only re-emerges in the rewrite's fast-memslot world, where the tripwire is the fix.
+
+**Rewrite role:** implement this SAME model fast+safe — real RW memslots over the GPA window, touch
+detection via userfaultfd/mprotect (zero-RO tripwire, RO-on-read, promote-on-write, batched), promotion
+as a typed state machine instead of a hook in `nvkvm_fb_write`. The C version is the executable spec +
+correctness oracle (cup7 = its conformance test); building it now is NOT build-twice slop (we reuse the
+existing trap, not the memslot/uffd subsystem) — it's the minimal thing that clears the apps-pass gate.
+
+**Build steps (gated `m2cefwd`):** (1) walk → `gpu_only` default for compute-client user vidmem;
+(2) promotion hook in the FB trap path (alloc CPU map of same hMem + replay fb_pages + redirect);
+(3) cup7@64 MiB metric: `gpga FAILED=0`, BAR1 reflects only CPU-touched pages, no Xid, no hang, and
+(once the host CE actually moves the bytes) byte-exact. The `gpu_only` primitive + `gpga_obj_ex` are
+already built/compiling/gated; the window/`m2_cefwd_dst` plumbing is now superseded (keep or strip).
+
+### Guest (emulated) BAR1 → 16 GiB — DONE + verified (m564c, 2026-06-14)
+
+Separate from the host-BAR1/CE-forward work: the EMULATED device BAR1 was a 256 MiB stub, capping
+how much vidmem the guest CPU can aperture-map (a prod-correctness ceiling). Bumped `bar1_size` to
+**16 GiB** (covers the ~11.7 GiB fake FB). Only the chip def + `memory_region_init` reference it;
+the GMMU-walked aperture (`bar1_pdb`) is size-agnostic, so only the addressable RANGE grew. Verified
+non-regressing: guest enumerated `00:07.0 BAR1 [0x380000000000-0x3803ffffffff 64bit pref]` = 16 GiB
+in the q35 above-4G window, booted clean, **cup7 @ 8 MiB → PASS=D1 byte-exact, gpga FAILED=0**. NOTE:
+this is the GUEST aperture; the host GPU's 256 MiB BAR1 (the D2 wall) is physical + not resizable here.
