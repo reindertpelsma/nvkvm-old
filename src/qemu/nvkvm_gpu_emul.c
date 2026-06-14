@@ -556,6 +556,57 @@ static MemTxResult nvkvm_dmaw(PCIDevice *dev, dma_addr_t gpa, const void *buf, d
     return pci_dma_write(dev, gpa, buf, len);
 }
 
+/* NVKVM-DPLANE (cup6 diag): quantify where the bulk cuMemcpyHtoD 64MB actually
+ * lands. (i) CE LAUNCH_DMA dest resolution: real m2_fbback / m2_gpga backing vs a
+ * fake g_malloc0 fb_page fallback. (ii) which path moves the bytes: the emulated CE
+ * byte-copy loop, or kernel/CPU (BAR1) writes into fb_pages. Pure logging; no
+ * behavior change. Dumped via nvkvm_dplane_summary() after any CE copy >= 1MB. */
+static uint64_t nvkvm_dp_ce_launchdma_calls;
+static uint64_t nvkvm_dp_ce_bytes_total;      /* sum of `bytes` over LAUNCH_DMA */
+static uint64_t nvkvm_dp_ce_dst_fbback_hits;
+static uint64_t nvkvm_dp_ce_dst_gpga_hits;
+static uint64_t nvkvm_dp_ce_dst_fbpage_fallback;
+static uint64_t nvkvm_dp_fbpage_write_bytes;      /* bytes into a g_malloc0 fb_page */
+static uint64_t nvkvm_dp_overlay_real_write_bytes;/* bytes into real fbback/gpga backing */
+
+/* Classify an FB address the SAME way nvkvm_fb_host_overlay does, WITHOUT touching
+ * the copy: 1=fbback, 2=gpga(real obj), 0=fb_page fallback (incl. gpga-known-no-obj). */
+static int nvkvm_dp_classify_fb(NvkvmGpuEmul *s, uint64_t fb_addr)
+{
+    for (int i = 0; i < s->m2_fbback_n; i++) {
+        if (fb_addr >= s->m2_fbback[i].fb_base &&
+            fb_addr <  s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < s->m2_gpga_n; i++) {
+        if (fb_addr >= s->m2_gpga[i].gpga_base &&
+            fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
+            int oi = s->m2_gpga[i].obj_idx;
+            if (oi < 0 || oi >= s->m2_objs_n || !s->m2_objs[oi].cpu_qva) {
+                break;                 /* gpga known but no CPU backing -> fb_pages */
+            }
+            return 2;
+        }
+    }
+    return 0;
+}
+
+static void nvkvm_dplane_summary(NvkvmGpuEmul *s, const char *why)
+{
+    qemu_log("nvkvm-gpu[%s] NVKVM-DPLANE SUMMARY (%s): ce_launchdma_calls=%llu "
+             "ce_bytes_total=%llu dst_fbback_hits=%llu dst_gpga_hits=%llu "
+             "dst_fbpage_fallback=%llu | fbpage_write_bytes=%llu "
+             "overlay_real_write_bytes=%llu\n", s->chip->name, why,
+             (unsigned long long)nvkvm_dp_ce_launchdma_calls,
+             (unsigned long long)nvkvm_dp_ce_bytes_total,
+             (unsigned long long)nvkvm_dp_ce_dst_fbback_hits,
+             (unsigned long long)nvkvm_dp_ce_dst_gpga_hits,
+             (unsigned long long)nvkvm_dp_ce_dst_fbpage_fallback,
+             (unsigned long long)nvkvm_dp_fbpage_write_bytes,
+             (unsigned long long)nvkvm_dp_overlay_real_write_bytes);
+}
+
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
     /* M5.44: m2_fbback is consulted FIRST. An fbback entry is a channel-bound AUTHORITATIVE
@@ -694,6 +745,7 @@ static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
     }
     uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: written through to real host GPU memory */
+        nvkvm_dp_overlay_real_write_bytes += size;   /* NVKVM-DPLANE (ii): real backing */
         switch (size) {
         case 1: *hp = (uint8_t)val; break;
         case 2: stw_le_p(hp, (uint16_t)val); break;
@@ -703,6 +755,7 @@ static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
         }
         return;
     }
+    nvkvm_dp_fbpage_write_bytes += size;             /* NVKVM-DPLANE (ii): fake fb_page */
     uint8_t *p = nvkvm_fb_page(s, fb_addr, true);
     uint32_t o = fb_addr & 0xfffu;
     switch (size) {
@@ -3813,6 +3866,40 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                         }
                     }
                     #undef NVKVM_CE_RESOLVE
+                    /* NVKVM-DPLANE (cup6): per-call attribution of the bulk copy DEST.
+                     * Resolve off_out's backing the SAME way the overlay resolver does
+                     * (PHYSICAL FB dest -> off_out is the fb addr; for VIRTUAL we can't
+                     * cheaply classify here, so tag "virt"). Answers (i): does the 64MB
+                     * DEST hit real host vidmem (fbback/gpga) or a fake fb_page? */
+                    {
+                        nvkvm_dp_ce_launchdma_calls++;
+                        nvkvm_dp_ce_bytes_total += bytes;
+                        const char *verdict;
+                        bool dst_fb_phys = dst_phys && (dst_pm == 0); /* PHYS + FB aperture */
+                        if (dst_fb_phys) {
+                            int c = nvkvm_dp_classify_fb(s, off_out);
+                            if (c == 1)      { nvkvm_dp_ce_dst_fbback_hits++;     verdict = "fbback"; }
+                            else if (c == 2) { nvkvm_dp_ce_dst_gpga_hits++;       verdict = "gpga";   }
+                            else             { nvkvm_dp_ce_dst_fbpage_fallback++; verdict = "fbpage"; }
+                        } else {
+                            verdict = dst_phys ? "phys-sys" : "virt";
+                        }
+                        /* Rate-limit: log every call but cap total volume. */
+                        static uint32_t dp_logged;
+                        if (dp_logged++ < 4000) {
+                            qemu_log("nvkvm-gpu[%s] NVKVM-DPLANE CE-LAUNCHDMA client=0x%08x "
+                                     "off_out=0x%llx off_in=0x%llx bytes=%llu dst_phys=%d "
+                                     "dst_pm=%u verdict=%s\n", s->chip->name, s->chan_client,
+                                     (unsigned long long)off_out, (unsigned long long)off_in,
+                                     (unsigned long long)bytes, dst_phys ? 1 : 0,
+                                     dst_pm, verdict);
+                        }
+                        /* Emit running totals right after any big copy so cup6's 64MB
+                         * shows up. Answers (ii): which counter scales with the size. */
+                        if (bytes >= (1u << 20)) {
+                            nvkvm_dplane_summary(s, "ce>=1MB");
+                        }
+                    }
                     qemu_log("nvkvm-gpu[%s] M5: CE %s in=0x%llx(%s) out=0x%llx(%s) "
                              "bytes=%llu const=0x%x [client=0x%08x gpfifo=0x%llx]\n",
                              s->chip->name,

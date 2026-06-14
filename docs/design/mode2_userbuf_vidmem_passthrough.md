@@ -1,105 +1,132 @@
-# Mode-2 user-buffer data plane: real host-vidmem passthrough (the cup5/LLM hang fix)
+# Mode-2 user-buffer data plane: real host-vidmem passthrough + CE forward (the cup5/LLM hang fix)
 
-Status: **diagnosis complete, implementation pending** (2026-06-14). Branch `consolidation`.
+Status: **diagnosis complete & corrected, implementation pending** (2026-06-14, m562). Branch `consolidation`.
 
-This doc captures the root-cause analysis of the Mode-2 bulk-copy / LLM-model-load hang and the
-agreed fix direction (real host-vidmem passthrough for user allocations + CE forward). It is the
-reviewable companion to the live agent-memory notes under
-`/root/.claude/projects/-workspace-nvidia-gpu-passthrough/memory/mode2_execfwd_layer2.md`.
+Root-cause analysis of the Mode-2 bulk-copy / LLM-model-load slowness and the agreed fix (real
+host-vidmem backing for user allocations + copy-engine forward). Reviewable companion to the live
+agent-memory notes (`memory/mode2_execfwd_layer2.md` tail).
+
+> **2026-06-14 correction.** An earlier version of this doc blamed a *UC userspace mapping / guest
+> libcuda CPU `memcpy`* and asserted the user vidmem `RM_ALLOC` "is forwarded to a real host vidmem
+> object." A boot on the **open-580 RM core built from source** (patchable, with placement printks
+> compiled into `src/nvidia`) **falsified both claims** — see Diagnosis below. The fix direction
+> (real vidmem backing + CE forward) is unchanged and now better-justified.
 
 ## Symptom
 
-`cuMemcpyHtoD` of a `cuMemAlloc` buffer is glacial: **~50–90 MB/s**, host GPU util ~0%. cup2 (4 KB)
-passes instantly via emulation; the LLM moves ~469 MB of weights and hangs the model load. Repro:
-`tests/mode2/cup5.c` (driver-API bulk HtoD/DtoH + byte-verify + timing), harness
-`scripts/mode2_diag/m558_bulk_dataplane_host.sh`.
+`cuMemcpyHtoD` of a `cuMemAlloc` buffer is glacial: **~95–107 MB/s**, host GPU util **0%** (host
+oracle on the same RTX 3060 does the identical 64 MB copy at **~7 GB/s** via CE). cup2 (4 KB) passes
+instantly; the LLM moves ~469 MB of weights and the model load crawls/hangs. Repro: `tests/mode2/cup5.c`
+(bulk HtoD/DtoH + byte-verify + timing); discriminator `tests/mode2/cup6.c` (3-copy + self-introspection).
 
-## Diagnosis — three instrumented boots (cheap probes, no behaviour change)
+## Diagnosis — ground truth from the open-580-from-source boot (m562)
 
-The earlier theory ("the bulk CE copy is CPU-emulated; forward it to the host CE") was **wrong**.
-What the data actually shows:
+We built `open-gpu-kernel-modules@580.159.04` **from source** as the guest driver (no `nv-kernel.o_binary`
+blob → patchable RM), with two diagnostic printks compiled in, and measured the host side *during* the
+copy. Hard facts:
 
-1. **Not a page-identity / `put=0` bug** (CE-INSTR probe). 292 channel-advance events, **zero**
-   page-A≠page-B divergences: the guest's GP_PUT reaches the host USERD. Real symptom: host
-   `GP_GET` stuck at 0 (host never consumes), and the **64 MB does not flow through CE emulation
-   at all** (CE COPY total 1.4 MB; emulated ops don't scale with copy size).
+1. **Placement is correct and matches real hardware.** `vidmemConstruct_IMPL` printk: the 64 MB
+   `cuMemAlloc` is **FBMEM via PMA** — `pmaInit=1 bIsPmaAlloc=1`. `memmgrInitBaseFbRegions_FWCLIENT`
+   printk: our faked GSP advertises a sane FB region table (`numFBRegions=5`, `usable=0x2ecad0000`
+   ≈ 11.7 GiB). So the guest RM places the buffer in real vidmem exactly as on bare metal.
 
-2. **The guest CPU moves the bytes** (m559 CPU-attribution, 256 MB). cup5 in R(running) state;
-   host GPU util ≈ 4% (idle); emulated-op bytes flat (~3 MB) regardless of copy size → not QEMU
-   emulation, not the GPU. It's a **guest-side libcuda CPU `memcpy`** ("effectively HtoH").
+2. **libcuda picks the CE/DMA path, like host.** cup6's `/proc/self/maps`×pagemap introspection: the
+   device pointer `dp` is **PROT_NONE (`---p`), no CPU mapping at all**. There is therefore **no
+   guest-userspace `memcpy`** of the payload — libcuda issues a copy-engine `LAUNCH_DMA`, identical to
+   the host oracle. (This retires the earlier "UC userspace memcpy" model, which had mis-attributed an
+   unrelated PROT_NONE VA reservation at `0x10000000000`.)
 
-3. **The mapping is UC, on a RAM memslot — not MMIO-trapping** (BAR1-TRAP-INSTR + m560
-   double-copy). Zero BAR1 aperture writes for a whole 64 MB copy → no per-access vmexit (it's a
-   RAM memslot). Three back-to-back copies to the *same* buffer are all equally slow
-   (52.3 / 54.8 / 55.4 MB/s) → **not** first-touch fault/residency overhead; it's **persistent UC
-   write cost**. `pat_memtype_list` confirms `uncached-minus` mappings. (A WB RAM memcpy is GB/s;
-   ~53 MB/s userspace memcpy is the UC signature — too slow even for WC.)
+3. **The data plane is fake — that is the whole bug.** Host `nvidia-smi` sampled *throughout* the
+   copy: **util stayed 0% and `memory.used` never moved off baseline** (peaked 19 MiB, never the
+   64 MB the guest "allocated"). Therefore:
+   - the guest's PMA-FBMEM buffer is **fake-backed** (emulated FB / `g_malloc0` `fb_page` /
+     guest-RAM), **not a real host vidmem object** — falsifying the prior "is forwarded to real host
+     vidmem" claim; and
+   - the copy **does not run on the host GPU** — it is **CPU work**. The `NVKVM-DPLANE` probe (below)
+     confirmed the mover is **QEMU's emulated `LAUNCH_DMA` loop** at `nvkvm_gpu_emul.c:3755-3844`,
+     which resolves and copies **4 bytes at a time** (`ce_bytes_total` scales with the payload; every
+     byte funnels through `nvkvm_fb_write`) → the ~100 MB/s ceiling.
 
-### Why the mapping is UC (and why that's wrong here)
+> **NVKVM-DPLANE diagnostic boot (2026-06-14) — refines the above.** A gated probe (CE per-call dest
+> verdict + byte attribution) showed: (a) the **emulated CE loop is the data mover** — confirmed, not a
+> kernel memcpy; (b) the dest is **mostly real-backed already** — `overlay_real_write_bytes ≈ 75 MB`
+> (bulk 16/14/2 MB chunks `verdict=gpga`, real host vidmem) vs only `fbpage_write_bytes ≈ 8.6 MB` (small
+> scattered 64 KB chunks `verdict=fbpage`, fake) plus 785 virtual-addressed copies. Host `memory.used`
+> stays ~19 MB because those real regions are small and **overwritten** (staging/scratch reuse), not a
+> fresh 64 MB object. ⇒ the dominant fix is **(B) forward the CE to the host GPU**; backing (A) is
+> largely present and shrinks to closing the `fbpage` gaps + host-VAS-mapping the full user dest.
 
-The stock guest `nvidia.ko` chooses CPU caching in `nv_encode_caching` from the **RM memory
-descriptor's attributes** (type / aperture / caching flag), *not* from the guest's e820 RAM-vs-MMIO
-map. `cuMemAlloc` is device/vidmem memory; on real hardware its CPU view is the BAR1 aperture mapped
-UC-/WC (correct for a real PCIe BAR). In Mode-2 we expose fake-vidmem as a CPU-mappable region but
-back it with a **guest-RAM memslot** — so the driver maps it with vidmem/BAR caching (UC-), which is
-pathologically slow on plain RAM and **needless**: x86 PCIe DMA is cache-coherent (the GPU snoops
-caches), so WB RAM the GPU DMAs into is safe. UC here is a descriptor artifact, not a DMA
-requirement. (Real nvidia maps vidmem BAR **WC**, coalesced → fast; the doorbell page may be the
-only legitimately-UC page.)
+### What is NOT the problem (closed branches — do not re-investigate)
 
-## Root cause — the buffer is a *fake page*
+- **Placement / PMA / FB-region table** — correct (item 1). The faked-GSP `fbRegionInfoParams` is fine.
+- **Cacheability / UC vs WB / `nv_encode_caching`** — moot: `dp` has no CPU mapping, so its cache
+  attribute is irrelevant to the copy. The WB-everywhere principle ([[mode2_wb_cacheability_principle]])
+  still holds generally, but it is **not** the cup5 lever.
+- **libcuda's CE-vs-CPU heuristic** — correct: it chose CE, same as host.
 
-- Guest vidmem `RM_ALLOC` (NV01_MEMORY_LOCAL 0x003e/0x0040, NVOS32 VidHeapControl) **is forwarded**
-  to the host → a **real host vidmem object + handle already exist** in the Mode-2 isolate
-  (`m2_iso`). (`nvkvm_frontend.c:86-201`, `nvkvm_dispatch.c:283-312`.)
-- But when the guest **maps** it: `RM_MAP_MEMORY` is forwarded then the host VA is zeroed
-  (`nvkvm_dispatch.c:332` "guest must not use host VA"); the guest instead gets a GPA whose backing,
-  **for user allocations, is fake guest-RAM / emulated `fb_page`**, *not* the real host vidmem
-  object. So the host GPU holds a real buffer while the guest CPU writes to a **different**, fake
-  RAM page — UC-, ~50 MB/s, GPU-invisible.
-- The real double-mmap passthrough exists and is **proven**, but is wired only for **privileged**
-  buffers (USERD/GPFIFO/GR-context), reactively, gated by `m2exec`. User data allocations were left
-  fake as bring-up scaffolding (see `docs/design/mode2_memory_model.md:36-40` "bring-up vs parity",
-  `mode2_dataplane_architecture.md:244-265` which names this exact gap).
+## Root cause — the FBMEM the guest gets is a fake page, and the CE runs on the CPU
+
+The guest RM correctly allocates FBMEM and emits a CE copy, but in Mode-2 that FBMEM is backed by
+emulated/guest-RAM pages instead of a real host GPU vidmem object, and the CE descriptor is executed
+by QEMU on the CPU instead of being submitted to the host GPU. Real double-mmap passthrough **exists
+and is proven**, but is wired only for **privileged** buffers (USERD / GPFIFO / GR-context), reactively
+via `m2exec`. User data allocations were left fake as bring-up scaffolding (see
+`mode2_memory_model.md:36-40`, `mode2_dataplane_architecture.md:244-265`, which names this exact gap).
 
 This matches the architectural principle: **guest userspace should see almost no fake pages** —
 anything guest userspace can obtain as a page is also obtainable by the QEMU/isolate via host
-ioctls/mmap, so it should be direct passthrough (guest RAM, or real host-GPU MMIO mmap'd through).
+ioctls/mmap, so it should be direct passthrough (guest RAM, or real host-GPU memory mmap'd through).
 Fake pages belong to the guest *kernel* side (PDTs etc.). This user buffer is wrongly fake.
 
 ## Reusable machinery (already proven — extend to user allocations)
 
 | Function | File:line | Role |
 |---|---|---|
-| `nvkvm_m2_host_alloc_map_vidmem()` | `nvkvm_gpu_emul.c:4577` | alloc real host vidmem (class 0x0040) + host `RM_MAP_MEMORY` → `{qva,size}` (proven 651d860) |
-| `nvkvm_m2_back_and_map()` | `:5056` | double-mmap a host vidmem obj into `m2_fbback[]` at guest-FB phys (guest CPU + host GPU share bytes) + map into host GR VAS at guest VA |
+| `nvkvm_m2_host_alloc_map_vidmem()` | `nvkvm_gpu_emul.c:4577` | alloc real host vidmem (CONTIGUOUS\|VIDMEM) + host `RM_MAP_MEMORY` → `{qva,mapfd,size}` |
+| `nvkvm_m2_back_and_map()` | `:5056` | double-mmap a host vidmem obj into `m2_fbback[]` at guest-FB phys (guest CPU + host GPU share bytes) + FIXED-map into host GR VAS at guest VA. Called today only with labels `ctx*`/`gpfifo`/`pushbuf`/`userd` |
 | `nvkvm_m2_back_and_map_sys()` | `:5260` | OS_DESCRIPTOR sysmem variant |
 | `nvkvm_m2_map_dma()` | `:4834` | `RM_MAP_MEMORY_DMA` FIXED (unprivileged) into a VASpace |
-| `nvkvm_m2_gpga_obj()` | `:5297` | register GPGA→host-obj so BAR1/PRAMIN resolve via `nvkvm_fb_host_overlay()` |
-| isolate device-mmap into GPA window | `nvkvm_isolate_handlers.c:1808-1839` | `mmap(target,len,…,h->fd,offset)` — the real passthrough mmap; user vidmem mmap currently doesn't reach it (falls to anon/guest-RAM ~1858-1869) |
+| `nvkvm_m2_gpga_obj()` | `:5297` | register GPGA→host-obj (`m2_objs[]`+`m2_gpga[]`) so BAR1/PRAMIN/overlay resolve via `nvkvm_fb_host_overlay()` |
+| host GR GPFIFO forward (doorbell) | `nvkvm_m2_doorbell_setup():5119`, `nvkvm_m2_exec_doorbell():2580-2637` | AMPERE_USERMODE_A doorbell + work-submit token; rings real host GR channel. **CE-forward extends this** |
+| emulated CE (to be bypassed for forwarded chans) | `nvkvm_chan_execute()` `LAUNCH_DMA` `:3755-3844` | current 4-byte CPU copy + completion-sema; user-CE sema already gated host-only |
+| isolate device-mmap into GPA window | `nvkvm_isolate_handlers.c:1808-1839` | the real passthrough mmap; user vidmem mmap currently falls to anon/guest-RAM (~1858-1869) |
 
-## Fix plan — option 3 (real vidmem + CE forward)
+## Fix plan — option 3 (real vidmem backing + CE forward)
 
-1. **Track** forwarded user-vidmem `RM_ALLOC` handles (guest↔host), distinct from privileged buffers.
-2. **On the guest's CPU-mmap of such a buffer**, back its guest-FB-phys with the already-forwarded
-   host vidmem object via `back_and_map`/`gpga_obj` (+ the isolate device-mmap into the GPA window /
-   KVM memslot) instead of fake RAM, **mapped WC**.
-3. Then the guest CPU memcpy hits real WC vidmem (GB/s, host-visible); or libcuda's CE path is
-   forwarded to the host CE.
-4. **Verify**: cup5 → GB/s + host util>0/visible + byte-exact; then llama (`m557`).
+**(A) Back user FBMEM with a real host vidmem object.**
+1. **Find the snoop hook** — the precise point where a guest user `cuMemAlloc` FBMEM allocation becomes
+   observable to the QEMU device (guest NVOS32 / `NV01_MEMORY_LOCAL_USER` `RM_ALLOC`, and the guest-FB
+   physical range PMA assigns it). User allocations are **not** snooped today; this is step 0.
+2. For each such allocation, allocate the real host vidmem object (`host_alloc_map_vidmem`) and back the
+   guest-FB-phys range with it via `back_and_map`/`gpga_obj` (double-mmap: CPU view at guest-FB phys,
+   GPU view at the guest VA in the host GR VAS) instead of a fake `fb_page`.
+3. **Verify (A):** re-run cup6 → host `memory.used` jumps ~64 MB (buffer now lives on the host GPU),
+   byte-exact preserved.
 
-**First implementation step:** a targeted instrumented boot to confirm the *exact routing* of a
-user-vidmem CPU-mmap in Mode-2 (which handler assigns its GPA/backing) — that is the precise hook
-point for step 2.
+**(B) Forward the CE copy to the host GPU.**
+4. With src (guest sysmem staging, already host-DMA-able via the memfd window / OS_DESCRIPTOR) and dst
+   (now real host vidmem) both real host objects, submit the `LAUNCH_DMA` to a host CE channel (new
+   `m2_ce_channel`, or the GR channel's CE subchannel) and ring the doorbell — extend `exec_doorbell`
+   (`:2580-2631`); bypass the emulated 4-byte loop for forwarded channels. User-CE completion sema is
+   already gated host-only.
+5. **Verify (B):** cup5/cup6 → **host util>0**, **GB/s**, byte-exact; then llama (`m557`).
 
-Band-aid alternatives (WC-only or WB-only on the fake RAM page) were considered and **rejected** in
-favour of real passthrough; the diagnosis is retained above for the trail.
+This honours the directive to prove real host compute (util>0, HW-written results), not faster faking —
+optimising the emulated CPU CE loop would be "faster faking" and is explicitly rejected.
 
-## Diagnostic artifacts (this work)
+**Diagnostic boot before coding (A):** one instrumented boot to pin (i) the exact handler/site where a
+user `cuMemAlloc` FBMEM alloc + its guest-FB-phys is observable in QEMU, and (ii) confirm which CPU path
+actually moves the 64 MB today (QEMU emulated-CE vs kernel memcpy into `fb_page`) — that fixes where the
+backing is wired.
 
-- `tests/mode2/cup5.c` (bulk repro), `tests/mode2/cup6.c` (3-copy UC-vs-fault discriminator).
-- `scripts/mode2_diag/m558_bulk_dataplane_host.sh`, `m559_cpu_attrib_host.sh`,
-  `m560_copy_discriminator_host.sh`; `rtp_run_guest.sh` `cup6` subcommand.
-- `nvkvm_gpu_emul.c` probes: `CE-INSTR` (per-advanced-channel page-A/B + gpga overlap, ~:2534),
-  tagged `M5: CE COPY` line with client/gpfifo (:3762), `BAR1-TRAP-INSTR` cumulative counter
-  (`nvkvm_baraperture_write`, :2876). Cheap logging; keep for fix verification.
+## Diagnostic artifacts
+
+- Tests: `tests/mode2/cup5.c` (bulk repro), `tests/mode2/cup6.c` (3-copy + maps×pagemap introspection).
+- Harnesses: `m558_bulk_dataplane_host.sh`, `m559_cpu_attrib_host.sh`, `m560_copy_discriminator_host.sh`,
+  `m561_cache_probe_host.sh`, **`m562_placement_probe_host.sh`** (open-580 from-source + placement printks);
+  `rtp_run_guest.sh` `cup6` subcommand.
+- Open-580 from-source guest driver: host tree `research_clones/open-580` (full source); lean bootable
+  tree `research_clones/open-580-guest` (kernel-open + materialized `nv-kernel.o_binary` + 0xFFF500 uvm
+  patch); boot via `OGKM=research_clones/open-580-guest`. Placement printks in
+  `open-580/src/nvidia/src/kernel/{gpu/mem_mgr/mem_mgr_gsp_client.c (NVKVM-FBREG), mem_mgr/video_mem.c (NVKVM-PLACE)}`.
+- QEMU probes: `CE-INSTR` (~:2534), tagged `M5: CE COPY` (:3762), `BAR1-TRAP-INSTR` (`nvkvm_baraperture_write`, :2876).
