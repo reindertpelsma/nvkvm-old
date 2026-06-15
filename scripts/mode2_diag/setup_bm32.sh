@@ -16,26 +16,24 @@ echo "===== S1: apt deps on .32 (idempotent) ====="
 S32 'command -v qemu-system-x86_64 >/dev/null && command -v ninja >/dev/null && echo "  [ok] qemu+ninja present"' \
   || S32 'DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils ninja-build 2>&1 | tail -2'
 
-echo "===== S2: compress status on vast ====="
-ssh vh 'ls -lah /opt/nvkvm-guest/ubuntu-24.04-cmp.qcow2 2>/dev/null; tail -1 /tmp/compress.log 2>/dev/null'
-# Proceed only when the cmp file size is STABLE (qemu-img convert finished). Verify before transfer:
-SZ1=$(ssh vh 'stat -c%s /opt/nvkvm-guest/ubuntu-24.04-cmp.qcow2 2>/dev/null' || echo 0)
-sleep 6
-SZ2=$(ssh vh 'stat -c%s /opt/nvkvm-guest/ubuntu-24.04-cmp.qcow2 2>/dev/null' || echo 0)
-if [ "$SZ1" != "$SZ2" ] || [ "${SZ1:-0}" -lt 1000000000 ]; then
-  echo "  compress NOT done (size still growing / <1G). Re-run setup_bm32.sh later."; exit 0
-fi
-echo "  [ok] compress done, size=$SZ2"
+echo "===== S2: (compression ABANDONED — image is ~28.8G incompressible CUDA libs + GGUF) ====="
+# qemu-img -c only got 29G->18G and would fill vast disk. We stream the RAW qcow2 directly instead.
 
 echo "===== S3: transfer to .32 (skip-if-present) ====="
 pipe_dir /opt        qemu-nvkvm           /opt          # QEMU runtime (458M, portable)
 pipe_dir /usr/lib/firmware/nvidia 580.159.04 /usr/lib/firmware/nvidia   # GSP firmware
 pipe_dir /usr/src    nvidia-580.159.04    /usr/src      # open-driver source (9p-shared)
-# guest base image (the big one): transfer the COMPRESSED qcow2, use it directly as BASE
+# guest base image (the big one): stream the RAW qcow2 vast->workspace->.32. NOT resumable; if it
+# breaks, delete the partial on .32 and re-run. (Resumable alt: put vast key on .32 + rsync-pull,
+# but that leaves a credential on the kiosk box — avoided per cleanup constraint.)
 S32 'test -f /opt/nvkvm-guest/ubuntu-24.04.qcow2 && echo "  [skip] guest image present"' || {
-  echo "  [xfer] guest image (compressed ~12G) vast -> .32 ..."
+  echo "  [xfer] guest image (RAW ~28.8G) vast -> .32 ..."
+  SRC_SZ=$(ssh vh 'stat -c%s /opt/nvkvm-guest/ubuntu-24.04.qcow2')
   S32 'mkdir -p /opt/nvkvm-guest'
-  ssh vh 'cat /opt/nvkvm-guest/ubuntu-24.04-cmp.qcow2' | S32 'cat > /opt/nvkvm-guest/ubuntu-24.04.qcow2'
+  ssh vh 'cat /opt/nvkvm-guest/ubuntu-24.04.qcow2' | S32 'cat > /opt/nvkvm-guest/ubuntu-24.04.qcow2'
+  DST_SZ=$(S32 'stat -c%s /opt/nvkvm-guest/ubuntu-24.04.qcow2')
+  [ "$SRC_SZ" = "$DST_SZ" ] || { echo "  [FAIL] size mismatch src=$SRC_SZ dst=$DST_SZ — partial; rm + re-run"; exit 1; }
+  echo "  [ok] image transferred, size=$DST_SZ"
 }
 # small files
 for f in seed.iso ga106_vbios.rom user-data meta-data; do
