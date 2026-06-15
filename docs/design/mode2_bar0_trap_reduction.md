@@ -74,6 +74,34 @@ Properties:
   the RAM buffer will read a stale value — enumerate every read-time special-case and convert it to a
   write-on-change.
 
+## Result (m582–m584, 2026-06-15)
+
+Implemented (`m2romregs`, default off): GSP-falcon page → rom-device subregion of a BAR0 **container**
+(reads from RAM via `nvkvm_gsp_falcon_sync`, writes via the thunk). Findings:
+
+- **Correctness: clean.** LLM coherent, `rc=0`, **Xid=0**; GSP boot/compute unaffected. The page-split
+  (status reads from RAM, side-effect writes still trap) is sound.
+- **The rom-device read intercepts at the QEMU level** — `0x110094`/`0x110118` reads in the `bar0_read`
+  trace dropped **104k → 0**, while the `0x110c00` doorbell write still traps (1015). So flatview +
+  priority overlay work (a **container** is required; a plain leaf-with-subregion overlay did NOT
+  render for the memory listener).
+- **But `mmio_exits` did NOT drop** (≈318k either way). A **full RW RAM** memslot variant (definite
+  memslot) *also* didn't drop exits. ⇒ **Under this nested-virt host, KVM does not serve no-exit reads
+  for a BAR-subregion memslot** — the reads bypass the QEMU ops but still vmexit (nested EPT forces an
+  exit on BAR-backed pages). This is consistent with Mode-1 reaching parity on the same box *by
+  avoiding MMIO entirely* (virtio/ioctl), not via memslots. On **bare-metal** KVM this rom-device
+  should give the intended no-exit win.
+- **Scope correction:** the `0x110094` storm is **LOAD-dominated** — back-calculating across NGEN
+  (~256k exits in load + ~640 exits/token in gen), the bulk is GSP-boot + model-setup RPC polling, not
+  per-token generation. So a *working* trap-elimination mainly speeds **load / nvidia-smi /
+  cudaMemGetInfo**, and only modestly helps gen t/s; gen is bound by per-token guest+host work + the
+  ±40% nested-virt variance.
+
+**Where this leaves it:** the rom-device is committed (gated, correct) as the right primitive and the
+bare-metal/load win; the *gen* parity path is Mode-1's model — **don't trap the hot path at all**
+(doorbell/poll passthrough via virtio-style submission), validated on a non-nested box. Re-measure on
+bare-metal before investing further in the memslot path.
+
 ## Pointers
 
 - Harnesses: `m580` (mmio_exit count + log-gate), `m581` (gen-vs-load trap histogram).

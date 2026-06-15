@@ -131,7 +131,13 @@ struct NvkvmGpuEmul {
     const NvkvmGpuChip *chip;
 
     /* BARs */
-    MemoryRegion bar0;   /* REGS  — MMIO, trapped/logged                     */
+    MemoryRegion bar0;   /* REGS  — container (BAR0); holds bar0_io + optional gsp_falcon overlay */
+    MemoryRegion bar0_io;/* the trapped/logged MMIO ops region (fills all of BAR0 at priority 0)   */
+    MemoryRegion gsp_falcon; /* M5.64: rom-device overlay on BAR0 0x110000 — GSP falcon status page
+                              * served from a RAM buffer (poll READS hit RAM = no vmexit), WRITES still
+                              * trap (QUEUE_HEAD doorbell, CPUCTL STARTCPU, IRQSCLR). Kills the
+                              * DEBUGINFO(0x94)/IRQSTAT/DMATRFCMD poll vmexit storm. */
+    uint8_t *gsp_falcon_ram; /* host pointer to the rom-device RAM (kept current by *_sync) */
     MemoryRegion bar1;   /* FB    — MMIO stub for M0 (address-virt layer L8) */
     MemoryRegion bar3;   /* IMEM/usermode — MMIO stub                        */
     MemoryRegion msix;   /* MSI-X table/PBA BAR (BAR5)                       */
@@ -416,6 +422,8 @@ struct NvkvmGpuEmul {
                                  * sema). Identity map_dma means src/dst VAs are already valid in the
                                  * CE channel's VAS once resident. Sub-flag of m2cefwd (needs the dst
                                  * real-backed). Default OFF — A/B vs the CPU-copy 23.6 tok/s. */
+    bool     m2romregs;         /* M5.64: install the GSP-falcon rom-device overlay (reads from RAM,
+                                 * no vmexit) — the 0x110094 poll-storm fix. Default OFF (A/B). */
     bool     m2_trace;          /* M5.63: enable the high-volume per-doorbell/per-fb-access DIAG
                                  * qemu_log spew (M5.9/RANG/CE-INSTR/M5.22 + crashwin M5.31/M5.15/
                                  * CRASHWIN-RD/DMAW — ~94 lines/doorbell, ~360k lines/run). Default
@@ -1213,6 +1221,26 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     }
 }
 
+/* M5.64: refresh the GSP-falcon rom-device RAM buffer (BAR0 page 0x110000) with the values
+ * nvkvm_reg_read would compute, so the driver's poll-READs hit RAM (no vmexit) yet see correct
+ * data. Called at init and after any source-state change. Cheap (a handful of stores). The page
+ * holds ONLY GSP falcon status regs (the GSP cmd/status queue DATA lives in sysmem, not here), and
+ * none have read side-effects, so RAM-serving is safe. WRITES still trap via the rom-device ops. */
+static void nvkvm_gsp_falcon_sync(NvkvmGpuEmul *s)
+{
+    uint8_t *p = s->gsp_falcon_ram;
+    if (!p) { return; }
+    memset(p, 0, 0x1000);                                         /* default 0 (DEBUGINFO 0x94, ...) */
+    stl_le_p(p + 0x008, s->gsp_swgen0_pending ? (1u << 6) : 0u);  /* FALCON IRQSTAT (SWGEN0 bit6) */
+    stl_le_p(p + 0x018, (1u << 6));                               /* FALCON IRQMASK  */
+    stl_le_p(p + 0x01c, (1u << 6));                               /* FALCON IRQDEST  */
+    stl_le_p(p + 0x040, s->gsp_suspended ? 0x80000000u : 0u);     /* MAILBOX0 (suspend poll) */
+    stl_le_p(p + 0x0f4, NV_PFALCON_FALCON_HWCFG2_RISCV_ENABLE_VAL);
+    stl_le_p(p + 0x100, NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE);
+    stl_le_p(p + 0x118, NV_PFALCON_DMATRFCMD_IDLE_VAL);           /* DMATRFCMD idle */
+    /* DEBUGINFO (0x94) stays 0 — same as the old default-return; the win is that it no longer traps. */
+}
+
 /* PROM window: return VBIOS bytes (little-endian dword at the aligned offset).
  * Not traced per-access — the driver streams the whole ~1 MiB image. */
 static bool nvkvm_prom_read(NvkvmGpuEmul *s, hwaddr off, unsigned size,
@@ -1401,6 +1429,7 @@ static void nvkvm_m3_post_event(NvkvmGpuEmul *s, uint32_t hclient,
 static void nvkvm_gsp_raise_swgen0(NvkvmGpuEmul *s)
 {
     s->gsp_swgen0_pending = true;
+    nvkvm_gsp_falcon_sync(s);                 /* M5.64: reflect IRQSTAT bit6 into the rom-device RAM */
     uint32_t vec = 155u, leaf = vec / 32u, bit = vec % 32u, subtree = leaf / 2u;
     if (leaf < NVKVM_VF_INTR_NLEAF) {
         s->intr_leaf[leaf] |= (1u << bit);
@@ -1745,6 +1774,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         if (fn == 47) {
             s->fwsec_ran = false;       /* WPR2 down (booter-unload effect)      */
             s->gsp_suspended = true;    /* MAILBOX0 -> SUSPENDED for the close poll */
+            nvkvm_gsp_falcon_sync(s);   /* M5.64: reflect MAILBOX0 suspend value into rom-device RAM */
             /* Reset the GSP-RPC queue/boot state so a re-init within one QEMU lifetime
              * (driver reload, or cudart's uvm-load + device reopen) re-runs the full
              * bootargs -> queue-init -> GSP_INIT_DONE handshake.  Without this,
@@ -3185,6 +3215,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     if (off == 0x00110004u) {
         if (val & (1u << 6)) {
             s->gsp_swgen0_pending = false;
+            nvkvm_gsp_falcon_sync(s);     /* M5.64: clear IRQSTAT bit6 in the rom-device RAM */
         }
         return;
     }
@@ -3247,6 +3278,21 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
 static const MemoryRegionOps nvkvm_bar0_ops = {
     .read       = nvkvm_bar0_read,
     .write      = nvkvm_bar0_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl       = { .min_access_size = 4, .max_access_size = 4 },
+    .valid      = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/* M5.64: rom-device write thunk for the GSP-falcon page. Reads are served from the region's RAM
+ * (kept current by nvkvm_gsp_falcon_sync — zero vmexit); writes carry the SIDE EFFECTS (QUEUE_HEAD
+ * doorbell, CPUCTL STARTCPU, IRQSCLR W1C) so they must still reach nvkvm_bar0_write. The subregion
+ * is at BAR0 offset 0x110000, so re-absolutize the offset. */
+static void nvkvm_gsp_falcon_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    nvkvm_bar0_write(opaque, off + 0x00110000u, val, size);
+}
+static const MemoryRegionOps nvkvm_gsp_falcon_ops = {
+    .write      = nvkvm_gsp_falcon_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl       = { .min_access_size = 4, .max_access_size = 4 },
     .valid      = { .min_access_size = 1, .max_access_size = 8 },
@@ -7279,8 +7325,21 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     pci_set_word(cfg + PCI_SUBSYSTEM_ID,        chip->sub_device_id);
 
     /* BAR0: REGS, 32-bit non-prefetchable MMIO (matches real GA10x). */
-    memory_region_init_io(&s->bar0, OBJECT(s), &nvkvm_bar0_ops, s,
+    /* BAR0 is a CONTAINER: the trapped MMIO ops fill all of it at priority 0; the M5.64 GSP-falcon
+     * rom-device overlays page 0x110000 at priority 1 so its poll-READS hit RAM (no vmexit) while
+     * WRITES fall through the rom-device thunk to the side-effect handler. (A plain leaf-with-
+     * subregion overlay did NOT take effect for KVM — m582; a container renders subregions reliably.) */
+    memory_region_init(&s->bar0, OBJECT(s), "nvkvm-gpu-bar0", chip->bar0_size);
+    memory_region_init_io(&s->bar0_io, OBJECT(s), &nvkvm_bar0_ops, s,
                           "nvkvm-gpu-regs", chip->bar0_size);
+    memory_region_add_subregion_overlap(&s->bar0, 0, &s->bar0_io, 0);
+    if (s->m2romregs) {
+        memory_region_init_rom_device(&s->gsp_falcon, OBJECT(s), &nvkvm_gsp_falcon_ops, s,
+                                      "nvkvm-gsp-falcon", 0x1000, &error_fatal);
+        s->gsp_falcon_ram = memory_region_get_ram_ptr(&s->gsp_falcon);
+        nvkvm_gsp_falcon_sync(s);
+        memory_region_add_subregion_overlap(&s->bar0, 0x00110000u, &s->gsp_falcon, 1);
+    }
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
 
     /* BAR1: FB aperture, 64-bit prefetchable (occupies BAR1+BAR2). */
@@ -7406,6 +7465,7 @@ static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("m2cexec", NvkvmGpuEmul, m2cexec, false), /* CE-EXEC fwd (A): host CE runs the user-CE LAUNCH_DMA; suppress CPU copy+sema. Sub-flag of m2cefwd. Default OFF (A/B) */
     DEFINE_PROP_BOOL("m2opaque", NvkvmGpuEmul, m2opaque, false), /* M5.62: skip GPFIFO walk when a userspace channel is fully resident (ring-only). Default OFF (perf experiment) */
     DEFINE_PROP_BOOL("m2trace", NvkvmGpuEmul, m2_trace, false), /* M5.63: high-volume per-doorbell/fb-access DIAG qemu_log. Default OFF (perf: synchronous log I/O overhead) */
+    DEFINE_PROP_BOOL("m2romregs", NvkvmGpuEmul, m2romregs, false), /* M5.64: GSP-falcon rom-device overlay (reads from RAM, no vmexit) — 0x110094 poll-storm fix. Default OFF (A/B) */
     DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
     DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
