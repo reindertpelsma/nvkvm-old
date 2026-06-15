@@ -524,3 +524,60 @@ the GMMU-walked aperture (`bar1_pdb`) is size-agnostic, so only the addressable 
 non-regressing: guest enumerated `00:07.0 BAR1 [0x380000000000-0x3803ffffffff 64bit pref]` = 16 GiB
 in the q35 above-4G window, booted clean, **cup7 @ 8 MiB → PASS=D1 byte-exact, gpga FAILED=0**. NOTE:
 this is the GUEST aperture; the host GPU's 256 MiB BAR1 (the D2 wall) is physical + not resizable here.
+
+---
+
+## PERF investigation — generation 22→60 tok/s (2026-06-15, measure-first)
+
+The LLM runs byte-exact at ~22–24 tok/s. This pass chased the generation bottleneck. Key discipline:
+**measure before building** — it overturned the plan twice and saved a multi-cycle wrong build.
+
+### Step 1 — time-share instrumentation (SHIPPED, commit 6217ca3)
+Added `qemu_clock` REALTIME timers + `nvkvm_timeshare_dump` (periodic, survives a killed run) around
+the hot paths: emulated-CE copy, PRAMIN-window guest-CPU traps, doorbell re-sweep, doorbell forward,
+`chan_execute`. Turned the perf guess into data. **The GPA-window data path is a non-issue** (6ms /
+17524 calls ≈ 0%) — the earlier ">=100k window traps" worry was a capped *diag* counter, not the path.
+
+### Step 2 — CE copy was per-4-byte; page-batched it (SHIPPED, 6217ca3)
+The CE `LAUNCH_DMA` copy loop called `nvkvm_chan_translate` (a full multi-level GMMU walk) +
+`nvkvm_fb_read` (O(n) overlay scan) **twice per 4 bytes**. Histogram: 73% of CE copies <4K; the 16 MB
+ones are one-time weight loads. Fix (`nvkvm_fb_host_ptr` + page-batched COPY/MEMSET in case 0x300):
+translate + resolve once per 4 KiB span, then `memcpy`/`memset`. Result: `ce_emul` **42%→0.7%** (~18×),
+model load **34s→28.6s** (~16% faster), cup7 byte-exact, no Xid. **But generation t/s unchanged** — the
+CE copy was *not* on the gen critical path; the "42% of gen" was load-phase-weighted.
+
+### CE-forward (host CE runs the copy) — RULED OUT by measurement
+Built approach A (forward user-CE channels to the host CE) behind gated `m2cexec` (default OFF,
+milestone-safe). Probe (m570): inert — the bulk copies are **PHYSICAL-mode** (`dst_phys=1 verdict=gpga`,
+guest-fb-phys meaningless to the host), so a verbatim pushbuffer-forward can't translate them; and 73%
+are <4K where host-CE submission overhead would *lose* to a CPU memcpy. Not worth the multi-cycle build.
+
+### Step 3 — the real gen bottleneck = COMPLETION-SYNC LATENCY
+- m571 (guest-cpu vs wait): during gen the guest is ~75% **idle**, ~1 of 4 vCPUs busy at ~100%, host
+  GPU **util 0%** → single-thread serialized per-op cost, not trap/cache/CPU-saturation.
+- m573 (real GPU-path perf, fresh boot + full setup): hot path =
+  `common_sampler_sample → llama_synchronize → cudaStreamSynchronize → cuStreamSynchronize → spin on
+  clock_gettime` (entry_SYSCALL/SYSRETQ ~27%). **libcuda busy-spins waiting for the completion signal;
+  the host GPU finishes in µs (util 0) but the completion takes ~10–20 ms to become visible to the
+  guest.** This is "not a million MMIO traps" — it's clock_gettime a million times in *userspace*.
+- Unifies with `nvidia-smi` taking seconds and `cudaMemGetInfo` dominating load: all the **same slow
+  control/completion round-trip**.
+- (Correction: an earlier profile showed CPU matmul — that was an artifact of an ad-hoc llama launch
+  that skipped the module/UVM setup, so CUDA failed init and llama fell back to CPU. Ignore it.)
+
+### Clocksource red herring — RULED OUT for throughput
+The guest's `kvm-clock` is **not vDSO-capable** here: 500k `perf_counter()` = 500,450 `clock_gettime`
+*syscalls* vs **0** under `tsc` (strace-proven). So libcuda's spin traps to the kernel every clock
+check (the ~27%). **But a fair 4-boot A/B (m575) showed NO throughput difference**: tsc {19.5, 26.6}
+mean ~23.0 vs kvm-clock {26.5, 23.9} mean ~25.2 — run-to-run variance swamps it. ⇒ the clocksource only
+wastes CPU; it does **not** set wall-time. This **confirms by elimination** that the limiter is the sema
+updating slowly, not the spin's cost.
+
+### NEXT LEVER (measure-first): completion-sema latency
+Instrument *submit → sema-visible-to-guest* in QEMU and determine the polled sema's aperture/mapping
+(sysmem-coherent vs vidmem/BAR1-UC/stale) to localize the ~10–20 ms. Candidates: spin-poll never sees
+the write → kernel fallback; stale CPU cache; wrong/UC mmap; or a poll-interval/interrupt-delivery
+delay. Same fix likely also collapses `nvidia-smi`/load latency. Control for the large (~19–27 t/s) run
+variance (avg ≥3 runs). Harnesses: `m569` (timeshare), `m570` (cexec probe), `m571` (cpu-vs-wait),
+`m573` (gen profile + nvidia-smi), `m574`/`m575` (clocksource A/B). `m2cexec` scaffolding stays gated
+OFF (repurpose for a translate-and-reissue CE path, or remove).
