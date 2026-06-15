@@ -463,6 +463,43 @@ hook), `gpga_obj_ex` blank-vs-written gate, `leaf_flush` compute-client default.
 `scripts/mode2_diag/m566_maptouch_host.sh`. NEXT: scale-test (cup4 matmul / m553 LLM at size) to
 confirm general-compute correctness; then the perf half of CE-forward (bulk HtoD via host CE).
 
+**GENERALIZED to real compute (m567/cup8, 2026-06-15):** a REAL grid fp32 matmul (N=2048, 48 MiB
+A/B/C, 2D grid 128×128 blocks, host GR engine) PASSES byte-exact (bad=0, maxerr=0) with
+`m2cefwd` — **host GPU util 100%** (un-forgeable: the CE software path cannot multiply/sum), gpga
+FAILED=0, gpu_only=105, eager CPU-mapped=8, PROMOTED=65 (the HtoD-written A/B inputs promote on the
+CPU write; replayed=0x0), GIVE-UP=1 (graceful), M5.60=0, no new Xid, GPU healthy. So map-on-touch
+holds for general compute (two large input reads + output write), not just cup7's add-1 kernel.
+Test `tests/mode2/cup8.c`, harness `scripts/mode2_diag/m567_matmul_scale_host.sh`. KNOWN LIMIT this
+exposes for the LLM: HtoD-written buffers (LLM **weights**) promote-on-write → consume host BAR1, so
+a GB-scale weight set will hit the 256 MiB wall again until the CE-forward PERF half lands (forward
+the bulk HtoD as a real host CE so the dst is written GPU-side and never CPU-promoted).
+
+### ★★★★★ LLM RUNS ON MODE-2 — coherent generation (m568, 2026-06-15)
+
+North-star step 3 FUNCTIONALLY PASSES: a small Qwen2 GGUF (469 MB) runs through the emulated GA106 +
+faked GSP + map-on-touch and **generates coherent text** — prompt "Explain in two sentences why GPU
+virtualization is useful for cloud computing" → *"GPU virtualization is useful for cloud computing
+because it allows cloud providers to deploy virtualized…"*. Real host GR compute (coherent tokens
+prove the engine read the right weights), 471 weight/KV buffers backed gpu_only off-BAR1, gpga
+FAILED=0, GIVE-UP=1 (graceful), **no new Xid**, GPU D-state 0.
+
+Two bugs were fixed to get here (both on top of map-on-touch):
+1. **M6.3b VA squat (investigated, NOT the cause).** The osdesc self-test FIXED-maps guest RAM at
+   0x300000000 (libcuda's low-GB range). Gating it off did NOT move the fault → reverted (kept the
+   milestone untouched). Eliminated hypothesis.
+2. **Doorbell re-sweep cap (THE fix).** `exec_doorbell` re-walks the compute VAS per new submission
+   (M5.48c, `m548_newwork` latches GP_PUT) to back newly-mapped working-set leaves, capped at 1000
+   total sweeps. cup3/4/7/8 stay under it; a real LLM issues FAR more than 1000 submissions, so a
+   buffer mapped after the 1000th sweep (e.g. 0x302000000) never got backed → GR GPC VIRT_WRITE
+   fault → wedge. Raised the cap 1000 → 200000 (the sweep is per-new-submission + idempotent via
+   `va_seen`, so a high cap is safe). The LLM then ran to coherent generation.
+
+REMAINING = PERFORMANCE, not correctness: ~0.1 tok/s (vs Mode-1's ~60). Two causes, both known/
+addressable: (a) the now-thousands of per-submission full-VAS re-sweeps (each O(page-table); a
+smarter trigger — sweep only on a genuinely-new MAPPING, not every GP_PUT advance — would cut most);
+(b) the ~100 MB/s GPA-window CPU data path (the CE-forward PERF half: forward bulk HtoD/DtoH as real
+host CE). Harness `scripts/mode2_diag/m568_llm_maptouch_host.sh` (boots NVKVM_M2CEFWD=1, LLM_TIMEOUT).
+
 ### Guest (emulated) BAR1 → 16 GiB — DONE + verified (m564c, 2026-06-14)
 
 Separate from the host-BAR1/CE-forward work: the EMULATED device BAR1 was a 256 MiB stub, capping

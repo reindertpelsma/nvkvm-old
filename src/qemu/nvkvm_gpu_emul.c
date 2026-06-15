@@ -6101,7 +6101,13 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             nc->sweep_put = np;          /* latch: one sweep per submission, not per doorbell */
         }
     }
-    if (nsweep && (s->m2_exec_sweeps < 8 || (m548_newwork && s->m2_exec_sweeps < 1000))) {
+    /* The cap bounds worst-case sweep cost; 1000 sufficed for short workloads (cup3/4/7/8) but
+     * a real LLM (m568) issues FAR more than 1000 submissions, and a buffer mapped after the
+     * 1000th sweep never gets backed -> GR engine VIRT_WRITE fault on it (Xid 31 @ 0x302000000).
+     * The sweep is per-NEW-submission (m548_newwork latches GP_PUT) and idempotent (va_seen dedup
+     * -> a walk that finds nothing new just reads page tables), so a high cap is safe; raise to
+     * cover a full inference. (2026-06-15) */
+    if (nsweep && (s->m2_exec_sweeps < 8 || (m548_newwork && s->m2_exec_sweeps < 200000))) {
         s->m2_exec_sweeps++;
         for (int k = 0; k < nsweep; k++) {
             qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x)%s — back newly-mapped "
