@@ -77,7 +77,7 @@ exec "$QEMU" \
     \
     `# Mode-2 emulated NVIDIA GPU — put it directly on root slot 7 so the` \
     `# guest RM-generated gpuId encodes as 0x7, matching the forwarded host GPU.` \
-    -device nvkvm-gpu-emul,addr=0x7,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2HOSTSEM:+,m2hostsem=on}${NVKVM_M2CEFWD:+,m2cefwd=on}${NVKVM_M2CEXEC:+,m2cexec=on}${NVKVM_M2OPAQUE:+,m2opaque=on}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
+    -device nvkvm-gpu-emul,addr=0x7,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2HOSTSEM:+,m2hostsem=on}${NVKVM_M2CEFWD:+,m2cefwd=on}${NVKVM_M2CEXEC:+,m2cexec=on}${NVKVM_M2OPAQUE:+,m2opaque=on}${NVKVM_M2TRACE:+,m2trace=on}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
     \
     `# Open driver source + GSP firmware (RO) + repo, all over 9p.` \
     -virtfs local,path="$OGKM",mount_tag=ogkm,security_model=mapped,readonly=on \
