@@ -431,6 +431,38 @@ existing trap, not the memslot/uffd subsystem) — it's the minimal thing that c
 (once the host CE actually moves the bytes) byte-exact. The `gpu_only` primitive + `gpga_obj_ex` are
 already built/compiling/gated; the window/`m2_cefwd_dst` plumbing is now superseded (keep or strip).
 
+### BUILT + VERIFIED — map-on-touch clears the D2 wall (m566, 2026-06-15) ★★★★★
+
+The map-on-touch design above is implemented (gated `m2cefwd`) and **PROVEN on the bench**. cup7@64 MiB
+— the EXACT workload that hung (rc=124, Xid 31 CE2 FAULT_PDE, `gpga FAILED=232`) at the host-BAR1 wall
+in m564/m565 — now **PASSES byte-exact**:
+
+| signal | m565 (window, pre-design) | m566 (map-on-touch) |
+|---|---|---|
+| cup7@64 MiB VERDICT | HANG rc=124 | **PASS=D1 byte-exact** (bad=0) |
+| `gpga FAILED` | 232 (BAR1 wall) | **0** |
+| `gpu_only` objs | 0 (window lost the race) | **147** (walk default engaged) |
+| eager CPU-mapped objs | (all) | **8** (the written control leaves only) |
+| PROMOTED (lazy CPU map on touch) | n/a | **57** (replayed=0x0, coherent) |
+| GIVE-UP (BAR1 full at touch) | n/a | **1** × 64 KiB → fb_pages, cup7 still PASS |
+| host Xid this run | 31 (fresh) | none (the logged one is stale m565 pid 663933) |
+| GPU health | wedge risk | D-state 0, idle |
+
+What the numbers say: the **ordering-immune walk default** (leaf_flush requests `gpu_only` for compute
+clients; `gpga_obj_ex` keeps it `gpu_only` iff the run is blank at walk time) did ALL the work —
+**M5.60 fired 0×**, so the decode-time net is now just a backstop. 147 blank dst/scratch leaves went
+off-BAR1 (real host vidmem + `map_dma`, zero `RM_MAP_MEMORY`); only 8 already-written control leaves
+took an eager CPU map + copy-preserve. 57 of the `gpu_only` leaves were later CPU-touched and promoted
+lazily (RM_MAP_MEMORY the SAME hMem, `replayed=0x0` because a pure dst is blank pre-promotion → the CPU
+view sees exactly the host-CE/GR bytes → coherent). The single GIVE-UP (a 64 KiB obj that couldn't get
+a CPU map at a momentary BAR1-full) fell back to fb_pages WITHOUT breaking correctness — the graceful
+degrade path working as designed. Net: D2 host-BAR1 (256 MiB) exhaustion is **solved** for a 64 MiB
+user buffer with host GR compute, byte-exact. Implementation: `nvkvm_gpu_emul.c` — `m2_objs[].promote`
+state (0/1/2), `nvkvm_m2_host_map_existing_vidmem` + `nvkvm_m2_promote_gpu_only` (overlay hot-path
+hook), `gpga_obj_ex` blank-vs-written gate, `leaf_flush` compute-client default. Harness:
+`scripts/mode2_diag/m566_maptouch_host.sh`. NEXT: scale-test (cup4 matmul / m553 LLM at size) to
+confirm general-compute correctness; then the perf half of CE-forward (bulk HtoD via host CE).
+
 ### Guest (emulated) BAR1 → 16 GiB — DONE + verified (m564c, 2026-06-14)
 
 Separate from the host-BAR1/CE-forward work: the EMULATED device BAR1 was a 256 MiB stub, capping

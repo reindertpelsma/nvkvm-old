@@ -360,14 +360,6 @@ struct NvkvmGpuEmul {
      * bring-up mechanism; KVM-memslot backing is the perf endpoint (see design doc). */
     struct { uint64_t fb_base, size; void *host_qva; } m2_fbback[64];
     int      m2_fbback_n;
-    /* CE-forward P1 (m2cefwd): VA windows of observed user-CE copy destinations. A vidmem
-     * leaf whose GR-VA falls inside a window is backed GPU-ONLY (real host vidmem object +
-     * map_dma, but NO RM_MAP_MEMORY/mmap -> zero host BAR1). Populated ONLY at the M5.60
-     * user-CE dst site (nvkvm_m2_is_user_ce-gated = never the kernel scrubber). Control
-     * structures (pushbuffers/USERD/GPFIFO/GR-ctx) are never in a window, so they keep their
-     * CPU view (guest writes them, host GPU fetches them) — coherency preserved. */
-    struct { uint64_t va_base, size; uint32_t client; } m2_cefwd_dst[64];
-    int      m2_cefwd_dst_n;
     /* M5.3 DIAG: crash-window FB-read probe. Set true the moment the GR compute
      * object (0xc7c0) alloc returns OK — libcuda then reads GR-context GPU memory
      * (no further ioctl per the trace) and crashes (rbp=0). Logging every FB read
@@ -501,6 +493,9 @@ struct NvkvmGpuEmul {
         uint32_t client;      /* host RM client (nvkvm-tracked) */
         uint32_t hMemory;     /* host RM object handle = the 'real' backing */
         uint64_t gr_va;       /* host GR-VAS VA where map_dma'd (0=not GPU-mapped) */
+        uint8_t  promote;     /* CE-fwd map-on-touch: 0=normal, 1=gpu_only(promotable on
+                               * first CPU touch -> RM_MAP_MEMORY same hMem), 2=promotion
+                               * given up (BAR1 full at touch; serve fb_pages, no retry) */
     } m2_objs[1024];            /* M5.48d: 2-MiB chunked mirror needs headroom (was 128) */
     int      m2_objs_n;
     struct {                  /* GPGA page-range -> (object, offset_in_target) */
@@ -605,9 +600,13 @@ static int nvkvm_dp_classify_fb(NvkvmGpuEmul *s, uint64_t fb_addr)
         if (fb_addr >= s->m2_gpga[i].gpga_base &&
             fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
             int oi = s->m2_gpga[i].obj_idx;
-            if (oi < 0 || oi >= s->m2_objs_n || !s->m2_objs[oi].cpu_qva) {
-                break;                 /* gpga known but no CPU backing -> fb_pages */
+            if (oi < 0 || oi >= s->m2_objs_n) {
+                break;                 /* gpga known but no object -> fb_pages */
             }
+            /* CE-fwd map-on-touch: a gpu_only object has cpu_qva==NULL but IS host-reachable
+             * (real host vidmem + map_dma) -> still "backed" (return 2). Only gpu_only objects
+             * ever have cpu_qva==NULL, so a valid obj_idx always means real host backing. This
+             * keeps the M5.60 re-back gate from redundantly re-backing a gpu_only dst. */
             return 2;
         }
     }
@@ -628,6 +627,11 @@ static void nvkvm_dplane_summary(NvkvmGpuEmul *s, const char *why)
              (unsigned long long)nvkvm_dp_fbpage_write_bytes,
              (unsigned long long)nvkvm_dp_overlay_real_write_bytes);
 }
+
+/* CE-fwd map-on-touch: lazily CPU-map a gpu_only object on its first guest CPU touch.
+ * Sets m2_objs[oi].cpu_qva on success (obj.promote 1->0) or gives up (1->2). fwd-decl
+ * because the overlay (below) is the first-touch hook. */
+static bool nvkvm_m2_promote_gpu_only(NvkvmGpuEmul *s, int oi);
 
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
@@ -652,8 +656,19 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
         if (fb_addr >= s->m2_gpga[i].gpga_base &&
             fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
             int oi = s->m2_gpga[i].obj_idx;
-            if (oi < 0 || oi >= s->m2_objs_n || !s->m2_objs[oi].cpu_qva) {
-                break;                       /* GPGA known but no CPU backing -> fb_pages */
+            if (oi < 0 || oi >= s->m2_objs_n) {
+                break;                       /* GPGA known but no object -> fb_pages */
+            }
+            /* CE-fwd map-on-touch: a gpu_only object (real host vidmem + GPU-side map_dma,
+             * NO CPU view -> zero host BAR1) has no cpu_qva yet. The guest CPU is touching it
+             * NOW (this is the trap) -> promote: RM_MAP_MEMORY the SAME hMem (coherent) +
+             * replay any pre-promotion fb_pages writes, then serve from the real bytes. Skip
+             * during the GMMU walk (m2_in_walk) to avoid re-entering backing mid-PTE-read. */
+            if (!s->m2_objs[oi].cpu_qva && s->m2_objs[oi].promote == 1 && !s->m2_in_walk) {
+                nvkvm_m2_promote_gpu_only(s, oi);   /* sets cpu_qva on success */
+            }
+            if (!s->m2_objs[oi].cpu_qva) {
+                break;                       /* no CPU backing (gpu_only/given-up) -> fb_pages */
             }
             return (uint8_t *)s->m2_objs[oi].cpu_qva + s->m2_gpga[i].off +
                    (fb_addr - s->m2_gpga[i].gpga_base);
@@ -1350,8 +1365,6 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                              uint64_t gpga, uint64_t size); /* M7 R2 fwd-decl (Phase A) */
 static int nvkvm_m2_gpga_obj_ex(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                 uint64_t gpga, uint64_t size, bool gpu_only); /* CE-fwd P1 */
-static void nvkvm_m2_add_cefwd_dst(NvkvmGpuEmul *s, uint32_t client,
-                                   uint64_t va, uint64_t size); /* CE-fwd P1 fwd-decl */
 static void nvkvm_m2_capture_devinfo(NvkvmGpuEmul *s); /* M14 fwd-decl */
 static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                                 uint64_t *out_redir); /* M5.18 fwd-decl */
@@ -3904,10 +3917,11 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                                 static uint32_t m560p;
                                 if (m560p < 4096) {
                                     m560p++;
-                                    /* CE-forward P1: back GPU-ONLY (zero host BAR1). off_out is
-                                     * a phys (=gpga) here; record it as a dst window keyed by the
-                                     * GR client so any later VIRT alias of the same range matches. */
-                                    nvkvm_m2_add_cefwd_dst(s, s->m2_gr_client, off_out, full);
+                                    /* CE-fwd map-on-touch: back GPU-ONLY (zero host BAR1). A
+                                     * physical CE copy has no PTE, so the GMMU walk can never find
+                                     * this dst — back it here directly. gpga_obj_ex keeps it
+                                     * gpu_only if still blank (the usual case for a CE dst) and the
+                                     * guest gets a CPU view lazily on first touch (DtoH read). */
                                     int oi = nvkvm_m2_gpga_obj_ex(s, s->m2_gr_client, off_out,
                                                                   off_out, full, true);
                                     qemu_log("nvkvm-gpu[%s] M5.60 user-CE PHYS dst back[gpu_only] "
@@ -3926,11 +3940,10 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                                 static uint32_t m560v;
                                 if (m560v < 4096) {
                                     m560v++;
-                                    /* CE-forward P1: register the dst VA window FIRST so the
-                                     * re-walk backs these leaves GPU-ONLY (zero host BAR1) — the
-                                     * D2 fix. The window is keyed to the GR client; control
-                                     * structures are never in a window so keep their CPU view. */
-                                    nvkvm_m2_add_cefwd_dst(s, s->m2_gr_client, off_out, full);
+                                    /* CE-fwd map-on-touch: re-walk the compute VAS so the proven
+                                     * coalescing path backs this VIRTUAL dst's leaves. leaf_flush
+                                     * now requests gpu_only by default for compute clients, so the
+                                     * (blank) dst leaves land off-BAR1 and promote on first touch. */
                                     qemu_log("nvkvm-gpu[%s] M5.60 user-CE VIRT dst un-backed "
                                              "va=0x%llx dphys=0x%llx -> re-walk compute VAS "
                                              "client=0x%08x (#%u)\n", s->chip->name,
@@ -4884,6 +4897,102 @@ static bool nvkvm_m2_host_alloc_vidmem_gpu_only(NvkvmGpuEmul *s, uint32_t hClien
     return true;
 }
 
+/* CE-fwd map-on-touch: add a CPU view to an ALREADY-ALLOCATED host vidmem object (the map
+ * half of nvkvm_m2_host_alloc_map_vidmem, factored out). Used to promote a gpu_only object
+ * on its first guest CPU touch: RM_MAP_MEMORY the SAME hMem -> mmap. Returns the qva or NULL
+ * (e.g. host BAR1 exhausted -> RM_MAP_MEMORY st!=0). Consumes host BAR1 only now, lazily. */
+static void *nvkvm_m2_host_map_existing_vidmem(NvkvmGpuEmul *s, uint32_t hClient,
+                                               uint32_t hDevice, uint32_t hMem,
+                                               uint64_t size)
+{
+    if (s->m2_maph_next < 16) {
+        s->m2_maph_next = 16;
+    }
+    uint32_t maph = s->m2_maph_next++;
+    int mapfd = -1;
+    if (nvkvm_isolate_open_device(&s->m2_iso, s->m2_iso_id, maph,
+                                  NVKVM_DEV_GPU(0), O_RDWR, &mapfd) != 0 || mapfd < 0) {
+        qemu_log("nvkvm-gpu[%s] CE-fwd promote: map-fd open failed (maph=%u)\n",
+                 s->chip->name, maph);
+        return NULL;
+    }
+    struct nv_ioctl_nvos33_parameters_with_fd mm;
+    memset(&mm, 0, sizeof(mm));
+    mm.h_client = nvkvm_m2_client(s, hClient);
+    mm.h_device = hDevice;
+    mm.h_memory = hMem;
+    mm.length   = size;
+    mm.fd       = (int32_t)maph;
+    unsigned int mc = (3u << 30) | ((unsigned int)sizeof(mm) << 16) |
+                      ((unsigned int)'F' << 8) | NV_ESC_RM_MAP_MEMORY;
+    uint32_t mnv = 0; uint64_t mf = 0;
+    int rc = nvkvm_isolate_ioctl(&s->m2_iso, s->m2_iso_id, s->m2_ctl_h, mc,
+                                 &mm, sizeof(mm), NULL, 0, 0, &mnv, &mf);
+    if (rc != 0 || mm.status != 0) {
+        qemu_log("nvkvm-gpu[%s] CE-fwd promote: RM_MAP_MEMORY 0x%x failed rc=%d st=0x%x "
+                 "(host BAR1 likely full)\n", s->chip->name, hMem, rc, mm.status);
+        return NULL;
+    }
+    void *qva = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mapfd, 0);
+    if (qva == MAP_FAILED) {
+        qemu_log("nvkvm-gpu[%s] CE-fwd promote: mmap host mem 0x%x failed: %s\n",
+                 s->chip->name, hMem, strerror(errno));
+        return NULL;
+    }
+    return qva;
+}
+
+/* CE-fwd map-on-touch promotion. The guest CPU is touching gpu_only object `oi` for the first
+ * time (via the overlay hot path). Give it a coherent CPU view of the SAME host object, then
+ * replay any bytes the guest already wrote to its GPGA range through the local fb_pages BEFORE
+ * promotion (mirrors the M5.44 copy-preserve that gpu_only skipped at alloc). After this the
+ * overlay resolves to the real object -> guest CPU and host GPU share the SAME bytes. On BAR1
+ * exhaustion the object is marked given-up (promote=2): we serve fb_pages and never retry (so
+ * a tight-BAR1 DtoH read degrades to stale-but-no-hang rather than an RM_MAP_MEMORY storm). */
+static bool nvkvm_m2_promote_gpu_only(NvkvmGpuEmul *s, int oi)
+{
+    if (oi < 0 || oi >= s->m2_objs_n) {
+        return false;
+    }
+    if (s->m2_objs[oi].promote != 1 || s->m2_objs[oi].cpu_qva) {
+        return s->m2_objs[oi].cpu_qva != NULL;   /* already promoted, or not promotable */
+    }
+    uint32_t client = s->m2_objs[oi].client;
+    uint32_t hMem   = s->m2_objs[oi].hMemory;
+    uint64_t size   = s->m2_objs[oi].size;
+    uint32_t hDev = 0;
+    for (int i = 0; i < s->m2_devvas_n; i++) {
+        if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
+    }
+    void *qva = hDev ? nvkvm_m2_host_map_existing_vidmem(s, client, hDev, hMem, size) : NULL;
+    if (!qva) {
+        s->m2_objs[oi].promote = 2;          /* give up: serve fb_pages, no retry storm */
+        qemu_log("nvkvm-gpu[%s] CE-fwd map-on-touch GIVE-UP obj=%d hMem=0x%08x size=0x%llx "
+                 "(host BAR1 full) -> fb_pages fallback\n", s->chip->name, oi, hMem,
+                 (unsigned long long)size);
+        return false;
+    }
+    /* Replay pre-promotion guest writes: find this object's GPGA range and copy any written
+     * fb_pages into the fresh CPU view (unwritten pages stay as the host CE left them). */
+    uint64_t replayed = 0;
+    for (int g = 0; g < s->m2_gpga_n; g++) {
+        if (s->m2_gpga[g].obj_idx != oi) { continue; }
+        uint64_t gbase = s->m2_gpga[g].gpga_base;
+        uint64_t goff  = s->m2_gpga[g].off;
+        uint64_t glen  = s->m2_gpga[g].size;
+        for (uint64_t off = 0; off < glen; off += 4096) {
+            uint8_t *gp = nvkvm_fb_page(s, gbase + off, false);
+            if (gp) { memcpy((uint8_t *)qva + goff + off, gp, 4096); replayed += 4096; }
+        }
+    }
+    s->m2_objs[oi].cpu_qva = qva;
+    s->m2_objs[oi].promote = 0;
+    qemu_log("nvkvm-gpu[%s] CE-fwd map-on-touch PROMOTED obj=%d hMem=0x%08x size=0x%llx "
+             "cpu_qva=%p replayed=0x%llx (coherent CPU+GPU view now)\n", s->chip->name,
+             oi, hMem, (unsigned long long)size, qva, (unsigned long long)replayed);
+    return true;
+}
+
 /* M6.2 (item-4 step 3): translate a guest GPA to the stub VA where the guest-RAM memfd is
  * MAP_FIXED'd. Uses pci_dma_map to get QEMU's host VA for the GPA (hole-safe across the q35
  * PCI hole), then stub_va = stub_base + (hva - ram_base_hva) since the stub mmapped the SAME
@@ -5573,6 +5682,17 @@ static int nvkvm_m2_gpga_obj_ex(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
         }
     }
     uint32_t hMem = 0xda000000u | (s->m2_databuf_next++ & 0xffffu);
+    /* CE-fwd map-on-touch: gpu_only is only SAFE when the run is still BLANK at walk time (a
+     * pure CE-copy dst / freshly-alloc'd-but-unwritten user buffer). If the guest already wrote
+     * ANY page (a pushbuffer/GPFIFO/src laid down before the doorbell), those bytes are needed by
+     * the host NOW -> fall back to the eager CPU-mapped + copy-preserve path. This blank-vs-written
+     * test (not a window or m2_gr_client gate, both of which lost the ordering race in m565) is
+     * what makes ordering irrelevant: written => eager-map+copy, blank => lazy promote-on-touch. */
+    if (gpu_only) {
+        for (uint64_t off = 0; off < tsize; off += 4096) {
+            if (nvkvm_fb_page(s, gpga + off, false)) { gpu_only = false; break; }
+        }
+    }
     struct nvkvm_host_map hm;
     if (gpu_only) {
         /* CE-forward P1: real host vidmem object, NO CPU view (zero host BAR1). The dst is a
@@ -5607,6 +5727,7 @@ static int nvkvm_m2_gpga_obj_ex(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     s->m2_objs[oi].client = client;
     s->m2_objs[oi].hMemory = hm.h_mem;
     s->m2_objs[oi].gr_va = gpu_mapped ? va : 0;
+    s->m2_objs[oi].promote = gpu_only ? 1 : 0;   /* 1 => CPU view deferred to first touch */
     int gi = s->m2_gpga_n++;
     s->m2_gpga[gi].gpga_base = gpga;
     s->m2_gpga[gi].size = asize;
@@ -5626,46 +5747,6 @@ static int nvkvm_m2_gpga_obj(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                              uint64_t gpga, uint64_t size)
 {
     return nvkvm_m2_gpga_obj_ex(s, client, va, gpga, size, false);
-}
-
-/* CE-forward P1: is `va` (in `client`'s VAS) inside an observed user-CE copy-dst window?
- * Such leaves get GPU-ONLY backing (zero host BAR1). Only ever true under m2cefwd. */
-static bool nvkvm_m2_in_cefwd_dst(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
-{
-    for (int i = 0; i < s->m2_cefwd_dst_n; i++) {
-        if (s->m2_cefwd_dst[i].client == client &&
-            va >= s->m2_cefwd_dst[i].va_base &&
-            va <  s->m2_cefwd_dst[i].va_base + s->m2_cefwd_dst[i].size) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* CE-forward P1: record a user-CE copy-dst VA window (dedup/extend by overlap). Called ONLY
- * from the M5.60 user-CE dst site (nvkvm_m2_is_user_ce-gated). */
-static void nvkvm_m2_add_cefwd_dst(NvkvmGpuEmul *s, uint32_t client, uint64_t va, uint64_t size)
-{
-    uint64_t v0 = va & ~0x1fffffull;                       /* 2-MiB align the window */
-    uint64_t v1 = (va + size + 0x1fffffull) & ~0x1fffffull;
-    for (int i = 0; i < s->m2_cefwd_dst_n; i++) {
-        if (s->m2_cefwd_dst[i].client != client) { continue; }
-        uint64_t e0 = s->m2_cefwd_dst[i].va_base;
-        uint64_t e1 = e0 + s->m2_cefwd_dst[i].size;
-        if (v0 <= e1 && e0 <= v1) {                        /* overlap/adjacent -> coalesce */
-            uint64_t n0 = v0 < e0 ? v0 : e0, n1 = v1 > e1 ? v1 : e1;
-            s->m2_cefwd_dst[i].va_base = n0;
-            s->m2_cefwd_dst[i].size    = n1 - n0;
-            return;
-        }
-    }
-    if (s->m2_cefwd_dst_n >= 64) { return; }
-    int k = s->m2_cefwd_dst_n++;
-    s->m2_cefwd_dst[k].client  = client;
-    s->m2_cefwd_dst[k].va_base = v0;
-    s->m2_cefwd_dst[k].size    = v1 - v0;
-    qemu_log("nvkvm-gpu[%s] CE-fwd P1: user-CE dst window client=0x%08x [0x%llx,0x%llx)\n",
-             s->chip->name, client, (unsigned long long)v0, (unsigned long long)v1);
 }
 
 /* M6.5 leaf accumulator: coalesce contiguous (VA,GPA,sys) leaf pages into runs, back each
@@ -5764,10 +5845,17 @@ static void nvkvm_m2_leaf_flush(struct nvkvm_leaf_acc *a)
                  * matmul-d_out fault). Now an unbacked chunk stays unmarked so a later
                  * sweep retries; on persistent failure the diag below names why. */
                 if (!nvkvm_m2_va_check(a->s, a->client, cva)) {
-                    /* CE-forward P1: a leaf inside an observed user-CE copy-dst window is
-                     * backed GPU-ONLY (real host vidmem + map_dma, no CPU view -> zero host
-                     * BAR1). Everything else keeps its CPU view. Only ever true under m2cefwd. */
-                    bool go = a->s->m2cefwd && nvkvm_m2_in_cefwd_dst(a->s, a->client, cva);
+                    /* CE-fwd map-on-touch: REQUEST gpu_only backing for a compute client's
+                     * vidmem leaf (the GR compute client + libcuda's CE-copy clients). This is
+                     * the DEFAULT now (no window, no m2_gr_client-at-decode gate — both lost the
+                     * ordering race in m565). gpga_obj_ex keeps it gpu_only ONLY if the run is
+                     * blank at walk time (real host vidmem + GPU-side map_dma, zero host BAR1);
+                     * a written run eager-maps+copies as before. A blank gpu_only leaf gets its
+                     * CPU view lazily on the first guest touch (promote-on-touch). Non-compute
+                     * clients keep the exact milestone path (go=false). Only under m2cefwd. */
+                    bool go = a->s->m2cefwd &&
+                              (a->client == a->s->m2_gr_client ||
+                               nvkvm_m2_is_user_ce(a->s, a->client));
                     if (nvkvm_m2_gpga_obj_ex(a->s, a->client, cva, a->gpa0 + off, clen, go) >= 0) {
                         nvkvm_m2_va_mark(a->s, a->client, cva);
                         a->backed++;  /* M7 R2: unified gpu_memory_object (GPGA + GR-VAS) */
