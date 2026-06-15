@@ -402,6 +402,22 @@ struct NvkvmGpuEmul {
                                  * authoritative) — regression-safe.  Default OFF. */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
+    /* M5.10 PERF (2026-06-15): the per-submission GR-VAS re-sweep was ~100% wasted on a real LLM
+     * (m568: 91932/91960 walks backed nothing). Re-sweep ONLY when a GR page table actually
+     * CHANGED: enum_gr_sysmem records the vidmem PT pages it walks (m2_gr_pt_set); a guest write
+     * to any tracked PT page (every PTE/PDE edit writes a tracked page or an ancestor of one) sets
+     * m2_gr_vas_dirty -> the next doorbell sweeps and rebuilds the set; otherwise it skips. New
+     * VAS (chan_vas_n grew) and budget-truncated walks force a sweep too; a periodic net bounds any
+     * missed trigger. Fault-safe: a mapping is always backed before the engine that uses it runs. */
+    bool     m2_gr_vas_dirty;   /* a tracked GR PT page was written since the last sweep */
+    bool     m2_recording_gr_pt;/* true only while enum_gr_sysmem walks (record PT pages) */
+    bool     m2_gr_pt_trunc;    /* last sweep hit the walk budget -> coverage incomplete, keep sweeping */
+    int      m2_last_swept_vas_n;/* chan_vas_n as of the last sweep (new VAS -> force a sweep) */
+    uint32_t m2_db_submits;     /* # of new-work doorbells seen (drives the sparse periodic net) */
+    uint64_t m2_gr_pt_lo, m2_gr_pt_hi; /* min/max tracked PT-page base (cheap fb_write pre-filter) */
+    uint64_t m2_gr_pt_last;     /* last page recorded (skip re-hashing sequential entry reads) */
+    int      m2_gr_pt_n;        /* live entries in m2_gr_pt_set */
+    uint64_t m2_gr_pt_set[8192];/* open-addressing hash set of 4 KiB vidmem PT-page bases */
     uint32_t m2_last_db_token;  /* M5.11: last guest work-submit token seen at the doorbell (dedup log) */
     bool     m2_last_db_valid;
     uint32_t m2_gr_client;      /* M5.7: the GR compute client (set at crashwin arm) */
@@ -632,6 +648,8 @@ static void nvkvm_dplane_summary(NvkvmGpuEmul *s, const char *why)
  * Sets m2_objs[oi].cpu_qva on success (obj.promote 1->0) or gives up (1->2). fwd-decl
  * because the overlay (below) is the first-touch hook. */
 static bool nvkvm_m2_promote_gpu_only(NvkvmGpuEmul *s, int oi);
+/* M5.10 PERF: GR PT-page set membership — fwd-decl (nvkvm_fb_write, below, is the dirty hook). */
+static bool nvkvm_m2_gr_pt_contains(NvkvmGpuEmul *s, uint64_t addr);
 
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
@@ -740,6 +758,14 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
                            unsigned size)
 {
+    /* M5.10 PERF: if this write lands on a tracked GR-VAS page-table page, a mapping changed ->
+     * flag a re-sweep for the next doorbell. The lo/hi range rejects the common data-plane write
+     * in two compares; the hash confirms. Once dirty, skip until the next sweep consumes it. */
+    if (s->m2_gr_pt_n && !s->m2_gr_vas_dirty &&
+        fb_addr >= s->m2_gr_pt_lo && fb_addr <= s->m2_gr_pt_hi + 0xfffull &&
+        nvkvm_m2_gr_pt_contains(s, fb_addr)) {
+        s->m2_gr_vas_dirty = true;
+    }
     /* M5.31 DIAG: log guest writes into the GR-VAS page-table region the cuCtxCreate
      * poll re-walks (the stuck small-page PDE @0x2efbc5000 + its PTE table @0x2efbc6xxx).
      * Tells us whether the CPU-RM WRITES these (per gmmu_walk.c memmgrMemWrite -> a
@@ -3166,6 +3192,45 @@ static uint64_t nvkvm_bar2_translate(NvkvmGpuEmul *s, uint64_t va)
     return NVKVM_GMMU_FAULT;
 }
 
+/* M5.10 PERF: open-addressing hash set of vidmem PT-page bases (4 KiB-aligned). 0 = empty slot;
+ * page base 0 is never a real PT page so the sentinel is safe. */
+#define NVKVM_GR_PT_SLOTS 8192
+static void nvkvm_m2_gr_pt_record(NvkvmGpuEmul *s, uint64_t addr)
+{
+    uint64_t base = addr & ~0xfffull;
+    if (!base || base == s->m2_gr_pt_last) { return; }   /* sequential entry reads share a page */
+    s->m2_gr_pt_last = base;
+    if (s->m2_gr_pt_n >= NVKVM_GR_PT_SLOTS * 3 / 4) { return; }  /* near full -> stop (lo/hi still bound) */
+    uint32_t h = (uint32_t)((base >> 12) * 2654435761u) & (NVKVM_GR_PT_SLOTS - 1);
+    for (int p = 0; p < NVKVM_GR_PT_SLOTS; p++) {
+        if (s->m2_gr_pt_set[h] == base) { return; }       /* already present */
+        if (s->m2_gr_pt_set[h] == 0) {
+            s->m2_gr_pt_set[h] = base; s->m2_gr_pt_n++;
+            if (base < s->m2_gr_pt_lo) { s->m2_gr_pt_lo = base; }
+            if (base > s->m2_gr_pt_hi) { s->m2_gr_pt_hi = base; }
+            return;
+        }
+        h = (h + 1) & (NVKVM_GR_PT_SLOTS - 1);
+    }
+}
+static bool nvkvm_m2_gr_pt_contains(NvkvmGpuEmul *s, uint64_t addr)
+{
+    uint64_t base = addr & ~0xfffull;
+    uint32_t h = (uint32_t)((base >> 12) * 2654435761u) & (NVKVM_GR_PT_SLOTS - 1);
+    for (int p = 0; p < NVKVM_GR_PT_SLOTS; p++) {
+        if (s->m2_gr_pt_set[h] == base) { return true; }
+        if (s->m2_gr_pt_set[h] == 0) { return false; }
+        h = (h + 1) & (NVKVM_GR_PT_SLOTS - 1);
+    }
+    return false;
+}
+static void nvkvm_m2_gr_pt_reset(NvkvmGpuEmul *s)
+{
+    if (s->m2_gr_pt_n) { memset(s->m2_gr_pt_set, 0, sizeof(s->m2_gr_pt_set)); }
+    s->m2_gr_pt_n = 0; s->m2_gr_pt_last = 0;
+    s->m2_gr_pt_lo = ~0ull; s->m2_gr_pt_hi = 0;
+}
+
 /* Read 8 bytes from a page-table entry in FB (vidmem) or sysmem (GPA). */
 static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
 {
@@ -3173,6 +3238,9 @@ static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
         uint8_t b[8];
         if (pci_dma_read(&s->parent_obj, addr, b, 8) != MEMTX_OK) return 0;
         return ldq_le_p(b);
+    }
+    if (s->m2_recording_gr_pt) {          /* M5.10 PERF: this vidmem addr is a GR-VAS PT page */
+        nvkvm_m2_gr_pt_record(s, addr);
     }
     s->m2_in_walk = true;                /* exclude this PTE read from the CRASHWIN probe */
     uint64_t v = nvkvm_fb_rd64(s, addr);
@@ -5976,6 +6044,9 @@ static void nvkvm_m2_enum_gr_sysmem(NvkvmGpuEmul *s, uint32_t client)
                  (unsigned long long)a.sysbytes, (unsigned long long)a.vidbytes,
                  a.backed, budget);
     }
+    /* M5.10 PERF: if we ran out of budget the walk was incomplete (unvisited PT pages aren't
+     * tracked) -> keep sweeping eagerly next doorbell rather than trust the dirty flag. */
+    s->m2_gr_pt_trunc = (budget <= 0);
 }
 
 /* M5.28 PER-CHANNEL VAS population: mirror the guest channel's ENTIRE address space into its
@@ -6101,20 +6172,37 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             nc->sweep_put = np;          /* latch: one sweep per submission, not per doorbell */
         }
     }
-    /* The cap bounds worst-case sweep cost; 1000 sufficed for short workloads (cup3/4/7/8) but
-     * a real LLM (m568) issues FAR more than 1000 submissions, and a buffer mapped after the
-     * 1000th sweep never gets backed -> GR engine VIRT_WRITE fault on it (Xid 31 @ 0x302000000).
-     * The sweep is per-NEW-submission (m548_newwork latches GP_PUT) and idempotent (va_seen dedup
-     * -> a walk that finds nothing new just reads page tables), so a high cap is safe; raise to
-     * cover a full inference. (2026-06-15) */
-    if (nsweep && (s->m2_exec_sweeps < 8 || (m548_newwork && s->m2_exec_sweeps < 200000))) {
+    /* M5.10 PERF: the sweep walks the WHOLE GR VAS (the LLM's was 7777 runs) and on a real LLM
+     * 99.97% of walks (m568: 91932/91960) backed NOTHING — pure waste that dropped it to ~0.1
+     * tok/s. Re-sweep ONLY when something that could need backing changed:
+     *   (a) bootstrap: the first 8 sweeps (populate the PT-page set + initial working set);
+     *   (b) m2_gr_vas_dirty: the guest wrote a tracked GR PT page (a mapping changed) — every
+     *       PTE/PDE edit writes a tracked page or an ancestor of one (the root PDB is always
+     *       tracked), so this catches all real mapping changes BEFORE the engine uses them;
+     *   (c) a new GR VAS appeared (chan_vas_n grew) — its PT pages aren't tracked yet;
+     *   (d) the last walk was budget-truncated (incomplete coverage -> stay eager);
+     *   (e) a sparse periodic net (every 64th submission) as belt-and-suspenders.
+     * m548_newwork (a submission actually advanced) still gates so we never sweep on idle
+     * doorbells. Each sweep RESETS + rebuilds the PT-page set so it tracks the current tables. */
+    if (m548_newwork) { s->m2_db_submits++; }
+    bool new_vas = (s->chan_vas_n != s->m2_last_swept_vas_n);
+    bool periodic = (m548_newwork && (s->m2_db_submits & 255u) == 0u);  /* sparse insurance net */
+    bool want = (s->m2_exec_sweeps < 8) ||
+                (m548_newwork && s->m2_exec_sweeps < 200000 &&
+                 (s->m2_gr_vas_dirty || new_vas || s->m2_gr_pt_trunc || periodic));
+    if (nsweep && want) {
         s->m2_exec_sweeps++;
+        s->m2_gr_vas_dirty = false;        /* consume; a later PT write re-arms it */
+        s->m2_last_swept_vas_n = s->chan_vas_n;
+        nvkvm_m2_gr_pt_reset(s);           /* rebuild the PT-page set from this walk */
+        s->m2_recording_gr_pt = true;
         for (int k = 0; k < nsweep; k++) {
             qemu_log("nvkvm-gpu[%s] M5.10 doorbell re-sweep #%u (client 0x%08x)%s — back newly-mapped "
                      "working set incl. completion semaphore\n", s->chip->name, s->m2_exec_sweeps,
                      sweepc[k], m548_newwork ? " [M5.48c new-work]" : "");
             nvkvm_m2_enum_gr_sysmem(s, sweepc[k]);
         }
+        s->m2_recording_gr_pt = false;
     }
     /* M5.13: one-shot DRY-RUN locate of the completion semaphore (0x2efbaf000, the page the
      * guest RM busy-polls during cuCtxCreate) so we learn its owning PDB + GR-VA before backing.

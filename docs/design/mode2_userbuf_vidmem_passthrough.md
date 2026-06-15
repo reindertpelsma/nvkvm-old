@@ -500,6 +500,21 @@ smarter trigger — sweep only on a genuinely-new MAPPING, not every GP_PUT adva
 (b) the ~100 MB/s GPA-window CPU data path (the CE-forward PERF half: forward bulk HtoD/DtoH as real
 host CE). Harness `scripts/mode2_diag/m568_llm_maptouch_host.sh` (boots NVKVM_M2CEFWD=1, LLM_TIMEOUT).
 
+#### Sweep trigger fixed → LLM 0.1 → 20 tok/s (m568d, 2026-06-15) ★★★★★
+
+Cause (a) above FIXED. MEASURED first: of 91960 GR-VAS walks in the LLM run, **91932 (99.97%) backed
+NOTHING** — pure waste (the 7777-run compute VAS was re-walked 10463×). The walk ran per NEW submission
+(`m548_newwork`), but the working set is stable after warmup, so almost every walk was redundant.
+FIX = re-sweep ONLY when a GR page table actually CHANGED: `enum_gr_sysmem` records the vidmem PT pages
+it walks (`m2_gr_pt_set`, an 8192-slot hash set, rebuilt each sweep); a guest write to any tracked PT
+page sets `m2_gr_vas_dirty` (in `nvkvm_fb_write`, behind a lo/hi range pre-filter) → the next doorbell
+sweeps. Fault-safe because every PTE/PDE edit writes a tracked page or an ancestor of one (the root PDB
+is always tracked), so a mapping is always backed before the engine that uses it runs. Extra triggers:
+new GR VAS (`chan_vas_n` grew), budget-truncated walk, and a sparse every-256-submissions insurance net.
+RESULT (m568d): re-sweeps **11487 → 41**, walks **91960 → 392**, **Generation 0.1 → 20.1 tok/s (200×)**,
+run COMPLETES (rc=0) with coherent output (correctness identical: gpga FAILED=0, no new Xid). Remaining
+perf headroom is the ~100 MB/s GPA-window data path (the CE-forward PERF half, still deferred).
+
 ### Guest (emulated) BAR1 → 16 GiB — DONE + verified (m564c, 2026-06-14)
 
 Separate from the host-BAR1/CE-forward work: the EMULATED device BAR1 was a 256 MiB stub, capping
