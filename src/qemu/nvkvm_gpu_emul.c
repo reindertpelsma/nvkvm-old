@@ -233,6 +233,13 @@ struct NvkvmGpuEmul {
                                  * again only when a channel's PUT ADVANCES (new submission =
                                  * the guest just mapped+filled new working-set leaves) */
         bool     ce_route_logged; /* CE-fwd Step 0: one-shot NVKVM-CEFWD-ROUTE probe per channel */
+        /* M5.62 OPAQUE fast-path (user's plan): once a userspace channel's working set is fully
+         * resident (the dirty-sweep backs everything; the walk maps NOTHING new for K subs), skip
+         * the per-doorbell GPFIFO walk + va_seen (uncached-vidmem reads) — just advance gp_get and
+         * ring, like Mode-1's opaque channel. Re-armed (resident=false) on ANY sweep (a mapping
+         * changed) so discovery resumes; self-heals the same way the sweep already does. */
+        uint32_t stable_subs;   /* consecutive submissions with newpushbufs==0 */
+        bool     resident;      /* working set fully resident -> skip the walk */
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -409,6 +416,14 @@ struct NvkvmGpuEmul {
                                  * sema). Identity map_dma means src/dst VAs are already valid in the
                                  * CE channel's VAS once resident. Sub-flag of m2cefwd (needs the dst
                                  * real-backed). Default OFF — A/B vs the CPU-copy 23.6 tok/s. */
+    bool     m2_trace;          /* M5.63: enable the high-volume per-doorbell/per-fb-access DIAG
+                                 * qemu_log spew (M5.9/RANG/CE-INSTR/M5.22 + crashwin M5.31/M5.15/
+                                 * CRASHWIN-RD/DMAW — ~94 lines/doorbell, ~360k lines/run). Default
+                                 * OFF: synchronous qemu_log I/O is pure overhead in control-heavy
+                                 * phases. Errors / one-shots / NVKVM-TWIN stay unconditional. */
+    bool     m2opaque;          /* M5.62 (user's plan): skip the GPFIFO walk for a userspace channel
+                                 * once it's fully resident (newpushbufs==0 for K subs) — ring only.
+                                 * Re-armed on any sweep. Default OFF (perf experiment). */
     bool     m2_exec_done;      /* M5.7: one-shot working-set back+map */
     uint32_t m2_exec_sweeps;    /* M5.10: # of doorbell-time GR-VAS re-sweeps done (bounded) */
     /* M5.10 PERF (2026-06-15): the per-submission GR-VAS re-sweep was ~100% wasted on a real LLM
@@ -530,6 +545,15 @@ struct NvkvmGpuEmul {
         bool     readable, writable;
     } m2_gpga[2048];            /* M5.48d: 2-MiB chunked mirror needs headroom (was 256) */
     int      m2_gpga_n;
+    /* M5.11c PERF: sorted-by-base index over m2_gpga[] so the hot fb_host_overlay lookup is a
+     * binary search (log n) instead of an O(n~430) linear scan that dominated exec_doorbell
+     * (60M fruitless iters/window). Ranges are non-overlapping (one obj per GPGA range). Lazily
+     * rebuilt when m2_gpga_n changes; mark dirty at the single insert site. */
+    uint16_t m2_gpga_sorted[2048];  /* gpga indices, ascending by gpga_base */
+    int      m2_gpga_sorted_n;      /* count built into m2_gpga_sorted */
+    bool     m2_gpga_idx_dirty;
+    uint64_t m2_gpga_idx_audit;     /* lookups remaining to cross-check vs the old linear scan */
+    uint64_t m2_gpga_idx_mismatch;  /* audit: binary-search vs linear-scan disagreements (must be 0) */
 
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
@@ -624,9 +648,26 @@ static uint64_t nvkvm_t_ce_emul_ns,   nvkvm_t_ce_emul_calls;   /* emulated-CE LA
 static uint64_t nvkvm_t_win_rd_ns,    nvkvm_t_win_rd_calls;    /* guest-CPU PRAMIN-window read trap */
 static uint64_t nvkvm_t_win_wr_ns,    nvkvm_t_win_wr_calls;    /* guest-CPU PRAMIN-window write trap */
 static uint64_t nvkvm_t_sweep_ns,     nvkvm_t_sweep_calls;     /* doorbell GR-VAS re-sweep walk */
-static uint64_t nvkvm_t_doorbell_ns,  nvkvm_t_doorbell_calls;  /* whole exec_doorbell (incl. sweep) */
+static uint64_t nvkvm_t_doorbell_ns,  nvkvm_t_doorbell_calls;  /* whole exec_doorbell WALL time (incl. sweep) */
+static uint64_t nvkvm_t_doorbell_cpu_ns;                       /* exec_doorbell THREAD-CPU time (vs wall = desched) */
 static uint64_t nvkvm_t_chan_exec_ns, nvkvm_t_chan_exec_calls; /* whole chan_execute (incl. doorbell) */
+static uint64_t nvkvm_t_event_ns,     nvkvm_t_event_calls;     /* nvkvm_gsp_deliver_events (os-event wake) */
+static uint64_t nvkvm_t_resolve_ns,   nvkvm_t_resolve_calls;   /* nvkvm_m2_resolve_fb GMMU walk */
+static uint64_t nvkvm_t_fbrd_calls;                            /* nvkvm_fb_read total calls */
+static uint64_t nvkvm_t_overlay_iters;                         /* fbback+gpga linear-scan iterations (O(n) cost) */
+static uint64_t nvkvm_t_vaseen_iters, nvkvm_t_vaseen_calls;    /* m2_mapped_va[] linear-scan (va_seen/va_check) */
+static uint64_t nvkvm_t_backmap_ns,   nvkvm_t_backmap_calls;   /* nvkvm_m2_back_and_map (host RM ioctls) */
+static uint64_t nvkvm_t_fbrd_ov_ns,   nvkvm_t_fbrd_ov_calls;   /* fb_read served from host overlay (GPU-BAR?) */
+static uint64_t nvkvm_t_fbrd_pg_ns,   nvkvm_t_fbrd_pg_calls;   /* fb_read served from fb_page (host RAM) */
 static inline uint64_t nvkvm_now_ns(void) { return qemu_clock_get_ns(QEMU_CLOCK_REALTIME); }
+/* M5.11e: per-thread CPU time (NOT wall) — db_cpu << db_wall would prove exec_doorbell is
+ * descheduling-bound (host preempts the BQL/vCPU thread mid-trap) rather than CPU-work-bound. */
+static inline uint64_t nvkvm_now_cpu_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 static inline void nvkvm_t_mark_start(void) { if (!nvkvm_t_run_start_ns) nvkvm_t_run_start_ns = nvkvm_now_ns(); }
 
 /* Classify an FB address the SAME way nvkvm_fb_host_overlay does, WITHOUT touching
@@ -705,12 +746,176 @@ static void nvkvm_timeshare_dump(NvkvmGpuEmul *s, const char *why)
 #undef NVKVM_PCT
 }
 
+/* M5.11b PERF window dump: per-WINDOW deltas (vs the cumulative dump, which is dominated by
+ * the model-load phase). Keyed to doorbell count from the exec_doorbell timing site so it
+ * samples steady-state GENERATION evenly. Decisive split for the 22->60 tok/s lever:
+ *   inside_qemu = (exec_doorbell + chan_execute + deliver_events) wall time in the window
+ *                 = the SUBMIT-side cost the vCPU is blocked in QEMU for.
+ *   outside     = wall - inside = guest-side launch overhead + libcuda's completion SPIN
+ *                 (cuStreamSynchronize waiting for the sema). If `outside` dominates while
+ *                 the host GPU is idle, the cost is completion-visibility latency (H2), not
+ *                 QEMU submit cost. event_us isolates the os-event wake path specifically. */
+static uint64_t nvkvm_tw_last_ns, nvkvm_tw_db_ns, nvkvm_tw_db_calls, nvkvm_tw_db_cpu_ns, nvkvm_tw_cx_ns,
+                nvkvm_tw_sweep_ns, nvkvm_tw_event_ns, nvkvm_tw_event_calls,
+                nvkvm_tw_winrd_calls, nvkvm_tw_winwr_calls, nvkvm_tw_ce_calls,
+                nvkvm_tw_resolve_ns, nvkvm_tw_resolve_calls, nvkvm_tw_fbrd_calls,
+                nvkvm_tw_overlay_iters, nvkvm_tw_vaseen_iters, nvkvm_tw_vaseen_calls,
+                nvkvm_tw_backmap_ns, nvkvm_tw_backmap_calls,
+                nvkvm_tw_fbrd_ov_ns, nvkvm_tw_fbrd_ov_calls,
+                nvkvm_tw_fbrd_pg_ns, nvkvm_tw_fbrd_pg_calls;
+static void nvkvm_timeshare_window_dump(NvkvmGpuEmul *s, const char *why)
+{
+    uint64_t now = nvkvm_now_ns();
+    uint64_t wall = nvkvm_tw_last_ns ? (now - nvkvm_tw_last_ns) : 1;
+    if (!wall) wall = 1;
+    uint64_t d_db  = nvkvm_t_doorbell_ns   - nvkvm_tw_db_ns;
+    uint64_t d_dbc = nvkvm_t_doorbell_calls - nvkvm_tw_db_calls;
+    uint64_t d_dbcpu = nvkvm_t_doorbell_cpu_ns - nvkvm_tw_db_cpu_ns;
+    uint64_t d_cx  = nvkvm_t_chan_exec_ns  - nvkvm_tw_cx_ns;
+    uint64_t d_sw  = nvkvm_t_sweep_ns      - nvkvm_tw_sweep_ns;
+    uint64_t d_ev  = nvkvm_t_event_ns      - nvkvm_tw_event_ns;
+    uint64_t d_evc = nvkvm_t_event_calls   - nvkvm_tw_event_calls;
+    uint64_t d_wrd = nvkvm_t_win_rd_calls  - nvkvm_tw_winrd_calls;
+    uint64_t d_wwr = nvkvm_t_win_wr_calls  - nvkvm_tw_winwr_calls;
+    uint64_t d_ce  = nvkvm_dp_ce_launchdma_calls - nvkvm_tw_ce_calls;
+    uint64_t d_rsn = nvkvm_t_resolve_ns    - nvkvm_tw_resolve_ns;
+    uint64_t d_rsc = nvkvm_t_resolve_calls - nvkvm_tw_resolve_calls;
+    uint64_t d_fbr = nvkvm_t_fbrd_calls    - nvkvm_tw_fbrd_calls;
+    uint64_t d_ovl = nvkvm_t_overlay_iters - nvkvm_tw_overlay_iters;
+    uint64_t d_vsi = nvkvm_t_vaseen_iters  - nvkvm_tw_vaseen_iters;
+    uint64_t d_vsc = nvkvm_t_vaseen_calls  - nvkvm_tw_vaseen_calls;
+    uint64_t d_bmn = nvkvm_t_backmap_ns    - nvkvm_tw_backmap_ns;
+    uint64_t d_bmc = nvkvm_t_backmap_calls - nvkvm_tw_backmap_calls;
+    uint64_t d_ovn = nvkvm_t_fbrd_ov_ns    - nvkvm_tw_fbrd_ov_ns;
+    uint64_t d_ovc = nvkvm_t_fbrd_ov_calls - nvkvm_tw_fbrd_ov_calls;
+    uint64_t d_pgn = nvkvm_t_fbrd_pg_ns    - nvkvm_tw_fbrd_pg_ns;
+    uint64_t d_pgc = nvkvm_t_fbrd_pg_calls - nvkvm_tw_fbrd_pg_calls;
+    uint64_t inside = d_db + d_cx + d_ev;
+    /* M5.11c: emit to stderr (NOT qemu_log) so this measurement survives running with `-d` removed
+     * — that lets us A/B the per-doorbell DIAG log spew (qemu_log off) vs on using the
+     * variance-robust db-us/doorbell metric instead of the ±40%-noisy end-to-end t/s. */
+    fprintf(stderr, "nvkvm-gpu[%s] NVKVM-TWIN (%s): wall=%llums dbells=%llu ce=%llu | "
+             "INSIDE_qemu=%.1f%% (db=%llums[cpu=%llums]/%lluus_per chan_exec=%llums event=%llums/%lluc) "
+             "sweep=%llums | resolve=%llums/%lluc fbrd=%lluc overlay_iters=%llu(%llu/fbrd) "
+             "gpga_n=%d idx_mismatch=%llu audit_left=%llu "
+             "vaseen=%lluit/%lluc(%llu/call,n=%d) backmap=%llums/%lluc "
+             "fbrd_BAR=%llums/%lluc(%lluns) fbrd_RAM=%llums/%lluc(%lluns) "
+             "winrd=%lluc winwr=%lluc | OUTSIDE(guest+spin)=%.1f%%\n",
+             s->chip->name, why,
+             (unsigned long long)(wall/1000000ull), (unsigned long long)d_dbc,
+             (unsigned long long)d_ce,
+             (double)inside*100.0/(double)wall,
+             (unsigned long long)(d_db/1000000ull),
+             (unsigned long long)(d_dbcpu/1000000ull),
+             (unsigned long long)(d_dbc ? d_db/1000ull/d_dbc : 0),
+             (unsigned long long)(d_cx/1000000ull),
+             (unsigned long long)(d_ev/1000000ull), (unsigned long long)d_evc,
+             (unsigned long long)(d_sw/1000000ull),
+             (unsigned long long)(d_rsn/1000000ull), (unsigned long long)d_rsc,
+             (unsigned long long)d_fbr, (unsigned long long)d_ovl,
+             (unsigned long long)(d_fbr ? d_ovl/d_fbr : 0),
+             s->m2_gpga_n, (unsigned long long)s->m2_gpga_idx_mismatch,
+             (unsigned long long)s->m2_gpga_idx_audit,
+             (unsigned long long)d_vsi, (unsigned long long)d_vsc,
+             (unsigned long long)(d_vsc ? d_vsi/d_vsc : 0), s->m2_mapped_va_n,
+             (unsigned long long)(d_bmn/1000000ull), (unsigned long long)d_bmc,
+             (unsigned long long)(d_ovn/1000000ull), (unsigned long long)d_ovc,
+             (unsigned long long)(d_ovc ? d_ovn/d_ovc : 0),
+             (unsigned long long)(d_pgn/1000000ull), (unsigned long long)d_pgc,
+             (unsigned long long)(d_pgc ? d_pgn/d_pgc : 0),
+             (unsigned long long)d_wrd, (unsigned long long)d_wwr,
+             100.0 - (double)inside*100.0/(double)wall);
+    nvkvm_tw_last_ns = now;
+    nvkvm_tw_db_ns = nvkvm_t_doorbell_ns; nvkvm_tw_db_calls = nvkvm_t_doorbell_calls;
+    nvkvm_tw_db_cpu_ns = nvkvm_t_doorbell_cpu_ns;
+    nvkvm_tw_cx_ns = nvkvm_t_chan_exec_ns; nvkvm_tw_sweep_ns = nvkvm_t_sweep_ns;
+    nvkvm_tw_event_ns = nvkvm_t_event_ns; nvkvm_tw_event_calls = nvkvm_t_event_calls;
+    nvkvm_tw_winrd_calls = nvkvm_t_win_rd_calls; nvkvm_tw_winwr_calls = nvkvm_t_win_wr_calls;
+    nvkvm_tw_ce_calls = nvkvm_dp_ce_launchdma_calls;
+    nvkvm_tw_resolve_ns = nvkvm_t_resolve_ns; nvkvm_tw_resolve_calls = nvkvm_t_resolve_calls;
+    nvkvm_tw_fbrd_calls = nvkvm_t_fbrd_calls; nvkvm_tw_overlay_iters = nvkvm_t_overlay_iters;
+    nvkvm_tw_vaseen_iters = nvkvm_t_vaseen_iters; nvkvm_tw_vaseen_calls = nvkvm_t_vaseen_calls;
+    nvkvm_tw_backmap_ns = nvkvm_t_backmap_ns; nvkvm_tw_backmap_calls = nvkvm_t_backmap_calls;
+    nvkvm_tw_fbrd_ov_ns = nvkvm_t_fbrd_ov_ns; nvkvm_tw_fbrd_ov_calls = nvkvm_t_fbrd_ov_calls;
+    nvkvm_tw_fbrd_pg_ns = nvkvm_t_fbrd_pg_ns; nvkvm_tw_fbrd_pg_calls = nvkvm_t_fbrd_pg_calls;
+}
+
 /* CE-fwd map-on-touch: lazily CPU-map a gpu_only object on its first guest CPU touch.
  * Sets m2_objs[oi].cpu_qva on success (obj.promote 1->0) or gives up (1->2). fwd-decl
  * because the overlay (below) is the first-touch hook. */
 static bool nvkvm_m2_promote_gpu_only(NvkvmGpuEmul *s, int oi);
 /* M5.10 PERF: GR PT-page set membership — fwd-decl (nvkvm_fb_write, below, is the dirty hook). */
 static bool nvkvm_m2_gr_pt_contains(NvkvmGpuEmul *s, uint64_t addr);
+
+/* M5.11c PERF: (re)build the sorted-by-base index over m2_gpga[]. Insertion sort — n is small
+ * (~430) and rebuilds happen only when an object is allocated (load-time), never during steady
+ * generation (the lookup-heavy phase). */
+static void nvkvm_m2_gpga_index_rebuild(NvkvmGpuEmul *s)
+{
+    int n = s->m2_gpga_n;
+    if (n > (int)ARRAY_SIZE(s->m2_gpga_sorted)) { n = (int)ARRAY_SIZE(s->m2_gpga_sorted); }
+    for (int i = 0; i < n; i++) { s->m2_gpga_sorted[i] = (uint16_t)i; }
+    for (int i = 1; i < n; i++) {
+        uint16_t key = s->m2_gpga_sorted[i];
+        uint64_t kb = s->m2_gpga[key].gpga_base;
+        int j = i - 1;
+        while (j >= 0 && s->m2_gpga[s->m2_gpga_sorted[j]].gpga_base > kb) {
+            s->m2_gpga_sorted[j + 1] = s->m2_gpga_sorted[j];
+            j--;
+        }
+        s->m2_gpga_sorted[j + 1] = key;
+    }
+    s->m2_gpga_sorted_n = n;
+    s->m2_gpga_idx_dirty = false;
+}
+
+/* Return the m2_gpga[] index whose range contains fb_addr, or -1. Ranges are non-overlapping
+ * (one object per GPGA range), so the only entry that can contain fb_addr is the one with the
+ * largest gpga_base <= fb_addr — a binary search, exact. Replaces the O(n~430) linear scan that
+ * dominated exec_doorbell (60M fruitless iters/window). A self-disabling audit (m2_gpga_idx_audit)
+ * cross-checks against the old linear scan for the first N lookups and counts any disagreement. */
+static int nvkvm_m2_gpga_find(NvkvmGpuEmul *s, uint64_t fb_addr)
+{
+    if (s->m2_gpga_idx_dirty || s->m2_gpga_sorted_n != s->m2_gpga_n) {
+        nvkvm_m2_gpga_index_rebuild(s);
+    }
+    int lo = 0, hi = s->m2_gpga_sorted_n - 1, cand = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        int gi = s->m2_gpga_sorted[mid];
+        if (s->m2_gpga[gi].gpga_base <= fb_addr) { cand = gi; lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    if (cand >= 0 && fb_addr >= s->m2_gpga[cand].gpga_base + s->m2_gpga[cand].size) {
+        cand = -1;
+    }
+    if (s->m2_gpga_idx_audit) {
+        s->m2_gpga_idx_audit--;
+        int lin = -1;
+        for (int i = 0; i < s->m2_gpga_n; i++) {
+            if (fb_addr >= s->m2_gpga[i].gpga_base &&
+                fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) { lin = i; break; }
+        }
+        /* Equivalent if both miss, or both hit the SAME gpga_base (allow a different array index
+         * that maps an identical range — never observed, but harmless). */
+        bool same = (lin < 0 && cand < 0) ||
+                    (lin >= 0 && cand >= 0 &&
+                     s->m2_gpga[lin].gpga_base == s->m2_gpga[cand].gpga_base &&
+                     s->m2_gpga[lin].size == s->m2_gpga[cand].size);
+        if (!same) {
+            s->m2_gpga_idx_mismatch++;
+            if (s->m2_gpga_idx_mismatch <= 20) {
+                qemu_log("nvkvm-gpu[%s] M5.11c GPGA-INDEX MISMATCH fb=0x%llx lin=%d(base=0x%llx) "
+                         "bin=%d(base=0x%llx) — OVERLAP, binary search UNSAFE\n", s->chip->name,
+                         (unsigned long long)fb_addr, lin,
+                         (unsigned long long)(lin >= 0 ? s->m2_gpga[lin].gpga_base : 0), cand,
+                         (unsigned long long)(cand >= 0 ? s->m2_gpga[cand].gpga_base : 0));
+            }
+            return lin;   /* trust the legacy scan while auditing */
+        }
+    }
+    return cand;
+}
 
 static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 {
@@ -723,6 +928,7 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
      * USERD pages stay authoritative while the rest of the GPGA run (GPFIFO entries the
      * host GPU fetches by VA) is still served by the gpu_memory_object. */
     for (int i = 0; i < s->m2_fbback_n; i++) {
+        nvkvm_t_overlay_iters++;
         if (fb_addr >= s->m2_fbback[i].fb_base &&
             fb_addr <  s->m2_fbback[i].fb_base + s->m2_fbback[i].size) {
             return (uint8_t *)s->m2_fbback[i].host_qva +
@@ -731,27 +937,25 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
     }
     /* M7 REFACTOR: fb_addr is a GPGA; resolve it to its backing gpu_memory_object's CPU
      * mapping. Empty => fall through (in the caller) to the local fb_pages. */
-    for (int i = 0; i < s->m2_gpga_n; i++) {
-        if (fb_addr >= s->m2_gpga[i].gpga_base &&
-            fb_addr <  s->m2_gpga[i].gpga_base + s->m2_gpga[i].size) {
-            int oi = s->m2_gpga[i].obj_idx;
-            if (oi < 0 || oi >= s->m2_objs_n) {
-                break;                       /* GPGA known but no object -> fb_pages */
-            }
-            /* CE-fwd map-on-touch: a gpu_only object (real host vidmem + GPU-side map_dma,
-             * NO CPU view -> zero host BAR1) has no cpu_qva yet. The guest CPU is touching it
-             * NOW (this is the trap) -> promote: RM_MAP_MEMORY the SAME hMem (coherent) +
-             * replay any pre-promotion fb_pages writes, then serve from the real bytes. Skip
-             * during the GMMU walk (m2_in_walk) to avoid re-entering backing mid-PTE-read. */
-            if (!s->m2_objs[oi].cpu_qva && s->m2_objs[oi].promote == 1 && !s->m2_in_walk) {
-                nvkvm_m2_promote_gpu_only(s, oi);   /* sets cpu_qva on success */
-            }
-            if (!s->m2_objs[oi].cpu_qva) {
-                break;                       /* no CPU backing (gpu_only/given-up) -> fb_pages */
-            }
-            return (uint8_t *)s->m2_objs[oi].cpu_qva + s->m2_gpga[i].off +
-                   (fb_addr - s->m2_gpga[i].gpga_base);
+    int i = nvkvm_m2_gpga_find(s, fb_addr);   /* M5.11c: binary search (was O(n~430) linear scan) */
+    if (i >= 0) {
+        int oi = s->m2_gpga[i].obj_idx;
+        if (oi < 0 || oi >= s->m2_objs_n) {
+            return NULL;                     /* GPGA known but no object -> fb_pages */
         }
+        /* CE-fwd map-on-touch: a gpu_only object (real host vidmem + GPU-side map_dma,
+         * NO CPU view -> zero host BAR1) has no cpu_qva yet. The guest CPU is touching it
+         * NOW (this is the trap) -> promote: RM_MAP_MEMORY the SAME hMem (coherent) +
+         * replay any pre-promotion fb_pages writes, then serve from the real bytes. Skip
+         * during the GMMU walk (m2_in_walk) to avoid re-entering backing mid-PTE-read. */
+        if (!s->m2_objs[oi].cpu_qva && s->m2_objs[oi].promote == 1 && !s->m2_in_walk) {
+            nvkvm_m2_promote_gpu_only(s, oi);   /* sets cpu_qva on success */
+        }
+        if (!s->m2_objs[oi].cpu_qva) {
+            return NULL;                     /* no CPU backing (gpu_only/given-up) -> fb_pages */
+        }
+        return (uint8_t *)s->m2_objs[oi].cpu_qva + s->m2_gpga[i].off +
+               (fb_addr - s->m2_gpga[i].gpga_base);
     }
     return NULL;
 }
@@ -759,6 +963,7 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
 /* Aligned reg accesses never straddle a 4 KiB page. */
 static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 {
+    nvkvm_t_fbrd_calls++;
     /* M5.14 DIAG: satisfy the guest-kernel post-PROMOTE_CTX completion poll. The fake-GSP model
      * never runs the real golden-image/ctx-init work, so the vidmem status word the guest RM
      * busy-polls stays 0 forever. Inject a sentinel (host owns real ctx-switch; guest userspace
@@ -775,6 +980,8 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
     uint8_t *hp = ((s->m2_fbback_n || s->m2_gpga_n) ? nvkvm_fb_host_overlay(s, fb_addr) : NULL);
     if (hp) {                            /* M5.3: served from real host GPU memory */
         uint64_t v;
+        uint64_t t0ov = nvkvm_now_ns();  /* M5.11d: isolate the host-overlay READ latency (uncached
+                                          * PCIe if cpu_qva is a BAR1 map of host vidmem) vs fb_page RAM */
         switch (size) {
         case 1: v = *hp; break;
         case 2: v = lduw_le_p(hp); break;
@@ -782,6 +989,7 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
         case 8: v = ldq_le_p(hp); break;
         default: v = 0; break;
         }
+        nvkvm_t_fbrd_ov_ns += nvkvm_now_ns() - t0ov; nvkvm_t_fbrd_ov_calls++;
         if (s->m2_crashwin && !s->m2_in_walk && s->m2_crashwin_reads < 100000) {
             s->m2_crashwin_reads++;
             qemu_log("nvkvm-gpu[GA106] CRASHWIN RD fb=0x%llx sz=%u = 0x%llx "
@@ -793,6 +1001,7 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
     uint8_t *p = nvkvm_fb_page(s, fb_addr, false);
     uint32_t o = fb_addr & 0xfffu;
     uint64_t v;
+    uint64_t t0pg = nvkvm_now_ns();
     if (!p) {
         v = 0;
     } else {
@@ -804,6 +1013,7 @@ static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
         default: v = 0; break;
         }
     }
+    nvkvm_t_fbrd_pg_ns += nvkvm_now_ns() - t0pg; nvkvm_t_fbrd_pg_calls++;
     /* M5.3 DIAG: crash-window probe — log FB reads after the 0xc7c0 alloc. A read
      * returning 0 from an UN-backed page (p==NULL) is a prime suspect for the value
      * that corrupts libcuda's frame; its fb_addr identifies the buffer to back. */
@@ -839,7 +1049,7 @@ static void nvkvm_fb_write(NvkvmGpuEmul *s, uint64_t fb_addr, uint64_t val,
     /* M5.44 TRACE: any write to a registered channel USERD's GP_GET(+0x88)/GP_PUT(+0x8C)
      * word — log the value and WHICH overlay branch serves this address, so a stolen/diverted
      * GP_PUT is directly visible. Rare (ring-control words only), unbounded is fine. */
-    if (((fb_addr & 0xfffu) == 0x88u || (fb_addr & 0xfffu) == 0x8Cu)) {
+    if (s->m2_trace && ((fb_addr & 0xfffu) == 0x88u || (fb_addr & 0xfffu) == 0x8Cu)) {
         for (int k = 0; k < s->m2_chanbuf_n; k++) {
             if ((fb_addr & ~0xfffull) == s->m2_chanbuf[k].fb_base) {
                 const char *br = "fb_pages"; int bi = -1;
@@ -1046,7 +1256,7 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
 
     /* Don't trace PTIMER reads (RM timeout loops poll millions of times) or the
      * PRAMIN window (BAR2/page-table setup hammers it). */
-    if (s->trace && off != NV_PTIMER_TIME_0_GA10X &&
+    if (s->m2_trace && s->trace && off != NV_PTIMER_TIME_0_GA10X &&
         off != NV_PTIMER_TIME_1_GA10X &&
         !(off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE)) {
         const char *nm = nvkvm_reg_name(off);
@@ -2598,9 +2808,10 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * GPFIFO/USERD are bridged; we also deliver the os-event so the guest's blocking-sync
          * poll wakes and re-reads the semaphore the HOST GPU (or Phase-B) wrote. */
         nvkvm_t_mark_start();
-        { uint64_t t0db = nvkvm_now_ns();
+        { uint64_t t0db = nvkvm_now_ns(); uint64_t t0cpu = nvkvm_now_cpu_ns();
           nvkvm_m2_exec_doorbell(s);
-          nvkvm_t_doorbell_ns += nvkvm_now_ns() - t0db; nvkvm_t_doorbell_calls++; }
+          nvkvm_t_doorbell_ns += nvkvm_now_ns() - t0db; nvkvm_t_doorbell_calls++;
+          nvkvm_t_doorbell_cpu_ns += nvkvm_now_cpu_ns() - t0cpu; }
         /* Work submitted on SOME channel.  The doorbell token's chid would name
          * it, but during init multiple GPFIFO channels coexist (CeUtils scrubber
          * + its self-verify channel + the host/compute channel) and tracking only
@@ -2770,7 +2981,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
              *          for the CE pool (extend the overlay/fbback-first guard).
              * Also reports the gpfifo VA + whether an m2_gpga[] entry shadows
              * c->userd (a GPGA mirror would feed reads from page B not A). */
-            {
+            if (s->m2_trace) {
                 uint32_t a_put = (uint32_t)nvkvm_fb_read(s, c->userd + 0x8C, 4);
                 uint32_t a_get = (uint32_t)nvkvm_fb_read(s, c->userd + 0x88, 4);
                 void *bqva = NULL;
@@ -2857,6 +3068,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                  * the host owns it thereafter. So just ring the doorbell — the host sees
                  * the guest's real GP_PUT > aligned GP_GET and fetches the new work. */
                 stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, c->host_token);
+                if (s->m2_trace)
                 qemu_log("nvkvm-gpu[%s] M5.22 RANG host doorbell ch[%d] token=0x%08x "
                          "(client=0x%08x gpfifo=0x%llx) hostUSERD put=%u get=%u%s\n",
                          s->chip->name, i, c->host_token, c->client,
@@ -2898,7 +3110,14 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * completed-doorbell is bounded by the queue ring; the guest drains all
          * queued POST_EVENTs in one SWGEN0 service. */
         if (any_completed) {
+            uint64_t t0ev = nvkvm_now_ns();
             nvkvm_gsp_deliver_events(s);
+            nvkvm_t_event_ns += nvkvm_now_ns() - t0ev; nvkvm_t_event_calls++;
+        }
+        /* M5.11b: per-window timeshare sample, keyed to doorbell count so steady-state
+         * generation is sampled evenly (every ~400 doorbells ~= a handful of tokens). */
+        if (nvkvm_t_doorbell_calls && (nvkvm_t_doorbell_calls % 400u) == 0u) {
+            nvkvm_timeshare_window_dump(s, "doorbell-window");
         }
         return;
     }
@@ -3015,7 +3234,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         }
     }
 
-    if (s->trace) {
+    if (s->m2_trace && s->trace) {
         const char *nm = nvkvm_reg_name(off);
         qemu_log("nvkvm-gpu[%s] #%llu BAR0 WR  off=0x%06llx sz=%u <- 0x%08llx%s%s\n",
                  s->chip->name, (unsigned long long)s->access_count++,
@@ -3696,6 +3915,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     uint32_t gp_put = s->chan_userd_sys
         ? nvkvm_phys_rd32(s, s->chan_userd + 0x8C, true)
         : (uint32_t)nvkvm_fb_read(s, s->chan_userd + 0x8C, 4);
+    if (s->m2_trace)
     qemu_log("nvkvm-gpu[%s] M5: chan_exec gpfifo=0x%llx userd=0x%llx(%s) "
              "gp_get=%u gp_put=%u ent=%u\n", s->chip->name,
              (unsigned long long)s->chan_gpfifo_va,
@@ -3842,6 +4062,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
             if (pb_pdb == 0) { continue; }   /* pb has no real backing in any VAS */
             s->chan_gpfifo_phys = cand;
             s->chan_pdb = pb_pdb;            /* pin the channel's true VAS for pb/sema */
+            if (s->m2_trace)
             qemu_log("nvkvm-gpu[%s] M5.16: GPFIFO resolved via BAR1-written page "
                      "FB 0x%llx (seq %llu) -> entry pb=0x%llx len=%u; pinned VAS "
                      "pdb=0x%llx (pushbuffer-backed) [VAS-walk gave wrong page]\n",
@@ -4015,7 +4236,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                  * Capped + trace-gated; compiled in for bring-up. */
                 if (s->trace) {
                     static uint32_t m22n;
-                    if (m22n++ < 1200) {
+                    if (s->m2_trace && m22n++ < 1200) {
                         qemu_log("nvkvm-gpu[%s] M5.22 method client=0x%08x gpfifo=0x%llx "
                                  "m=0x%04x d=0x%08x\n", s->chip->name, s->chan_client,
                                  (unsigned long long)s->chan_gpfifo_va, m, d);
@@ -4882,12 +5103,17 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
     if (hClass == 0xc7c0u && rc == 0 && p.status == 0) {
         /* M5.3 DIAG: arm the crash-window FB-read probe. libcuda now reads GR-context
          * GPU memory and crashes (rbp=0); the reads logged from here pin the buffer. */
-        if (!s->m2_crashwin) {
-            s->m2_crashwin = true;
-            s->m2_gr_client = hClient;        /* M5.7: the GR compute client */
-            qemu_log("nvkvm-gpu[GA106] CRASHWIN ARMED (after 0xc7c0 compute obj "
-                     "0x%08x) client=0x%08x — logging subsequent FB reads\n",
-                     hObject, hClient);
+        if (!s->m2_gr_client) {
+            s->m2_gr_client = hClient;        /* M5.7: the GR compute client (load-bearing, always) */
+            /* M5.63: crashwin drives ONLY the high-volume per-fb/per-doorbell DIAG logs (M5.31/M5.15/
+             * CRASHWIN-RD/DMAW/M5.6/M5.11/M6.6/M5.10) — arm it only when tracing. m2_gr_client above
+             * is the real side effect and stays unconditional. */
+            s->m2_crashwin = s->m2_trace;
+            if (s->m2_crashwin) {
+                qemu_log("nvkvm-gpu[GA106] CRASHWIN ARMED (after 0xc7c0 compute obj "
+                         "0x%08x) client=0x%08x — logging subsequent FB reads\n",
+                         hObject, hClient);
+            }
         }
         /* M5.5: validate the RM_MAP_MEMORY_DMA-FIXED primitive once, on the GR client's
          * real host VASpace. Proves we can place a mapping at a VA we choose — the
@@ -5624,7 +5850,19 @@ static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
  * host fills. The FB overlay is registered ONLY on a successful PLACE (st=0): a 0x51
  * (already-host-mapped, e.g. ctx) must NOT be overlaid or we'd shadow the host's real buffer
  * with zeroed memory. phys==0 => VA-only mapping (no overlay). */
+static bool nvkvm_m2_back_and_map_inner(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                  uint64_t phys, uint64_t size, bool copy_content,
+                                  const char *label);
 static bool nvkvm_m2_back_and_map(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
+                                  uint64_t phys, uint64_t size, bool copy_content,
+                                  const char *label)
+{
+    uint64_t t0 = nvkvm_now_ns();
+    bool r = nvkvm_m2_back_and_map_inner(s, client, va, phys, size, copy_content, label);
+    nvkvm_t_backmap_ns += nvkvm_now_ns() - t0; nvkvm_t_backmap_calls++;
+    return r;
+}
+static bool nvkvm_m2_back_and_map_inner(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
                                   uint64_t phys, uint64_t size, bool copy_content,
                                   const char *label)
 {
@@ -5774,7 +6012,7 @@ static void nvkvm_m2_doorbell_setup(NvkvmGpuEmul *s, uint32_t client)
 
 /* M5.9: resolve a GR-VAS guest VA -> guest-FB phys by trying each snooped VAS PDB (FB leaf
  * only; sysmem leaves are the GPU->CPU DMA path, handled elsewhere). 0 on miss. */
-static uint64_t nvkvm_m2_resolve_fb(NvkvmGpuEmul *s, uint64_t va)
+static uint64_t nvkvm_m2_resolve_fb_inner(NvkvmGpuEmul *s, uint64_t va)
 {
     for (int v = 0; v < s->chan_vas_n; v++) {
         bool sy = false;
@@ -5783,10 +6021,19 @@ static uint64_t nvkvm_m2_resolve_fb(NvkvmGpuEmul *s, uint64_t va)
     }
     return 0;
 }
+static uint64_t nvkvm_m2_resolve_fb(NvkvmGpuEmul *s, uint64_t va)
+{
+    uint64_t t0 = nvkvm_now_ns();
+    uint64_t r = nvkvm_m2_resolve_fb_inner(s, va);
+    nvkvm_t_resolve_ns += nvkvm_now_ns() - t0; nvkvm_t_resolve_calls++;
+    return r;
+}
 /* M5.9: has this VA already been backed+mapped? (dedup repeated pushbuffers). Adds if new. */
 static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
 {
+    nvkvm_t_vaseen_calls++;
     for (int i = 0; i < s->m2_mapped_va_n; i++) {
+        nvkvm_t_vaseen_iters++;
         if (s->m2_mapped_va[i].va == va && s->m2_mapped_va[i].client == client) {
             return true;
         }
@@ -5806,7 +6053,9 @@ static bool nvkvm_m2_va_seen(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
  * use va_check() first and only va_mark() on SUCCESS, so a failed/transient back is retried. */
 static bool nvkvm_m2_va_check(NvkvmGpuEmul *s, uint32_t client, uint64_t va)
 {
+    nvkvm_t_vaseen_calls++;
     for (int i = 0; i < s->m2_mapped_va_n; i++) {
+        nvkvm_t_vaseen_iters++;
         if (s->m2_mapped_va[i].va == va && s->m2_mapped_va[i].client == client) {
             return true;
         }
@@ -5949,6 +6198,7 @@ static int nvkvm_m2_gpga_obj_ex(NvkvmGpuEmul *s, uint32_t client, uint64_t va,
     s->m2_gpga[gi].off = 0;
     s->m2_gpga[gi].readable = true;
     s->m2_gpga[gi].writable = true;
+    s->m2_gpga_idx_dirty = true;   /* M5.11c: stale the sorted index (rebuilt lazily on next lookup) */
     qemu_log("nvkvm-gpu[%s] M7 R2 gpga_obj%s: va=0x%llx gpga=0x%llx size=0x%llx hMem=0x%08x "
              "cpu_qva=%p gpu_mapped=%d(st=0x%x) obj=%d gpga_n=%d\n", s->chip->name,
              gpu_only ? "[gpu_only]" : "", (unsigned long long)va, (unsigned long long)gpga,
@@ -6353,6 +6603,13 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
         }
         nvkvm_t_sweep_ns += nvkvm_now_ns() - t0sw; nvkvm_t_sweep_calls++;
         s->m2_recording_gr_pt = false;
+        /* M5.62: a mapping changed (a sweep just (re)backed working-set leaves) — re-arm the walk on
+         * every channel so the next doorbell rediscovers any new pushbuffers before going opaque. */
+        if (s->m2opaque) {
+            for (int ci = 0; ci < s->chan_n; ci++) {
+                s->chans[ci].resident = false; s->chans[ci].stable_subs = 0;
+            }
+        }
     }
     /* M5.13: one-shot DRY-RUN locate of the completion semaphore (0x2efbaf000, the page the
      * guest RM busy-polls during cuCtxCreate) so we learn its owning PDB + GR-VA before backing.
@@ -6396,23 +6653,45 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
             continue;                            /* no new (non-wrapping) work */
         }
         int newmaps = 0;
-        for (uint32_t idx = c->gp_get; idx < gp_put && idx < c->gpfifo_ent; idx++) {
-            uint64_t epa = gpf_phys + (uint64_t)idx * 8;
-            uint32_t e0 = (uint32_t)nvkvm_fb_read(s, epa, 4);
-            uint32_t e1 = (uint32_t)nvkvm_fb_read(s, epa + 4, 4);
-            uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
-            uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
-            if (!pb) { continue; }
-            uint64_t pbbase = pb & ~0xfffull;
-            if (nvkvm_m2_va_seen(s, cc, pbbase)) { continue; }
-            uint64_t pbphys = nvkvm_m2_resolve_fb(s, pbbase);
-            uint64_t sz = ((pb - pbbase) + (uint64_t)pblen * 4 + 0xfff) & ~0xfffull;
-            if (!sz) { sz = 0x1000; }
-            nvkvm_m2_back_and_map(s, cc, pbbase, pbphys, sz, true, "pushbuf");
-            newmaps++;
+        /* M5.62 OPAQUE fast-path: a fully-resident userspace channel re-references only
+         * already-mapped pushbuffers (the dirty-sweep keeps the working set backed; newpushbufs has
+         * been 0 for K subs). Skip the per-entry GPFIFO walk + va_seen (uncached host-vidmem reads)
+         * entirely — just ring (gp_get advances to gp_put at ring time). Re-armed on any sweep. */
+        bool skip_walk = s->m2opaque && c->resident;
+        if (!skip_walk) {
+            for (uint32_t idx = c->gp_get; idx < gp_put && idx < c->gpfifo_ent; idx++) {
+                uint64_t epa = gpf_phys + (uint64_t)idx * 8;
+                uint32_t e0 = (uint32_t)nvkvm_fb_read(s, epa, 4);
+                uint32_t e1 = (uint32_t)nvkvm_fb_read(s, epa + 4, 4);
+                uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
+                uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
+                if (!pb) { continue; }
+                uint64_t pbbase = pb & ~0xfffull;
+                if (nvkvm_m2_va_seen(s, cc, pbbase)) { continue; }
+                uint64_t pbphys = nvkvm_m2_resolve_fb(s, pbbase);
+                uint64_t sz = ((pb - pbbase) + (uint64_t)pblen * 4 + 0xfff) & ~0xfffull;
+                if (!sz) { sz = 0x1000; }
+                nvkvm_m2_back_and_map(s, cc, pbbase, pbphys, sz, true, "pushbuf");
+                newmaps++;
+            }
+            /* Promote to resident after K consecutive zero-newmap submissions; reset the instant
+             * anything new is mapped (working set grew -> keep walking until stable again). */
+            if (s->m2opaque) {
+                if (newmaps == 0) {
+                    if (++c->stable_subs >= 8u && !c->resident) {
+                        c->resident = true;
+                        qemu_log("nvkvm-gpu[%s] M5.62 OPAQUE promote ch[%d] client=0x%08x "
+                                 "(resident — skip GPFIFO walk)\n", s->chip->name, i, cc);
+                    }
+                } else {
+                    c->stable_subs = 0; c->resident = false;
+                }
+            }
         }
-        qemu_log("nvkvm-gpu[%s] M5.9 exec_doorbell %s gp_get=%u->%u newpushbufs=%d (client=0x%08x)\n",
-                 s->chip->name, (c->client == grc) ? "GR" : "CE", c->gp_get, gp_put, newmaps, cc);
+        if (s->m2_trace)
+        qemu_log("nvkvm-gpu[%s] M5.9 exec_doorbell %s gp_get=%u->%u newpushbufs=%d (client=0x%08x)%s\n",
+                 s->chip->name, (c->client == grc) ? "GR" : "CE", c->gp_get, gp_put, newmaps, cc,
+                 skip_walk ? " [OPAQUE skip-walk]" : "");
         /* M5.46: ring THIS channel's own host token. The GR channel (token from M5.8
          * doorbell_setup) may legitimately use s->m2_gr_token; EVERY other channel
          * must use its OWN per-channel token. NEVER fall back to the GR token for a
@@ -6447,6 +6726,7 @@ static void nvkvm_m2_exec_doorbell(NvkvmGpuEmul *s)
                 }
             }
             stl_le_p((uint8_t *)s->m2_usermode_qva + 0x90, tok);
+            if (s->m2_trace)
             qemu_log("nvkvm-gpu[%s] M5.9 *** RANG host doorbell token=0x%08x (USERMODE+0x90) "
                      "— host GPU should now run gpfifo=0x%llx *** hostUSERD put=%u get=%u%s\n",
                      s->chip->name, tok, (unsigned long long)c->gpfifo_va, hput, hget,
@@ -6948,6 +7228,14 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 
     s->chip = chip;
     g_nvkvm_dma_s = s;                    /* M5.15 DIAG: enable DMA-write logging hook */
+    /* M5.11c PERF: arm the GPGA binary-search-index audit — cross-check the new sorted lookup
+     * against the legacy linear scan for the first N lookups (covers load + early gen) to PROVE
+     * semantic equivalence (m2_gpga_idx_mismatch must stay 0). Self-disabling; ~free once spent. */
+    /* Proven idx_mismatch=0 over millions of lookups (non-overlap invariant holds) -> default the
+     * cross-check OFF (it re-runs the O(n) legacy scan); re-enable for re-verification via m2trace. */
+    s->m2_gpga_idx_audit = s->m2_trace ? 3000000 : 0;
+    s->m2_gpga_idx_mismatch = 0;
+    s->m2_gpga_idx_dirty = true;
     s->access_count = 0;
     s->prom_reads = 0;
     s->mbox0 = 0;
@@ -7116,6 +7404,8 @@ static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("m2hostsem", NvkvmGpuEmul, m2hostsem, false), /* M5.35: host owns completion sema */
     DEFINE_PROP_BOOL("m2cefwd", NvkvmGpuEmul, m2cefwd, false), /* CE-fwd: Step-0 route probe + Phase-A (M5.60) real-back the user-CE copy dst in the GR fvas (completion/CPU-copy unchanged) */
     DEFINE_PROP_BOOL("m2cexec", NvkvmGpuEmul, m2cexec, false), /* CE-EXEC fwd (A): host CE runs the user-CE LAUNCH_DMA; suppress CPU copy+sema. Sub-flag of m2cefwd. Default OFF (A/B) */
+    DEFINE_PROP_BOOL("m2opaque", NvkvmGpuEmul, m2opaque, false), /* M5.62: skip GPFIFO walk when a userspace channel is fully resident (ring-only). Default OFF (perf experiment) */
+    DEFINE_PROP_BOOL("m2trace", NvkvmGpuEmul, m2_trace, false), /* M5.63: high-volume per-doorbell/fb-access DIAG qemu_log. Default OFF (perf: synchronous log I/O overhead) */
     DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
     DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
