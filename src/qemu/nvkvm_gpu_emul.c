@@ -968,6 +968,33 @@ static uint8_t *nvkvm_fb_host_overlay(NvkvmGpuEmul *s, uint64_t fb_addr)
     return NULL;
 }
 
+/* M5.48: a CE fill/copy/scrub must NEVER overwrite a LIVE channel's USERD page —
+ * the page that holds the ring GP_GET(+0x88)/GP_PUT(+0x8C) cursors.  PyTorch's
+ * caching allocator zero-fills a fresh 2 MiB pool (a single CE LAUNCH_DMA with
+ * SET_REMAP_CONST_A=0) whose PHYSICAL FB destination happens to span a registered
+ * channel's USERD (observed: fb 0x4202000 sits inside a 0x4200000 + 2 MiB fill).
+ * Zeroing it makes the next GP_PUT read return 0, the ring goes permanently idle
+ * (get==put==0), the channel's genuinely-pending work never executes, and the
+ * guest's cuStreamSynchronize / cuCtxSynchronize blocks forever — the PyTorch
+ * CUDA hang.  Return true if [fb_phys, fb_phys+4) lies within any registered
+ * channel USERD so the CE write loops SKIP that span.  Spans are already clamped
+ * to a single 4 KiB page, so this protects exactly the USERD page(s) and writes
+ * all surrounding data normally.  (Follow-up correctness refinement: UNregister a
+ * channel's USERD from m2_chanbuf[]/chans[] on GSP_RM_FREE of the channel object,
+ * so a freed-then-recycled region is no longer protected; until then a still-
+ * registered USERD is treated as live and preserved, which is the safe default.) */
+static bool nvkvm_fb_is_live_userd(NvkvmGpuEmul *s, uint64_t fb_phys)
+{
+    for (int k = 0; k < s->m2_chanbuf_n; k++) {
+        uint64_t b = s->m2_chanbuf[k].fb_base;
+        uint64_t e = b + (s->m2_chanbuf[k].size ? s->m2_chanbuf[k].size : 0x1000ull);
+        if (b && fb_phys >= b && fb_phys < e) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Aligned reg accesses never straddle a 4 KiB page. */
 static uint64_t nvkvm_fb_read(NvkvmGpuEmul *s, uint64_t fb_addr, unsigned size)
 {
@@ -4461,6 +4488,10 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                             uint64_t span = bytes - b, dpg = 0x1000ull - (p & 0xfffull);
                             if (span > dpg) span = dpg;
                             span &= ~3ull; if (span == 0) span = 4;
+                            /* M5.48: never let a fill zero a live channel's USERD page (its
+                             * GP_PUT/GP_GET ring cursors) — that idles the ring forever and
+                             * hangs the guest's sync.  Skip the span (it's one 4 KiB page). */
+                            if (!sy && nvkvm_fb_is_live_userd(s, p)) { b += span; continue; }
                             uint8_t *dhp = sy ? NULL : nvkvm_fb_host_ptr(s, p, true);  /* M5.12 PERF */
                             if (!sy && dhp && remapA == 0) {          /* zero-fill: bulk */
                                 memset(dhp, 0, span);
@@ -4492,6 +4523,9 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
                             if (span > dpg) span = dpg;
                             span &= ~3ull;
                             if (span == 0) span = 4;                      /* progress guarantee */
+                            /* M5.48: protect a live channel's USERD page from a CE copy dst
+                             * landing on it (same hazard as the fill path above). */
+                            if (!dsy && nvkvm_fb_is_live_userd(s, dp)) { b += span; continue; }
                             if (!logged0) {
                                 logged0 = true;
                                 qemu_log("nvkvm-gpu[%s] M5:   COPY[0] src 0x%llx(%s)=0x%08x -> "
