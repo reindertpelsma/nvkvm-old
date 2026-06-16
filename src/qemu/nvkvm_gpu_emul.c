@@ -1528,6 +1528,85 @@ static void nvkvm_m2_osevent_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fO
     }
 }
 
+/* M5.49 (2026-06-16): drop per-context channel/VASpace bookkeeping on GSP_RM_FREE so a
+ * SECOND CUDA context (a fresh process after the first cleanly exits) starts clean.
+ * Without this, ctx1's freed channels/VASes linger in chans[]/m2_chanbuf[]/chan_vas[]/
+ * m2_devvas[]/m2_cvas[]; ctx2 reuses the same compute-channel VA region (gpfifo in
+ * 0x2002xxxxx) but its gpfifo then FAULTs on every snooped VAS (the stale ctx1 PDBs no
+ * longer map it and ctx2's real root is masked / the content-probe is misled) -> ctx2's
+ * work never executes -> cuStreamSynchronize spins forever (task #12, sequential case).
+ * Mirrors nvkvm_m2_osevent_drop: free of a specific channel/VASpace handle drops that
+ * object; free of the client root (fClient==fObj) purges everything owned by the client.
+ * Only fires for genuinely-freed objects, so removal is safe (cup8/LLM/single-proc PyTorch
+ * never free a still-in-use object mid-run). */
+static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fObj)
+{
+    bool root = (fClient == fObj);            /* client-root free: purge all of fClient */
+    int dropped = 0;
+    /* chans[]: match the freed channel handle, or any channel of the freed client. */
+    for (int i = 0; i < s->chan_n; ) {
+        bool hit = (root && s->chans[i].client == fClient) ||
+                   (s->chans[i].client == fClient && s->chans[i].hobject == fObj);
+        if (hit) {
+            s->chans[i] = s->chans[s->chan_n - 1];
+            s->chan_n--; dropped++; continue;
+        }
+        i++;
+    }
+    /* m2_chanbuf[]: the channel's host-USERD registration. */
+    for (int i = 0; i < s->m2_chanbuf_n; ) {
+        bool hit = (root && s->m2_chanbuf[i].client == fClient) ||
+                   (s->m2_chanbuf[i].client == fClient && s->m2_chanbuf[i].chan == fObj);
+        if (hit) {
+            s->m2_chanbuf[i] = s->m2_chanbuf[s->m2_chanbuf_n - 1];
+            s->m2_chanbuf_n--; dropped++; continue;
+        }
+        i++;
+    }
+    /* m2_devvas[]: client -> {dev,vas}.  Collect the freed VAS handles so we can also drop
+     * their page-directory roots from chan_vas[] (which has no client key). */
+    uint32_t drop_hvas[32]; int drop_hvas_n = 0;
+    for (int i = 0; i < s->m2_devvas_n; ) {
+        bool hit = (root && s->m2_devvas[i].client == fClient) ||
+                   (s->m2_devvas[i].client == fClient && s->m2_devvas[i].vas == fObj);
+        if (hit) {
+            if (drop_hvas_n < (int)ARRAY_SIZE(drop_hvas)) {
+                drop_hvas[drop_hvas_n++] = s->m2_devvas[i].vas;
+            }
+            s->m2_devvas[i] = s->m2_devvas[s->m2_devvas_n - 1];
+            s->m2_devvas_n--; dropped++; continue;
+        }
+        i++;
+    }
+    /* m2_cvas[]: per-(client,tsg) fresh VAS state. */
+    for (int i = 0; i < s->m2_cvas_n; ) {
+        if (s->m2_cvas[i].client == fClient) {     /* root or specific: both scope to client */
+            s->m2_cvas[i] = s->m2_cvas[s->m2_cvas_n - 1];
+            s->m2_cvas_n--; dropped++; continue;
+        }
+        i++;
+    }
+    /* chan_vas[] (no client key): drop the directly-freed VASpace handle, plus any whose
+     * handle was referenced by a just-removed devvas entry of this client. */
+    for (int i = 0; i < s->chan_vas_n; ) {
+        bool hit = (s->chan_vas[i].hvas == fObj);
+        for (int j = 0; !hit && j < drop_hvas_n; j++) {
+            if (s->chan_vas[i].hvas == drop_hvas[j]) { hit = true; }
+        }
+        if (hit) {
+            s->chan_vas[i] = s->chan_vas[s->chan_vas_n - 1];
+            s->chan_vas_n--; dropped++; continue;
+        }
+        i++;
+    }
+    if (s->trace && dropped) {
+        qemu_log("nvkvm-gpu[%s] M5.49 ctx-free drop %s fClient=0x%08x fObj=0x%08x: %d entries "
+                 "(chans=%d chanbuf=%d devvas=%d cvas=%d chanvas=%d)\n", s->chip->name,
+                 root ? "ROOT" : "obj", fClient, fObj, dropped, s->chan_n, s->m2_chanbuf_n,
+                 s->m2_devvas_n, s->m2_cvas_n, s->chan_vas_n);
+    }
+}
+
 /* ── DIAG (address-virtualization bring-up, removable) ──────────────────────
  * Decode the alloc/control RPCs so we can build the GPU-VA -> physical side
  * table from the GSP_RM_ALLOC memory descriptors and GSP_RM_CONTROL map cmds.
@@ -1988,6 +2067,11 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * Free body == alloc body: hClient@80, hObject(freed)@88. */
         if (fn == 10 && s->osevent_n > 0) {
             nvkvm_m2_osevent_drop(s, ldl_le_p(cmd + 80), ldl_le_p(cmd + 88));
+        }
+        /* M5.49: also drop freed channel/VASpace bookkeeping so a 2nd CUDA context
+         * (next process) doesn't inherit ctx1's stale VAS routing (task #12 seq case). */
+        if (fn == 10) {
+            nvkvm_m2_ctx_free_drop(s, ldl_le_p(cmd + 80), ldl_le_p(cmd + 88));
         }
         if (!async) {
             /* Build the response in a large buffer — GSP_RM_CONTROL responses can
