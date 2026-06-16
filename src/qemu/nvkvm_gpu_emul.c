@@ -310,7 +310,7 @@ struct NvkvmGpuEmul {
      * FB.  False for the FB-rooted VASes snooped from VASPACE_COPY_SERVER_RESERVED
      * _PDES; set true for UVM-managed VASes whose root we learn from
      * NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY (0x801813) with a SYSMEM aperture. */
-    struct { uint32_t hvas; uint64_t pdb; bool root_sys; } chan_vas[16];
+    struct { uint32_t hvas; uint32_t client; uint64_t pdb; bool root_sys; } chan_vas[16];
     int      chan_vas_n;
     uint32_t chan_hvaspace;    /* the tracked channel's hVASpace handle */
 
@@ -1952,10 +1952,11 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             if (s->chan_vas_n < 16) {
                 int k = s->chan_vas_n++;
                 s->chan_vas[k].hvas = ldl_le_p(cmd + 84);   /* control hObject = VASpace */
+                s->chan_vas[k].client = ldl_le_p(cmd + 80); /* GSP_RM_CONTROL hClient (#12-L3) */
                 s->chan_vas[k].pdb  = ldq_le_p(cmd + 160);  /* levels[0].physAddress */
                 s->chan_vas[k].root_sys = false;            /* FB-rooted (GSP-client) */
-                qemu_log("nvkvm-gpu[%s] M5: VAS hObject=0x%08x PDB=0x%llx\n",
-                         s->chip->name, s->chan_vas[k].hvas,
+                qemu_log("nvkvm-gpu[%s] M5: VAS hObject=0x%08x client=0x%08x PDB=0x%llx\n",
+                         s->chip->name, s->chan_vas[k].hvas, s->chan_vas[k].client,
                          (unsigned long long)s->chan_vas[k].pdb);
             }
         }
@@ -1993,6 +1994,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
             if (!dup && phys && s->chan_vas_n < 16) {
                 int k = s->chan_vas_n++;
                 s->chan_vas[k].hvas = hvas;
+                s->chan_vas[k].client = ldl_le_p(cmd + 80); /* GSP_RM_CONTROL hClient (#12-L3) */
                 s->chan_vas[k].pdb = phys;
                 s->chan_vas[k].root_sys = rsys;
                 qemu_log("nvkvm-gpu[%s] M5.30 SET_PAGE_DIR UVM-VAS hVASpace=0x%08x "
@@ -3982,6 +3984,27 @@ static uint64_t nvkvm_chan_translate(NvkvmGpuEmul *s, uint64_t va, bool *out_sys
             break;
         }
     }
+    /* #12-L3: prefer a VAS owned by the EXECUTING channel's RM client before the
+     * blind any-client fallback below.  Host VASpaces are per-client, so VA X in
+     * client A's VAS and VA X in client B's VAS are DIFFERENT physical pages.  The
+     * blind fallback returns the first snooped VAS that resolves X regardless of
+     * owner — which collapsed two distinct kernel semaphores (CeUtils' completion
+     * sema and a UVM channel's tracking sema, both at VA 0x121000010 in their own
+     * VASes) onto ONE phys page: CeUtils' release climbed the UVM page to 0x8a, then
+     * UVM's own low release looked like a 2^32 backward jump (uvm_gpu_semaphore.c:776
+     * + ce_utils.c:349) → the 2nd-context matmul hang.  Same-client-first stops the
+     * cross-client collision; the blind pass stays as last resort so every VA that
+     * legitimately resolves only under another client's VAS (e.g. a scrubber reading
+     * a shared surface, or a channel with no snooped own VAS) behaves exactly as
+     * before. */
+    if (s->chan_client) {
+        for (int i = 0; i < s->chan_vas_n; i++) {
+            if (s->chan_vas[i].client != s->chan_client) { continue; }
+            uint64_t p = nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, va,
+                                             s->chan_vas[i].root_sys, out_sys);
+            if (p != NVKVM_GMMU_FAULT) { return p; }
+        }
+    }
     for (int i = 0; i < s->chan_vas_n; i++) {
         uint64_t p = nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, va,
                                          s->chan_vas[i].root_sys, out_sys);
@@ -4046,7 +4069,24 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * always call us; we decide here whether to write locally or defer to the host. */
     bool hostonly = s->m2exec && s->m2hostsem && nvkvm_m2_is_user_ce(s, s->chan_client);
     bool sy; uint64_t p = nvkvm_chan_translate(s, va, &sy);
-    if (p != NVKVM_GMMU_FAULT && !hostonly) { nvkvm_phys_wr32(s, p, sy, payload); wrote = true; }
+    if (p != NVKVM_GMMU_FAULT && !hostonly) {
+        /* #12-L3 DIAG: a CE completion-sema write whose payload goes BACKWARDS vs
+         * the value already at that phys page is the exact event that trips UVM's
+         * 32->64-bit wrap detector (uvm_gpu_semaphore.c:776) across a ctx teardown/
+         * re-init.  Log it with full attribution (phys, old, new, writing client) so
+         * one bench run distinguishes (a) a single channel rewound by re-init from
+         * (b) two distinct channels' semas ALIASING one phys page.  Rare event ->
+         * unconditional, low-volume. */
+        uint32_t sem_old = nvkvm_phys_rd32(s, p, sy);
+        if (sem_old != 0 && payload < sem_old) {
+            qemu_log("nvkvm-gpu[%s] #12-L3 CE-SEM BACKWARD va=0x%llx phys=0x%llx(%s) "
+                     "old=0x%x new=0x%x client=0x%08x chan_gpfifo_va=0x%llx\n",
+                     s->chip->name, (unsigned long long)va, (unsigned long long)p,
+                     sy ? "sys" : "fb", sem_old, payload, s->chan_client,
+                     (unsigned long long)s->chan_gpfifo_va);
+        }
+        nvkvm_phys_wr32(s, p, sy, payload); wrote = true;
+    }
     if (hostonly && p != NVKVM_GMMU_FAULT) {
         qemu_log("nvkvm-gpu[%s] M5.49b host-only sema VA=0x%llx payload=%u client=0x%08x "
                  "— host GPU writes this (sim suppressed)\n", s->chip->name,
