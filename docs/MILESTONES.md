@@ -1,5 +1,42 @@
 # Milestones
 
+## Mode-2 (emulated GPU + faked GSP) — single-process apps at native parity (2026-06-16)
+
+Stock NVIDIA driver in the guest drives an **emulated GA106 + faked GSP**; we recover the
+guest's compute intent and forward it to a real host GPU. Validated on **bare-metal** box .32
+(RTX 3050 = GA106, non-nested) against host **open driver 595.71.05** (our stack builds for
+575/580):
+
+- **`cuCtxCreate → PTX JIT → cuLaunchKernel → matmul → DtoH`, byte-exact** at scale
+  (cup8 N=1024, `bad=0 maxerr=0`).
+- **llama.cpp LLM inference** (small Qwen2 GGUF) — coherent, completes, **49.9 tok/s ≈
+  host-native 47.5 tok/s on the same 3050 = ~zero forwarding overhead on bare metal**. (The
+  vast.ai 20→50 t/s gap was entirely nested-virt vmexit tax, not Mode-2 design.)
+- **PyTorch 2.5.1 single-process** — full workload byte-correct, `rc=0`: CUDA events
+  (`torch.cuda.Event` timing), non-default streams, a 50-step training loop (autograd + SGD).
+  The init "hang" was a CE zero-fill stomping a live channel's USERD page (fix 32c5115), not
+  an event bug.
+
+So three app classes (general compute, LLM, PyTorch training) run single-process through Mode-2
+at near-native throughput on a commodity consumer GPU, no vGPU/SR-IOV/license.
+
+### In progress — multi-process / multi-context (#12)
+
+Two concurrent or sequential CUDA contexts is the gate to in-guest usefulness. It's a stack of
+context-lifecycle bugs, being peeled layer by layer:
+
+- **L1 (fixed, 7680305):** drop a context's channel/VAS bookkeeping on `GSP_RM_FREE` so the next
+  context doesn't inherit stale VAS routing (was: ctx2 gpfifo faults).
+- **L2 (fixed, 05ac359):** `UNLOADING_GUEST_DRIVER` (fn 47) fires on GPU-idle release, not just
+  rmmod; we no longer zero the GSP-RPC seqNum before acking it, so teardown stops corrupting the
+  queue (was: Xid 119). **Also fixes "driver reload crashes QEMU" without a VM restart.**
+- **L3 (open):** ctx2's CeUtils CE-scrubber completion semaphore jumps backwards across the GPU
+  re-init → UVM 2³²-wrap poison (`uvm_gpu_semaphore.c:776`, `ce_utils.c:349`). Fix direction:
+  discriminate fn-47 idle (keep GSP live) vs real reload (full reset).
+
+Security: multi-tenant isolation is **not yet honest** for Mode-2; the per-GR-VAS-keyed isolate
+(the GMMU-aligned boundary, superseding the CR3 plan) lands with the Rust rewrite + review passes.
+
 ## v0.1 — first LLM inference through nvkvm (2026-05-28, eb6e16f)
 
 End-to-end CUDA pipeline working:
