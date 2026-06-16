@@ -30,9 +30,18 @@ context-lifecycle bugs, being peeled layer by layer:
 - **L2 (fixed, 05ac359):** `UNLOADING_GUEST_DRIVER` (fn 47) fires on GPU-idle release, not just
   rmmod; we no longer zero the GSP-RPC seqNum before acking it, so teardown stops corrupting the
   queue (was: Xid 119). **Also fixes "driver reload crashes QEMU" without a VM restart.**
-- **L3 (open):** ctx2's CeUtils CE-scrubber completion semaphore jumps backwards across the GPU
-  re-init → UVM 2³²-wrap poison (`uvm_gpu_semaphore.c:776`, `ce_utils.c:349`). Fix direction:
-  discriminate fn-47 idle (keep GSP live) vs real reload (full reset).
+- **L3a (fixed, 011843d):** a CE completion-semaphore page collision — `nvkvm_chan_translate`'s
+  blind VAS fallback collapsed CeUtils' and a UVM channel's semaphores (both at guest VA
+  `0x121000010` in their own per-client VASes) onto one phys page, so a low payload read as a 2³²
+  backward jump (`uvm_gpu_semaphore.c:776` + `ce_utils.c:349`). Fix: a client key on `chan_vas[]` +
+  prefer the executing channel's own-client VAS before the blind pass. Bench-confirmed de-aliased;
+  cup8 byte-exact, no single-process regression. (The fn-47 teardown fires *after* the rewind, so it
+  was not the cause — the earlier "discriminate idle vs reload" direction was wrong.)
+- **L3b (open):** after de-aliasing, a distinct **intra-UVM temporal page-reuse** remains — a live
+  UVM channel tracking semaphore observes a backward payload as its slot/page is recycled across the
+  ctx1→ctx2 boundary (UVM only canary-resets a slot on channel free, after which the tracking sema is
+  destroyed; our emulation lets a low release land on a still-live slot). Next: instrument the sema's
+  resolved guest-phys vs the guest CPU mapping + the channel free→cursor reset.
 
 Security: multi-tenant isolation is **not yet honest** for Mode-2; the per-GR-VAS-keyed isolate
 (the GMMU-aligned boundary, superseding the CR3 plan) lands with the Rust rewrite + review passes.
