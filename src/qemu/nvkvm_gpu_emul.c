@@ -1908,23 +1908,33 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * ("unexpected WPR2 already up") — a false cascade that masks the real
          * init failure and forces a full VM/QEMU restart between iterations. */
         if (fn == 47) {
+            /* UNLOADING_GUEST_DRIVER.  TWO distinct triggers share this RPC: a real
+             * driver unload (rmmod; a later insmod re-runs the full GSP boot), AND a
+             * GPU-idle release when the last client/context exits while the kernel
+             * module stays loaded (the next process's context re-acquires the GPU).  In
+             * BOTH cases the guest re-runs the queue handshake (re-writes the status-
+             * queue tx header), so reset here ONLY the boot state that gates re-detection:
+             * WPR2 down + bootargs/q_ready.  Without that, bootargs_dumped/q_ready stay
+             * set, the tx header is never re-detected, and GspStatusQueueInit/msgqRxLink
+             * times out (kernel_gsp_tu102.c:570) — the original reload bug.
+             *
+             * M5.50 (2026-06-16): do NOT reset the queue COUNTERS (stat_seqnum/
+             * stat_writeptr/cmd_readptr) here.  The guest sent THIS fn-47 at the current
+             * rxSeqNum and polls (rpcRecvPoll) for its ack at that seqNum.  Zeroing
+             * stat_seqnum before the ack is posted (the !async response path below) sends
+             * the ack at seqNum 0 -> guest sees "Bad sequence number", never accepts it,
+             * times out (Xid 119) — and that corrupts teardown so the NEXT context
+             * inherits a broken GPU (the sequential/multi-process #12 hang).  The counters
+             * are reset at the re-handshake (the tx-header-write path) where BOTH sides
+             * reset rxSeqNum=0 together — the only moment that keeps them in lockstep. */
             s->fwsec_ran = false;       /* WPR2 down (booter-unload effect)      */
             s->gsp_suspended = true;    /* MAILBOX0 -> SUSPENDED for the close poll */
             nvkvm_gsp_falcon_sync(s);   /* M5.64: reflect MAILBOX0 suspend value into rom-device RAM */
-            /* Reset the GSP-RPC queue/boot state so a re-init within one QEMU lifetime
-             * (driver reload, or cudart's uvm-load + device reopen) re-runs the full
-             * bootargs -> queue-init -> GSP_INIT_DONE handshake.  Without this,
-             * bootargs_dumped stays set, nvkvm_m3_dump_bootargs is skipped on the 2nd
-             * boot, the status-queue tx header is never re-written, and the guest's
-             * GspStatusQueueInit/msgqRxLink polls until NV_ERR_TIMEOUT (kernel_gsp_tu102
-             * .c:570).  Mirrors the device-reset init (q_shmem et al. re-cache on boot). */
-            s->bootargs_dumped = false;
-            s->q_ready         = false;
-            s->stat_writeptr   = 0;
-            s->stat_seqnum     = 0;
-            s->cmd_readptr     = 0;
-            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> WPR2 down + GSP suspended + "
-                     "GSP-RPC queue reset\n", s->chip->name);
+            s->bootargs_dumped = false; /* re-dump bootargs on the next boot         */
+            s->q_ready         = false; /* re-detect the queue handshake on re-init  */
+            qemu_log("nvkvm-gpu[%s] M4: UNLOADING -> WPR2 down + GSP suspended "
+                     "(queue counters preserved for the in-flight fn-47 ack)\n",
+                     s->chip->name);
         }
         /* M5: snoop GSP_RM_ALLOC (fn 103) for a *_CHANNEL_GPFIFO_A alloc so we can
          * locate the GPFIFO ring when the doorbell rings.  rpc_gsp_rm_alloc body
