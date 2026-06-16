@@ -1471,6 +1471,36 @@ static void nvkvm_gsp_deliver_events(NvkvmGpuEmul *s)
     }
 }
 
+/* M7 fix (2026-06-16): drop os-event entries when the guest frees the event object
+ * (GSP_RM_FREE of the NV01_EVENT_OS_EVENT) or its owning client (root).  Without
+ * this, nvkvm_gsp_deliver_events keeps POSTing POST_EVENT to dead (hClient,hEvent)
+ * pairs -> guest _kgspRpcPostEvent's CliGetEventInfo returns OBJECT_NOT_FOUND, the
+ * SHARED status queue's seqNum desyncs ("Bad sequence number"), and the whole
+ * RPC/event path wedges.  Reproduced THREE independent ways on bare-metal .32:
+ * PyTorch CUDA-init hang, 2-process concurrent compute hang, and nvidia-smi-then-
+ * cup8 (nvidia-smi frees its events on exit, leaving stale entries that poison the
+ * next process's completion delivery).  freeing the client itself (fClient==fObj)
+ * tears down all of its events. */
+static void nvkvm_m2_osevent_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fObj)
+{
+    for (int i = 0; i < s->osevent_n; ) {
+        bool ev  = (s->osevents[i].hclient == fClient && s->osevents[i].hevent == fObj);
+        bool cli = (fClient == fObj && s->osevents[i].hclient == fObj);
+        if (ev || cli) {
+            if (s->trace) {
+                qemu_log("nvkvm-gpu[%s] M7: drop stale os-event hClient=0x%08x "
+                         "hEvent=0x%08x (freed 0x%08x) %d->%d\n", s->chip->name,
+                         s->osevents[i].hclient, s->osevents[i].hevent, fObj,
+                         s->osevent_n, s->osevent_n - 1);
+            }
+            s->osevents[i] = s->osevents[s->osevent_n - 1];   /* swap-with-last */
+            s->osevent_n--;
+            continue;                                          /* re-check slot i */
+        }
+        i++;
+    }
+}
+
 /* ── DIAG (address-virtualization bring-up, removable) ──────────────────────
  * Decode the alloc/control RPCs so we can build the GPU-VA -> physical side
  * table from the GSP_RM_ALLOC memory descriptors and GSP_RM_CONTROL map cmds.
@@ -1925,6 +1955,12 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                          (unsigned long long)s->chan_inst_block,
                          s->chan_inst_sys ? "sys" : "fb");
             }
+        }
+        /* M7 fix: on GSP_RM_FREE (fn==10) drop os-events for the freed event/client
+         * so we never POST_EVENT to a dead (hClient,hEvent) — see nvkvm_m2_osevent_drop.
+         * Free body == alloc body: hClient@80, hObject(freed)@88. */
+        if (fn == 10 && s->osevent_n > 0) {
+            nvkvm_m2_osevent_drop(s, ldl_le_p(cmd + 80), ldl_le_p(cmd + 88));
         }
         if (!async) {
             /* Build the response in a large buffer — GSP_RM_CONTROL responses can
