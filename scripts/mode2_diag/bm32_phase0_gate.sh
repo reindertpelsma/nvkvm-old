@@ -6,12 +6,10 @@
 # FAIL on cuInit/alloc => 595 ABI gap -> extend abi_profile to 595, or drop in 580 (invasive).
 set -u
 PORT=2223
-# guest authorizes password "ubuntu" (cloud-init ssh_pwauth=true); .32's key isn't baked in, so
-# use password auth via sshpass for both ssh + scp into the guest.
-PW=${GUEST_PW:-ubuntu}
-SSHO="-o StrictHostKeyChecking=no -o ConnectTimeout=6 -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no"
-SSHG="sshpass -p $PW ssh -p $PORT $SSHO ubuntu@localhost"
-SCPG() { sshpass -p "$PW" scp -P $PORT $SSHO "$@"; }
+# .32's root pubkey was injected into the guest image (inject_key.sh), so key auth works.
+SSHO="-o StrictHostKeyChecking=no -o ConnectTimeout=6 -o UserKnownHostsFile=/dev/null"
+SSHG="ssh -p $PORT $SSHO ubuntu@localhost"
+SCPG() { scp -P $PORT $SSHO "$@"; }
 N=${CUP8_N:-1024}
 CUP8_SRC=/workspace/nvkvm/tests/mode2/cup8.c
 CUP8_RUN=/workspace/nvkvm/scripts/mode2_diag/cup8_run_guest.sh
