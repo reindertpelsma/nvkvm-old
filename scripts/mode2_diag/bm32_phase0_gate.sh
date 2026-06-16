@@ -6,7 +6,12 @@
 # FAIL on cuInit/alloc => 595 ABI gap -> extend abi_profile to 595, or drop in 580 (invasive).
 set -u
 PORT=2223
-SSHG="ssh -p $PORT -o StrictHostKeyChecking=no -o ConnectTimeout=6 -o UserKnownHostsFile=/dev/null ubuntu@localhost"
+# guest authorizes password "ubuntu" (cloud-init ssh_pwauth=true); .32's key isn't baked in, so
+# use password auth via sshpass for both ssh + scp into the guest.
+PW=${GUEST_PW:-ubuntu}
+SSHO="-o StrictHostKeyChecking=no -o ConnectTimeout=6 -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+SSHG="sshpass -p $PW ssh -p $PORT $SSHO ubuntu@localhost"
+SCPG() { sshpass -p "$PW" scp -P $PORT $SSHO "$@"; }
 N=${CUP8_N:-1024}
 CUP8_SRC=/workspace/nvkvm/tests/mode2/cup8.c
 CUP8_RUN=/workspace/nvkvm/scripts/mode2_diag/cup8_run_guest.sh
@@ -24,8 +29,8 @@ up=0; for i in $(seq 1 60); do $SSHG echo OK 2>/dev/null | grep -q OK && { up=1;
 echo "  guest up."
 
 echo "=== stage cup8.c into guest /tmp ==="
-scp -P $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$CUP8_SRC" ubuntu@localhost:/tmp/cup8.c
-scp -P $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$CUP8_RUN" ubuntu@localhost:/tmp/cup8_run_guest.sh
+SCPG "$CUP8_SRC" ubuntu@localhost:/tmp/cup8.c
+SCPG "$CUP8_RUN" ubuntu@localhost:/tmp/cup8_run_guest.sh
 
 echo "=== run cup8 (CUP8_N=$N) in guest ==="
 $SSHG "CUP8_N=$N bash /tmp/cup8_run_guest.sh" 2>&1 | tee /tmp/bm32_cup8.log
