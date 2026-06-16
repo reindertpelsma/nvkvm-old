@@ -3,7 +3,7 @@
 set -u
 systemctl stop bm32phase0 2>/dev/null
 pkill -9 -f "[q]emu-system-x86_64"; sleep 3
-PUB=$(cat /root/.ssh/id_ed25519.pub)
+PUB=$(ssh-keygen -y -f /root/.ssh/id_ed25519)   # derive from PRIVATE key — .pub on disk may be stale/mismatched
 echo "injecting: ${PUB:0:40}..."
 modprobe nbd max_part=16 2>&1
 QN=/opt/qemu-nvkvm/bin/qemu-nbd
