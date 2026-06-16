@@ -4068,7 +4068,25 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * fwd-map MUST happen on this same call path (it lives here), so the parser sites
      * always call us; we decide here whether to write locally or defer to the host. */
     bool hostonly = s->m2exec && s->m2hostsem && nvkvm_m2_is_user_ce(s, s->chan_client);
-    bool sy; uint64_t p = nvkvm_chan_translate(s, va, &sy);
+    /* #12-L3b: resolve the completion-sema VA under the channel's OWN content-validated
+     * VAS when chan_execute could NOT pin chan_pdb (the GSP-managed-channel case: the
+     * ring lives in vidmem read via BAR1, so every VAS-walk of the ring entry reads 0 and
+     * the value-gated pin is skipped → chan_pdb==0).  Without this the sema VA falls to
+     * nvkvm_chan_translate's blind last-resort fallback, which resolves it under whatever
+     * snooped VAS maps it first — collapsing DISTINCT channels' completion semaphores onto
+     * one phys page (a live UVM channel then reads a backward payload → uvm_gpu_semaphore.c
+     * :776 / ce_utils.c:349 → the 2nd-context hang).  nvkvm_chan_own_pdb_rs is content-
+     * validated (returns a PDB only if it maps THIS channel's gpfifo VA), so it is the
+     * channel's real VAS even when the ring reads 0.  CONFINED to the sema write: the
+     * pushbuffer/gpfifo translation is untouched (pinning own globally into chan_pdb
+     * regressed single-context init). */
+    bool sy; uint64_t p = NVKVM_GMMU_FAULT;
+    if (s->chan_pdb == 0) {
+        bool own_rs = false;
+        uint64_t own = nvkvm_chan_own_pdb_rs(s, &own_rs);
+        if (own) { p = nvkvm_walk_pdb_root(s, own, va, own_rs, &sy); }
+    }
+    if (p == NVKVM_GMMU_FAULT) { p = nvkvm_chan_translate(s, va, &sy); }
     if (p != NVKVM_GMMU_FAULT && !hostonly) {
         /* #12-L3 DIAG: a CE completion-sema write whose payload goes BACKWARDS vs
          * the value already at that phys page is the exact event that trips UVM's
