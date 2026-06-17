@@ -4,42 +4,53 @@ Status: diagnosed 2026-06-17 (root cause proven end-to-end via an instrumented
 full-source guest driver). The wrap-wedge *layer* is fixed and committed
 (`37d15c5`); the CE-completion *layer* documented here is the remaining blocker.
 
-> ### UPDATE 2026-06-17 (bench-proven) — the fix is NOT "parse the ring better"; it's **synthesize the completion**
+> ### UPDATE 2026-06-17 (bench-proven, DEFINITIVE) — it's a missing address-table entry + foreign-VAS aliasing, NOT synthesis
 >
-> A narrow fix was tried and bench-validated as **insufficient**: in `nvkvm_chan_execute`,
-> pin the channel's OWN content-validated VAS (root-aperture-correct) on a *non-fault*
-> walk even when the gpfifo slot reads zero (dropping the non-zero content gate, keeping
-> it only on the blind `chan_vas[]` guess-loop for anti-aliasing). Result on `cupctx2`:
-> the scrub channel's VAS now resolves (`picked_pdb=0x2efa6c000`, ×85), **but the hang is
-> byte-identical** — `scrubberDestruct: Timed out` + `ce_utils.c:349`, CTX2 still wedged.
+> Two earlier framings here were **wrong** and are retracted: (a) the narrow "pin the
+> channel's own VAS" fix — bench-insufficient; (b) the "GSP-composed empty ring, must
+> synthesize the completion" conclusion — an **artifact**: pinning a non-zero PDB *disabled*
+> the `bar1_wpg` fallback, so the channel showed "0 methods" only in that one experimental
+> run. On **normal HEAD** the channel parses fine. The real cause, proven by an
+> `m2trace` capture + log mining on normal HEAD:
 >
-> **Why (proven by mining the 448 030-line QEMU log of that run):** the CeUtils scrub
-> channel `gpfifo=0x120064000` is rung **763 times** and yet decodes **0 methods** — it
-> is **never** one of the method-decoding gpfifos (those are all the guest-CPU-driven
-> compute/user-CE channels: `0x1210d0000` ×1127, the `0x121010000`-family, `0x420064000`).
-> Even with the VAS pinned, every gpfifo ring slot at `gp_get` reads **zero**. The ring is
-> empty *from our vantage point* because the scrub pushbuffer + GP entries are composed by
-> **GSP-RM firmware on the GSP microcontroller** — which we faked away — **not** by the
-> guest CPU through BAR1. So there is **nothing in any address table to resolve**: no
-> agent ever composes the entries, nobody ever executes the finishPayload `SET_SEMAPHORE`,
-> and the guest's CPU-side `scrubberDestruct` waits forever for a sema that will never move.
+> **The stuck channel is `client=0xc1e00007` (a UVM CE channel, gpfifo `0x120064000`).** It
+> releases its completion semaphore to **`va=0x121000010`** with **incrementing payloads
+> 1,2,3,4…** — a perfectly healthy guest-side release; the methods ARE parsed
+> (`m=0x0240/0x0244 d=0x21000010 /0x0248`). The bug is purely **where we write it**:
+> ```
+> #12-L3c SEMW va=0x121000010 phys=0x12bb86010(sys) old=0x33 new=0x1 client=0xc1e00007 res=translate chan_pdb=0x3114000
+> #12-L3c PROBE cli_vas[0] client=0xc1e00007 pdb=0x2efba5000 -> FAULT        ← its OWN VAS has NO mapping for the sema
+> #12-L3c PROBE chan_vas[2] client=0xc1d00001 pdb=0x3114000  -> 0x12bb86010  ← a FOREIGN client's VAS aliases the VA
+> ```
+> `0xc1e00007`'s real mapping for `0x121000010` is **absent from our table** (its own VAS
+> faults; the shared `0xc1e00008` VAS resolves it to garbage `0x1000010`). So the write
+> falls back (`res=translate`) to a **foreign** client's VAS (`0xc1d00001`, pdb `0x3114000`)
+> that aliases the same VA onto a *different* phys (`0x12bb86010`) holding `0xc1d00001`'s own
+> sema (already `0x33`). `new=1` < `0x33` ⇒ **backward** ⇒ the `#12-L3` backward-defer
+> (`37d15c5`) refuses the write ⇒ `0xc1e00007`'s completion never advances ⇒ its teardown
+> wait (`ceutilsDestruct`→`channelWaitForFinishPayload`) times out ⇒ device `StateUnload`
+> botched ⇒ CTX2 cold `StateLoad` hangs.
 >
-> This distinguishes the scrub channel categorically from the compute/user-CE channels
-> (which ARE guest-CPU-composed and DO parse + release). The address table governs the
-> **guest-driven data plane**; this is a **GSP-internal control-plane completion**, which
-> the forwarding model says to **synthesize the observable end-state of**, not replay.
+> **Chain:** missing table entry → foreign-VAS aliasing fallback → backward write → deferred → wedge.
 >
-> **The fix (per `mode2_forwarding_model.md`, "correctness = observable end-states only"):**
-> recognize the CeUtils CE channel's finishPayload completion and **synthesize it** — write
-> the expected payload to the finishPayload sema (VA `0x12006c004` → FB `0x31f006c`,
-> `bUseBar1=1`) when the channel advances its submitted-work counter, so
-> `channelWaitForFinishPayload` / `scrubberDestruct` observe completion. The memory scrub
-> itself is a correctness no-op in our model: real allocations are forwarded to the host
-> GPU, which scrubs its own vidmem; the guest-side vidmem scrub is bookkeeping over
-> emulated/forwarded memory. Open design points: (1) which trigger cleanly identifies a
-> finishPayload submission (doorbell/gp_put advance on a CE channel whose ring stays empty),
-> (2) what payload value to write (track lastSubmittedPayload), (3) keep it confined to the
-> GSP-managed scrub/CeUtils channel so it can never touch a guest-CPU-driven ring.
+> Contrast the *working* sibling `client=0xc1e00008`/gpfifo `0x420064000`: its finishPayload
+> `0x42006c004` resolves under its OWN VAS (`res=cli_vas pdb=0x2efa6c000`) and writes cleanly.
+> And it explains the LLM/cup8 passing: a single context has no *second* UVM client whose
+> sema VA aliases onto a foreign, higher-valued sema page, so the backward-defer never fires.
+>
+> **The fix is the address table, exactly as designed:**
+> 1. **Populate** `va=0x121000010` → `0xc1e00007`'s *own* sema-pool phys (the missing entry).
+>    Source: the RPC/UVM map that establishes the semaphore-pool mapping (PDB-read can't —
+>    its own captured root `0x2efba5000` faults on it). This is the open implementation
+>    question: *which* transport maps UVM's `uvm_gpu_semaphore` pool, and snoop it.
+> 2. **Never alias to a foreign client's VAS** on a sema-write miss — per the directive's
+>    "MISS = FAULT, no backwards/heuristic resolve." The `res=translate` foreign-VAS
+>    fallback IS the bug; with (1) in place it becomes dead, and on a true miss it must
+>    fault, not write someone else's page.
+>
+> So: **no synthesis.** The guest releases the completion correctly; we mis-route it to an
+> aliased foreign page because one mapping is absent and the resolver guesses instead of
+> faulting. See `mode2_address_table.md` (this is its canonical motivating bug).
 
 The clean fix is the address table — see `mode2_address_table.md`.
 
