@@ -4,53 +4,57 @@ Status: diagnosed 2026-06-17 (root cause proven end-to-end via an instrumented
 full-source guest driver). The wrap-wedge *layer* is fixed and committed
 (`37d15c5`); the CE-completion *layer* documented here is the remaining blocker.
 
-> ### UPDATE 2026-06-17 (bench-proven, DEFINITIVE) — it's a missing address-table entry + foreign-VAS aliasing, NOT synthesis
+> ### UPDATE 2026-06-17 — CORRECTED ATTRIBUTION (ground truth wins): the blocker is the finishPayload `0x…6c004`, NOT `0x121000010`
 >
-> Two earlier framings here were **wrong** and are retracted: (a) the narrow "pin the
-> channel's own VAS" fix — bench-insufficient; (b) the "GSP-composed empty ring, must
-> synthesize the completion" conclusion — an **artifact**: pinning a non-zero PDB *disabled*
-> the `bar1_wpg` fallback, so the channel showed "0 methods" only in that one experimental
-> run. On **normal HEAD** the channel parses fine. The real cause, proven by an
-> `m2trace` capture + log mining on normal HEAD:
->
-> **The stuck channel is `client=0xc1e00007` (a UVM CE channel, gpfifo `0x120064000`).** It
-> releases its completion semaphore to **`va=0x121000010`** with **incrementing payloads
-> 1,2,3,4…** — a perfectly healthy guest-side release; the methods ARE parsed
-> (`m=0x0240/0x0244 d=0x21000010 /0x0248`). The bug is purely **where we write it**:
+> **Correction of a same-day mis-attribution.** An intermediate write-up of this section
+> (commit `99bb828`) named `va=0x121000010` (client `0xc1e00007`) as the root cause —
+> the backward-aliased write the resolver mis-routes to a foreign VAS. That is a **real but
+> SEPARATE** phenomenon (the UVM *tracking* sema, the `#12-L3` line, already contained by the
+> `37d15c5` backward-defer). It is **not** what `scrubberDestruct` waits on. The
+> **instrumented-guest ground truth** (counters printed from *inside* the guest driver at the
+> hanging destruct — stronger than any QEMU-side parse, because only the guest knows what its
+> destruct polls) is decisive:
 > ```
-> #12-L3c SEMW va=0x121000010 phys=0x12bb86010(sys) old=0x33 new=0x1 client=0xc1e00007 res=translate chan_pdb=0x3114000
-> #12-L3c PROBE cli_vas[0] client=0xc1e00007 pdb=0x2efba5000 -> FAULT        ← its OWN VAS has NO mapping for the sema
-> #12-L3c PROBE chan_vas[2] client=0xc1d00001 pdb=0x3114000  -> 0x12bb86010  ← a FOREIGN client's VAS aliases the VA
+> destruct #1 PASSES: lastSub=2  hwsema=2  finVa=0x42006c004  bUseBar1=0  (sysmem finishPayload — parser writes it → match)
+> destruct #2 HANGS:  lastSub=63 hwsema=0  finVa=0x12006c004  bUseBar1=1  (VIDMEM finishPayload — NEVER written → timeout)
 > ```
-> `0xc1e00007`'s real mapping for `0x121000010` is **absent from our table** (its own VAS
-> faults; the shared `0xc1e00008` VAS resolves it to garbage `0x1000010`). So the write
-> falls back (`res=translate`) to a **foreign** client's VAS (`0xc1d00001`, pdb `0x3114000`)
-> that aliases the same VA onto a *different* phys (`0x12bb86010`) holding `0xc1d00001`'s own
-> sema (already `0x33`). `new=1` < `0x33` ⇒ **backward** ⇒ the `#12-L3` backward-defer
-> (`37d15c5`) refuses the write ⇒ `0xc1e00007`'s completion never advances ⇒ its teardown
-> wait (`ceutilsDestruct`→`channelWaitForFinishPayload`) times out ⇒ device `StateUnload`
-> botched ⇒ CTX2 cold `StateLoad` hangs.
+> **EXACT ROOT CAUSE:** the hanging channel is gpfifo **`0x120064000`** (pbGpuVA
+> `0x120000000`, a GSP-managed UVM CE channel). `chan_exec` shows **`picked_pdb=0`** → we
+> cannot resolve its pushbuffer VAS, so we *drain* its ring (gp_get 0→63) but **do not parse
+> its methods**. Its CE `SET_SEMAPHORE`/release to the **finishPayload sema
+> `0x12006c004`** (= pbGpuVA + `finishPayloadOffset 0x6c004`, in **VIDMEM**, `bUseBar1=1`)
+> therefore **never executes** → the sema reads 0 → `ceutilsDestruct`→
+> `channelWaitForFinishPayload(63)` times out (4 s) → `ce_utils.c:349` → device `StateUnload`
+> botched (last-context destroy de-inits the whole GPU) → CTX2 cold `StateLoad` hangs.
+> Confirmed both nights: **zero writes to `0x12006c004`** in the QEMU log; the analogous
+> *sysmem* sibling gpfifo `0x420064000` DOES get its `CE_SEM_RELEASE → 0x42006c004` and
+> passes (`bUseBar1=0`, parser resolves + writes it).
 >
-> **Chain:** missing table entry → foreign-VAS aliasing fallback → backward write → deferred → wedge.
+> Today's `m2trace` is **consistent** with this once read correctly: a re-mine query for any
+> `SET_SEMAPHORE` targeting `0x12006c004` came back **empty** (never parsed), while the
+> `0x121000010` releases ARE parsed — i.e. we parse *part* of the channel's ring but miss the
+> GP entry carrying the finishPayload release. `picked_pdb=0` is why.
 >
-> Contrast the *working* sibling `client=0xc1e00008`/gpfifo `0x420064000`: its finishPayload
-> `0x42006c004` resolves under its OWN VAS (`res=cli_vas pdb=0x2efa6c000`) and writes cleanly.
-> And it explains the LLM/cup8 passing: a single context has no *second* UVM client whose
-> sema VA aliases onto a foreign, higher-valued sema page, so the backward-defer never fires.
+> **Why single-context (LLM/cup8) passes:** the finishPayload that goes unwritten is on a
+> **vidmem, `bUseBar1=1`** channel that only appears at the *2nd* context's device-reinit
+> teardown; the sysmem sibling (`bUseBar1=0`) we DO write covers the 1st.
 >
-> **The fix is the address table, exactly as designed:**
-> 1. **Populate** `va=0x121000010` → `0xc1e00007`'s *own* sema-pool phys (the missing entry).
->    Source: the RPC/UVM map that establishes the semaphore-pool mapping (PDB-read can't —
->    its own captured root `0x2efba5000` faults on it). This is the open implementation
->    question: *which* transport maps UVM's `uvm_gpu_semaphore` pool, and snoop it.
-> 2. **Never alias to a foreign client's VAS** on a sema-write miss — per the directive's
->    "MISS = FAULT, no backwards/heuristic resolve." The `res=translate` foreign-VAS
->    fallback IS the bug; with (1) in place it becomes dead, and on a true miss it must
->    fault, not write someone else's page.
+> **The fix targets `0x12006c004`, not `0x121000010`:**
+> 1. **Parse the GSP-managed channel's finishPayload release even when `picked_pdb=0`** — via
+>    the `bar1_wpg` FB-backing fallback (the guest BAR1-wrote the ring to vidmem we mirror);
+>    then `nvkvm_chan_sem_wr32` writes the vidmem sema via `fb_write` (it already handles
+>    vidmem). The finishPayload VA→FB mapping is already known (the guest's own
+>    `DIAG BAR1 WR off=0x12006c → FB 0x31f006c`). The missing piece is **parsing the
+>    release**, not resolving a sema VA. ⇒ `bar1_wpg` is **load-bearing** here — the earlier
+>    "pin the own VAS" attempt regressed precisely by *disabling* it.
+> 2. **OR forge-complete at teardown** (the "wait if real work, else complete now" rule):
+>    finishPayload is at a fixed `+0x8004` offset in the same buffer we already resolve for
+>    `GP_PUT`; on a `bUseBar1` scrub channel whose ring we can't fully parse, write
+>    `finishPayload = lastSubmittedPayload`. Safe because the scrubbed memory is being freed.
 >
-> So: **no synthesis.** The guest releases the completion correctly; we mis-route it to an
-> aliased foreign page because one mapping is absent and the resolver guesses instead of
-> faulting. See `mode2_address_table.md` (this is its canonical motivating bug).
+> The `0x121000010` foreign-VAS aliasing (MISS=FAULT, address-table population) is still a
+> valid cleanup — but it is a **separate** task, not the `#12` destruct blocker. Do not
+> conflate them again.
 
 The clean fix is the address table — see `mode2_address_table.md`.
 
