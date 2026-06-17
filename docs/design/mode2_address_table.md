@@ -1,0 +1,231 @@
+# Mode-2 address table — the one table of truth
+
+Status: design, 2026-06-17 (user brainstorm + source verification against the
+open kernel modules `research_clones/ogkm`, tag 580.159.04 / Ampere GA10x).
+Supersedes the per-access "walk + heuristic cascade" in `nvkvm_chan_execute`.
+Governs all Mode-2 data-plane address resolution; the #12 teardown hang is the
+first bug it dissolves. See also `mode2_address_virtualization.md` (the two
+translation chains and the GPU-physical page categories this builds on).
+
+## 0. Core invariant (non-negotiable)
+
+There is **one authoritative table** that resolves any guest GPU virtual address
+to a GPU-physical (GPGA) range. It is:
+
+- **Forward-populated only.** Data flows *in* at bind time and *out* at lookup.
+  Never traced backwards from a VA at execution time.
+- **Never resolved by walking the PDB at lookup.** Lookups are pure table reads.
+- **No heuristic fallbacks.** Delete the `nvkvm_chan_execute` cascade
+  (instblk → snooped `chan_vas[]` → `bar1_wpg` FB scan → "one VA aliases many GPAs"
+  guessing). A lookup either hits the table or it is a **fault** (§6).
+
+This is stricter than "a cache." The table *is* the truth for our resolution; the
+guest's in-memory page tables (PDB) are treated as **a communication channel, not
+storage** (§2).
+
+## 1. Mental model: the table IS the GPU's TLB
+
+The guest's contract with GPU hardware is: *write PTEs to memory → issue a TLB
+invalidate → only then rely on the mapping.* A real TLB holds stale/absent
+entries until an invalidate; it is refreshed from memory on invalidate (and, on
+real HW, on a miss-walk — which we deliberately do NOT replicate, §6).
+
+We make **our table play the role of that TLB.** The guest cannot distinguish
+"real HW TLB, flushed on invalidate" from "our table, refreshed on invalidate":
+the observable semantics (a write does not take effect until invalidate) are
+identical. Consequences:
+
+- Our table's "staleness" between invalidates is **not a bug** — it is
+  architecturally identical to a real TLB. The guest's own invalidate discipline
+  is exactly what keeps our table correct. We add no new requirement on the guest.
+- We do **not** model the *host* GPU's TLB. We resolve guest-VA → host backing +
+  host VA and keep the host VA space aligned; the host driver owns the host TLB.
+  Two TLBs: the guest's (= our table) and the host's (= host driver's job).
+
+## 2. Why the guest is the authoritative allocator (and PDB is communication)
+
+Verified in ogkm:
+
+- **PMA (vidmem heap allocator) is CPU-side**, even under GSP
+  (`bPmaEnabled = NV_TRUE` set in the kernel RM, `mem_mgr.c`). The guest kernel RM
+  picks vidmem physical offsets. GSP does **not** pick free GPU-phys for the heap.
+- Every object carries a **memdesc**; `memdescGetPhysAddr(pMemDesc, AT_GPU, off)`
+  is its authoritative GPU-physical address. The guest records the phys of
+  everything it allocates.
+
+So the binding (VA↔phys) is *decided by the guest* and *crosses our boundary* at
+the bind-time RPC/ioctl (we are the device and the faked GSP). What GSP owns is
+not the allocation but the **page-table management** for `bGspOwned` channels
+(`kernel_channel.c: pKernelChannel->bGspOwned`) — which is exactly why their
+CPU-side instance-block PDB reads empty and the old cascade failed on them.
+
+→ We record the authoritative binding at bind time; we never need to reverse it.
+
+## 3. Data structure
+
+- **Keyed by VAS** (the PDB root / page-dir base), NOT a global VA space. The same
+  GPU-VA legitimately maps to different GPAs in different VASes (the aliasing the
+  cascade fell into — one VA → 4 GPAs across kernel VASes). Per-VAS keying makes
+  RPC-populated and PDB-populated VASes disjoint, so the two sources never collide.
+- Per VAS: a sorted set of `VA-range → { gpga_base, aperture, size }`
+  (interval tree or sorted array + binary search; the existing "GPGA binary-search
+  index" is precedent).
+- The GPGA→host-object layer is the *second* table (already exists as
+  `m2_fbback[]` / `m2_gpga`): an allocated GPGA range is an offset/slice into a
+  real host GPU allocation (double-mmap). Lookup chains:
+  `VA → (this table) → GPGA → (m2_fbback) → host slice`.
+- **Locking:** one RW-lock per VAS (shard later if contention shows). Resolvers
+  take read; populate/invalidate handlers take write. Soundness depends on §5.
+
+## 4. Population — forward, from exactly these sources
+
+1. **Direct map RPC/ioctl** — `NV0080_CTRL_CMD_DMA_FILL_PTE_MEM` (0x801802),
+   `rpc_map_memory_dma_v2` / `rpc_unmap_memory_dma`, channel-create (the channel
+   buffer's VA↔phys). These hand us the binding directly; record it. (libcuda's
+   userspace maps route here too — kernel-mediated, observable.)
+2. **Invalidate → read-the-PDB-diff** — for VASes whose page tables the guest
+   writes directly into memory (UVM, `DMA_FILL_PTE_MEM`), on the invalidate event
+   (§5) read that PDB's memslot and diff the changed ranges into the table.
+
+PDB pages may live in a **fast RAM memslot — we do NOT trap individual PTE
+writes.** We read the PDB only at the invalidate commit point (§5), which is the
+only point the guest guarantees a consistent, committed view.
+
+## 5. The coherence event: TLB invalidate (two transports, both observed)
+
+Both carry the **PDB address** (so we know which VAS to refresh) and **membar**
+bits (the fence, §5.1). Both are observable to us.
+
+- **RM / GSP-managed VASes → `INVALIDATE_TLB` RPC.**
+  `NV_VGPU_MSG_FUNCTION_INVALIDATE_TLB`, `rpcInvalidateTlb_v23_03(pdbAddress, regVal)`
+  (`vgpu/rpc.c`; issued via `NV_RM_RPC_INVALIDATE_TLB`, `kern_gmmu_gm107.c`). In GSP
+  mode the privileged MMU register is owned by GSP, so the invalidate is RPC'd —
+  it lands in our GSP-RPC queue (already decoded; today likely acked blindly).
+- **UVM / privileged kernel channels → `MEM_OP` pushbuffer method.**
+  `uvm_hal_ampere_host_tlb_invalidate_all(push, pdb, depth, membar)`
+  (`uvm_ampere_host.c`) emits, on class C56F (AMPERE_CHANNEL_GPFIFO_A):
+  ```
+  NV_PUSH_4U(C56F, MEM_OP_A, sysmembar_value | INVAL_SCOPE=NON_LINK_TLBS,
+                   MEM_OP_C, TLB_INVALIDATE_PDB=ONE | PDB_ADDR_LO(pdb_lo)
+                            | PAGE_TABLE_LEVEL(level) | aperture | ack,
+                   MEM_OP_D, OPERATION=MMU_TLB_INVALIDATE (0x9) | PDB_ADDR_HI(pdb_hi));
+  ```
+  We see this **in the pushbuffer parser** when draining the channel — the *same*
+  parser the #12 fix needs (§7). Decode `MEM_OP_D.OPERATION == MMU_TLB_INVALIDATE`
+  (0x9) / `..._TARGETED` (0xa); reconstruct `pdb` from `PDB_ADDR_LO|HI`; read
+  `SYSMEMBAR` / `ACK_TYPE=GLOBALLY` for the fence.
+
+On either event: take the VAS write-lock, refresh/diff that PDB's bindings into
+the table, apply MMIO changes per §5.1–5.2, release.
+
+### 5.1 Membar = hard barrier (the in-flight-DMA fence)
+
+When the invalidate carries a membar/sysmembar bit, it is a **serialization
+point**. In our managed pushbuffer interpreter we do **not advance to the next
+method** until: (a) the table refresh for that PDB is applied, AND (b) the fenced
+outstanding host-side work has drained. That is the literal meaning of the bit;
+honoring it is how "atomic end-state after invalidate" is actually achieved.
+
+### 5.2 MMIO materialization: unmap eager, map lazy, reclaim deferred
+
+- **Unmap is eager (correctness + security).** A removed or re-pointed range must
+  have its stale host backing dropped *before* the guest can reach it — else its
+  next DMA hits stale memory (a cross-context leak). Bounded to the ranges the
+  invalidate touched.
+- **Map is lazy (perf).** Materialize new host mmaps on first touch, re-checking
+  the table. (Eager-map is an option if invalidates prove rare/scoped and you want
+  "after sync, MMIO == table, nothing deferred" — measure first; UVM migration can
+  storm invalidates.)
+- **Deferred reclamation for the fence.** Refcount the backing. Invalidate marks
+  the old backing for-delete, drops its ref, and returns *without blocking*; the
+  in-flight forwarded op, on completion, sees the flag and does the munmap. The
+  *table* update is synchronous (new binding visible immediately); only the *old
+  backing's reclamation* is deferred. While marked-for-delete, new accesses see
+  the new binding (or fault), never the stale backing.
+
+## 6. Miss handling — a miss is a fault, never a walk, never a guess
+
+A lookup that finds no binding means the guest never committed (invalidated) that
+VA → it is not relying on it yet → resolving it would mean reading **uncommitted,
+possibly mid-update** page-table state. That is a security hole (torn multi-level
+walk → wrong physical page → cross-context leak), not a recoverable case.
+
+Therefore: **miss = a real GPU page fault**, surfaced loud and forwarded to the
+guest as a fault (which is exactly what real HW does for a genuinely unmapped VA).
+
+- We explicitly do **NOT** do an opportunistic "walk the PDB one last time" on a
+  miss. Real HW's miss-walk is safe only because the driver never *acts* on an
+  uncommitted VA — which, for us, means it is already in the table (no miss). A
+  miss is, by definition, the unsafe-to-walk state.
+- A miss is also the signal that we failed to capture a binding at its populate
+  site (§4) — fix it there, not with a fallback.
+
+## 7. Relationship to #12 (same plumbing)
+
+The #12 teardown hang (`mode2_baremetal_32.md`) is: a `bGspOwned` CE scrub channel
+(gpfifo 0x120064000, `picked_pdb=0`) whose finishPayload sema (vidmem 0x12006c004)
+we never wrote, because we could not resolve its pushbuffer VAS. Under this design:
+the channel-buffer binding is recorded at channel-create (§4.1); the sema resolves
+by table hit; no PDB, no cascade, no special case. And UVM's invalidate being a
+`MEM_OP` pushbuffer method (§5) means the table's invalidation hook and #12's
+`SET_SEMAPHORE` parsing are the **same** channel-pushbuffer decoder. Build the
+decoder once; both are served.
+
+## 8. Allocation & host OOM
+
+- **When backing is allocated:** at the guest's `RM_ALLOC` (vidmem) — forward to
+  the host GPU there and record the GPGA→host-slice in `m2_fbback`. Distinct from
+  *binding* (§4), which happens later at map/invalidate.
+- **OOM reporting:** the host alloc must be **reserved at the alloc RPC** so its
+  failure returns synchronously as `NV_ERR_NO_MEMORY` (`heap.c`) → guest RM →
+  `cudaErrorMemoryAllocation`. Lazy "promote-on-touch" cannot report OOM cleanly
+  (no RPC in flight at touch; only recourse is a fatal Xid). Compromise:
+  reserve/account host capacity at alloc (cheap, synchronous error), materialize
+  pages lazily, treat a post-reservation OOM as the genuinely-fatal exception.
+
+## 9. Security properties (why determinism beats opportunism)
+
+- No torn reads: the PDB is read only at the invalidate commit point.
+- No stale backing reachable: unmap is eager for changed ranges (§5.2).
+- No guessing: a miss is a fault, not a heuristic resolution to *some* page (§6).
+- Per-VAS keying prevents cross-VAS aliasing from resolving one client's VA to
+  another's backing.
+
+## 10. Userspace rings stay opaque (verified safe)
+
+Opaque passthrough of userspace (libcuda) gpfifo rings does **not** endanger the
+table:
+
+- Userspace channels are **non-privileged** (`uvm_channel_is_privileged` is the
+  privilege gate; user channels lack it) → cannot issue `MMU_TLB_INVALIDATE`.
+- Userspace memory maps are **kernel-mediated** (`DMA_FILL_PTE_MEM` ioctl, RM
+  control) → observed at §4.1, not in the user ring.
+- User rings *may* carry `MEM_OP` **membars** (data ordering) — irrelevant to the
+  table; only `OPERATION=MMU_TLB_INVALIDATE` matters, and that is privileged.
+
+So the table changes only via kernel-observable events; the `m2opaque` fast path
+remains sound.
+
+## 11. Open items to verify before/while implementing
+
+1. **Always-invalidate is universal.** Strongly evidenced (UVM pushes the
+   invalidate inline after PTE writes; RM carries it via RPC), but not proven for
+   every map path. The §6 "miss = fault" rule makes a missed-invalidate a loud,
+   safe failure rather than silent corruption — but a *legitimate* path that
+   maps-and-uses without invalidate would then false-fault. Confirm none exists.
+2. **Ampere routes `INVALIDATE_TLB` via RPC in GSP mode** (saw Maxwell HAL +
+   generic RPC; Ampere HAL almost certainly the same — verify the GA10x HAL).
+3. **HW rejects `MMU_TLB_INVALIDATE` from a non-privileged channel** (strongly
+   implied by the privilege model; not proven by a HW privilege-check line).
+4. **UVM PTE-write transport** (CPU vs CE inline) — not load-bearing for the
+   design (we read at invalidate regardless), but informs whether PDB reads ever
+   touch sysmem vs vidmem.
+
+## 12. Migration / refactor note
+
+Implementing this means **deleting** `nvkvm_chan_execute`'s PDB-resolution cascade
+and the per-doorbell re-sweep, replacing exec-time resolution with a table lookup.
+Populate from §4 sites; invalidate from §5; fault on miss. This is also the clean
+shape for the Rust rewrite ([[rewrite_horizon_target]]): an owned
+`HashMap<PdbRoot, IntervalMap<VaRange, Binding>>` behind a lock, two populate
+entry points, one lookup, no heuristics.

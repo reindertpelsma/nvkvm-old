@@ -33,6 +33,10 @@ Start here: `README.md`, `PLAN.md`, `docs/ARCHITECTURE.md`, `docs/MILESTONES.md`
 - **Forwarding model (read first for Mode-2):** `mode2_forwarding_model.md` — translate guest
   *intent* to unprivileged host userspace ops; never replay privileged GSP-internal controls;
   correctness = observable end-states only.
+- **★ Address table (the data-plane core, read with the forwarding model):** `mode2_address_table.md`
+  — one authoritative per-VAS VA→GPGA table, forward-populated (RPC + PDB-read-at-invalidate),
+  never reverse-resolved; the table IS the guest's TLB; miss = fault. `mode2_2nd_context_hang.md`
+  = the #12 bug it dissolves (GSP-managed CE channel finishPayload, root-caused).
 - Mode-2 compute path: `mode2_compute_forwarding.md`, `mode2_gr_forwarding.md`,
   `mode2_cuctxcreate_resume.md` (+ `_problem.md`), `mode2_execfwd_keystone_plan.md`.
 - Mode-2 internals: `mode2_memory_model.md`, `mode2_address_virtualization.md`,
