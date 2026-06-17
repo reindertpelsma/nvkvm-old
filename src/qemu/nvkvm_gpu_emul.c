@@ -312,6 +312,18 @@ struct NvkvmGpuEmul {
      * NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY (0x801813) with a SYSMEM aperture. */
     struct { uint32_t hvas; uint32_t client; uint64_t pdb; bool root_sys; } chan_vas[16];
     int      chan_vas_n;
+    /* #12-L3c: STICKY per-client VAS roots — same captures as chan_vas[] but NEVER
+     * dropped on RM-handle free.  A GSP-managed UVM CE channel (empty instblk, hvas=0)
+     * whose VAS *handle* the guest frees during init still runs later and releases its
+     * tracking semaphore; chan_vas[] has been pruned (L1, correctly — gpfifo/pushbuffer
+     * translation must not use a freed VAS) so the sema VA falls to the stale global
+     * chan_pdb (a FOREIGN channel's root, e.g. CeUtils 0x3114000) → distinct clients'
+     * semaphores at the same guest VA collapse onto one phys → uvm_gpu_semaphore.c:776
+     * backward jump → 2nd-context hang.  This sticky table is consulted ONLY for the
+     * sema write (nvkvm_chan_sem_wr32), client-keyed, so each channel's completion sema
+     * resolves under its OWN client's VAS even after the handle is gone. */
+    struct { uint32_t client; uint64_t pdb; bool root_sys; } m2_cli_vas[64];
+    int      m2_cli_vas_n;
     uint32_t chan_hvaspace;    /* the tracked channel's hVASpace handle */
 
     /* DEBUG-PROOF backdoor (mode2_uvm_complete): the patched guest UVM reports
@@ -321,6 +333,16 @@ struct NvkvmGpuEmul {
      * a bring-up PROOF that forging the completion unblocks cuInit; production
      * needs a validated guest<->VMM mapping-report channel (untrusted guest). */
     uint32_t dbg_gpa_lo, dbg_gpa_hi;
+    /* #12-L3c: page bases (GPA & ~0xfff) the backdoor (0xFFF508) has written.  The
+     * backdoor is the AUTHORITATIVE writer for kernel UVM/CeUtils tracking semas (the
+     * guest reports the exact GPA + payload).  The CE_SEM_RELEASE pushbuffer parser
+     * (nvkvm_chan_sem_wr32) cannot resolve these kernel semas reliably — one GPU-VA
+     * (0x121000010) maps to 4+ distinct GPAs across the kernel VASes, so it collapses
+     * DISTINCT channels' tracking semas onto one pool slot (CeUtils' climb landing on
+     * the UVM channel's slot → uvm_gpu_semaphore.c:776 backward jump → 2nd-ctx hang).
+     * So the parser must DEFER: never software-write a page the backdoor owns. */
+    uint64_t m2_bd_pages[128];
+    int      m2_bd_pages_n;
 
     /* M5 compute forwarding (docs/design/mode2_compute_forwarding.md). The
      * emulated GPU hosts its own forwarding backend (separate QEMU process from
@@ -1539,6 +1561,41 @@ static void nvkvm_m2_osevent_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fO
  * object; free of the client root (fClient==fObj) purges everything owned by the client.
  * Only fires for genuinely-freed objects, so removal is safe (cup8/LLM/single-proc PyTorch
  * never free a still-in-use object mid-run). */
+/* #12-L3c: record a (client, pdb) VAS root in the STICKY table (never dropped on
+ * free), deduped on (client,pdb).  Consulted only by the sema-write resolver so a
+ * GSP-managed channel whose VAS handle is gone still resolves its completion sema
+ * under its OWN client's address space (see the m2_cli_vas[] comment). */
+static void nvkvm_m2_cli_vas_add(NvkvmGpuEmul *s, uint32_t client, uint64_t pdb, bool root_sys)
+{
+    if (!client || !pdb) { return; }
+    for (int i = 0; i < s->m2_cli_vas_n; i++) {
+        if (s->m2_cli_vas[i].client == client && s->m2_cli_vas[i].pdb == pdb) { return; }
+    }
+    if (s->m2_cli_vas_n >= (int)ARRAY_SIZE(s->m2_cli_vas)) { return; }
+    int k = s->m2_cli_vas_n++;
+    s->m2_cli_vas[k].client = client;
+    s->m2_cli_vas[k].pdb = pdb;
+    s->m2_cli_vas[k].root_sys = root_sys;
+}
+
+/* #12-L3c: record / test a GPA page base the backdoor (0xFFF508) authoritatively
+ * writes, so the CE_SEM_RELEASE parser defers on it (see m2_bd_pages[] comment). */
+static void nvkvm_m2_bd_page_add(NvkvmGpuEmul *s, uint64_t page)
+{
+    for (int i = 0; i < s->m2_bd_pages_n; i++) {
+        if (s->m2_bd_pages[i] == page) { return; }
+    }
+    if (s->m2_bd_pages_n >= (int)ARRAY_SIZE(s->m2_bd_pages)) { return; }
+    s->m2_bd_pages[s->m2_bd_pages_n++] = page;
+}
+static bool nvkvm_m2_bd_page_has(NvkvmGpuEmul *s, uint64_t page)
+{
+    for (int i = 0; i < s->m2_bd_pages_n; i++) {
+        if (s->m2_bd_pages[i] == page) { return true; }
+    }
+    return false;
+}
+
 static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fObj)
 {
     bool root = (fClient == fObj);            /* client-root free: purge all of fClient */
@@ -1548,6 +1605,14 @@ static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t f
         bool hit = (root && s->chans[i].client == fClient) ||
                    (s->chans[i].client == fClient && s->chans[i].hobject == fObj);
         if (hit) {
+            /* #12-L3c DIAG: a channel free is the (a)-vs-(b) hinge — log the freed
+             * channel's gpfifo VA + client so the bench timeline shows whether the
+             * 0x8a-climber's channel is FREED before the payload-9 writer appears
+             * (→ page-reuse, case b) or stays live (→ same-VA alias, case a). */
+            qemu_log("nvkvm-gpu[%s] #12-L3c CHAN-FREE gpfifo_va=0x%llx client=0x%08x "
+                     "hobj=0x%08x (fClient=0x%08x fObj=0x%08x root=%d)\n", s->chip->name,
+                     (unsigned long long)s->chans[i].gpfifo_va, s->chans[i].client,
+                     s->chans[i].hobject, fClient, fObj, root);
             s->chans[i] = s->chans[s->chan_n - 1];
             s->chan_n--; dropped++; continue;
         }
@@ -1955,6 +2020,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 s->chan_vas[k].client = ldl_le_p(cmd + 80); /* GSP_RM_CONTROL hClient (#12-L3) */
                 s->chan_vas[k].pdb  = ldq_le_p(cmd + 160);  /* levels[0].physAddress */
                 s->chan_vas[k].root_sys = false;            /* FB-rooted (GSP-client) */
+                nvkvm_m2_cli_vas_add(s, s->chan_vas[k].client, s->chan_vas[k].pdb, false);
                 qemu_log("nvkvm-gpu[%s] M5: VAS hObject=0x%08x client=0x%08x PDB=0x%llx\n",
                          s->chip->name, s->chan_vas[k].hvas, s->chan_vas[k].client,
                          (unsigned long long)s->chan_vas[k].pdb);
@@ -1997,6 +2063,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 s->chan_vas[k].client = ldl_le_p(cmd + 80); /* GSP_RM_CONTROL hClient (#12-L3) */
                 s->chan_vas[k].pdb = phys;
                 s->chan_vas[k].root_sys = rsys;
+                nvkvm_m2_cli_vas_add(s, s->chan_vas[k].client, phys, rsys);
                 qemu_log("nvkvm-gpu[%s] M5.30 SET_PAGE_DIR UVM-VAS hVASpace=0x%08x "
                          "PDB=0x%llx aperture=%u root=%s (candidate %d)\n",
                          s->chip->name, hvas, (unsigned long long)phys,
@@ -2881,6 +2948,14 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * CE_SEM_RELEASE / SEM_EXECUTE parser sites, NOT here.  So always forge. */
         if (gpa) {
             nvkvm_dmaw(&s->parent_obj, gpa, b, 4);
+            /* #12-L3c: claim this EXACT sema GPA for the backdoor so the
+             * CE_SEM_RELEASE parser never software-writes it via (unreliable) VAS
+             * translation.  Per-slot (not per-page): the UVM kernel sema pool packs
+             * several channels' tracking semas onto one page, and only the channels
+             * whose uvm_channel.c reports via 0xFFF508 are backdoor-owned.  A page-
+             * granular claim wrongly suppressed co-located non-backdoor slots
+             * (e.g. CeUtils @ ce_utils.c:349), starving their completion. */
+            nvkvm_m2_bd_page_add(s, gpa);
             qemu_log("nvkvm-gpu[%s] M5: DBG-FORGE uvm sema GPA=0x%llx <- payload=%u\n",
                      s->chip->name, (unsigned long long)gpa, (uint32_t)val);
         }
@@ -3903,23 +3978,37 @@ static uint64_t nvkvm_chan_own_pdb_rs(NvkvmGpuEmul *s, bool *out_root_sys)
      * root_sys so populate_cvas enumerates with the correct root aperture (UVM roots are
      * sys-rooted; the hardcoded false mis-walked them even when the PDB was found). */
     if (s->chan_gpfifo_va) {
-        for (int i = 0; i < s->chan_vas_n; i++) {
-            if (!s->chan_vas[i].pdb) {
-                continue;
-            }
-            bool sy = false;
-            if (nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, s->chan_gpfifo_va,
-                                    s->chan_vas[i].root_sys, &sy) != NVKVM_GMMU_FAULT) {
-                if (out_root_sys) { *out_root_sys = s->chan_vas[i].root_sys; }
-                if (s->m2_own_pdb_diag < 8) {
-                    qemu_log("nvkvm-gpu[%s] M5.36 own_pdb PROBE hit: client=0x%08x "
-                             "hvas=0x%08x pdb=0x%llx root_sys=%d maps gpfifo=0x%llx\n",
-                             s->chip->name, s->chan_client, s->chan_vas[i].hvas,
-                             (unsigned long long)s->chan_vas[i].pdb,
-                             s->chan_vas[i].root_sys,
-                             (unsigned long long)s->chan_gpfifo_va);
+        /* #12-L3c: TWO PASSES.  Pass 0 prefers a root whose snooped owning CLIENT
+         * matches the executing channel's client (chan_vas[].client, the L3a key) —
+         * the content-probe alone is NOT client-keyed, so when DISTINCT clients put
+         * their gpfifo at VAs that both validate under a shared/foreign root it
+         * collapses their per-client VASes onto one (the CeUtils 0xc1d00001 vs UVM
+         * 0xc1e00007 completion-sema-at-va-0x121000010 collision → uvm_gpu_semaphore.c
+         * :776 backward jump → 2nd-context hang).  Pass 1 = the original blind probe,
+         * for channels whose true root was captured only under a foreign dup handle
+         * (e.g. UVM's 0xcaf00005, client-unlinkable) — unchanged behavior there. */
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < s->chan_vas_n; i++) {
+                if (!s->chan_vas[i].pdb) {
+                    continue;
                 }
-                return s->chan_vas[i].pdb;
+                if (pass == 0 && s->chan_vas[i].client != s->chan_client) {
+                    continue;   /* pass 0: same-client roots only */
+                }
+                bool sy = false;
+                if (nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, s->chan_gpfifo_va,
+                                        s->chan_vas[i].root_sys, &sy) != NVKVM_GMMU_FAULT) {
+                    if (out_root_sys) { *out_root_sys = s->chan_vas[i].root_sys; }
+                    if (s->m2_own_pdb_diag < 8) {
+                        qemu_log("nvkvm-gpu[%s] M5.36 own_pdb PROBE hit (pass%d): client=0x%08x "
+                                 "vas_client=0x%08x hvas=0x%08x pdb=0x%llx root_sys=%d maps gpfifo=0x%llx\n",
+                                 s->chip->name, pass, s->chan_client, s->chan_vas[i].client,
+                                 s->chan_vas[i].hvas, (unsigned long long)s->chan_vas[i].pdb,
+                                 s->chan_vas[i].root_sys,
+                                 (unsigned long long)s->chan_gpfifo_va);
+                    }
+                    return s->chan_vas[i].pdb;
+                }
             }
         }
     }
@@ -4081,10 +4170,31 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
      * pushbuffer/gpfifo translation is untouched (pinning own globally into chan_pdb
      * regressed single-context init). */
     bool sy; uint64_t p = NVKVM_GMMU_FAULT;
-    if (s->chan_pdb == 0) {
+    uint64_t dbg_own = 0; const char *dbg_res = "translate";   /* #12-L3c DIAG */
+    /* #12-L3c: for a KERNEL completion sema (NOT the user-CE hostonly path — that
+     * resolves correctly via chan_pdb and is cup8's hot path, leave it untouched),
+     * resolve under the WRITING client's OWN VAS from the sticky table FIRST.  This
+     * overrides the stale global chan_pdb a foreign channel left behind, which is the
+     * CeUtils(0xc1d00001)<->UVM(0xc1e00007) sema-at-va-0x121000010 collapse: the UVM
+     * CE channel is GSP-managed (empty instblk, hvas=0) and its VAS handle was freed,
+     * so without this its sema resolves under CeUtils' 0x3114000 → one phys → backward
+     * jump (uvm_gpu_semaphore.c:776) → 2nd-context hang.  Client-keyed ⇒ each client's
+     * sema lands in its own address space. */
+    if (!hostonly && s->chan_client) {
+        for (int i = 0; i < s->m2_cli_vas_n; i++) {
+            if (s->m2_cli_vas[i].client != s->chan_client) { continue; }
+            uint64_t cp = nvkvm_walk_pdb_root(s, s->m2_cli_vas[i].pdb, va,
+                                              s->m2_cli_vas[i].root_sys, &sy);
+            if (cp != NVKVM_GMMU_FAULT) { p = cp; dbg_res = "cli_vas"; break; }
+        }
+    }
+    {
         bool own_rs = false;
-        uint64_t own = nvkvm_chan_own_pdb_rs(s, &own_rs);
-        if (own) { p = nvkvm_walk_pdb_root(s, own, va, own_rs, &sy); }
+        dbg_own = nvkvm_chan_own_pdb_rs(s, &own_rs);            /* probe for DIAG always */
+        if (p == NVKVM_GMMU_FAULT && s->chan_pdb == 0 && dbg_own) {
+            p = nvkvm_walk_pdb_root(s, dbg_own, va, own_rs, &sy);
+            if (p != NVKVM_GMMU_FAULT) { dbg_res = "own"; }
+        }
     }
     if (p == NVKVM_GMMU_FAULT) { p = nvkvm_chan_translate(s, va, &sy); }
     if (p != NVKVM_GMMU_FAULT && !hostonly) {
@@ -4102,8 +4212,66 @@ static bool nvkvm_chan_sem_wr32(NvkvmGpuEmul *s, uint64_t va, uint32_t payload,
                      s->chip->name, (unsigned long long)va, (unsigned long long)p,
                      sy ? "sys" : "fb", sem_old, payload, s->chan_client,
                      (unsigned long long)s->chan_gpfifo_va);
+            /* #12-L3c PROBE: on the collision, resolve va under EVERY captured VAS
+             * (chan_vas[] live + m2_cli_vas[] sticky) to find whether UVM's OWN sema
+             * page exists in our captures at all (distinct phys) or is entirely
+             * uncaptured (→ must snoop the sema-pool alloc).  Bounded: backward is rare. */
+            for (int i = 0; i < s->chan_vas_n; i++) {
+                bool fs = false;
+                uint64_t fp = s->chan_vas[i].pdb ?
+                    nvkvm_walk_pdb_root(s, s->chan_vas[i].pdb, va, s->chan_vas[i].root_sys, &fs)
+                    : NVKVM_GMMU_FAULT;
+                qemu_log("nvkvm-gpu[%s] #12-L3c PROBE chan_vas[%d] client=0x%08x pdb=0x%llx "
+                         "rs=%d -> %s0x%llx\n", s->chip->name, i, s->chan_vas[i].client,
+                         (unsigned long long)s->chan_vas[i].pdb, s->chan_vas[i].root_sys,
+                         fp == NVKVM_GMMU_FAULT ? "FAULT " : "", (unsigned long long)fp);
+            }
+            for (int i = 0; i < s->m2_cli_vas_n; i++) {
+                bool fs = false;
+                uint64_t fp = nvkvm_walk_pdb_root(s, s->m2_cli_vas[i].pdb, va,
+                                                  s->m2_cli_vas[i].root_sys, &fs);
+                qemu_log("nvkvm-gpu[%s] #12-L3c PROBE cli_vas[%d] client=0x%08x pdb=0x%llx "
+                         "rs=%d -> %s0x%llx\n", s->chip->name, i, s->m2_cli_vas[i].client,
+                         (unsigned long long)s->m2_cli_vas[i].pdb, s->m2_cli_vas[i].root_sys,
+                         fp == NVKVM_GMMU_FAULT ? "FAULT " : "", (unsigned long long)fp);
+            }
         }
-        nvkvm_phys_wr32(s, p, sy, payload); wrote = true;
+        /* #12-L3c DIAG: full sema-write timeline (M2TRACE). Pairs every writer's
+         * (client, gpfifo_va) with the resolved (va, phys) it lands on, so one run
+         * shows whether the 0x8a-climber and the payload-9 writer have DISTINCT VAs
+         * collapsed to one phys (translation bug → fix VAS disambiguation) or the
+         * SAME VA under the shared UVM VAS (page-reuse → fix free/realloc lifecycle). */
+        if (s->trace) {
+            qemu_log("nvkvm-gpu[%s] #12-L3c SEMW va=0x%llx phys=0x%llx(%s) old=0x%x new=0x%x "
+                     "client=0x%08x gpfifo_va=0x%llx res=%s chan_pdb=0x%llx own_pdb=0x%llx\n",
+                     s->chip->name, (unsigned long long)va, (unsigned long long)p,
+                     sy ? "sys" : "fb", sem_old, payload, s->chan_client,
+                     (unsigned long long)s->chan_gpfifo_va, dbg_res,
+                     (unsigned long long)s->chan_pdb, (unsigned long long)dbg_own);
+        }
+        /* #12-L3c FIX: on a backdoor-owned sema slot (0xFFF508 — the patched guest
+         * UVM reports its kernel tracking-sema GPA+payload at CE-PUSH/submit time),
+         * suppress ONLY the parser writes that go BACKWARD.  Rationale:
+         *  - The backdoor reports the SUBMITTED payload; the parser's CE_SEM_RELEASE
+         *    reports COMPLETION.  In steady state the backdoor races ahead, so the
+         *    parser lags and writes a LOWER value → that backward write is exactly
+         *    what trips UVM's 32→64 wrap detector (uvm_gpu_semaphore.c:776) across a
+         *    2nd context.  Suppress it; the backdoor's monotonic value stands.
+         *  - But the backdoor MISSES some submits (e.g. CeUtils scrubberDestruct's
+         *    final scrub), leaving the slot below lastSubmittedPayload → ce_utils.c:349
+         *    "scrub timed out".  A FORWARD parser write is the legitimate completion
+         *    the backdoor never reported — let it through so the scrub signals done.
+         * Combined with per-slot (exact-GPA) ownership, co-located non-backdoor slots
+         * still get all their parser writes. */
+        if (sy && nvkvm_m2_bd_page_has(s, p) && sem_old != 0 && payload < sem_old) {
+            if (s->trace) {
+                qemu_log("nvkvm-gpu[%s] #12-L3c SEMW-DEFER backdoor owns phys=0x%llx "
+                         "(client=0x%08x) — parser write suppressed\n", s->chip->name,
+                         (unsigned long long)p, s->chan_client);
+            }
+        } else {
+            nvkvm_phys_wr32(s, p, sy, payload); wrote = true;
+        }
     }
     if (hostonly && p != NVKVM_GMMU_FAULT) {
         qemu_log("nvkvm-gpu[%s] M5.49b host-only sema VA=0x%llx payload=%u client=0x%08x "
