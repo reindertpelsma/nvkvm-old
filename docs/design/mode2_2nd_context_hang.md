@@ -69,6 +69,45 @@ binding existed at channel-create (the guest knows the channel buffer's phys via
 reverse-resolve at exec time — which fails for GSP-managed channels. This is the
 exact failure the address-table design removes.
 
+## REFINEMENT 2026-06-17 (re-derived from the overnight `m0_qemu.log`)
+
+The "unresolvable VAS" framing above is **imprecise** — corrected here from the
+full candidate dump in the overnight trace (`/tmp/m0_qemu.log` on `vh`):
+
+- The CeUtils gpfifo VA `0x120064000` **DOES resolve via PDB walk.** Both captured
+  roots of its VAS (`hVASpace=0xcaf00005`: `0x3114000` from RESERVED_PDES and
+  `0x3400000` from SET_PAGE_DIRECTORY) agree it maps to **sysmem phys
+  `0x165664000`** (`DIAG vas[2]/vas[3] … eva=0x120064000 -> SYS phys=0x165664000`).
+  So the gpfifo ring is in **sysmem**, and the walk is correct.
+- `picked_pdb=0` is **not** a resolution failure — it is a **content-gate
+  artifact.** `nvkvm_chan_execute` only pins a PDB if the GP entry reads
+  **non-zero** (`val != 0`). At the moment of the sweep the ring slot reads `0`
+  (an idle/empty GP slot — `val=0x00000000`), so the value-gated pin is **skipped**
+  and we fall through to the `bar1_wpg` heuristic, which pins the **wrong** (a
+  vidmem) pushbuffer page. The gate conflates "ring momentarily empty" with "wrong
+  VAS."
+- Proof the channel is otherwise parseable: `M5: CE COPY … gpfifo=0x120064000`
+  (line ~136257) — when the ring is non-empty we *do* decode its CE methods.
+- Aperture split: the **gpfifo is sysmem** (`0x165664000`) but the **finishPayload
+  sema is vidmem** (`bUseBar1=1`, guest counters) — different memdescs in the same
+  channel. So the sema must be resolved on its **own** VA (not gpfifo+offset into
+  sysmem); under the same VAS its VA resolves to the vidmem phys we must write.
+
+**Corrected failure chain:** content-gate false-rejects the (idle) sysmem gpfifo →
+`chan_pdb=0` → `bar1_wpg` heuristic pins the wrong (UVM-tracking) ring → the
+CeUtils completion `SET_SEMAPHORE` is never parsed → its vidmem finishPayload sema
+is never written → scrubberDestruct times out.
+
+**Implication for the address table:** this is *exactly* the false-reject the
+forward table removes — a forward binding (`gpfifo_va 0x120064000 → 0x165664000
+sys`, recorded at map/FILL_PTE time) carries no content-gate, so an idle ring never
+demotes resolution to a heuristic. The sema's own VA resolves the same way. Still
+to confirm by one targeted run: (a) the finishPayload sema VA and what each root
+resolves it to (phys+aperture), (b) whether a `FILL_PTE_MEM` (0x801802) /
+`INVALIDATE_TLB` (RPC fn 200 / ctrl 0x80180c) carries that sema's binding forward,
+(c) whether trusting the PDB-walk gpfifo result (drop the content-gate, or gate on
+"resolves" not "non-zero") lets the `SET_SEMAPHORE` parse + complete the scrub.
+
 ## The fix
 
 **Clean (do this): the address table** (`mode2_address_table.md`). Record the

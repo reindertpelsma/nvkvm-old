@@ -79,17 +79,37 @@ CPU-side instance-block PDB reads empty and the old cascade failed on them.
 
 ## 4. Population — forward, from exactly these sources
 
-1. **Direct map RPC/ioctl** — `NV0080_CTRL_CMD_DMA_FILL_PTE_MEM` (0x801802),
-   `rpc_map_memory_dma_v2` / `rpc_unmap_memory_dma`, channel-create (the channel
-   buffer's VA↔phys). These hand us the binding directly; record it. (libcuda's
-   userspace maps route here too — kernel-mediated, observable.)
-2. **Invalidate → read-the-PDB-diff** — for VASes whose page tables the guest
-   writes directly into memory (UVM, `DMA_FILL_PTE_MEM`), on the invalidate event
-   (§5) read that PDB's memslot and diff the changed ranges into the table.
+> **Correction 2026-06-17 (ogkm-verified): §4.2 is the load-bearing source, not
+> §4.1.** `FILL_PTE_MEM` is *not* the general map transport under GSP. The common
+> map path is the CPU-side MMU walker `dmaUpdateVASpace` (`virt_mem_allocator_gm107.c`),
+> which sets `bFillPteMem = flags & DMA_UPDATE_VASPACE_FLAGS_FILL_PTE_MEM` (bit 25)
+> and **writes PTEs directly into the page-table memory CPU-side** — there is no
+> per-map GSP-RPC carrying VA↔phys for it. The explicit `NV0080_CTRL_CMD_DMA_FILL_PTE_MEM`
+> control (0x801802) exists but is not the path UVM/CeUtils maps take. So the table
+> must be populated predominantly via **§4.2 (read the page tables at invalidate)**;
+> §4.1 covers only the cases that genuinely cross as an RPC (PROMOTE_CTX, channel/
+> object create). This makes §4.2 + §5 the spine of the design, not a fallback.
+
+1. **Direct RPC/ioctl bindings** — `GPU_PROMOTE_CTX` (0x2080012b, already captured
+   into `va_map[]`), channel/object create, and the rare explicit
+   `NV0080_CTRL_CMD_DMA_FILL_PTE_MEM` (0x801802). These hand us the binding
+   directly across the GSP boundary; record it.
+2. **Invalidate → read-the-page-tables (LOAD-BEARING)** — for every VAS whose PTEs
+   the guest writes CPU-side via the walker (the general case: UVM, CeUtils, device-
+   default channels), on the invalidate event (§5) read that PDB's page tables from
+   the FB/sysmem memslot and diff the changed ranges into the table.
 
 PDB pages may live in a **fast RAM memslot — we do NOT trap individual PTE
 writes.** We read the PDB only at the invalidate commit point (§5), which is the
 only point the guest guarantees a consistent, committed view.
+
+**Caveat surfaced 2026-06-17 (must hold for §4.2 to work):** the CPU-written PTEs
+must actually land in a memslot we can read. The overnight trace shows this is
+*partially* true today — e.g. gpfifo VA `0x120064000` walks cleanly to sysmem phys
+`0x165664000` under PDB `0x3114000`/`0x3400000` — but the same PDB **faults** for
+other VAs/contexts (e.g. `0x121010000` under client `0xc1d00001`). So our page-walk
+/ FB-mirror has gaps that must be closed (or the walk made reliable) before "read at
+invalidate" is trustworthy for *all* VAs. This is the #11-open item in §11.
 
 ## 5. The coherence event: TLB invalidate (two transports, both observed)
 
