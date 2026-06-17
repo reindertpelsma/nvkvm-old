@@ -108,6 +108,40 @@ resolves it to (phys+aperture), (b) whether a `FILL_PTE_MEM` (0x801802) /
 (c) whether trusting the PDB-walk gpfifo result (drop the content-gate, or gate on
 "resolves" not "non-zero") lets the `SET_SEMAPHORE` parse + complete the scrub.
 
+## CONFIRMED on current HEAD 2026-06-17 (cupctx2 repro, dc5c24c)
+
+Reproduced cleanly with `tests/mode2/cupctx2.c` (create→matmul→destroy ×2) on a
+fresh boot, `m2cefwd=on`, guest open-580 rebuilt in-guest (vermagic 6.8.0-117):
+
+```
+[CTX1] SYNC OK → RESULT bad=0 C[0]=256 → PASS      # ctx1 matmul correct
+[CTX1] cuCtxDestroy (fires CeUtils scrubberDestruct) → CTX DESTROY OK
+[CTX2] cuCtxCreate...                               # HANGS (rc=124)
+NVRM: scrubberDestruct: Timed out waiting for the scrub to complete the pending work.
+NVRM: nvAssertFailedNoLog: pCeUtils->lastCompletedPayload == lastSubmittedPayload @ ce_utils.c:349
+```
+
+QEMU-side log at teardown nails the mechanism:
+- `chan_exec … picked_pdb=0x0 gpfifoVA=0x120064000` — the content-gate false-reject
+  (refined cause above) still fires; the channel falls to the `bar1_wpg` heuristic.
+- The channel **is** partially parsed under the heuristic — `M5: CE COPY … gpfifo=
+  0x120064000` decodes the scrub copies, and `#12-L3c SEMW va=0x121000010 …` writes
+  the **UVM tracking sema** (sysmem; here also handled by the instrumented build's
+  backdoor, `SEMW-DEFER backdoor owns …`). So the wrap-wedge layer is contained.
+- The **finishPayload sema is never written**: the only event touching its region is
+  `DIAG BAR1 WR off=0x12006c -> FB 0x31f006c <- 0xd801` (the *guest* CPU initializing
+  it). **No `SEMW`/`SET_SEMAPHORE` ever targets `0x12006c…`** — its release method sits
+  in a GP entry the heuristic never reaches. So `lastCompletedPayload` stays < 63,
+  scrubberDestruct times out, asserts, wedges → CTX2 hangs.
+
+Decisive corollaries for the fix: (a) the finishPayload's **FB backing is known**
+(`0x31f006c`, from the guest's own BAR1 write) and the channel's VAS resolves via PDB
+walk — so the only thing missing is *reaching + resolving the release method*; (b) the
+fix is to stop the content-gate from demoting a PDB-resolvable channel to partial
+heuristic parsing, so the **whole** ring (including the finishPayload `SET_SEMAPHORE`)
+is parsed and written. This is the forward-binding / drop-the-content-gate change the
+address table generalizes. Repro is now turnkey: `cupctx2_run_guest.sh`.
+
 ## The fix
 
 **Clean (do this): the address table** (`mode2_address_table.md`). Record the
