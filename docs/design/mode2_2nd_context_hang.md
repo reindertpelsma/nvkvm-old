@@ -3,6 +3,44 @@
 Status: diagnosed 2026-06-17 (root cause proven end-to-end via an instrumented
 full-source guest driver). The wrap-wedge *layer* is fixed and committed
 (`37d15c5`); the CE-completion *layer* documented here is the remaining blocker.
+
+> ### UPDATE 2026-06-17 (bench-proven) — the fix is NOT "parse the ring better"; it's **synthesize the completion**
+>
+> A narrow fix was tried and bench-validated as **insufficient**: in `nvkvm_chan_execute`,
+> pin the channel's OWN content-validated VAS (root-aperture-correct) on a *non-fault*
+> walk even when the gpfifo slot reads zero (dropping the non-zero content gate, keeping
+> it only on the blind `chan_vas[]` guess-loop for anti-aliasing). Result on `cupctx2`:
+> the scrub channel's VAS now resolves (`picked_pdb=0x2efa6c000`, ×85), **but the hang is
+> byte-identical** — `scrubberDestruct: Timed out` + `ce_utils.c:349`, CTX2 still wedged.
+>
+> **Why (proven by mining the 448 030-line QEMU log of that run):** the CeUtils scrub
+> channel `gpfifo=0x120064000` is rung **763 times** and yet decodes **0 methods** — it
+> is **never** one of the method-decoding gpfifos (those are all the guest-CPU-driven
+> compute/user-CE channels: `0x1210d0000` ×1127, the `0x121010000`-family, `0x420064000`).
+> Even with the VAS pinned, every gpfifo ring slot at `gp_get` reads **zero**. The ring is
+> empty *from our vantage point* because the scrub pushbuffer + GP entries are composed by
+> **GSP-RM firmware on the GSP microcontroller** — which we faked away — **not** by the
+> guest CPU through BAR1. So there is **nothing in any address table to resolve**: no
+> agent ever composes the entries, nobody ever executes the finishPayload `SET_SEMAPHORE`,
+> and the guest's CPU-side `scrubberDestruct` waits forever for a sema that will never move.
+>
+> This distinguishes the scrub channel categorically from the compute/user-CE channels
+> (which ARE guest-CPU-composed and DO parse + release). The address table governs the
+> **guest-driven data plane**; this is a **GSP-internal control-plane completion**, which
+> the forwarding model says to **synthesize the observable end-state of**, not replay.
+>
+> **The fix (per `mode2_forwarding_model.md`, "correctness = observable end-states only"):**
+> recognize the CeUtils CE channel's finishPayload completion and **synthesize it** — write
+> the expected payload to the finishPayload sema (VA `0x12006c004` → FB `0x31f006c`,
+> `bUseBar1=1`) when the channel advances its submitted-work counter, so
+> `channelWaitForFinishPayload` / `scrubberDestruct` observe completion. The memory scrub
+> itself is a correctness no-op in our model: real allocations are forwarded to the host
+> GPU, which scrubs its own vidmem; the guest-side vidmem scrub is bookkeeping over
+> emulated/forwarded memory. Open design points: (1) which trigger cleanly identifies a
+> finishPayload submission (doorbell/gp_put advance on a CE channel whose ring stays empty),
+> (2) what payload value to write (track lastSubmittedPayload), (3) keep it confined to the
+> GSP-managed scrub/CeUtils channel so it can never touch a guest-CPU-driven ring.
+
 The clean fix is the address table — see `mode2_address_table.md`.
 
 ## Symptom
