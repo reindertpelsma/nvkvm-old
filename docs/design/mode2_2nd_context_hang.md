@@ -140,6 +140,36 @@ The clean fix is the address table — see `mode2_address_table.md`.
 > is the *delivery*. Recommended order: fix the FB-phys collision first (it likely also removes
 > the M5.16 aliasing symptom, since pages stop being shared), then re-enable the forge default-on.
 
+> ### UPDATE 2026-06-18 (cont. 2) — mechanism verified in code+log; isolation test narrows it to CROSS-CLIENT
+>
+> **Step 1 (mechanism, verified):** `bar1_wpg` (our MRU cache of guest-BAR1-written FB pages,
+> which M5.16 uses to resolve the GSP-managed scrub ring) is **never invalidated** — grep shows
+> only write + read sites, no clear path. And the guest **does** issue the completing action we
+> ignore: `INVALIDATE_TLB`-class + `0x20800a6c`/`0x20800a61` FB-flush/membar control RPCs
+> (`status=0x0`, we just ack), including right after the channel free. So we trust a stale
+> VA/BAR1→FB cache instead of a refcounted GPGA reference, and drop the guest's membar.
+>
+> **Step 2 (isolation/coherence test `tests/mode2/chshare.c`):** two channels (streams) in the
+> SAME client/VAS → **PASS** (each fills its own 64 KiB buffer with a distinct pattern, no
+> contamination; + a shared buffer written by ch1 and read by ch2 is coherent). So the backing
+> model is correct *within one client*. The #12 collision is therefore **cross-client / cross-VAS**:
+> the CeUtils scrub channel (`client 0xc1e00007`) vs a UVM channel (`client 0xc1d00001`) — and
+> `bar1_wpg` + the FB-phys overlays are global, not client-isolated.
+>
+> **Stale-after-free confirmed by timeline:** UVM channel `0x1210d0000` is **freed at log line
+> 362099**, but `nvkvm_m2_ctx_free_drop` only drops bookkeeping (chans/chanbuf/devvas/cvas/
+> chanvas) — it does **NOT** release the channel's `m2_fbback`/`m2_gpga`/host-object backing or
+> invalidate `bar1_wpg`. So the dead UVM channel's overlay at FB `0x31f0000` persists, and the
+> scrub channel's finishPayload (collided onto that phys) reads the dead channel's RAM at the
+> teardown poll (after 362099) → the 4 s timeout.
+>
+> **Fix (the address-table lifecycle, per the agreed model):** on channel/object free, release
+> that channel's FB-phys backing (refcounted — freed only when the last VAS/BAR mapping drops,
+> never while still referenced) and invalidate the matching `bar1_wpg` entries; honor the guest's
+> TLB-invalidate/flush as the membar that gates phys reuse; and key resolution per-client so two
+> live clients can't alias one emulated-FB page. Then the (already-exact) forge delivers to the
+> right, un-collided backing.
+
 ## Symptom
 
 A 2nd CUDA context after the 1st tears down hangs. Markers: `CTX1` runs and exits
