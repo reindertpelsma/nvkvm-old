@@ -100,10 +100,45 @@ The clean fix is the address table — see `mode2_address_table.md`.
 > aliasing other channels' pages into this channel. Both are the "one address table of truth"
 > work (`mode2_address_table.md`): per-channel-isolated VA→backing with the guest's BAR1
 > mapping as the authority. **Next experiment:** stage the instrumented 580.159.04 guest
-> (the oracle that prints the finishPayload CPU-VA + the value it reads each poll) to nail the
+ (the oracle that prints the finishPayload CPU-VA + the value it reads each poll) to nail the
 > exact read backing in one run, rather than guessing QEMU-side. Forge code lives in
 > `nvkvm_chan_execute`'s doorbell loop (the `#12 FORGE` block + `c->fin_payload` +
 > `chan_gpfifo_bar1off` + `bar1_wpg[].off`), gated behind `m2trace`.
+
+> ### UPDATE 2026-06-18 (cont.) — ROOT CAUSE FOUND by log forensics: an FB-physical COLLISION (no oracle needed)
+>
+> Mining the persisted QEMU log (zero extra bench rounds) decoded the layout AND the bug:
+> - **BAR1↔FB is contiguous-linear here** (`off 0x120000→FB 0x31f0000`, `off 0x12006x` are the
+>   GP ring entries, e.g. `0x20000648 / 0xd801`), so `finishPayload = gpfifo_va + 0x8004 →
+>   FB 0x31f8004` IS geometrically correct. The forge writes the right *offset*.
+> - **But emulated-FB phys `0x31f0000` is CLAIMED BY TWO DIFFERENT GUEST CHANNELS** — the
+>   decisive lines:
+>   ```
+>   M5.7 back_and_map VA=0x1210d0000 phys=0x31f0000 size=0x10000 client=0xc1d00001  OK PLACED
+>   M7  gpga_obj      va=0x1210d0000 gpga=0x31f0000 cpu_qva=0x77a7e5e49000 obj=8
+>   M5.24 GPFIFO      va=0x120064000 phys=0x31f0000 sz=0x8000 client=0xc1e00007  -> map-FAILED
+>   ```
+>   The **CeUtils scrub channel** (`client=0xc1e00007`, VA `0x120064000`) and a **UVM kernel
+>   channel** (`client=0xc1d00001`, VA `0x1210d0000`) both resolve to FB phys `0x31f0000`. The
+>   scrub channel's `M5.24` double-mmap FAILED *because the UVM channel already owns that phys*.
+> - **Consequence:** the finishPayload page `0x31f8004` is inside the UVM channel's `gpga_obj`
+>   `[0x31f0000, 0x3200000)`, so `fb_write(0x31f8004)` lands in the **UVM channel's** host RAM
+>   (`cpu_qva 0x77a7e5e49000+0x8004`). The guest reads the **scrub** channel's finishPayload
+>   from *its* own (different) mapping → never sees the forge. Hang persists.
+>
+> **This is the page-reuse / free-realloc aliasing the `#12-L3c` note predicted, now proven
+> concretely:** when the scrub channel tears down, its vidmem (`0x31f0000`) is reused by the
+> UVM channel — but our FB-phys model lets both VAs alias the same emulated page, so a write
+> to "the scrub finishPayload" actually hits the other channel's buffer. **No instrumented
+> oracle is needed** — the collision is fully visible in the QEMU log.
+>
+> **THE FIX is squarely the address table (`mode2_address_table.md`): per-channel-isolated
+> VA→FB-phys so two live channels can never alias the same emulated-FB page, plus free/realloc
+> lifecycle tracking so a torn-down channel's phys isn't silently reused under a still-polling
+> owner.** Once VA→backing is per-channel-correct, the (already-exact) forge writes the right
+> RAM and the guest's poll completes. The forge is the *completion policy*; the address table
+> is the *delivery*. Recommended order: fix the FB-phys collision first (it likely also removes
+> the M5.16 aliasing symptom, since pages stop being shared), then re-enable the forge default-on.
 
 ## Symptom
 
