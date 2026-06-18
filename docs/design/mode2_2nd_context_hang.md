@@ -71,12 +71,16 @@ The clean fix is the address table — see `mode2_address_table.md`.
 >   entries == `lastSubmittedPayload`, since `channelPbInfo.payload = lastSubmitted+1` and one
 >   entry per op, `ce_utils.c:611`). Never a backward write ⇒ no `uvm_gpu_semaphore` poison.
 >   CTX1 fully passes; the hang is unchanged at CTX2's first `cuCtxCreate`.
-> - **The guest reads finishPayload via a non-trapping MEMSLOT, not the FB page we write.**
->   In the run, `DIAG BAR1 RD` fired **0** times while `DIAG BAR1 WR` fired **1032** — the
->   guest *writes* the channel region through the trapping BAR1 path but *reads* finishPayload
->   from a RAM memslot. Our `nvkvm_fb_write(fin_fb,…)` never reaches that backing. Proof the
->   page is wrong, not just lagging: the resolved page `0x31f8004` reached the **full** count
->   (45) yet the guest still timed out.
+> - **The guest reads finishPayload via a non-trapping MEMSLOT — CONFIRMED (round 3).** A
+>   poll-spin detector with the LOFB window REMOVED (fire on any address read ≥2000× in a row)
+>   fired **0** times during the 4 s timeout, while `DIAG BAR1 WR` fired **1032**. So the
+>   finishPayload reads NEVER reach a QEMU trap at all — they are served by a KVM RAM memslot
+>   mapped into the guest's BAR1. **QEMU is structurally blind to the poll**, and
+>   `nvkvm_fb_write(fin_fb,…)` only reaches it if `fin_fb`'s overlay IS that memslot's host RAM
+>   — which M5.16 aliasing breaks. Proof the page is wrong, not just lagging: the resolved page
+>   `0x31f8004` reached the **full** count (45) yet the guest still timed out. ⇒ **No QEMU-side
+>   read-trap diagnostic can locate the target; resolution must come from the guest's BAR1
+>   mapping authority (address table) or a guest-side oracle.**
 > - **FB+0x8004 is wrong (buffer is FB-fragmented); BAR1-offset+0x8004 via the BAR1 PTEs is
 >   the right primitive but still hits the memslot mismatch.** The ring pages jump
 >   `0x31f0000 → 0x3130000` in FB, so `chan_gpfifo_phys+0x8004` lands on a foreign fragment.

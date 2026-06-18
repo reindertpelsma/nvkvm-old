@@ -3629,16 +3629,20 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
         rv = nvkvm_fb_read(s, pa, size);
         s->m2_cur_gva = 0;
     }
-    /* DIAG: BAR1 reads landing in the low-FB region (where the UVM channel's
-     * GPFIFO/USERD/semaphore live) — a poll spin shows up as repeated reads of
-     * one address; that address is the completion semaphore the guest waits on. */
-    if (s->trace && !sys && pa >= NVKVM_DIAG_LOFB_LO && pa < NVKVM_DIAG_LOFB_HI) {
+    /* #12 DIAG: a finishPayload poll spins on ONE address thousands of times.  The
+     * earlier LOFB-windowed detector fired 0× — so either the poll reads a page
+     * OUTSIDE the [3M,3.3M) window, or it is memslot-served (no trap).  Drop the
+     * window and fire only on a genuine spin (same addr read ≥2000× consecutively)
+     * so this pinpoints the TRUE finishPayload FB page (compare against the forge's
+     * resolved finFB) with negligible noise.  If this also fires 0×, the read is
+     * memslot-served and the fix must target that backing. */
+    if (s->trace && !sys) {
         static uint64_t last_pa; static uint32_t rep; static uint32_t total;
         if (pa != last_pa) { last_pa = pa; rep = 0; }
-        if ((rep++ % 4096) == 0 && total++ < 4000) {
-            qemu_log("nvkvm-gpu[GA106] DIAG BAR1 RD off=0x%llx -> FB 0x%llx "
-                     "= 0x%llx (rep~%u)\n", (unsigned long long)off,
-                     (unsigned long long)pa, (unsigned long long)rv, rep);
+        else if (++rep == 2000 && total++ < 200) {   /* 2000× spin on one addr = a poll */
+            qemu_log("nvkvm-gpu[GA106] #12 DIAG BAR1 POLL-SPIN off=0x%llx -> FB 0x%llx "
+                     "= 0x%llx\n", (unsigned long long)off,
+                     (unsigned long long)pa, (unsigned long long)rv);
         }
     }
     /* M5.10 DIAG: after the GR compute object constructs (crashwin), log ALL BAR1 reads
