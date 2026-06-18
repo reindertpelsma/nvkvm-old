@@ -58,6 +58,49 @@ full-source guest driver). The wrap-wedge *layer* is fixed and committed
 
 The clean fix is the address table — see `mode2_address_table.md`.
 
+> ### UPDATE 2026-06-18 — forge MECHANISM bench-validated; target-DELIVERY is the remaining wall
+>
+> Implemented the "complete the no-op scrub" forge (option 2) and ran cupctx2 on the
+> vast.ai vh bench (RTX 3060) over two rounds. **The mechanism is validated; the value is
+> exact; CTX1 passes; no UVM poison. cupctx2 still hangs (rc=124)** — the forged value never
+> reaches the backing the guest actually polls. Precise findings (the value of this round):
+>
+> - **Forge fires on EXACTLY the right channel/value.** `#12 FORGE finishPayload ch[0]
+>   gpfifo=0x120064000 … client=0xc1e00007` — the CeUtils scrub channel from the instrumented
+>   ground truth — with a **monotonic, exact** value (`c->fin_payload` = cumulative GPFIFO
+>   entries == `lastSubmittedPayload`, since `channelPbInfo.payload = lastSubmitted+1` and one
+>   entry per op, `ce_utils.c:611`). Never a backward write ⇒ no `uvm_gpu_semaphore` poison.
+>   CTX1 fully passes; the hang is unchanged at CTX2's first `cuCtxCreate`.
+> - **The guest reads finishPayload via a non-trapping MEMSLOT, not the FB page we write.**
+>   In the run, `DIAG BAR1 RD` fired **0** times while `DIAG BAR1 WR` fired **1032** — the
+>   guest *writes* the channel region through the trapping BAR1 path but *reads* finishPayload
+>   from a RAM memslot. Our `nvkvm_fb_write(fin_fb,…)` never reaches that backing. Proof the
+>   page is wrong, not just lagging: the resolved page `0x31f8004` reached the **full** count
+>   (45) yet the guest still timed out.
+> - **FB+0x8004 is wrong (buffer is FB-fragmented); BAR1-offset+0x8004 via the BAR1 PTEs is
+>   the right primitive but still hits the memslot mismatch.** The ring pages jump
+>   `0x31f0000 → 0x3130000` in FB, so `chan_gpfifo_phys+0x8004` lands on a foreign fragment.
+>   Resolving through `walk_pdb(bar1_pdb, chan_gpfifo_bar1off + (gpfifo_va&0xfff) + 0x8004)`
+>   correctly absorbs the fragmentation — but the guest still reads elsewhere (memslot).
+> - **M5.16 cross-channel ALIASING.** The shared `bar1_wpg` pool makes M5.16 sometimes pick
+>   the **compute** channel's ring page (`b1off=0xa0000 → FB 0x3130000`, the known compute
+>   gpfifo) as the scrub channel's base, so the monotonic sequence splits across the real page
+>   and a wrong one — and a forge write can corrupt the compute channel's buffer (a real
+>   regression risk; the forge is therefore gated behind `m2trace`, default OFF, NOT a default
+>   fix yet).
+> - **`M5.24 GPFIFO double-mmap … phys=0x31f0000 sz=0x8000 → map-FAILED`** for this channel,
+>   and finishPayload (`+0x8004`) is past the `0x8000` gpfifo span regardless.
+>
+> **The remaining problem is now precise:** deliver the (correct, exact) forged value to the
+> **exact backing the guest polls** (a memslot we don't currently write), and stop M5.16 from
+> aliasing other channels' pages into this channel. Both are the "one address table of truth"
+> work (`mode2_address_table.md`): per-channel-isolated VA→backing with the guest's BAR1
+> mapping as the authority. **Next experiment:** stage the instrumented 580.159.04 guest
+> (the oracle that prints the finishPayload CPU-VA + the value it reads each poll) to nail the
+> exact read backing in one run, rather than guessing QEMU-side. Forge code lives in
+> `nvkvm_chan_execute`'s doorbell loop (the `#12 FORGE` block + `c->fin_payload` +
+> `chan_gpfifo_bar1off` + `bar1_wpg[].off`), gated behind `m2trace`.
+
 ## Symptom
 
 A 2nd CUDA context after the 1st tears down hangs. Markers: `CTX1` runs and exits

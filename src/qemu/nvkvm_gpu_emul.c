@@ -225,6 +225,11 @@ struct NvkvmGpuEmul {
     struct nvkvm_chan_entry {
         uint64_t gpfifo_va, userd;
         uint32_t gpfifo_ent, gp_get, hvaspace, payload;
+        uint32_t fin_payload;   /* #12: monotonic count of submitted GPFIFO entries on this
+                                 * channel == CeUtils lastSubmittedPayload (each memset/memcopy
+                                 * does payload=lastSubmitted+1 and submits exactly one entry,
+                                 * ce_utils.c:611). Used to forge the VIDMEM finishPayload sema
+                                 * the GSP-managed scrub channel never lets us parse/write. */
         uint32_t client;        /* owning RM client (hClient) — VAS scope key */
         bool     userd_sys;
         uint32_t hobject;       /* M5.12: the channel's RM handle (== host handle: shadow_fwd
@@ -276,12 +281,17 @@ struct NvkvmGpuEmul {
      * most-recent-first, so chan_execute can resolve the GPFIFO to where the guest
      * actually wrote it rather than trusting the unreliable channel-VAS walk. */
 #define NVKVM_MAX_BAR1PG 64
-    struct { uint64_t page; uint64_t seq; } bar1_wpg[NVKVM_MAX_BAR1PG];
+    struct { uint64_t page; uint64_t seq; uint64_t off; } bar1_wpg[NVKVM_MAX_BAR1PG];
     int      bar1_wpg_n;
     uint64_t bar1_wpg_seq;
     uint64_t chan_gpfifo_phys;  /* M5.16: if non-0, read GP entries DIRECTLY from this
                                  * FB phys (the BAR1-resolved true ring), bypassing the
                                  * stale channel-VAS walk for the GPFIFO entry. */
+    uint64_t chan_gpfifo_bar1off; /* #12: BAR1 page-offset M5.16 resolved chan_gpfifo_phys at.
+                                 * The channel buffer is contiguous in BAR1-offset space (one
+                                 * memdesc -> one BAR1 VA range) even when FB-fragmented, so the
+                                 * VIDMEM finishPayload FB page = walk_pdb(bar1_pdb, this +
+                                 * (gpfifo_va&0xfff) + 0x8004) — robust to FB non-contiguity. */
 
     /* M7 — CPU interrupt tree (raise MSI-X on LEAF_TRIGGER; ISR reads TOP/LEAF) */
     uint32_t intr_leaf[NVKVM_VF_INTR_NLEAF];     /* pending per leaf reg */
@@ -2130,6 +2140,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         s->chans[cslot].scheduled  = false;
                         s->chans[cslot].gp_get     = 0;
                         s->chans[cslot].payload    = 0;
+                        s->chans[cslot].fin_payload = 0;   /* #12 */
                         s->chans[cslot].token_valid = false;
                     }
                 }
@@ -3233,6 +3244,12 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (c->gp_get == before) {
                 continue;                        /* no new work on this channel */
             }
+            /* #12: track lastSubmittedPayload == cumulative GPFIFO entries submitted on
+             * this channel (CeUtils does exactly one entry per memset/memcopy and
+             * payload=lastSubmitted+1, ce_utils.c:611). Monotonic; handles ring wrap. */
+            c->fin_payload += (c->gp_get >= before)
+                            ? (c->gp_get - before)
+                            : (c->gpfifo_ent - before + c->gp_get);
             any_completed = true;
             /* RESUME-INSTR (host-CE forward, 2026-06-13): disambiguate the CE
              * pool put=0 BEFORE coding. Fires for EVERY advanced channel (NOT
@@ -3342,28 +3359,72 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (s->chan_sem_released) {
                 continue;                        /* explicit release already done */
             }
-            /* M5.37: DO NOT forge a synthetic finish-payload here.
+            /* #12 FIX — targeted, safe finishPayload forge (supersedes the removed
+             * naive forge; see WHY-NOT below).
              *
-             * Channels reaching this point with no parsed CE_SEM_RELEASE are
-             * guest-KERNEL-internal CE/UVM channels (client 0xc1d00001) whose
-             * 64-bit completion semaphores are ALREADY advancing monotonically
-             * via their own CE_SEM_RELEASE (exact, kernel-internal -> simulated
-             * exactly per the governing principle).  The previous fallback wrote
-             * `++c->payload` (a fresh per-channel counter, =1,2,...) into
-             * gpfifo_va+0x8004, RESETTING the low dword of a live 64-bit sema
-             * (e.g. 0x1e -> 1).  UVM's uvm_gpu_semaphore wrap detector reads the
-             * backwards jump, assumes a 32-bit wrap, bumps the software upper-32
-             * counter to 1, and reconstructs completed_value = 0x1_00000001
-             * ("unexpected semaphore jump from 0x1e to 0x100000001").  That
-             * poisons `upper` permanently: every subsequent CORRECT release to
-             * 0x54 then reads back as 0x1_00000054 > queued 0x54, UVM declares
-             * the channel wedged, and cuCtxCreate's MC_SERVICE_INTERRUPTS pump
-             * spins forever.  (Oracle 7fb47f1 gated the equivalent spray off with
-             * the same warning about manufacturing 0x100000082.)  Never write a
-             * value we don't know into a semaphore the guest driver tracks; only
-             * the real parsed release (above) or real host execution may.
+             * The GSP-managed CeUtils memory-scrubber channel runs with picked_pdb=0:
+             * its VIDMEM finishPayload sema (pbGpuVA + finishPayloadOffset =
+             * gpfifo_va + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004, bUseBar1=1)
+             * is released by a CE SET_SEMAPHORE whose target VA never resolves under
+             * any VAS we own, so we never write it.  ceutilsDestruct then polls
+             * READ_CHANNEL_PAYLOAD_SEMA >= lastSubmittedPayload (channel_utils.c:359),
+             * times out after 4 s, and the botched last-context device StateUnload
+             * wedges shared driver state -> the 2nd cuCtxCreate hangs (#12).  Ground
+             * truth (instrumented guest): destruct #2 lastSub=63 hwsema=0
+             * finVa=0x12006c004 bUseBar1=1.  The scrub is a no-op for us (our FB is
+             * sparse-zero / the host pre-zeros backing), so per the rule "wait if
+             * there is real work to complete, else complete now" we complete it:
+             * write the EXACT lastSubmittedPayload to the finishPayload sema.
              *
-             * The only correct action here is to do nothing. */
+             * WHY-NOT (the removed naive forge): it wrote a FRESH `++c->payload`
+             * (1,2,3...) into gpfifo_va+0x8004 for EVERY unreleased channel,
+             * including the UVM-tracked semas of client 0xc1d00001 — a BACKWARD
+             * jump (0x1e -> 1) that tripped uvm_gpu_semaphore's 32-bit wrap detector
+             * ("jump 0x1e -> 0x100000001"), poisoning `upper` and wedging CE2.  This
+             * forge avoids BOTH failure modes:
+             *   (1) VALUE is the channel's TRUE monotonic submit count
+             *       (c->fin_payload == lastSubmittedPayload, 1 entry == 1 op), and we
+             *       only ever advance it (cur < fin_payload) — never a backward jump.
+             *   (2) TARGET is ONLY the VIDMEM finishPayload of a channel whose ring we
+             *       resolved via the guest's own BAR1-written page (chan_gpfifo_phys,
+             *       M5.16).  The channel buffer is one contiguous memdesc, so the
+             *       finishPayload's FB address is chan_gpfifo_phys + 0x8004.  We skip
+             *       the user compute CE (the host executes + releases it for real) and
+             *       any channel whose ring resolved through a real VAS (chan_gpfifo_phys
+             *       == 0 -> sysmem sibling, gets its real parsed CE_SEM_RELEASE). */
+            /* WIP / EXPERIMENTAL (#12): gated behind m2trace (default OFF) — the
+             * target-delivery is NOT yet correct (the guest reads finishPayload from a
+             * memslot backing this fb_write does not reach; M5.16 also aliases other
+             * channels' ring pages -> a write here can land on the compute channel's
+             * buffer).  Do NOT enable by default until both are fixed (regression risk
+             * to cup8/LLM).  See docs/design/mode2_2nd_context_hang.md. */
+            if (s->m2_trace &&
+                s->chan_gpfifo_phys && s->bar1_pdb &&  /* M5.16: GSP-managed VIDMEM ring */
+                c->client != s->m2_gr_client &&
+                !nvkvm_m2_is_user_ce(s, c->client)) {
+                /* finishPayload GPU-VA = gpfifo_va + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004.
+                 * The channel buffer is FB-FRAGMENTED (ring pages jump e.g. 0x31f0000 -> 0x3130000),
+                 * so chan_gpfifo_phys+0x8004 in FB space lands on an unrelated page.  But the buffer
+                 * is CONTIGUOUS in BAR1-offset space (one memdesc -> one BAR1 VA range), and
+                 * chan_gpfifo_bar1off is the BAR1 offset M5.16 resolved the ring base at.  So the
+                 * finishPayload's true (fragmented) FB page = bar1_pdb walk of
+                 * chan_gpfifo_bar1off + (gpfifo_va&0xfff) + 0x8004 — the BAR1 PTEs absorb the
+                 * fragmentation.  This is the same primitive the guest itself uses to read it. */
+                uint64_t fin_b1 = s->chan_gpfifo_bar1off + (c->gpfifo_va & 0xfffull) + 0x8004ull;
+                bool fsys = false;
+                uint64_t fin_fb = nvkvm_walk_pdb(s, s->bar1_pdb, fin_b1, &fsys);
+                if (fin_fb != NVKVM_GMMU_FAULT && !fsys) {
+                    uint32_t cur = (uint32_t)nvkvm_fb_read(s, fin_fb, 4);
+                    if (cur < c->fin_payload) {       /* lagging -> never written; forge fwd only */
+                        nvkvm_fb_write(s, fin_fb, c->fin_payload, 4);
+                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload ch[%d] gpfifo=0x%llx "
+                                 "b1off=0x%llx finFB=0x%llx %u->%u client=0x%08x\n",
+                                 s->chip->name, i, (unsigned long long)c->gpfifo_va,
+                                 (unsigned long long)fin_b1, (unsigned long long)fin_fb,
+                                 cur, c->fin_payload, c->client);
+                    }
+                }
+            }
             (void)c->payload;
             continue;
         }
@@ -3648,6 +3709,7 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
             s->bar1_wpg[hit].page = pg;
         }
         s->bar1_wpg[hit].seq = ++s->bar1_wpg_seq;
+        s->bar1_wpg[hit].off = off & ~0xFFFull;   /* #12: BAR1 page-offset of this FB page */
     }
     /* DIAG: BAR1 writes into the low-FB region reveal where the guest CPU lays
      * down the UVM channel's GPFIFO entry, pushbuffer, and inits the semaphore. */
@@ -4360,6 +4422,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
      * (entry/pushbuffer/sema) uses the same correct VAS. */
     s->chan_pdb = 0;
     s->chan_gpfifo_phys = 0;
+    s->chan_gpfifo_bar1off = 0;
     if (gp_put < s->chan_gpfifo_ent && gp_put != s->chan_gp_get) {
         uint64_t eva = s->chan_gpfifo_va + (uint64_t)s->chan_gp_get * 8;
         /* M5.21: prefer the channel's OWN client VAS — authoritative, avoids the
@@ -4490,6 +4553,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
             }
             if (pb_pdb == 0) { continue; }   /* pb has no real backing in any VAS */
             s->chan_gpfifo_phys = cand;
+            s->chan_gpfifo_bar1off = s->bar1_wpg[best].off;   /* #12: BAR1 offset of the ring base */
             s->chan_pdb = pb_pdb;            /* pin the channel's true VAS for pb/sema */
             if (s->m2_trace)
             qemu_log("nvkvm-gpu[%s] M5.16: GPFIFO resolved via BAR1-written page "
