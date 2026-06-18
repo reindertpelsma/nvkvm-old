@@ -1674,6 +1674,18 @@ static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t f
         }
         i++;
     }
+    /* #12 NOTE (bench-disproven 2026-06-18): a naive "release this client's GPGA
+     * overlays on its root-free" is UNSAFE and does NOT fix the hang.  The CeUtils scrub
+     * channel (client 0xc1e00007) reads its ring/finishPayload from an emulated-FB phys
+     * (e.g. 0x3130000) OWNED by a different UVM client (0xc1d00003); releasing the owner's
+     * overlay on its free yanks the backing out from under the still-polling scrub — the
+     * exact cross-client SHARING the address-table model forbids without a refcount over
+     * ALL referencing clients/VAS.  And it's moot anyway: the forge writes the correct
+     * monotonic value to finFB but the guest reads finishPayload through a non-trapping
+     * KVM memslot whose backing is not coherent with fb_write, so ce_utils.c:349 still
+     * fires.  Real fix = give the scrub its own coherent backing+memslot, OR execute the
+     * scrub CE on the host so the real SET_SEMAPHORE writes the page the guest reads.
+     * See docs/design/mode2_2nd_context_hang.md (UPDATE cont. 3). */
     if (s->trace && dropped) {
         qemu_log("nvkvm-gpu[%s] M5.49 ctx-free drop %s fClient=0x%08x fObj=0x%08x: %d entries "
                  "(chans=%d chanbuf=%d devvas=%d cvas=%d chanvas=%d)\n", s->chip->name,

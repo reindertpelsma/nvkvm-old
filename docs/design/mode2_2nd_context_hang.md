@@ -4,6 +4,55 @@ Status: diagnosed 2026-06-17 (root cause proven end-to-end via an instrumented
 full-source guest driver). The wrap-wedge *layer* is fixed and committed
 (`37d15c5`); the CE-completion *layer* documented here is the remaining blocker.
 
+> ### UPDATE 2026-06-18 (cont. 3) — FIX ATTEMPT BENCH-DISPROVEN: the wall is memslot/fb_write INCOHERENCE, and owning-client overlay-release is UNSAFE
+>
+> Built + bench-ran the agreed first fix (release a root-freed client's GPGA overlays so
+> the scrub finishPayload de-aliases to base FB) on `cupctx2` (2-context #12 repro), fresh
+> QEMU, forge active. **Result: STILL HANGS** — CTX1 matmul byte-exact PASS, CTX1
+> `cuCtxDestroy` returns, then CTX2 `cuCtxCreate` hangs (rc=124). Guest dmesg is unchanged:
+> `scrubberDestruct: Timed out` (4 s) + `nvAssertFailedNoLog … lastCompletedPayload ==
+> lastSubmittedPayload @ ce_utils.c:349`. Two hard facts fell out:
+>
+> 1. **The forge fires with the EXACT right values, and the guest still doesn't see them.**
+>    45 `#12 FORGE finishPayload` lines on the scrub channel (`client 0xc1e00007`,
+>    `gpfifo=0x120064000`): `finFB=0x31f8004` written `0→1→…→8`, then the ring re-fragments
+>    mid-run (`b1off 0x128004 → 0xa8004`) and `finFB=0x3138004` written `9→10→…→20+` — a
+>    clean monotonic `lastSubmittedPayload`. So the *value* and the *channel* are correct;
+>    the **delivery target is not the memory the guest reads.** The guest read is
+>    memslot-served (poll-spin still 0), so QEMU's `nvkvm_fb_write` (which routes through
+>    `nvkvm_fb_host_overlay` → an overlay `host_qva`, else base `fb_page`) writes a
+>    *different* host backing than the KVM memslot the guest's BAR1 read resolves to. This
+>    incoherence — not the value, not the offset — is THE remaining wall.
+>
+> 2. **Owning-client overlay-release is UNSAFE (cross-client sharing), so it was reverted.**
+>    The release fired for UVM `client=0xc1d00003`, dropping the overlay for FB `0x3130000`
+>    — **but the scrub channel (`client 0xc1e00007`) reads its ring/finishPayload from that
+>    same FB phys.** Freeing the backing on the *owner's* free yanks it out from under a
+>    still-polling *different* client — exactly the cross-VAS/cross-client sharing the
+>    address-table model forbids without a refcount over **all** referencing clients/VAS
+>    (the user's "phys freed only when every reference drops"). The naive
+>    `m2_objs[].client == fClient` scope violates that. Reverted to the committed baseline
+>    (only an explanatory NOTE remains in `ctx_free_drop`).
+>
+> **Where this leaves the fix (pick one; (b) is the principled "real not fake" path):**
+> - **(a) Coherent backing for the scrub ring.** Stop the scrub channel's FB phys from
+>   COLLIDING with a UVM client's object (the `M5.24` map-FAIL is the symptom): give the
+>   GSP-managed scrub its OWN host object + memslot so its finishPayload page is written and
+>   read through the SAME backing. Forge then lands where the guest reads.
+> - **(b) Execute the scrub CE on the host.** Forward the GSP-managed scrub channel's
+>   pushbuffer (resolve its VAS via the address table, not the `bar1_wpg` heuristic) so the
+>   host GPU's real `SET_SEMAPHORE` writes the real finishPayload through the guest-coherent
+>   backing. This is `mode2_real_forward_not_fake` + the address-table execution piece.
+> - **(c) Memslot-punch.** Exclude the finishPayload page from the non-trapping memslot so
+>   the guest's poll TRAPS into `baraperture_read`, where QEMU returns `c->fin_payload`
+>   directly (no backing-coherence needed). Smallest blast radius; least "real".
+>
+> Incidental blockers cleared this session (not #12): the VAST guest auto-upgraded its
+> kernel to `6.8.0-124` while `nvmods` are vermagic `6.8.0-117` (`Invalid module format` →
+> `cuInit=100`) — pinned grub to 117 + QEMU restart (see `[[mode2_bench_kernel_drift]]`);
+> and the `mode2_diag` orchestrators slurp the piped script via a stdin-less inner `ssh`
+> in the boot-wait loop (silent truncation) — fixed with `</dev/null`.
+>
 > ### UPDATE 2026-06-17 — CORRECTED ATTRIBUTION (ground truth wins): the blocker is the finishPayload `0x…6c004`, NOT `0x121000010`
 >
 > **Correction of a same-day mis-attribution.** An intermediate write-up of this section
