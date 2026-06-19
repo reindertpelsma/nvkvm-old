@@ -4,6 +4,54 @@ Status: diagnosed 2026-06-17 (root cause proven end-to-end via an instrumented
 full-source guest driver). The wrap-wedge *layer* is fixed and committed
 (`37d15c5`); the CE-completion *layer* documented here is the remaining blocker.
 
+> ### UPDATE 2026-06-19 (cont. 4) — SOURCE + LOG forensics: it's a VAS-RESOLUTION miss (transient-VAS free), NOT sharing/lifecycle; map-loss pinpointed
+>
+> Read the open RM source (`ce_utils.c`, `channel_utils.c`, `mem_utils_gm107.c`, `video_mem.c`)
+> + mined the persisted `cupctx2` QEMU log. Six facts, then the exact map-loss point.
+>
+> **Architecture (source).** CeUtils is **kernel RM** (CPU-side), via
+> `rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL)`; it allocates its **own** `NV01_ROOT` client and
+> its **own fresh VAS**, `bUseBar1=TRUE`. The scrub channel buffer (gpfifo+pushbuffer+semas, one
+> memdesc) is vidmem by default (`ADDR_FBMEM`). The teardown wait `channelWaitForFinishPayload`
+> is a **kernel CPU busy-poll** (`while(READ_CHANNEL_PAYLOAD_SEMA < target)`, 4 s timeout,
+> services scrubber interrupts but completion authority = the sema *value*). The sema is read by
+> `channelReadChannelMemdesc` → `memmgrMemDescBeginTransfer(USE_BAR1)` → `MEM_RD32(pbCpuVA +
+> finishPayloadOffset)` — a **CPU read through BAR1 of the channel buffer's vidmem**, at
+> `pbGpuVA + finishPayloadOffset` (`= gpfifo_va + 0x8004`).
+>
+> **CORRECTION to cont.-era claims — who allocates FB phys.** *We do NOT assign vidmem phys.* The
+> **guest's CPU-side PMA is the sole FB allocator**: `vidmemConstruct` → `pmaAllocatePages`
+> (unconditional, CPU-side); `NV_RM_RPC_ALLOC_VIDMEM` is gated `!IS_GSP_CLIENT` (a vGPU alias
+> step, not the allocator) and our GSP-client guest skips it. Our fake GSP only declares the heap
+> *bounds* at boot (`pmaRegisterRegion`); the guest picks every offset within them and writes
+> them into PTEs (GPU VAS + BAR1). **One allocator ⇒ a GSP-vs-driver phys overlap is structurally
+> impossible** — so the `0x31f0000` "collision" is **not** sharing, **not** temporal reuse, **not**
+> a lifecycle bug. It is our resolver guessing.
+>
+> **Map-loss pinpointed (log).** Hang channel = scrub, client `0xc1e00007`, gpfifo VA
+> `0x120064000`, **instance block `0x2efa6e000`**. The mapping is lost at three points:
+> 1. **Transient-VAS free.** Guest allocs VASPACE `0x0c` → we capture PDB `0x2efba5000` (L3476) →
+>    guest **frees `0x0c`** (L3482) → *then* allocs the channel (L3523). So our recorded `cli_vas`
+>    for this client is the dead `0x2efba5000`; every probe FAULTs. The **sibling** scrub channel
+>    (`0xc1e00008`, VAS `0x0a`/PDB `0x2efa6c000`) kept its VAS, resolved via `res=cli_vas`, and its
+>    finishPayload `0x42006c004` → **sysmem `0x144a48004`** was written correctly. *Same code path,
+>    correct result — the only difference is the transient free.*
+> 2. **Instance-block PDB reads empty.** `M5.14` reports "PDB empty (GSP-managed)" for these
+>    channels — `instblk + RAMIN_PDB_off` is zero in our mirrored FB, so the bulletproof fallback
+>    (read the channel's own GMMU root) yields nothing.
+> 3. **The forge bypasses VAS resolution** and uses the `bar1_wpg` MRU → `finFB=0x31f8004`, the UVM
+>    channel's buffer (`0x1210d0000`/phys `0x31f0000`). Collision → guest reads its real
+>    finishPayload elsewhere → `ce_utils.c:349`.
+>
+> **Fix anchors (both match the address-table directive; retire `bar1_wpg` for finishPayload):**
+> (1) **Instance-block PDB** — make `instblk 0x2efa6e000 → PDB` resolve, then
+> `finishPayload phys = walk(PDB, gpfifo_va + 0x8004)`; immune to VAS-handle churn, general to
+> every channel. (2) **Don't lose the real VAS** — bind the channel to the VAS its `c56f` params
+> reference (the `cli_vas` capture that already works for the sibling), don't drop it on the
+> transient's free. **Open read-only question gating (1):** *why does RAMIN+0x200 read empty here*
+> — wrong offset for this channel class, not mirrored into our FB, or genuinely GSP-populated (our
+> fake GSP never wrote it)? That's the next step. (See `[[mode2_address_table_of_truth]]`.)
+>
 > ### UPDATE 2026-06-18 (cont. 3) — FIX ATTEMPT BENCH-DISPROVEN: the wall is memslot/fb_write INCOHERENCE, and owning-client overlay-release is UNSAFE
 >
 > Built + bench-ran the agreed first fix (release a root-freed client's GPGA overlays so
