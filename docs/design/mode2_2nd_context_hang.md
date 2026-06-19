@@ -561,3 +561,60 @@ binding — the open question is what authoritative signal *does* carry the scru
 channel's PDB (candidate: the instblk *would*, if our fake GSP synthesized RAMIN+0x200
 from the channel-alloc memdescs at construction — making us populate what real GSP
 populates).
+
+## UPDATE cont. 7 — ROOT CAUSE: we key VAS by client; HW keys by PDB (instance block)
+
+The cheap-hook dead-ends in cont. 5/6 were a symptom. The real root cause, found by
+walking the *map* failures instead of the sema:
+
+**The `map-FAILED` is deterministic, not racy, and not a host-ioctl error.** Every
+`M5.19 fwd-map pushbuffer … client=0xc1e00007 -> map-FAILED` (42×) bails at the **first
+line** of `nvkvm_m2_back_and_map_sys`: `hDev = m2_devvas[client].dev; if (!hDev) return
+false;` — there is **no device/VAS registered for client `0xc1e00007`** (confirmed:
+`M5.7 grmapper: no dev/vas for client 0xc1e00007`; every `M5.49` drop shows
+`devvas=0 cvas=0 chanvas=0`). No `M6.5 back_sys …` line is ever emitted for it, proving
+it returns *before* any host RM call. The **identical** VA→GPA
+(`0x120800000→0x155e00000`) mapped fine under client `0xc1d00001` (`-> MAPPED`), so the
+mapping is valid and shareable — just unreachable under the scrub client's key.
+
+**Why the scrub client owns no VAS — the keying divergence (open-RM ground truth).**
+`kernel_channel.c:1030`: `pKernelChannel->hVASpace =
+pKernelChannel->pKernelCtxShareApi->hVASpace;` — a channel's effective VAS comes from
+its **KernelCtxShare** (subcontext, under the TSG), **not** from the channel's own
+`hVASpace` param (which is `0` here). With `hVASpace=0` and no explicit ctxshare, the
+implicit TSG binds the **device's default VAS**. So the VAS is owned by the
+**ctxshare/TSG and identified by its PDB (instance block) — client-independent and
+shareable.** Hardware roots every channel's translation at `RAMIN+0x200` (the PDB); the
+client handle is irrelevant to translation.
+
+We do the opposite: `m2_devvas[**client**]`. A channel whose VAS is inherited/shared
+(not owned by its own client handle) is **invisible** to a per-client lookup → `hDev=0`
+→ everything for that channel "doesn't exist." **The 42 `map-FAILED`s and the
+unresolvable vidmem finishPayload are the same bug.**
+
+**PDB chase result (cont. 7): the scrub channel's true root is not observable in our
+state.** No captured PDB correctly roots its own buffer (`gpfifo 0x120064000 → real FB
+0x31f0000`, or the finishPayload): `0x2efba5000` (its freed explicit VAS) FAULTs;
+`0x2efa6c000` (sibling) maps to a sparse/wrong page; `0x3114000` (UVM) resolves only the
+**sysmem** host-sema; `picked_pdb=0` otherwise. There is **no `PDB=`, `SET_PAGE_DIRECTORY`,
+or page-table write** that establishes the device-default VAS for this channel. It is
+created GSP-side and our fake GSP never models it, so its root was never materialized in
+our world (even though the guest's PMA allocated the page directory — we never associated
+that allocation with this VAS).
+
+**Fix (three parts, HW-faithful):**
+1. **Key the VAS table by PDB (instance-block root), not by client** — a global
+   `pdb → {host device, host VAS, page-table view, isolate}` map.
+2. **Resolve a channel's VAS via the ctxshare/TSG → PDB chain** (mirroring
+   `kernel_channel.c:1030`), with `hVASpace=0` → the **device-default VAS** — never via
+   the client handle. Channels/clients sharing a ctxshare share one entry → one isolate.
+3. **Model (or capture) the device-default VAS's PDB**, since cont. 7 shows it is not
+   observed for this channel: our fake GSP must create/assign it (as real GSP does) or
+   capture the guest PMA's page-directory allocation and bind it to the device-default
+   VAS. Then `back_and_map_sys` finds the shared VAS and **reuses** the existing host
+   placement (generalize the `mst==0x51` ALREADY-MAPPED path to "shared VAS, reuse"),
+   and the finishPayload VA `0x12006c004` walks through the now-known PDB.
+
+This is the address-table-of-truth (`mode2_address_table.md`) stated precisely: one
+table per VAS keyed by PDB, channels finding their VAS through the instance-block/
+ctxshare chain like silicon — never through the client handle.

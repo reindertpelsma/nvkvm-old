@@ -249,3 +249,49 @@ Populate from §4 sites; invalidate from §5; fault on miss. This is also the cl
 shape for the Rust rewrite ([[rewrite_horizon_target]]): an owned
 `HashMap<PdbRoot, IntervalMap<VaRange, Binding>>` behind a lock, two populate
 entry points, one lookup, no heuristics.
+
+## 13. VAS identity = PDB, never the client handle (the #12 lesson)
+
+The table is keyed **per-VAS by its PDB** (the page-directory-base physical address =
+the GPU's CR3, stored in each channel's instance block at `RAMIN+0x200`). This is how
+hardware identifies an address space, and it is **client-independent**: many channels —
+and many RM clients — share one VAS by pointing their instance blocks at the same PDB.
+
+A channel does **not** name its VAS directly. Open-RM `kernel_channel.c:1030`:
+
+```c
+pKernelChannel->hVASpace = pKernelChannel->pKernelCtxShareApi->hVASpace;
+```
+
+The effective VAS comes from the channel's **KernelCtxShare** (subcontext, under the
+TSG). When the channel's own `hVASpace == NV01_NULL_OBJECT` (`0`) and there is no
+explicit ctxshare, the implicit TSG binds the **device-default VAS**. So resolution
+order for a channel's VAS is:
+
+1. channel `hVASpace` if non-null, else
+2. its ctxshare / TSG VAS, else
+3. the **device-default VAS** (lazily created per device).
+
+…then that VAS → its **PDB** = the table key.
+
+**Anti-pattern this forbids (root cause of #12, see
+[[mode2_2nd_context_hang]] cont. 7):** keying the per-VAS host state by the **client
+handle** (`m2_devvas[client]`). A GSP-managed `_VIRTUAL_MODE` CeUtils scrubber channel
+runs with `hVASpace=0` in a *shared/inherited* VAS owned by its ctxshare/device-default,
+**not** by its client handle. A per-client lookup returns nothing → the host map bails
+(`hDev=0`), the buffer "doesn't exist," and the vidmem finishPayload never resolves —
+all one bug. Two channels with the **same** VA→GPA then collide on a FIXED-map (one
+"MAPPED", the next "map-FAILED") purely because they were keyed by different clients
+instead of the one PDB they share.
+
+**Rule:** resolve every channel to its PDB via the chain above and key the table (and
+the host isolate / VAS) on that PDB. Channels sharing a ctxshare/TSG share one table
+entry and one isolate — matching silicon, and making "same VA in two clients" a
+**reuse**, not a collision.
+
+**Corollary (device-default VAS must be modeled):** because the device-default VAS is
+established GSP-side, a faked GSP must itself **materialize its PDB** (assign it / build
+its page directory, or capture the guest PMA's page-directory allocation and bind it),
+or there is no root to key on for `hVASpace=0` channels. The Rust core's
+`HashMap<PdbRoot, …>` (§12) is populated for the device-default VAS at device-alloc
+time, not lazily on first channel use.
