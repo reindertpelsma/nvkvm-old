@@ -450,3 +450,73 @@ guest driver:
    literals are invisible to `strings`).
 5. Deploy `nvidia.ko` to guest `~/nvmods` (back up `~/nvmods.good` first), fresh
    boot, run `pt_ctx2`, read `dmesg | grep NVKVM-`.
+
+## UPDATE cont. 5 — forge bench-disproven; the "FB backing known" corollary was wrong
+
+A run with the `#12 FORGE` active (markers present, `cupctx2`, 117-pinned guest)
+**still hangs**, and the persisted log (`vh:/tmp/m0_qemu.log`, 30 MB) lets us correct
+two earlier claims and reframe the fix.
+
+**Verified, unchanged:** our RAMIN PDB offsets are correct — `NV_RAMIN_PAGE_DIR_BASE_LO
+= word 128 = byte 0x200`, `_HI = word 129 = 0x204` (ga102 inherits gm107
+`dev_ram.h`), matching `NVKVM_RAMIN_PDB_{LO,HI}_OFF`. The instblk path is not
+mis-offset; the instblk at `0x2efa6e000` is simply **never populated** — every channel
+logs `M5.14 … PDB empty (GSP-managed)` because our fake GSP (which owns instblk
+construction in GSP-client mode) never writes RAMIN+0x200. So "read the instblk PDB"
+is a dead end for *all* channels, not just this one.
+
+**The channel names no VAS.** `M5.3 DIAG c56f … hVASpace@28=0x00000000` — confirmed
+from both source (`hVASpaceId = NV01_NULL_OBJECT`) and log. The only VAS the client
+(`0xc1e00007`) ever created (obj `0x0c`, PDB `0x2efba5000`) is **RM-handle-freed at
+M5.49 *before* the channel even allocates** (`hVASpace`-less). So `picked_pdb=0` on
+every `chan_exec`; there is no handle to bind to.
+
+**The decisive asymmetry (this is the bug, precisely):** the channel has two
+semaphores in *different apertures*, and only one resolves —
+- host/progress sema, GPU-VA `0x121000000` → **SYSMEM** `0x14444d000`. Resolves
+  (`res=translate`, GPA-backed, already in the address table) → the ring drains, the
+  guest's progress sema advances.
+- finishPayload, GPU-VA `0x12006c004` → **VIDMEM**. Needs the channel's VAS PTEs to
+  translate; we have none → VAS-walk through the only candidate PDB (`0x3114000` =
+  the UVM client `0xc1d00001`'s VAS, line 5110) **FAULTs**; the resolver falls to the
+  `bar1_wpg` MRU heuristic.
+
+**Correction to cont. 4 corollary (a).** The earlier note "finishPayload FB backing is
+known = `0x31f006c`, from the guest's own BAR1 write" is **wrong**. BAR1 off `0x12006c`
+→ FB `0x31f006c` is the **gpfifo ring entry at byte `0x6c`** (first page) — a
+coincidental digit-match with the finishPayload *GPU-VA* `0x12006c004`. They are not
+the same thing. finishPayload lives at **channel-buffer offset `0x8004`** (`gpfifo_va +
+0x8004`), i.e. BAR1 off `~0x128004`. The captured BAR1 PTEs for this buffer cover only
+off `0x120000–0x1200xx` → FB `0x31f0000–0x31f00xx` (the first page). **No captured PTE
+— BAR1 or VAS — ever maps the finishPayload page.**
+
+**Why the forge fails.** It computes `finFB = gpfifo_FB(0x31f0000) + 0x8004 =
+0x31f8004` — a *contiguity extrapolation* from the first page. The doc's own interim
+section flagged the risk ("GPU-VA contiguity ≠ physical-FB contiguity"); this run
+**confirms the risk materialized**: the forge wrote `0x31f8004` for the entire run
+(counter climbed `0→39+`) and `CeUtils` still read `0` → timeout → assert → wedge.
+The buffer is provably **non-contiguous** — the host sema is sysmem and the
+finishPayload is vidmem, so they are *separate memdescs*; `gpfifo_FB + 0x8004` is the
+wrong page.
+
+**Reframed fix (still the address table, now sharper).** The write authority for the
+finishPayload is the CE `SET_SEMAPHORE` method targeting GPU-VA `0x12006c004` in the
+channel's VAS — which we cannot resolve. But the guest *also* maps the same memdesc
+through **BAR1** for its own CPU read (`memmgrMemDescBeginTransfer(USE_BAR1)` in
+`channelReadChannelMemdesc`). Both tables point at the *same* finishPayload FB page.
+The BAR1 table is the one we **can** populate authoritatively (the guest writes BAR1
+PTEs; we snoop them) — so the principled fix is: **walk the BAR1 page table for the
+finishPayload page's BAR1-VA to get its true FB, then write there** — *not* extrapolate
+`+0x8004` from the gpfifo. Open sub-question gating this: the guest's `USE_BAR1`
+transfer mapping for the finishPayload is **transient** (created per-read during the
+poll, torn down after), so at method-execute time there may be no live BAR1 PTE for it.
+If so, the table must record the finishPayload memdesc's FB at **channel-buffer
+construction** (the `c56f`/memdesc RPC carries the sema memdesc) and resolve by table
+hit at drain — exactly the "record the channel-buffer binding at channel-create" clean
+fix above, with the emphasis that the *sema* memdesc (not just the gpfifo) must be the
+recorded unit, since the two are not contiguous.
+
+Net: the clean address-table fix is unchanged in direction but the *unit of binding*
+is corrected — bind each **channel-buffer memdesc separately** (gpfifo, sysmem host
+sema, **vidmem finishPayload**), never assume one contiguous span. The `bar1_wpg`
++`+0x8004` interim is disproven and should be retired for finishPayload.
