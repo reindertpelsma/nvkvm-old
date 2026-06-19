@@ -295,3 +295,22 @@ its page directory, or capture the guest PMA's page-directory allocation and bin
 or there is no root to key on for `hVASpace=0` channels. The Rust core's
 `HashMap<PdbRoot, …>` (§12) is populated for the device-default VAS at device-alloc
 time, not lazily on first channel use.
+
+### 13.1 Concrete instance: the `hVASpace=0` system VAS
+
+The device-default VAS for `hVASpace == NV01_NULL_OBJECT` kernel channels is the first
+table to build, because it is **GSP-managed = ours to mint**. Implementation (full
+detail + the #12 worked example in [[mode2_2nd_context_hang]] cont. 8):
+
+- One **QEMU-owned VAS per kernel device**, with a **PDB we mint** (not GPU-wide — per
+  device, to avoid cross-device VA aliasing).
+- **Forward-populated by observation** (BAR1-written page → `VA→FB` interval); the
+  finishPayload then resolves by contiguity within the buffer object — no GSP page
+  tables, no reverse resolve.
+- **Keyed by the minted PDB**, so sibling kernel channels share one entry and one host
+  isolate (HW keys by instance-block PDB, client-independent).
+- Resolution + host placement consult this VAS when the channel names none and the
+  per-client lookup misses — fixing the "no dev/vas for client" class of failures.
+- Separate, smaller **coherence** step on the *write* side: complete semas into the host
+  page the guest actually reads (the overlay/memslot backing), never the emulated-FB
+  copy, and never after a de-alias of a still-referenced shared buffer.

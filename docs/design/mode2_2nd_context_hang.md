@@ -618,3 +618,79 @@ that allocation with this VAS).
 This is the address-table-of-truth (`mode2_address_table.md`) stated precisely: one
 table per VAS keyed by PDB, channels finding their VAS through the instance-block/
 ctxshare chain like silicon — never through the client handle.
+
+## UPDATE cont. 8 — the fix: a QEMU-owned "system VAS" + coherent write (supersedes cont.5)
+
+Co-designed with the user; this supersedes two earlier errors and names the build.
+
+**Correction to cont. 5 (the finishPayload IS contiguous).** cont. 5 claimed the
+finishPayload was a *separate, non-contiguous* memdesc. Wrong — it conflated two
+different semaphores: the channel's **host/progress sema** (genuinely SYSMEM,
+`0x14444d000`, VA `0x121000000`) with the **finishPayload** (VIDMEM, VA `0x12006c004` =
+`gpfifo_va + 0x8004`). The instrumented guest's backdoor reported the finishPayload
+region at **FB `0x31f8000`** (`= gpfifo_FB 0x31f0000 + 0x8000`), i.e. **contiguous**
+with the gpfifo inside the same 64 KB channel-buffer object. The forge's location
+(`0x31f8004`) was therefore **correct**; it failed only on coherence (below). The FB was
+knowable all along.
+
+**Exhaustive PDB check (settles cont. 7's open question).** No captured GMMU VAS maps
+the scrub buffer to its real backing: the sibling's `0x2efa6c000` has VA `0x120064000`
+only as a **sparse/identity reservation** (`fb=0x64000 val=0`), `0x3110000`/`0x2efba5000`
+FAULT, UVM's `0x3114000` resolves only the sysmem host-sema. The buffer's *real* FB
+(`0x31f0000`) is reachable **only via the BAR1 VAS** (`bar1_pdb`, statically
+pre-allocated) — because the scrubber is `bUseBar1=TRUE` and the guest reaches it through
+BAR1. So: don't chase the absent GMMU channel PDB; the address is already observable.
+
+**Root cause, final form.** `hVASpace == NV01_NULL_OBJECT (0)` → the channel uses the
+**device-default VAS** (via ctxshare, `kernel_channel.c:1030`). For kernel-internal /
+GSP-managed work that default is a **shared kernel/system address space**, and it is
+**GSP-managed — i.e. ours to define.** Today we key per *client* (`m2_devvas[client]`),
+so the scrub client (which owns no VAS of its own) is invisible → `no dev/vas` →
+map-FAILED + unresolvable finishPayload, all one bug. FB `0x31f0000` (incl. the
+finishPayload at `0x31f8004`) is actually backed by UVM client `0xc1d00001`'s `gpga_obj`
+obj 8 (`cpu_qva=0x75d18c023000`), **aliased** by the scrub channel — and a (disproven)
+`#12 LIFECYCLE release … de-alias` even tore that backing out mid-run.
+
+### The build: a QEMU-owned system VAS, forward-populated, keyed by a minted PDB
+
+1. **`m2_system_vas` (per kernel device).** A QEMU-owned default VAS with a **PDB we
+   mint** (we are GSP). One per kernel device (NOT one GPU-wide — avoid cross-device VA
+   aliasing). Fields: `{ device, client, pdb_synth, va→fb interval map }`.
+2. **Resolve `hVASpace=0` → `m2_system_vas[device]`.** In the channel VAS-resolution
+   chain (`nvkvm_chan_own_pdb_rs`), when the channel names no VAS and `cli_vas` doesn't
+   resolve, fall to the system VAS for the channel's device. Key the table + host
+   isolate/device on the **minted PDB**, not the client — so sibling kernel channels
+   share one entry (matches HW: instance-block PDB, client-independent).
+3. **Forward-populate from observation.** We already derive `VA 0x120064000 → FB
+   0x31f0000` for the scrub channel (`M5.24 GPFIFO double-mmap`, from the BAR1-written
+   page). Record that interval into the system VAS regardless of host-placement success.
+   Then `VA 0x12006c004 = base + 0x8004 → FB 0x31f8004` falls out by contiguity within
+   the 64 KB buffer object. (Address-table directive verbatim: forward-populate, never
+   reverse-resolve.)
+4. **Give the system-VAS client a device** so `back_and_map_sys` stops bailing at
+   `hDev=0`: resolve the scrub client to the system-VAS device, and treat an existing
+   placement at the same VA→GPA as **reuse** (generalize the `mst==0x51` ALREADY-MAPPED
+   path) instead of a FIXED-map collision → kills the 42× map-FAILED.
+5. **Coherent write (separate, smaller fix).** Resolution finds `0x31f8004`; completion
+   must write the **host page the guest actually reads**. The guest reads the
+   finishPayload via BAR1; per the in-tree note that path is a **non-trapping memslot**
+   whose backing ≠ the emulated-FB `g_malloc` page the forge wrote. Fix: route the
+   completion write through the **same overlay/memslot backing** (obj-8's `cpu_qva`, via
+   `nvkvm_fb_host_overlay`), and **do not de-alias** a shared kernel buffer while a
+   channel still references it. Write value = the channel's `lastSubmittedPayload`
+   (already tracked as `c->fin_payload`); advance-only, never backward.
+
+### Open questions to settle at implementation (bench-verifiable)
+- **Coherence path (load-bearing):** does the guest's BAR1 read of `0x31f8004` route
+  through `nvkvm_fb_host_overlay` (then fb_write is already coherent and step 5 is
+  trivial), or through a separate non-trapping KVM memslot (then we must write *that*
+  backing)? One instrumented read-trap confirms which.
+- **PDB minting:** any value is fine for QEMU-internal resolution, but if we later
+  **forward** the scrub CE to the host (option B), the host VAS needs real page tables —
+  out of scope for the in-QEMU completion, which is all #12 needs.
+- **De-alias safety:** ensure the disproven `#12 LIFECYCLE release` de-alias path is gone
+  / gated so it can't yank a shared kernel buffer's backing.
+
+This is the address-table-of-truth (`mode2_address_table.md` §13) made concrete for the
+`hVASpace=0` kernel case: one QEMU-owned VAS per kernel device, minted PDB, populated by
+observation, keyed by PDB — exactly the Rust core's `HashMap<PdbRoot, IntervalMap<…>>`.
