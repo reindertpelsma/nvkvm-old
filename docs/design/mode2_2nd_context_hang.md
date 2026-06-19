@@ -520,3 +520,44 @@ Net: the clean address-table fix is unchanged in direction but the *unit of bind
 is corrected — bind each **channel-buffer memdesc separately** (gpfifo, sysmem host
 sema, **vidmem finishPayload**), never assume one contiguous span. The `bar1_wpg`
 +`+0x8004` interim is disproven and should be retired for finishPayload.
+
+## UPDATE cont. 6 — both cheap hooks closed; (C) sysmem-aperture is guest-hardcoded
+
+Re-converged after re-reading the in-tree `#12 NOTE` (line ~1677) + the open RM
+scrubber init. Two QEMU-side "cheap" hooks are **both structurally closed**, and the
+clean sysmem angle is **not ours to flip**:
+
+- **Write emulated-FB (the forge): dead.** The guest reads the finishPayload through a
+  **non-trapping KVM memslot** whose backing is not coherent with `nvkvm_fb_write`
+  (the promoted/GPA-window page ≠ the emulated-FB `g_malloc`), so even a correctly
+  *located* write would not be seen. (And cont. 5 showed the forge's *location* is also
+  wrong — `gpfifo_FB + 0x8004` assumes a contiguity the sysmem-hostsema/vidmem-fin
+  split disproves.)
+- **Intercept the poll read: dead.** Same non-trapping memslot — the finishPayload poll
+  does **not** trap (BAR1 reads aren't traced; the 100k trapped reads are the BAR0
+  PRAMIN/CRASHWIN window, which the guest stops using before the wait). Nothing to hook
+  on the read side.
+- **(C) make finishPayload land in sysmem: not GSP-controllable.** The aperture split is
+  hardcoded in the guest driver: general CeUtils passes `_NO_BAR1_USE_TRUE`
+  (`mem_mgr.c:4134`) → `bUseBar1=FALSE` → **sysmem** (this is the sibling that resolves
+  and works); the memory scrubber passes `_VIRTUAL_MODE_TRUE` with no `_NO_BAR1_USE`
+  (`mem_scrub.c:154`) → `bUseBar1=TRUE` → **vidmem**. `bUseBar1` is purely
+  `FLD_TEST_DRF(_NO_BAR1_USE, allocFlags)` — no GPU-cap / GSP input — so our fake GSP
+  cannot nudge the scrubber onto the sysmem path without modifying the (unmodified)
+  guest driver.
+
+**Net.** There is no patch-sized fix. The crux is singular and unavoidable: **resolve
+the GSP-managed, `_VIRTUAL_MODE` scrubber channel's VAS** so its own buffer VA
+`0x12006c004` translates to FB. The scrubber issues its CE *copies* through this VAS and
+we already forward those (`CE COPY … out=…(phys)`), so the data plane works; only the
+channel's *self-referential* finishPayload sema is unresolvable, because the VAS it runs
+in has `hVASpace=0`, an empty (GSP-owned) instblk, and a transient VAS handle
+(`0x2efba5000`) freed before the channel ran. Once that PDB is known, the fix is either
+(A) coherent-write the translated FB through the promoted memslot backing, or (B)
+forward the `SET_SEMAPHORE` to the host CE alongside the copies. Both are real work;
+neither is a heuristic. This is the address-table directive's "PDB = communication, the
+channel must carry its binding" applied to a channel that deliberately discards its
+binding — the open question is what authoritative signal *does* carry the scrubber
+channel's PDB (candidate: the instblk *would*, if our fake GSP synthesized RAMIN+0x200
+from the channel-alloc memdescs at construction — making us populate what real GSP
+populates).
