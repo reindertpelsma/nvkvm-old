@@ -230,6 +230,16 @@ struct NvkvmGpuEmul {
                                  * does payload=lastSubmitted+1 and submits exactly one entry,
                                  * ce_utils.c:611). Used to forge the VIDMEM finishPayload sema
                                  * the GSP-managed scrub channel never lets us parse/write. */
+        uint64_t fin_fb;        /* #12: forward-populated FB address of THIS channel's VIDMEM
+                                 * finishPayload sema (ring_base_BAR1off + (gpfifo_va&0xfff) +
+                                 * 0x8004, GMMU-walked through bar1_pdb).  Resolved ONCE — the
+                                 * first doorbell the channel advances, when its just-written ring
+                                 * page is freshest in bar1_wpg so the M5.16 MRU scan picks the
+                                 * RIGHT page — then PINNED.  Re-resolving every doorbell drifts
+                                 * (the global chan_gpfifo_bar1off is stomped by whichever channel
+                                 * last decoded plausibly), splitting the monotonic payload across
+                                 * two FB pages so the guest's real sema never reaches lastSubmitted
+                                 * (#12 root cause, proven 2026-06-20).  0 = unresolved. */
         uint32_t client;        /* owning RM client (hClient) — VAS scope key */
         bool     userd_sys;
         uint32_t hobject;       /* M5.12: the channel's RM handle (== host handle: shadow_fwd
@@ -2153,6 +2163,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         s->chans[cslot].gp_get     = 0;
                         s->chans[cslot].payload    = 0;
                         s->chans[cslot].fin_payload = 0;   /* #12 */
+                        s->chans[cslot].fin_fb      = 0;   /* #12: re-resolve on (re)alloc */
                         s->chans[cslot].token_valid = false;
                     }
                 }
@@ -3422,17 +3433,36 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                  * finishPayload's true (fragmented) FB page = bar1_pdb walk of
                  * chan_gpfifo_bar1off + (gpfifo_va&0xfff) + 0x8004 — the BAR1 PTEs absorb the
                  * fragmentation.  This is the same primitive the guest itself uses to read it. */
-                uint64_t fin_b1 = s->chan_gpfifo_bar1off + (c->gpfifo_va & 0xfffull) + 0x8004ull;
-                bool fsys = false;
-                uint64_t fin_fb = nvkvm_walk_pdb(s, s->bar1_pdb, fin_b1, &fsys);
-                if (fin_fb != NVKVM_GMMU_FAULT && !fsys) {
-                    uint32_t cur = (uint32_t)nvkvm_fb_read(s, fin_fb, 4);
-                    if (cur < c->fin_payload) {       /* lagging -> never written; forge fwd only */
-                        nvkvm_fb_write(s, fin_fb, c->fin_payload, 4);
-                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload ch[%d] gpfifo=0x%llx "
-                                 "b1off=0x%llx finFB=0x%llx %u->%u client=0x%08x\n",
+                /* Forward-populate THIS channel's finishPayload FB exactly ONCE, then PIN it
+                 * (one forward-populated table, never reverse-resolve — see
+                 * docs/design/mode2_address_table.md).  We are here only because the channel
+                 * ADVANCED this doorbell (the no-advance `continue` above), so its just-written
+                 * ring page is freshest in bar1_wpg and the M5.16 MRU scan that produced
+                 * chan_gpfifo_bar1off picked the RIGHT page for THIS channel.  Resolve fin_fb
+                 * from it now and cache on the channel.  Re-resolving on later doorbells would
+                 * drift (the global bar1off is stomped by whichever channel last decoded
+                 * plausibly), splitting the monotonic payload across two FB pages so the guest's
+                 * real sema never reaches lastSubmitted — the #12 root cause. */
+                if (!c->fin_fb && s->chan_gpfifo_phys) {
+                    uint64_t fin_b1 = s->chan_gpfifo_bar1off + (c->gpfifo_va & 0xfffull) + 0x8004ull;
+                    bool fsys = false;
+                    uint64_t fb = nvkvm_walk_pdb(s, s->bar1_pdb, fin_b1, &fsys);
+                    if (fb != NVKVM_GMMU_FAULT && !fsys) {
+                        c->fin_fb = fb;
+                        qemu_log("nvkvm-gpu[%s] #12 FORGE-RESOLVE ch[%d] gpfifo=0x%llx "
+                                 "b1off=0x%llx -> finFB=0x%llx (pinned) client=0x%08x\n",
                                  s->chip->name, i, (unsigned long long)c->gpfifo_va,
-                                 (unsigned long long)fin_b1, (unsigned long long)fin_fb,
+                                 (unsigned long long)fin_b1, (unsigned long long)fb, c->client);
+                    }
+                }
+                if (c->fin_fb) {
+                    uint32_t cur = (uint32_t)nvkvm_fb_read(s, c->fin_fb, 4);
+                    if (cur < c->fin_payload) {       /* lagging -> never written; forge fwd only */
+                        nvkvm_fb_write(s, c->fin_fb, c->fin_payload, 4);
+                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload ch[%d] gpfifo=0x%llx "
+                                 "finFB=0x%llx %u->%u client=0x%08x\n",
+                                 s->chip->name, i, (unsigned long long)c->gpfifo_va,
+                                 (unsigned long long)c->fin_fb,
                                  cur, c->fin_payload, c->client);
                     }
                 }
