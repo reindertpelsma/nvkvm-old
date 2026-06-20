@@ -149,6 +149,15 @@ struct NvkvmGpuEmul {
 
     /* M3 — GSP-RPC message queue */
     uint32_t mbox0, mbox1;   /* GSP falcon mailbox halves (LibOS boot-args GPA) */
+    uint32_t sec_mbox0;      /* #12 L3 (2026-06-20): SEC2 falcon MAILBOX0 latch.  The
+                              * SEC2 Booter is run for both LOAD (raises WPR2) and
+                              * UNLOAD (lowers WPR2); from BAR0 alone they differ only
+                              * by the mailbox args set before SEC2 STARTCPU.  A NORMAL
+                              * Booter Unload writes MAILBOX0/1 = 0xff (Load writes 0 or
+                              * the WprMeta GPA), so we latch MAILBOX0 and, on the SEC2
+                              * STARTCPU, bring WPR2 down iff it is 0xff — otherwise the
+                              * driver's kgspExecuteBooterUnloadIfNeeded reads WPR2 still
+                              * up after Unload and asserts (osinit.c:2363).            */
     bool     bootargs_dumped;/* one-shot: read+log the queue region once        */
     bool     fwsec_ran;      /* set when GSP falcon STARTCPU written: FWSEC "ran"
                               * -> WPR2 becomes "initialized" (stateful: the
@@ -1467,9 +1476,11 @@ static void nvkvm_m3_post_status(NvkvmGpuEmul *s, const uint8_t *src,
 /* M3 keystone: post GSP_INIT_DONE (seqNum 0). */
 static void nvkvm_m3_post_init_done(NvkvmGpuEmul *s)
 {
+    uint32_t seq = s->stat_seqnum; /* captured before post_status advances it */
     nvkvm_m3_post_status(s, NULL, 0x1001u /* GSP_INIT_DONE */, 0 /* NV_OK */);
-    qemu_log("nvkvm-gpu[%s] M3: posted GSP_INIT_DONE (seqNum 0) -> "
-             "RmInitAdapter should pass kgspWaitForRmInitDone\n", s->chip->name);
+    qemu_log("nvkvm-gpu[%s] M3: posted GSP_INIT_DONE (seqNum %u) -> "
+             "RmInitAdapter should pass kgspWaitForRmInitDone\n",
+             s->chip->name, seq);
 }
 
 /* M5/M7 — post a GSP NV_VGPU_MSG_EVENT_POST_EVENT (0x1003).  The body is
@@ -2898,11 +2909,32 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                             s->q_msgcount     = ldl_le_p(txh + 12);
                             s->q_cmd_entryoff = ldl_le_p(txh + 28);
                             s->q_stat_entryoff= ldl_le_p(txh + 28);
+                            /* #12 L3 (2026-06-20): RESET the status-queue WRITE
+                             * position but PRESERVE the seqNums across a GSP
+                             * re-acquire.  The driver's MESSAGE_QUEUE_INFO (and its
+                             * rx/txSeqNum) is built in kgspConstructEngine and torn
+                             * down only in kgspDestruct (module unload) — NOT on the
+                             * cuCtxDestroy-of-last-ctx idle-release — so it PERSISTS
+                             * across the re-boot.  Per boot the driver re-links the
+                             * status queue (GspStatusQueueInit -> msgqRxLink), which
+                             * resets only the POSITION (rxReadPtr=0), never the
+                             * seqNum (no rxSeqNum= reset exists anywhere in the gsp
+                             * tree — it is only ++'d).  So on re-acquire the guest
+                             * still expects the next status element at seqNum N, and
+                             * its cmd-queue writePtr continues from N too.  Resetting
+                             * stat_seqnum/cmd_readptr to 0 here (as the old one-shot
+                             * boot did) makes the re-posted INIT_DONE arrive at seqNum
+                             * 0 << N -> msgq treats it as an old package and ignores
+                             * it (message_queue_cpu.c:762,768) -> the 2nd context
+                             * hangs in kgspWaitForRmInitDone.  On the FIRST boot all
+                             * three are already 0 (realize), so preserving is a no-op
+                             * there; only stat_writeptr is reset (the per-boot RX
+                             * re-link zeroes the guest read pointer, so our write
+                             * pointer must match). */
                             s->stat_writeptr  = 0;
-                            s->stat_seqnum    = 0;
-                            s->cmd_readptr    = 0;
                             s->q_ready        = true;
-                            /* step 2: post GSP_INIT_DONE (seqNum 0) */
+                            /* step 2: re-post GSP_INIT_DONE at the PRESERVED seqNum
+                             * (== guest rxSeqNum); first boot posts it at 0. */
                             nvkvm_m3_post_init_done(s);
                         }
                     }
@@ -3578,6 +3610,26 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         s->gsp_reloaded = true;
     }
 
+    /* #12 L3 (2026-06-20): SEC2 falcon.  The driver runs the SEC2 Booter for both
+     * LOAD (kgspExecuteBooterLoad, raises WPR2) and UNLOAD
+     * (kgspExecuteBooterUnloadIfNeeded, lowers WPR2).  On a context teardown/re-init
+     * it runs Booter Unload and then ASSERTS that WPR2 reads down
+     * (kernel_gsp_booter_tu102.c "WPR2 is still up" -> osinit.c:2363).  From BAR0
+     * alone Load and Unload differ only by the mailbox args written before the SEC2
+     * STARTCPU: a NORMAL Unload writes MAILBOX0/1 = 0xff (Load writes 0 or the WprMeta
+     * GPA; GC6 Unload writes 0xdeaddead, not our path).  Latch SEC2 MAILBOX0; on the
+     * SEC2 STARTCPU (CPUCTL bit1), if it is 0xff this is a Booter Unload -> drop WPR2. */
+    if (off == NV_PSEC_FALCON_MAILBOX0) {
+        s->sec_mbox0 = (uint32_t)val;
+    }
+    if (off == NV_PSEC_FALCON_CPUCTL && (val & 0x2u) && s->sec_mbox0 == 0xffu) {
+        if (s->fwsec_ran && s->trace) {
+            qemu_log("nvkvm-gpu[%s] M4: SEC2 Booter Unload (mbox0=0xff) -> WPR2 down\n",
+                     s->chip->name);
+        }
+        s->fwsec_ran = false;   /* WPR2 lowered, matching kgspIsWpr2Up post-Unload */
+    }
+
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
      * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
     if ((off == NV_PGSP_FALCON_CPUCTL || off == 0x00110130u) && (val & 0x2u)) {
@@ -3597,6 +3649,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * context hangs forever on GSP_INIT_DONE (#12 next-layer, 2026-06-20).  A bare
          * trailing-teardown STARTCPU (no reload) must NOT re-raise WPR2 (the original
          * reload-cascade fix). */
+        bool was_suspended = s->gsp_suspended;
         bool teardown = s->gsp_suspended && !s->gsp_reloaded;
         s->gsp_suspended = false;       /* any STARTCPU => GSP active, not suspended */
         s->gsp_reloaded  = false;       /* consume the reload latch                  */
@@ -3605,6 +3658,23 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (s->trace) {
                 qemu_log("nvkvm-gpu[%s] M3: GSP STARTCPU -> FWSEC ran, WPR2 up\n",
                          s->chip->name);
+            }
+            /* #12 L3 (2026-06-20): a genuine GSP RE-acquire (cuCtxDestroy of the
+             * last ctx -> fn-47 idle-release -> next cuCtxCreate) reuses the
+             * existing boot-args + GSP message queue and does NOT re-write the
+             * boot-args mailbox, so the mailbox-keyed dump below never re-runs and
+             * GSP_INIT_DONE is never re-posted -> the guest polls the status queue
+             * in sysmem forever.  This is the real 2nd-context hang: the SEC2 Booter
+             * Load and WPR2 re-raise both complete cleanly UPSTREAM of this (verified
+             * in trace: MAILBOX0=0, WPR2_HI up), then the guest goes quiet on BAR0
+             * waiting on INIT_DONE.  Re-post from the cached boot-args GPA: the queue
+             * allocations persist across the idle-release and mbox0/mbox1 still hold
+             * the right GPA (the guest never rewrote them).  was_suspended (true only
+             * on a re-acquire; the first boot was never suspended) distinguishes this
+             * from the first boot, whose own mailbox write drives the dump as usual. */
+            if (was_suspended && (s->mbox0 | s->mbox1)) {
+                nvkvm_m3_dump_bootargs(s);
+                s->bootargs_dumped = true; /* don't double-post if mailbox is rewritten */
             }
         } else if (s->trace) {
             qemu_log("nvkvm-gpu[%s] M4: teardown-phase STARTCPU off=0x%llx -> WPR2 "

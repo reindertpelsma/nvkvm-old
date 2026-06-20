@@ -11,6 +11,7 @@ QLOG=/tmp/m0_qemu.log
 
 echo "==> [1/7] copy deploy src -> build tree"
 cp /workspace/nvkvm/src/qemu/nvkvm_gpu_emul.c /opt/qemu-src/hw/misc/nvkvm_gpu_emul.c
+cp /workspace/nvkvm/src/qemu/mode2_regs_ga10x.h /opt/qemu-src/hw/misc/mode2_regs_ga10x.h
 echo "  #12 FORGE markers in build src (expect >=1): $(grep -c '#12 FORGE finishPayload' /opt/qemu-src/hw/misc/nvkvm_gpu_emul.c)"
 
 echo "==> [2/7] rebuild QEMU"

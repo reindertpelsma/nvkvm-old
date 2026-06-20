@@ -49,6 +49,7 @@
 #define NV_PSEC_FALCON_DMATRFCMD     0x00840118u
 #define NV_PSEC_FALCON_CPUCTL        0x00840100u
 #define NV_PSEC_FALCON_HWCFG2        0x008400F4u
+#define NV_PSEC_FALCON_MAILBOX0      0x00840040u /* Booter Load/Unload arg low; =0xff on NORMAL Unload */
 
 /* M3 — WPR2 (Write-Protect Region 2 in FB), dev_fb.h */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_LO  0x001FA824u
