@@ -159,6 +159,15 @@ struct NvkvmGpuEmul {
                               * the faked GSP must report suspended or the close
                               * hangs 4s (_threadNodeCheckTimeout) and WPR2 stays
                               * up -> next open EIO (WPR2 re-boot cascade).        */
+    bool     gsp_reloaded;   /* #12 (2026-06-20): set when the guest re-loads the GSP
+                              * falcon image (a DMATRFCMD transfer) WHILE suspended —
+                              * the unambiguous "this is a genuine GSP re-boot" signal
+                              * for a context RE-ACQUIRE (cuCtxDestroy of the last ctx
+                              * sends fn-47 UNLOADING; the next cuCtxCreate reloads the
+                              * falcon + STARTCPUs).  Distinguishes that re-boot STARTCPU
+                              * (must raise WPR2) from a bare trailing-teardown STARTCPU
+                              * (must NOT), so a 2nd context boots instead of hanging
+                              * forever waiting for GSP_INIT_DONE (#12 next-layer).   */
 
     /* M4 — GSP-RM RPC shim. Cached message-queue layout (from RMARGS) + ring
      * state. The driver posts a command on the cmd queue then writes the cmd
@@ -3557,6 +3566,18 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
 
+    /* #12 (2026-06-20): a GSP-falcon DMA transfer (DMATRFCMD) issued WHILE suspended
+     * means the guest is re-loading the GSP image to RE-BOOT it for a new context
+     * (cuCtxDestroy of the last ctx sent fn-47 UNLOADING -> gsp_suspended; the next
+     * cuCtxCreate reloads the falcon then STARTCPUs).  Latch it so the STARTCPU below
+     * is recognised as a genuine re-boot (raise WPR2) rather than a bare trailing-
+     * teardown STARTCPU (keep WPR2 down).  Without this the 2nd context hangs forever
+     * waiting for a GSP_INIT_DONE that never comes (WPR2 never re-raised). */
+    if (off == NV_PGSP_FALCON_DMATRFCMD && s->gsp_suspended &&
+        val != NV_PFALCON_DMATRFCMD_IDLE_VAL) {   /* any transfer while suspended = reload */
+        s->gsp_reloaded = true;
+    }
+
     /* M3: GSP falcon STARTCPU => FWSEC "executes" => WPR2 becomes initialized.
      * (CPUCTL bit1 STARTCPU, or via CPUCTL_ALIAS 0x110130.) */
     if ((off == NV_PGSP_FALCON_CPUCTL || off == 0x00110130u) && (val & 0x2u)) {
@@ -3570,8 +3591,15 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * raise on !gsp_suspended leaves WPR2 down after teardown, so a reload / reopen
          * boots cleanly.  The teardown STARTCPU still clears gsp_suspended, so the next
          * genuine boot STARTCPU (suspended already false) raises WPR2 as normal. */
-        bool teardown = s->gsp_suspended;
+        /* A post-UNLOADING STARTCPU is a GENUINE re-boot iff the guest re-loaded the
+         * GSP image first (gsp_reloaded) — a context RE-ACQUIRE (cuCtxDestroy ->
+         * fn-47 -> cuCtxCreate) does exactly that, and must raise WPR2 or the 2nd
+         * context hangs forever on GSP_INIT_DONE (#12 next-layer, 2026-06-20).  A bare
+         * trailing-teardown STARTCPU (no reload) must NOT re-raise WPR2 (the original
+         * reload-cascade fix). */
+        bool teardown = s->gsp_suspended && !s->gsp_reloaded;
         s->gsp_suspended = false;       /* any STARTCPU => GSP active, not suspended */
+        s->gsp_reloaded  = false;       /* consume the reload latch                  */
         if (!teardown && !s->fwsec_ran) {
             s->fwsec_ran = true;
             if (s->trace) {
@@ -7788,6 +7816,7 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     s->mbox1 = 0;
     s->bootargs_dumped = false;
     s->fwsec_ran = false;
+    s->gsp_reloaded = false;
     s->q_ready = false;
     s->stat_writeptr = 0;
     s->stat_seqnum = 0;
