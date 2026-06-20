@@ -694,3 +694,58 @@ obj 8 (`cpu_qva=0x75d18c023000`), **aliased** by the scrub channel — and a (di
 This is the address-table-of-truth (`mode2_address_table.md` §13) made concrete for the
 `hVASpace=0` kernel case: one QEMU-owned VAS per kernel device, minted PDB, populated by
 observation, keyed by PDB — exactly the Rust core's `HashMap<PdbRoot, IntervalMap<…>>`.
+
+---
+
+## UPDATE cont. 9 (2026-06-20) — IMPLEMENTED + BENCHED: #12 is LAYERED. L1+L2 fixed, L3 found.
+
+Built the fix and ran it (`cupctx2`, `NVKVM_M2TRACE=1`, `m12_forge_orch.sh`). The result:
+the documented finishPayload root cause is **fixed**, and the hang **moved twice**, exposing
+#12 as a *multi-layer GSP re-acquire* problem — each layer a stage of a teardown+reboot the
+one-shot fake-boot never exercised.
+
+**Correction to cont. 3/8's premise.** BAR1 is **pure MMIO** (`memory_region_init_io`,
+`nvkvm_aperture_ops`) — there is NO memslot over it, so every guest BAR1 read traps
+`nvkvm_baraperture_read` and walks the same `bar1_pdb` as `nvkvm_fb_write`. Forge-write and
+guest-read are therefore **coherent by construction**; the "memslot-served / no-trap" claim
+was a false read of the 2000×-consecutive-spin heuristic (it resets on any interleaved read,
+so a real poll loop never trips it). The coherent-backing step is **not needed**.
+
+**Layer 1 — finishPayload split (the real root cause). FIXED, commit `c6b4150`.** The forge
+resolved its target FB from the *global* `chan_gpfifo_phys`/`chan_gpfifo_bar1off` (the M5.16
+content-heuristic MRU scan over `bar1_wpg`), stomped per doorbell by whichever channel last
+decoded plausibly. Persisted-log proof: the *same* scrub channel (`0xc1e00007`,
+`gpfifo 0x120064000`) alternated `finFB 0x31f8004 ↔ 0x3138004`, **splitting its monotonic
+payload across two FB pages** so the guest's real sema (VA `0x12006c004` → FB `0x31f8004`)
+only ever saw a subset and never reached `lastSubmitted` → 4 s `scrubberDestruct` timeout +
+assert + wedge. Fix = the address-table principle scoped to one channel: forward-populate the
+finishPayload FB **once**, on the first doorbell the channel advances (its just-written ring
+page is freshest in `bar1_wpg`, so the MRU scan picks the *right* page), cache it in
+`chans[].fin_fb`, **pin it** — never heuristically re-resolve. Verified: 58 forge writes all
+to the single page `0x31f8004`; one `FORGE-RESOLVE … (pinned)`; **no scrub timeout/assert;
+`[CTX1] CTX DESTROY OK`** (clean teardown — previously asserted+wedged here).
+
+**Layer 2 — GSP re-boot keeps WPR2 down. FIXED, commit `bf36f63`.** With L1 fixed the hang
+moves to `[CTX2] cuCtxCreate`. `cuCtxDestroy` of the *last* context sends **fn-47 UNLOADING**
+(a GPU-idle release while the module stays loaded — not just rmmod) → `gsp_suspended` + WPR2
+down. The next `cuCtxCreate` re-acquires: it **reloads the GSP falcon image** (`DMATRFCMD`)
+then `STARTCPU`s to re-boot. But the teardown-phase gate (`teardown = gsp_suspended`) treated
+that single re-boot `STARTCPU` as a *bare trailing-teardown* STARTCPU and **kept WPR2 down**,
+so the guest waited forever for a `GSP_INIT_DONE` that never came. The gate assumed *two*
+post-UNLOADING STARTCPUs (defensive-unload then boot); a re-acquire has only *one*, and it
+must boot. Fix: latch `gsp_reloaded` when the guest issues a `DMATRFCMD` transfer **while
+suspended** (the unambiguous genuine-reboot signal); `teardown = suspended && !reloaded`.
+Verified: a 2nd `M3: GSP STARTCPU → FWSEC ran, WPR2 up` now fires and the re-boot progresses.
+
+**Layer 3 — SEC2 Booter Load on re-acquire (OPEN, next).** After WPR2 re-raises, the guest
+re-establishes WPR2 through the **SEC2 Booter** (the "separate SEC2 path we don't model" the
+STARTCPU comment already flagged): it DMA-loads the Booter ucode into SEC2 (`0x84011c`
+stepping `0x4000,0x4100,…` = IMEM/DMEM; `0x840118` `DMATRFCMD` transfers), runs it (SEC2
+`STARTCPU`), then **polls `0x8403c0` / `0x8400f4` for a Booter-done signal our emulation never
+produces** → hang. Decisive asymmetry: the **first** boot touched SEC2 (`0x840xxx`) **zero**
+times (it used the GSP-falcon FWSEC fake directly); only the **re-acquire** uses SEC2. So the
+remaining #12 work is a scoped sub-project: fake the SEC2 Booter Load completion (read the
+driver's SEC2 Booter completion check; set the polled status/mailbox to its success values on
+SEC2 `STARTCPU`; keep WPR2 up), analogous to the original M3 GSP-boot faking. Rejected
+alternative: prevent the fn-47 idle-release to keep the GSP alive across contexts (hacky,
+fights the guest driver, doesn't generalise to real teardown).
