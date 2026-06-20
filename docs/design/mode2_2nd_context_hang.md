@@ -749,3 +749,58 @@ driver's SEC2 Booter completion check; set the polled status/mailbox to its succ
 SEC2 `STARTCPU`; keep WPR2 up), analogous to the original M3 GSP-boot faking. Rejected
 alternative: prevent the fn-47 idle-release to keep the GSP alive across contexts (hacky,
 fights the guest driver, doesn't generalise to real teardown).
+
+---
+
+## UPDATE cont. 10 (2026-06-20, evening) — L3 RE-DIAGNOSED from guest dmesg; assert #2 fixed
+
+**cont.9's L3 ("guest hangs polling SEC2 `0x8403c0`/`0x8400f4` for a Booter-done signal") was
+WRONG.** The SEC2 register polls all complete cleanly (DMATRFCMD→IDLE, CPUCTL→HALTED,
+MAILBOX0→0). The real wall was found by reading the **guest kernel log** (`dmesg`) — the ground
+truth I should have pulled first. It shows two asserts, neither in the GSP-boot/INIT_DONE path:
+
+```
+scrubberDestruct: Timed out when waiting for the scrub to complete the pending work
+nvAssertFailedNoLog: pCeUtils->lastCompletedPayload == lastSubmittedPayload @ ce_utils.c:349
+kgspExecuteBooterUnloadIfNeeded_TU102: failed to execute Booter Unload: WPR2 is still up
+nvAssertFailedNoLog: rmStatus == NV_OK @ osinit.c:2363
+```
+
+So L3 is a multi-part **teardown/re-acquire** problem, not a GSP-boot-faking problem:
+
+**L3a — SEC2 Booter UNLOAD must lower WPR2. FIXED, commit `ea219c4`.** On a context
+teardown/re-init the driver runs `kgspExecuteBooterUnloadIfNeeded_TU102` (SEC2 Booter Unload)
+and then asserts WPR2 reads **down** (else "WPR2 is still up" → `osinit.c:2363`). Our model only
+ever *raised* WPR2 (GSP-falcon FWSEC STARTCPU) and never lowered it on the SEC2 path. From BAR0
+alone Load vs Unload differ **only by the mailbox args** before the SEC2 STARTCPU: a NORMAL
+Booter Unload writes `MAILBOX0/1 = 0xff` (`kgspExecuteBooterUnloadIfNeeded_TU102`; Load writes 0
+or the WprMeta GPA; GC6 writes `0xdeaddead`). Fix: latch `NV_PSEC_FALCON_MAILBOX0` (0x840040);
+on SEC2 CPUCTL STARTCPU, if it is `0xff` drop `fwsec_ran` → WPR2 reads down. Verified: trace
+shows `SEC2 Booter Unload (mbox0=0xff) → WPR2 down`, WPR2_HI then reads 0, assert #2 gone.
+
+**L3c — GSP_INIT_DONE re-post + seqNum preservation. LANDED `ea219c4` (correct, not yet
+exercised — guest faults at L3b first).** On a re-acquire the guest reuses the existing boot-args
++ message queue and does **not** re-write the boot-args mailbox, so the mailbox-keyed
+`nvkvm_m3_dump_bootargs` never re-runs → INIT_DONE never re-posted. Re-post it on the genuine
+re-boot (`was_suspended`) from the cached boot-args GPA. **Critical seqNum fact** (from the open
+driver): `MESSAGE_QUEUE_INFO` (and `rx/txSeqNum`) is built in `kgspConstructEngine` and freed
+only in `kgspDestruct` (module *unload*), NOT on the idle-release, so it **persists** across the
+re-boot. Per boot `GspStatusQueueInit→msgqRxLink` resets only the **position** (`rxReadPtr=0`),
+never the seqNum (there is **no** `rxSeqNum=` reset anywhere in the gsp tree — only `++`). So the
+re-post must carry the **continuing** seqNum (== guest `rxSeqNum`), not 0 — else
+`message_queue_cpu.c:762,768` treats it as an old package and ignores it. Implemented by
+preserving `stat_seqnum`/`cmd_readptr` across re-acquire and resetting only `stat_writeptr`
+(first boot keeps them 0 from realize, so this is first-boot-neutral).
+
+**L3b — PMA/heap CeUtils scrubber `scrubberDestruct` timeout. OPEN (current wall).** The memory
+scrubber torn down in `RmShutdownAdapter` (`mem_scrub.c scrubberDestruct` → `_isScrubWorkPending`
+→ `ceutilsUpdateProgress` → `READ_CHANNEL_PAYLOAD_SEMA`) times out waiting for
+`lastCompletedPayload == lastSubmittedPayload` (`ce_utils.c:349`). This is a **second**
+finishPayload target, distinct from L1's cuCtxDestroy CeUtils (different channel/client). Same
+class as L1, but the right fix is the documented one — **CE-forward / coherent backing** so the
+real `SET_SEMAPHORE` writes the page the guest reads (task #2), rather than extending the forge
+heuristic to yet another channel. Next focused session.
+
+Repro/forensics: `m12_forge_orch.sh` on vh (now also copies `mode2_regs_ga10x.h`), then
+`ssh -p 2223 ubuntu@localhost sudo dmesg` for the driver-side asserts (the qemu log alone hides
+them — the qemu-side "scrub timeout" grep checks the wrong place).
