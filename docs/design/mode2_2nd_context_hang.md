@@ -804,3 +804,96 @@ heuristic to yet another channel. Next focused session.
 Repro/forensics: `m12_forge_orch.sh` on vh (now also copies `mode2_regs_ga10x.h`), then
 `ssh -p 2223 ubuntu@localhost sudo dmesg` for the driver-side asserts (the qemu log alone hides
 them — the qemu-side "scrub timeout" grep checks the wrong place).
+
+---
+
+## UPDATE cont. 11 (2026-06-21) — L3b ROOT-CAUSED + FIXED (per-channel finishPayload)
+
+cont.10 said L3b's "right fix is CE-forward (task #2), not more forge heuristic." That was the
+wrong framing: forensics show the scrubber's finishPayload completion was failing for **two
+mechanical reasons**, and the principled fix **removes** a heuristic (the global-stomp) rather
+than adding one — squarely the [address-table-of-truth] directive.
+
+**Evidence (the L3a-fix run, /tmp/m0_qemu.log + guest dmesg):**
+- Guest dmesg ground truth: `scrubberDestruct: Timed out` (132s) → `nvAssertFailedNoLog:
+  pCeUtils->lastCompletedPayload == lastSubmittedPayload @ ce_utils.c:349` (136s).
+- CE-INSTR census: the timing-out scrubber traffic is **client `0xc1d00001`** (the guest-RM
+  kernel CeUtils — ch[3]×125, ch[7]×213, plus ch[4..10]); the forge only EVER fired for
+  `0xc1e00007` (the cuCtxDestroy CeUtils): `FORGE-RESOLVE` once, `FORGE` ×58, all done by log
+  line 361774 — well before teardown.
+- The scrubber's parsed `CE_SEM_RELEASE`s target a **shared tracking sema at `0x121000010`/
+  `0x121000000`**, NOT the per-channel finishPayload at `gpfifo_va+0x8004` (e.g. ch[7]
+  gpfifo=`0x1210d0000` → finishPayload `0x1210d8004`). Distinct semaphores.
+- Open-driver confirm: the kernel CeUtils channel buffer (and thus its finishPayload) is
+  **SYSMEM by default** (`NV01_MEMORY_SYSTEM`/NCOH; `mem_utils_gm107.c`), unlike `0xc1e00007`'s
+  VIDMEM ring. finishPayload is the channel-HOST semaphore released per GP entry
+  (`channelWaitForFinishPayload` polls exactly it) — NOT a pushbuffer CE method.
+
+**Two mechanical bugs (both fixed):**
+1. **WRONG GATE.** The old forge fired only when M5.16 had pinned a VIDMEM ring
+   (`s->chan_gpfifo_phys != 0`). The scrubber resolves through its OWN VAS (`chan_pdb != 0`), so
+   M5.16 never runs for it → `chan_gpfifo_phys` stays 0 → gate failed → never forged.
+2. **WRONG SKIP.** `if (chan_sem_released) continue;` ran FIRST and skipped the finishPayload
+   completion for any scrubber whose tracking-sema release (`0x121000010`) we parsed — but that
+   release does not advance the finishPayload.
+
+**Fix (implemented this session, gpu_emul doorbell loop):** generalise the L1 forge —
+- Resolve the finishPayload **per-channel through the channel's own VAS** via
+  `nvkvm_chan_own_pdb_rs()` (the same authoritative root `chan_translate` uses), walking
+  `gpfifo_va + 0x8004`; **aperture-aware** write via `nvkvm_phys_rd32/wr32` (SYSMEM *or* FB).
+  The M5.16 bar1off shortcut stays as a fallback for the VIDMEM-ring channel.
+- Run the completion **before** the `chan_sem_released` continue for kernel CeUtils channels
+  (client != GR, !user-CE). Forward-only (`cur < fin_payload`), pinned once per channel
+  (`c->fin_fb` + new `c->fin_sys`).
+- Gated on `m2trace` for this validation iteration (the #12 repro runs `NVKVM_M2TRACE=1`);
+  graduate the own-VAS path to default-on after a cup8/LLM no-regression run.
+
+This unifies L1 + L3b into one correct per-channel rule (no global stomp, no second heuristic),
+and — with L3a (WPR2-down) + L3c (INIT_DONE re-post) already landed — should let the 2nd
+cuCtxCreate re-acquire complete. Validation: `m12_forge_orch.sh` cupctx2 (in progress).
+
+---
+
+## UPDATE cont. 12 (2026-06-21) — BENCHED: forge generalised + L2/L3c CONFIRMED; the wall MOVED
+
+Ran cupctx2 with the cont.11 fix (build verified, fresh boot). Results re-frame #12.
+
+**What now works (proven in the CTX2 re-acquire trace + guest dmesg):**
+- **Forge generalisation lands.** 434 `#12 FORGE` writes now cover the kernel CeUtils scrubber
+  (client `0xc1d00001`, ch[3..10]) — previously ZERO. Resolution per-channel, pinned. (Apertures:
+  `0xc1e00007`/`0xc1e00008` resolve via own-VAS to SYS; `0xc1d00001`/`0xc1d0000a` via the BAR1
+  shortcut to FB. **cont.12 follow-up:** reordered to BAR1-PRIMARY / VAS-FALLBACK so we never
+  regress the PROVEN L1 `0xc1e00007` FB page `0x31f8004` — its own-VAS walk resolves to a
+  DIFFERENT sysmem alias `0x14f26c004`, NOT where the guest reads it.)
+- **L2 confirmed.** CTX2 re-boot raises WPR2: `M3: GSP STARTCPU -> FWSEC ran, WPR2 up`.
+- **L3c confirmed.** `M3: posted GSP_INIT_DONE (seqNum 916)` — the PRESERVED/continuing seqNum
+  (first boot was seqNum 0; CTX1 ran the queue to stat_seq=915), exactly as the seqNum-persist
+  analysis predicted. So the re-post carries the right seqNum.
+
+**The scrub timeout is NON-FATAL — it was never the rc=124 hang.** `scrubberDestruct` breaks out of
+its wait on timeout and `nvAssertFailedNoLog` only logs (`ce_utils.c:349`); `[CTX1] CTX DESTROY OK`
+prints regardless. So L3b is a 4 s detour + cosmetic assert, NOT the deadlock. (The forge still
+does not fully silence it — the scrubber's BAR1-resolved page is alias-prone and the per-channel
+gp_get count may undershoot the guest's lastSubmittedPayload — but that is cosmetic, deprioritise.)
+
+**THE REAL WALL (rc=124): the CTX2 GSP re-acquire INIT_DONE handshake.** After we post INIT_DONE
+(seqNum 916), the guest issues **zero** GSP RPCs. The entire post-INIT_DONE window (682 BAR0 ops)
+is **100% SEC2 falcon**: ~316× `0x840118` DMATRFCMD (Booter ucode DMA-load), status polls
+(`0x8403c0`/`0x8400f4`), then `MAILBOX0/1=0xff` + STARTCPU = **SEC2 Booter Unload** → WPR2 down →
+guest stalls (only AHCI IRQ noise after). I.e. the guest does NOT accept the re-boot: instead of
+proceeding past INIT_DONE it runs the Booter **Unload** (teardown) and gives up.
+
+Open question for next session (this is L2/L3c boundary, NOT L3b/scrub):
+1. Is our GSP-falcon-FWSEC re-boot model (L2: raise WPR2 on a suspended-state `0x110118` DMATRFCMD)
+   even the right mechanism for re-acquire? The FIRST boot used GSP-falcon FWSEC and touched SEC2
+   ZERO times; the RE-acquire is ALL SEC2 Booter. Perhaps on re-acquire WPR2 must be (re)established
+   by the **SEC2 Booter LOAD**, and our premature GSP-falcon "WPR2 up" + INIT_DONE post is the lie
+   the guest rejects → it runs Booter Unload to undo and bails.
+2. Does the guest actually CONSUME our INIT_DONE re-post? Verify rxReadPtr/rxSeqNum at the moment of
+   the post vs what the guest reads (instrument the msgq read). seqNum 916 is posted, but position/
+   queue-header state after `GspStatusQueueInit` on re-boot may not match where the guest reads.
+3. Distinguish SEC2 Booter LOAD vs UNLOAD on re-acquire more robustly than `mbox0==0xff` — if the
+   re-acquire LOAD path also transiently writes 0xff, L3a is mis-firing a WPR2-down mid-boot.
+
+Status: forge-generalisation + BAR1-primary committed (gated on m2trace, no production path).
+#12 still hangs; the wall is now the re-acquire boot-sequence model, not the scrubber.
