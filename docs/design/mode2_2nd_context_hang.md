@@ -1150,3 +1150,40 @@ does a DMAW land in CTX2's guest-phys channel page, and to what value vs targetP
 (address-table-aligned): write CTX2's finishPayload into the guest SYSMEM channel-buffer page (DMAW
 path) via the per-channel forward-populated table; retire the FB content-scan forge. ★read the open
 driver BEFORE inferring from traces.
+
+---
+
+## cont.21 (2026-06-21) — log-confirmed mechanism: CeUtils 0xc1e00007 is a SINGLETON; forge froze at payload 85; nothing re-fires it for CTX2 (no usermode doorbell after CTX1)
+
+Verified against the same run's qemu log:
+- **Last `#12 FORGE` = line 365517, payload 85, channel `0xc1e00007` (gpfifo 0x120064000).** AFTER that:
+  ZERO `chan_exec gpfifo=0x120064000`, ZERO work-doorbells `WR 0xbb0090`, ZERO forge writes — all the
+  way to the spin at 432035.
+- The forge loop (and `chan_exec`) is driven by the **usermode work-doorbell `0xbb0090`**. CTX1's
+  matmul rings it constantly, so CTX1's kernel CeUtils scrubs on `0xc1e00007` got executed + forged
+  (payload→85). CTX2's `cuCtxCreate` runs scrubs **before any usermode compute**, so `0xbb0090` is
+  never rung → the doorbell loop never runs → the forge never advances `0xc1e00007` past 85.
+- The pre-spin scrub-like DMAW activity (page-zero + counter bumps at gpa 0x140c4xxxx) comes through
+  the **fn=10/RPC path**, not `chan_exec` — i.e. a different code path that does NOT touch the per-
+  channel finishPayload forge.
+
+**Mechanism (high confidence): CeUtils is a per-GPU SINGLETON** (the scrubber channel `0xc1e00007`
+persists across contexts; finishPayload is monotonic). CTX1's compute drove it to 85 via the
+usermode-doorbell-gated forge. CTX2's create-time scrub raises `targetPayload` above 85 but our forge
+is **only re-fired by the usermode doorbell**, which CTX2's create never rings → finishPayload frozen
+at 85 → `channelWaitForFinishPayload(target>85)` spins until the 90s test kill.
+
+**Why this is the real shape (ties cont.18/19/20 together):** it is NOT os-event delivery (osevent_n=0),
+NOT a GSP re-boot, NOT 0x110094. It is a **completion-forwarding gap**: our finishPayload advance is
+coupled to the wrong trigger (usermode work-doorbell) instead of to the actual scrub submission. The
+FB-vs-sysmem aperture question (cont.20) matters for WHERE to write, but the primary defect is WHEN/
+WHETHER we advance it at all for a kernel scrub submitted outside the usermode doorbell path.
+
+**NEXT EXPERIMENT (instrument + rerun, precise):** add emulator logging that fires on EVERY channel
+submission path (not just `0xbb0090`): for the kernel CeUtils ring, log {client, gpfifo_va, the
+doorbell/RPC that submitted it, gp_put, resolved finishPayload phys+aperture, current value,
+targetPayload}. Re-run cupctx2; confirm CTX2's `cuCtxCreate` raises `0xc1e00007` targetPayload>85 and
+that no path advances it. **FIX direction:** advance (forge/forward) the CeUtils finishPayload on the
+SCRUB SUBMISSION itself (the kernel doorbell / GSP work-submit for `0xc1e00007`), decoupled from the
+usermode `0xbb0090` — landing it in the aperture the guest's pbCpuVA reads (cont.20). Then retire the
+content-scan forge in favour of the per-channel forward-populated table.
