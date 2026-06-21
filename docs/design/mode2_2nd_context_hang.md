@@ -897,3 +897,48 @@ Open question for next session (this is L2/L3c boundary, NOT L3b/scrub):
 
 Status: forge-generalisation + BAR1-primary committed (gated on m2trace, no production path).
 #12 still hangs; the wall is now the re-acquire boot-sequence model, not the scrubber.
+
+---
+
+## UPDATE cont. 16 (2026-06-21) — ★ MAJOR REFRAME: the "re-acquire" was POST-KILL teardown
+
+Three benched runs (cont.13/14/15) tried to model the CTX2 GSP re-acquire boot sequence
+(defer WPR2 / post INIT_DONE / SEC2 Booter Load-Unload re-key).  None fixed #12 — and chasing
+*why* exposed that **the whole L2/L3c/cont.1x "WPR2 re-boot" line has been modeling the wrong
+event.**  The fn-47 + FWSEC-SB + SEC2 Booter Unload sequence is **post-SIGKILL teardown cleanup**,
+NOT the re-acquire.
+
+**Proof (cont.15 log + guest dmesg, ground truth):**
+- `kgspBootstrap_TU102` (cold/re-boot) = Scrubber → FWSEC → ResetIntoRiscv → ProgramLibosBootArgs
+  → **BooterLoad** → SendInitRpcs → check RISCV active → GspStatusQueueInit → **WaitForRmInitDone**.
+  `kgspTeardown_TU102` (driver UNLOAD) = GSP reset → **FWSEC-SB** ("put back PreOsApps during driver
+  unload") → **Booter Unload**.  The observed re-acquire window (GSP-falcon STARTCPU + SEC2 Booter
+  UNLOAD, mbox0=0xff) is `kgspTeardown`, not `kgspBootstrap`.
+- **Only ONE fn-47 (UNLOADING) in the entire log.**  CTX1's cuCtxDestroy did NOT send it -> CTX1
+  destroy did NOT unload the GSP; the GSP stayed loaded for CTX2.
+- **Last real compute (forge/CE-INSTR) = line 365552.**  Then ~75K lines of **busy-polling GSP reg
+  0x110094 (returns 0)** + occasional GSP RPCs, up to fn-47 at line 440331.
+- **`scrubberDestruct` timed out at guest-time 161s** — AFTER the 120s `timeout` SIGKILL of cupctx2.
+  In the driver, scrubberDestruct precedes `kgspUnloadRm`(fn-47)→`kgspTeardown`(FWSEC-SB+Unload).
+  So fn-47 + FWSEC-SB + Booter Unload (440331-442021, the END of the log) happen at ~161-165s =
+  **post-kill**.  The "2nd FWSEC ran / WPR2 up / Booter" activity prior sessions saw was ALWAYS this
+  post-kill teardown.
+
+**REFRAMED #12:** CTX2 `cuCtxCreate` hangs **busy-polling GSP register 0x110094** (BAR0, returns 0),
+waiting for a GSP completion/response the emulation never delivers.  The GSP is NOT re-booted on
+CTX2 (it stayed loaded since CTX1).  So: NOT a WPR2/Booter/INIT_DONE re-boot problem at all.
+
+**Status / actions:**
+- Reverted cont.13/14/15 (they modeled post-kill teardown as a re-boot); HEAD back at `5f74fc8`
+  (the per-channel finishPayload forge generalisation — kept, it is a real improvement and the scrub
+  timeout is non-fatal regardless).
+- L1 (finishPayload), L3a (Booter-Unload→WPR2-down), L3c (INIT_DONE re-post) all operate on the
+  post-kill teardown and are MOOT for the actual hang (harmless; can stay).
+
+**NEXT (real wall):** find what CTX2 `cuCtxCreate` polls 0x110094 for.  Identify the GSP RPC the
+guest issues during the SECOND context's create that goes unanswered (or whose completion/interrupt
+we never deliver) — between the end of CTX1 (line ~365552) and the kill.  0x110094 is the GSP reg
+the guest spins on for GSP responses (same reg as the per-token vmexit storm, see
+[[mode2_execfwd_layer2]]).  Diff the RPC/interrupt sequence of CTX1's cuCtxCreate (works) vs CTX2's
+(hangs) — the first divergence is the bug.  ★ Re-run with a SHORTER body but capture the 0x110094
+poll context + the last guest RPC before the spin; do NOT analyse past the kill.
