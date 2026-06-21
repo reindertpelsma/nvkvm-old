@@ -942,3 +942,124 @@ the guest spins on for GSP responses (same reg as the per-token vmexit storm, se
 [[mode2_execfwd_layer2]]).  Diff the RPC/interrupt sequence of CTX1's cuCtxCreate (works) vs CTX2's
 (hangs) — the first divergence is the bug.  ★ Re-run with a SHORTER body but capture the 0x110094
 poll context + the last guest RPC before the spin; do NOT analyse past the kill.
+
+---
+
+## cont.17 (2026-06-21) — host-log forensics CORRECT cont.16: the spin is a leaf-poll WAIT (sysmem completion), NOT a 0x110094 poll
+
+Mined the live cupctx2 qemu log (`/tmp/m0_qemu.log`, 487431 lines, the run that produced the
+161s `ce_utils.c:349` assert). cont.16 said CTX2 "busy-polls 0x110094"; the trace says otherwise.
+
+**What the spin actually is.** The hang region (lines ~367400→429786, ~62K lines) is ONE tight loop:
+```
+RD off=0x000000 -> 0x176000a1     ; PMC_BOOT_0 = osIsGpuLost liveness check (valid id => alive)
+RD off=0xb81008 (LEAF2) -> 0
+RD off=0xb8100c (LEAF3) -> 0
+RD off=0xb81010 (LEAF4) -> 0x08000000   ; vec155 bit27 SET but STALE (see below)
+RD off=0xb81014 (LEAF5) -> 0
+RD off=0xb81018 (LEAF6) -> 0
+RD off=0xb8101c (LEAF7) -> 0
+```
+0x110094 is read only **866× in the whole log** and the bulk are early GSP boot (line ~2397); in the
+spin region it appears ~23× total. So 0x110094 is NOT the spin. The spin is PMC_BOOT_0 + INTR LEAF.
+
+**It is NOT an interrupt service routine.** (1) TOP (`0xb81600`) is read only **10× in the entire
+log**, last at line 360312 (=0x4, subtree-2 pending) — after 360312 the guest NEVER reads TOP again.
+A real NVIDIA stall-ISR reads TOP first. (2) The guest NEVER writes LEAF4 (`0xb81010`) to RW1C-clear
+bit27 — **0 writes in the whole log**. So vec155/bit27 (our GSP SWGEN0, set at the last pre-teardown
+delivery @360312) is left STALE; the guest is not servicing it. The leaf reads are the kernel poll
+loop's *inline* liveness+interrupt sample, not a dispatch.
+
+**The emulator is 100% IDLE during the spin.** Lines 367400→429700: **zero** non-BAR0 trace lines —
+no `M4: RPC`, no status post, no `M7: SWGEN0`, no doorbell (`0xbb0090`), no `M5: chan_exec`,
+stat_wp frozen at 10. So the guest is NOT waiting on a GSP RPC response (it got every one; last was
+fn=10/seq=834 NV_OK @365827) and is NOT submitting new work. It is **polling a SYSMEM completion**
+(a semaphore in guest RAM — those reads do NOT appear in the MMIO trace), and we never advance it.
+
+**Last real work before the spin = CTX1 cuCtxDestroy teardown:** an fn=10 (FREE) RPC loop (seq
+~825→834), each iteration DMA-writing guest-mem counters (`0x140c41010`→0xb, `0x140c41020`→0x2d);
+CTX1 os-events (client `0xc1d00003`) freed 3→2→1→0 @365583-365601; last `M5: chan_exec` @365545 was
+`gpfifo=0x120064000` (the CTX1 CeUtils scrub channel `0xc1e00007`, cont.11) gp_put=85.
+
+**Guest dmesg (this exact run) shows ONLY the post-kill artifact:** `scrubberDestruct: Timed out` +
+`nvAssertFailedNoLog: pCeUtils->lastCompletedPayload == lastSubmittedPayload @ ce_utils.c:349` at
+**161s** (> the 120s SIGKILL). No kernel message for the actual hang ⇒ it is a userspace/kernel
+busy-WAIT, not a kernel timeout — consistent with the sysmem-semaphore poll above.
+
+**Corrected diagnosis:** CTX2 hang = the guest polls a **sysmem completion (CeUtils finishPayload
+semaphore) that the emulator never releases to the expected value**. The same CeUtils is what times
+out in teardown at `ce_utils.c:349`. This is a **finishPayload-completion gap** (cont.11's forge was
+the right track but does NOT cover this final payload) — NOT a 0x110094 GSP-poll, NOT an ISR miss,
+NOT a GSP re-boot. The forge (cont.11) covers CTX1's scrub but the monotonic target the guest awaits
+is never met (alias-prone BAR1 page / gp_put undershoot noted in cont.12).
+
+**OPEN (needs guest-side correlation — the one thing the host log cannot show):** is the wait the
+TAIL of CTX1 `cuCtxDestroy` (scrubberDestruct, which SHOULD break at 4s — so why 120s?) or the START
+of CTX2 `cuCtxCreate` (a fresh CeUtils scrub of the new ctx)? Disambiguate by capturing cupctx2
+STDOUT: does `[CTX1] CTX DESTROY OK` print (⇒ hang is in CTX2 create) or not (⇒ hang is CTX1
+destroy)? That single boolean picks the fix site. ★ NEXT EXPERIMENT: fresh boot, run cupctx2 with
+full stdout saved + (optionally) a kernel trace of the CeUtils finishPayload poll site; correlate the
+stdout boundary with the qemu-log spin start.
+
+---
+
+## cont.18 (2026-06-21) — DEFINITIVE: hang is CTX2 cuCtxCreate waiting on an UNDELIVERED GSP os-event (SWGEN0), not a CE scrub
+
+Fresh instrumented repro (cupctx2 N=256, full stdout captured). The stdout settles every prior
+ambiguity:
+```
+[CTX1] ... RESULT bad=0 -> PASS        ; CTX1 compute CORRECT
+[CTX1] CTX DESTROY OK                   ; CTX1 fully torn down, clean
+[CTX2] cuCtxCreate...                   ; LAST line printed, then rc=124 (hang)
+```
+So: **CTX1 fully works (compute + clean destroy); the hang is unambiguously inside CTX2
+`cuCtxCreate`** (`[CTX2] CTX OK` never prints). The test's inline comment calling cuCtxSynchronize
+"the #12 hang point" is MISLEADING — the hang is earlier, in create.
+
+**The 4s CE-scrub timeout is NOT the 90s hang (kills the cont.11/L1 finishPayload theory for #12).**
+Guest dmesg shows only `scrubberDestruct: Timed out ... ce_utils.c:349` at **131s** (>90s SIGINT) =
+post-kill teardown. That wait's timeout is **4000 ms** (`_threadNodeCheckTimeout: Timeout was set to
+4000 msecs`), so it BREAKS at 4s — it cannot be the source of a 90s hang. The finishPayload forge
+(cont.11) fired 372× and the qemu log shows NO scrub timeout during the run; CTX1's CeUtils is fully
+covered. #12 is a *separate, ~indefinite* wait.
+
+**What CTX2 actually waits on (qemu-log forensics):**
+- Spin region lines 432035→442363 (~10K lines): the SAME bare poll loop as cont.17 — `RD 0x0`
+  (PMC_BOOT_0 = osIsGpuLost liveness) + `RD 0xb81008..b8101c` (INTR LEAF2-7), leaf4=0x08000000
+  (vec155/SWGEN0 bit27 STALE-set), never RW1C-cleared, TOP (0xb81600) never read. = an indefinite
+  *interrupt/event* wait, NOT an ISR, NOT a 0x110094 GSP-queue poll.
+- **Emulator is 100% idle during the spin** (0 non-BAR0 trace lines): no RPC, no `M5: chan_exec`,
+  no doorbell (0xbb0090), no `M7: delivered os-event`.
+- Last RPC before spin = `fn=76 cmd=0x20800a38` = `NV2080_CTRL_CMD_INTERNAL_GR_GET_FECS_TRACE_HW_ENABLE`
+  (a GR/FECS internal control, part of GR-context setup in cuCtxCreate), answered with the golden
+  24-byte `ctl_20800a38` reply (status=0). Appears EXACTLY ONCE in the whole log (unique to CTX2).
+  The guest got a valid answer, then waits for an event.
+
+**Root-cause mechanism (os-event/SWGEN0 delivery, gpu_emul.c):**
+- `nvkvm_gsp_deliver_events()` (≈L1541) posts a POST_EVENT per registered os-event + `raise_swgen0`
+  (sets leaf4 bit27 vec155 + MSI). It is **gated**: `if (gsp_swgen0_pending) return;` (≈L1553), and
+  is **called from exactly ONE site** — the work-doorbell handler, only when a channel completed
+  (`any_completed`, ≈L3546). `gsp_swgen0_pending` is set true by raise (L1524) and cleared (L3619)
+  only when the guest writes FALCON IRQSCLR `0x110004` bit6 during kgspService.
+- **Log proof of the poison:** the LAST `raise_swgen0` is line 360163 (pending→true); the guest's
+  LAST IRQSTAT (0x110008) read is line 360110 — BEFORE that raise. After 360163 the guest never
+  reads IRQSTAT and never clears (0 writes to `0x110004` in the entire log). So
+  **`gsp_swgen0_pending` is stuck TRUE for all of CTX2** — and there are ZERO work-doorbells after
+  360163, so `deliver_events` is never even invoked for CTX2.
+
+**Two compounding gaps (either alone can hang CTX2):**
+- **(A) Stuck gate.** CTX1's final raise (360163, for events that are then freed at the
+  osevent_drop @~365k) leaves `gsp_swgen0_pending` permanently true → blocks every future delivery.
+- **(B) Missing trigger.** `deliver_events` only fires on a work-doorbell completion; CTX2's
+  cuCtxCreate registers an os-event and waits BEFORE submitting any work-doorbell, so the trigger
+  never fires.
+
+**FIX DIRECTION (next session):** make GSP os-event delivery robust to the 2nd-context case.
+Candidates, cheapest first: (1) clear `gsp_swgen0_pending` when `osevent_n` drops to 0 in
+`nvkvm_m2_osevent_drop` (a stale pending for freed events must not poison the next context); (2)
+add a delivery trigger independent of work-doorbells (e.g., deliver on os-event REGISTER, or when a
+GSP RPC that the guest will block-wait on is answered); (3) re-raise SWGEN0 if events are pending
+but the gate has been closed with no guest IRQSTAT activity. **VERIFY-FIRST instrumentation:** log
+(a) every os-event REGISTER (hclient/hevent) and (b) every `deliver_events` EARLY-RETURN (gate hit)
+vs actual delivery — re-run cupctx2 to confirm CTX2 registers an event and the gate/trigger is the
+blocker, THEN pick the fix. Do NOT analyse past the SIGINT (131s teardown).
