@@ -1104,3 +1104,49 @@ guest open driver (nvidia/src/.../ce_utils.c) to capture the VA/aperture + expec
 it spins on during CTX2 cuCtxCreate; then fix the forge to land THAT sysmem location (or forward the
 real CE method release to it). Guest driver source is mounted at /usr/src/nvidia-580.159.04.
 ★ Don't analyse past the SIGINT.
+
+---
+
+## cont.20 (2026-06-21) — open-driver source (channel_utils.c/ce_utils.c) GROUNDS the diagnosis: the spin IS channelWaitForFinishPayload; finishPayload is SYSMEM read via pbCpuVA; the #12 forge's FB target is the WRONG aperture (real path = DMAW-to-sysmem)
+
+Read the guest open driver (it's mounted /usr/src/nvidia-580.159.04 AND vendored research_clones/ogkm)
+instead of inferring from MMIO. This should have been done first (cont.18 lesson, doubled). Findings:
+
+**The spin is `channelWaitForFinishPayload` (channel_utils.c:344).** One loop:
+```
+gpuSetTimeout(GPU_TIMEOUT_DEFAULT, BYPASS_THREAD_STATE);
+while(1){ if (READ_CHANNEL_PAYLOAD_SEMA(ch) >= targetPayload) break;
+          if (gpuCheckTimeout()==TIMEOUT) break;
+          if (rmGpuLockIsOwner) channelServiceScrubberInterrupts(ch); else osSchedule(); }
+```
+This UNIFIES cont.17/19's two rival reads: the invisible part is `READ_CHANNEL_PAYLOAD_SEMA` (a
+sysmem MEM_RD32, below) and the INTR-LEAF2-7 reads are `channelServiceScrubberInterrupts` →
+`intrServiceStallList` INSIDE the same loop. PMC_BOOT_0 = gpuCheckTimeout/osIsGpuLost. So the spin
+is NOT a separate interrupt-wait and NOT a 0x110094 poll — it is this finishPayload poll.
+
+**The poll target + aperture (channel_utils.h:116, channel_utils.c:276-285):**
+`READ_CHANNEL_PAYLOAD_SEMA(ch) = channelReadChannelMemdesc(ch, ch->finishPayloadOffset)
+ = MEM_RD32(ch->pbCpuVA + finishPayloadOffset)`. pbCpuVA is a CPU mapping of
+`pChannelBufferMemdesc`; the kernel CeUtils channel buffer is **SYSMEM** (cont.11) — which is why
+the spin shows ZERO BAR1 reads (the guest reads its own RAM, untrapped). The GPU writes the SAME
+location via `pbGpuVA + finishPayloadOffset` (NVC8B5_SET_SEMAPHORE_A/B, channel_utils.c:671). Layout
+(mem_mgr.c:2236): semaOffset = channelPbSize + GPFIFO_SIZE; finishPayloadOffset = semaOffset + 4
+(CHANNEL_HOST_SEMAPHORE_SIZE=4). So finishPayload = gpfifo_va + 0x8004 — the offset the forge already
+uses; the bug is the APERTURE, not the offset.
+
+**Reframed root cause (forge writes wrong aperture):** in Mode-2 the host GPU's CE writes HOST memory,
+so the emulator must land the completion in the GUEST's copy of the channel buffer = the guest sysmem
+page that pbCpuVA reads. The correct mechanism is the **`M5.15 DMAW gpa=...`** path (emulator writes
+the guest physical page). The `#12` forge writes **FB `0x31f8004`** (vidmem) — a DIFFERENT aperture —
+which is exactly why every forge logs `FB 0->N` with OLD value ALWAYS 0 (it writes a page the guest
+never reads). CTX1 completes via the DMAW-to-sysmem path (not the forge); CTX2's finishPayload never
+reaches targetPayload in its guest sysmem page.
+
+**Open (now NARROW): why CTX2's sysmem finishPayload falls short** — (i) emulator stops executing
+CTX2's scrub submissions, or (ii) CTX2's completion is routed through the FB forge instead of the
+sysmem DMAW, or (iii) CTX2's channel-buffer guest-phys page isn't resolved the way CTX1's was. NEXT =
+instrument/trace the emulator's write to `finishPayloadOffset` (gpfifo_va+0x8004) for CTX2's channel:
+does a DMAW land in CTX2's guest-phys channel page, and to what value vs targetPayload? FIX direction
+(address-table-aligned): write CTX2's finishPayload into the guest SYSMEM channel-buffer page (DMAW
+path) via the per-channel forward-populated table; retire the FB content-scan forge. ★read the open
+driver BEFORE inferring from traces.
