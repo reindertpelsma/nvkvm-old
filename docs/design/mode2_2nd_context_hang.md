@@ -1063,3 +1063,44 @@ but the gate has been closed with no guest IRQSTAT activity. **VERIFY-FIRST inst
 (a) every os-event REGISTER (hclient/hevent) and (b) every `deliver_events` EARLY-RETURN (gate hit)
 vs actual delivery — re-run cupctx2 to confirm CTX2 registers an event and the gate/trigger is the
 blocker, THEN pick the fix. Do NOT analyse past the SIGINT (131s teardown).
+
+---
+
+## cont.19 (2026-06-21) — CORRECTION to cont.18: os-event delivery is RULED OUT (osevent_n=0 for CTX2); the wait is a SYSMEM completion, target invisible to the host log
+
+cont.18 concluded "undelivered GSP os-event (SWGEN0)". That was PREMATURE — I reasoned from the
+delivery code without checking whether CTX2 registers any os-event. It does not. Corrected facts:
+
+**os-event delivery is NOT the CTX2 hang cause.** The register site already traces every
+NV01_EVENT_OS_EVENT (0x0079). In the log: ALL os-events are client `0xc1d00003`, in two batches
+(#1-7 reg@146374-248882 drop@250944-255353; #1-3 reg@353128-353966 drop@365548-365566). **The last
+drop brings osevent_n to 0 at line 365566, and ZERO os-events are registered after that** (the spin
+is at 432035). So during CTX2's create/spin `osevent_n==0`, and `nvkvm_gsp_deliver_events`
+early-returns at its FIRST line (`if (osevent_n<=0) return`) — it never reaches the
+`gsp_swgen0_pending` gate. The gate/trigger gaps (cont.18 A/B) are real code smells but are NOT this
+bug. (Leaving cont.18's top-line as the diagnosis would mislead — hence this correction.)
+
+**What IS confirmed (still solid from cont.18):** hang is CTX2 `cuCtxCreate` (CTX1 fully works:
+compute PASS + clean destroy); the wait is ~indefinite (90s, not the 4s scrubberDestruct).
+
+**What the wait is (narrowed, but target is host-log-invisible):**
+- During the spin (432035→442363): **no BAR1 reads at all** + emulator 100% idle + osevent_n=0.
+  The bare poll loop is only PMC_BOOT_0 (liveness) + INTR LEAF2-7 (timeout/interrupt housekeeping).
+  ⇒ the guest is polling a **SYSMEM location** (guest RAM — NOT in the MMIO trace), i.e. a CeUtils/
+  channel **finishPayload semaphore in sysmem**, waiting for a release that never lands.
+- **Forge wrong-aperture smell:** the #12 forge writes the finishPayload to **FB** `0x31f8004`
+  (`finPHYS`), but every forge logs `FB 0->N` with OLD value ALWAYS 0 (0->80,0->81,...0->85) — the
+  FB page it writes reads 0 each time, i.e. nothing accumulates there. Meanwhile cont.11 notes the
+  kernel CeUtils channel buffer is **SYSMEM by default**. Strong hypothesis: the guest's REAL
+  finishPayload is in sysmem and the forge has been writing to an unrelated/aliased FB page — a
+  no-op from the guest's view. CTX1 still completes because its scrub is satisfied by the actual CE
+  **method** semaphore (the `M5.15 DMAW` counter releases at 0x140c41010/0x140c41020), not the
+  forge; CTX2's create-time scrub waits on the finishPayload the forge fails to land.
+
+**Why the host log is now EXHAUSTED:** the wait target is a sysmem poll (guest RAM reads don't trap),
+so no amount of qemu-log mining can reveal the exact address/value. **The definitive next step is
+GUEST-SIDE instrumentation:** ftrace / printk the CeUtils `channelWaitForFinishPayload` poll in the
+guest open driver (nvidia/src/.../ce_utils.c) to capture the VA/aperture + expected-vs-actual payload
+it spins on during CTX2 cuCtxCreate; then fix the forge to land THAT sysmem location (or forward the
+real CE method release to it). Guest driver source is mounted at /usr/src/nvidia-580.159.04.
+★ Don't analyse past the SIGINT.
