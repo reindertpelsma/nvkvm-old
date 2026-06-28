@@ -1187,3 +1187,41 @@ that no path advances it. **FIX direction:** advance (forge/forward) the CeUtils
 SCRUB SUBMISSION itself (the kernel doorbell / GSP work-submit for `0xc1e00007`), decoupled from the
 usermode `0xbb0090` — landing it in the aperture the guest's pbCpuVA reads (cont.20). Then retire the
 content-scan forge in favour of the per-channel forward-populated table.
+
+---
+
+## cont.22 (2026-06-28) — MINIMAL repro (create→destroy→create, NO compute) reproduces #12: the hang is in CTX2's GR-context SETUP, not compute (refutes cont.21's cause)
+
+Built `tests/mode2/cupctx2_min.c` (cuCtxCreate→cuCtxDestroy×2, no module/H2D/launch/sync) +
+`scripts/mode2_diag/cupctx2_min_run_guest.sh`. Fresh boot, current build (no emulator change).
+Result — hangs IDENTICALLY:
+```
+[CTX1] CTX OK → [CTX1] CTX DESTROY OK → [CTX2] cuCtxCreate...  (rc=124)
+```
+**So #12 does NOT need CTX1 compute — bare create→destroy→create reproduces it.** This REFUTES
+cont.21's stated CAUSE ("CTX1 matmul drove the singleton to 85"): there were ZERO matmul doorbells
+(`0xbb0090` count = 0 the whole run). The forge still reached payload **84** on `0xc1e00007` — driven
+purely by CTX1's create/destroy scrubs — so the frozen-singleton OUTCOME holds; the trigger was
+create/destroy, not compute. `cupctx2_min` is now the canonical, faster #12 repro.
+
+**Clean-log forensics (minimal run):** last forge = line 361804 (payload 84, `0xc1e00007`); last
+`chan_exec` on it = 361795 (gp_put=84). CTX2's create activity (361810→spin) is:
+- CTX1 teardown: `fn=10` FREE ×38 + `M5.49 ctx-free drop` of clients `0xc1d00003`, `0xc1d0000a`,
+  `0xc1e00008`.
+- CTX2 GR-context setup: `fn=76` controls `0x20800a38` (GET_FECS_TRACE_HW_ENABLE), `0x20800a6c`,
+  `0x20800a70`×2; `M6: BAR2_BLOCK` rebind; `M5.31 GRPT-WR` (GR page-table writes); `fn=70`×1.
+- Then the spin. **ZERO `chan_exec`, ZERO `0xbb0090` doorbells in the whole window.**
+
+**Refined location:** the hang is in CTX2's **GR-context setup** (after FECS_TRACE + GR PT writes),
+in a `channelWaitForFinishPayload` whose completion the emulator never lands — and CTX2 submits NO
+work through a path we execute (`chan_exec`) before waiting. So either (i) the GR-ctx CE scrub is
+submitted via a path we don't execute/forge, or (ii) CTX2 waits on a finishPayload from a re-created
+CeUtils whose initial scrub we never run. The exact channel + targetPayload live in guest kernel
+memory (pChannel->lastSubmittedPayload, the sysmem sema) — NOT visible in the host trace.
+
+**NEXT (definitive): guest-side printk.** Add a print in the open driver's `channelWaitForFinishPayload`
+(channel_utils.c:344) logging {channel id/handle, targetPayload, READ_CHANNEL_PAYLOAD_SEMA current}
+each spin, rebuild the guest `nvidia.ko` (src mounted /usr/src/nvidia-580.159.04; current .ko in
+/home/ubuntu/nvmods), re-run `cupctx2_min`. That nails the exact channel + target CTX2 waits on →
+then land that completion (DMAW into the guest sysmem page pbCpuVA reads, per cont.20) on the right
+trigger. Host-log analysis is exhausted for this question.
