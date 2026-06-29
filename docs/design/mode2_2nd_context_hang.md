@@ -1342,3 +1342,61 @@ lands there) but is **necessary-not-sufficient**. The `fin_fb/fin_sys` struct fi
 
 **Tools added this cont:** `scripts/mode2_diag/m570_ctx2_fix_verify_host.sh` (fresh-boot +
 kprobe2 + forge-resolution verdict greps).
+
+---
+
+## cont.25 (2026-06-29) — GROUND TRUTH via guest OBJCHANNEL/memdesc kprobe: the hang channel reads its finishPayload through **BAR1 (vidmem)**, stuck at 0. cont.24 forged SYSMEM = wrong aperture (opposite direction).
+
+Built a register_kprobe that reads OBJCHANNEL fields by offsets computed from the open headers
+(`g_mem_mgr_nvoc.h` OBJCHANNEL, `g_mem_desc_nvoc.h` MEMORY_DESCRIPTOR) — validated in-run
+(`finishPayloadOffset=0x6c004 == channelPbSize 0x64000 + 0x8004`; `pbGpuVA=0x120000000 → gpfifo
+0x120064000` matches the emulator). Tool: `scripts/mode2_diag/cupctx2_min_kprobe3_guest.sh` +
+`m571_ctx2_groundtruth_host.sh`. The decisive field: `slow_virt_to_phys(pbCpuVA + finishPayloadOffset)`
+= the guest-physical address the read actually hits, plus `bUseBar1` and the live value.
+
+**Result (cupctx2_min, the 2 CeUtils channels):**
+```
+CTX1 chan (target 1,2):  bUseBar1=0  finGPA=0x12867a004 (SYSMEM)  CURVAL=1 then 2  -> COMPLETES
+CTX2 chan (target=84):   bUseBar1=1  finGPA=0x108824004 (BAR1)    CURVAL=0          -> HANGS
+```
+
+**=> ROOT CAUSE (ground truth, both semantics + aperture):**
+- The CTX2 CeUtils channel has **`bUseBar1 = NV_TRUE`** — `channelReadChannelMemdesc` maps the
+  channel buffer through **BAR1** (`TRANSFER_FLAGS_USE_BAR1`, channel_utils.c:272), so the finishPayload
+  lives in **VIDMEM (FB)** and the guest's poll `MEM_RD32(pbCpuVA+finishPayloadOffset)` is a **BAR1
+  read** that traps into the emulator and is served from an FB page. `slow_virt_to_phys` of that CPU VA
+  = **0x108824004** (a BAR1-window GPA), and its CURRENT value is **0** (needs 84).
+- cont.24's forge resolved the finishPayload VA to **SYSMEM 0x102626004** (cli_vas) and wrote there —
+  the guest never reads sysmem for this channel. **WRONG APERTURE, and the OPPOSITE direction** from
+  what cont.23/24 chased: the guest reads FB-via-BAR1, we wrote sysmem.
+- CTX1's CeUtils is `bUseBar1=0` (sysmem channel buffer); its finishPayload IS satisfied (CURVAL
+  tracks target) by the existing sysmem completion path — which is why only the *2nd* context (whose
+  CeUtils happens to come up `bUseBar1=1`) hangs. (Why CTX2's is BAR1 and CTX1's is sysmem: not yet
+  pinned down — likely BAR1 CPU-access availability differs after the 1st ctx's teardown; not blocking.)
+
+This VINDICATES cont.16/17's original BAR1→FB instinct (right aperture) and explains why cont.23's
+"BAR1→0x31f8004" still failed: that was a *scrubber's* page via the **stomped global
+`chan_gpfifo_bar1off`**, not this channel's. The aperture was right; the per-channel FB page was wrong.
+
+**THE FIX (well-scoped):** write `fin_payload` to the **FB page the guest's BAR1 finishPayload read
+resolves to** — i.e. `bar1_pdb` walk of the channel's finishPayload BAR1 offset
+(`chan_gpfifo_bar1off + (gpfifo_va & 0xfff) + 0x8004`, the cont.16/17 shortcut) using a **correct
+PER-CHANNEL `chan_gpfifo_bar1off`** (the struct field is global and gets stomped — comment at the
+`fin_fb` decl). The blocker to close: **M5.16 does NOT pin `chan_gpfifo_phys`/`chan_gpfifo_bar1off`
+for this c1e00007 CeUtils channel** (cont.24 showed `redir=0x0`, so the BAR1-relative mirror in
+`nvkvm_chan_sem_wr32` never fired). So:
+  (a) make the M5.16 ring resolution capture + store the gpfifo BAR1 base **per-channel** (in
+      `nvkvm_chan_entry`), set when the emulator resolves THIS channel's BAR1-written ring, and
+  (b) in the forge, for a `bUseBar1` kernel channel, resolve `bar1_pdb(per_chan_bar1off + 0x8004)` →
+      FB page and write `fin_payload` there (forward-only).
+  Alternative (more general, address-table-of-truth): capture the channel-buffer→BAR1 mapping from the
+  RM map RPC / BAR1 PTE writes, keyed by channel, and resolve from that.
+  VERIFY with the SAME kprobe: CTX2 `CURVAL` must reach 84 and `cupctx2_min` rc=0, then cup8/LLM/
+  PyTorch no-regress.
+
+**Note:** the kprobe's MEMORY_DESCRIPTOR walk gave junk (`addrSpace=0`, `pte[0]=0`) — those memdesc
+offsets are off (likely ListNode/checked-build padding) — but it does not matter: `bUseBar1` +
+`slow_virt_to_phys(pbCpuVA)` are the authoritative ground truth and both validated.
+
+**Tools added:** `scripts/mode2_diag/cupctx2_min_kprobe3_guest.sh`,
+`scripts/mode2_diag/m571_ctx2_groundtruth_host.sh`.
