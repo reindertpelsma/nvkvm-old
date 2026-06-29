@@ -1449,3 +1449,52 @@ scrubber's page (cont.23) → writing 84 there is a corruption risk that BLOCKS 
 + M5.16 capture + forge BAR1 write. The aperture mechanism is right; the ring-ID predicate needs to
 be deterministic. Tools: `scripts/mode2_diag/cupctx2_min_kprobe3_guest.sh`,
 `m572_ctx2_barfix_verify_host.sh`.
+
+---
+
+## cont.28 (2026-06-29) — REFRAME: the 2nd-ctx hang is a USERSPACE busy-poll in libcuda cuCtxCreate, NOT channelWaitForFinishPayload (which only fires at teardown). cwfp/cont.22-27 was a wrong turn.
+
+After the cont.26/27 BAR1 forge made the guest's finishPayload reach CURVAL=84 but cupctx2_min
+STILL rc=124, I stopped trusting the cwfp framing and instrumented the PROCESS directly
+(/proc/PID/stack, wchan, syscall + gdb), which the cwfp kprobe never did.
+
+**Ground truth (m574 hang-stack + m575 gdb bt + m576 ioctl-decode + m577 random sampling):**
+- The hung cupctx2_min main thread is **State=R (running), wchan=0, syscall=running, EMPTY kernel
+  stack** for the entire CTX2 `cuCtxCreate` — it is **busy-spinning in USERSPACE (libcuda)**, never
+  blocked in a kernel wait.
+- Random-interrupt sampling: **13 of 14 samples at the SAME userspace RIP** (a high/vDSO-region
+  addr, e.g. 0x7ffc…bb2) = a **tight spin-wait-with-timeout loop** (the lone `ktime_get_raw_ts64`
+  /clock read in the hang-stack fits: poll value, check clock, repeat).
+- gdb bt: the loop is under `cuCtxCreate_v2` -> several libcuda frames; caught variously in a
+  `memset` and in `ioctl`s.  The ioctl stream (m576) is a *progressing* setup sequence, NOT one
+  repeated control: RM_ALLOC (0x2b) of GR class 0xc7c0, CE class 0xc7b5, mem class 0x3e; RM_CONTROL
+  (0x2a) cmds 0x0080170d / 0x906f0101 / 0xc36f0108 / 0x20801218 / 0x00000d01; a 0x4e MAP — i.e.
+  cuCtxCreate makes forward progress through object setup, THEN enters the userspace busy-poll that
+  never completes.
+- **channelWaitForFinishPayload is a RED HERRING:** it is entered only at teardown
+  (consistently test-timeout + ~47s = the RM gpuCheckTimeout after SIGINT), NOT during the test.
+  cont.22/23 mistook "last cwfp logged" for "the hang."
+
+**=> ROOT CAUSE (reframed): a libcuda USERSPACE busy-poll in cuCtxCreate waits on a value/state the
+emulator never satisfies** (a correctness gap), so it spins until killed.  This MATCHES the older
+pre-cwfp framing — [[mode2_cuctxcreate_999_diagnosis]] (MC_SERVICE_INTERRUPTS / interrupt-delivery
+hang) and [[mode2_cuctxcreate_pagetable_poll]] (RM busy-walking GR VAS page tables).  The 1st context
+passes because its setup state is satisfied; the 2nd context's is not (something not reset/re-armed
+across teardown — interrupt delivery, a poll-sema, or a GR/page-table state).
+
+**Code state:** the cont.23-27 finishPayload BAR1 forge (chan_fin_ring_off capture + bar1_pdb write)
+is a real-but-SECONDARY completion (it correctly drove the teardown cwfp's CURVAL 0->84) — RE-GATED
+behind m2trace (cont.28) so it is NOT default-on (was briefly un-gated in cont.27; unvalidated).
+Zero default-path impact.  Keep it for when the teardown completion is needed post-fix.
+
+**NEXT (find the polled value — the actual #12 fix):**
+  1. Get the libcuda spin frame's caller (gdb `bt` full at the spin) + disassemble it to find the
+     LOAD address X it polls and the value it awaits.
+  2. Identify X's backing (sysmem GPA vs BAR/vidmem) and what should set it — likely an
+     interrupt/event completion or a GPU-written status the emulator must deliver for the 2nd ctx.
+  3. Cross-check against [[mode2_cuctxcreate_999_diagnosis]] (MC_SERVICE_INTERRUPTS) — the 2nd-ctx
+     interrupt/event arming may not be re-established after the 1st ctx tears down.
+  VERIFY: cupctx2_min rc=0 (CTX2 CTX OK) with a normal timeout, then cup8/LLM/PyTorch no-regress.
+
+**Tools added:** `scripts/mode2_diag/cupctx2_hangstack_guest.sh` (+m574),
+`cupctx2_gdb_guest.sh`, `cupctx2_ctrlpoll_guest.sh`, `cupctx2_sample_guest.sh`.

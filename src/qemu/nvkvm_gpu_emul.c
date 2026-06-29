@@ -3478,9 +3478,11 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
              * reverse-resolved — docs/design/mode2_address_table.md).  User-CE / GR
              * channels are excluded (the host executes + releases those for real).
              *
-             * Still gated behind m2trace for THIS validation iteration (the #12 repro runs
-             * with NVKVM_M2TRACE=1); graduate the own-VAS path to default-on after a
-             * cup8/LLM no-regression run.  See docs/design/mode2_2nd_context_hang.md. */
+             * cont.27→28: the finishPayload forge is a real-but-SECONDARY completion (cwfp
+             * only fires at teardown; cont.28 proved the actual 2nd-ctx hang is a userspace
+             * memset over a BAR1-mapped vidmem buffer, an MMIO-write perf wall — NOT this).
+             * Re-gated behind m2trace (unvalidated for cup8/LLM as default-on); revisit if the
+             * completion is needed once the memset wall is fixed.  See mode2_2nd_context_hang.md. */
             if (s->m2_trace &&
                 c->client != s->m2_gr_client &&
                 !nvkvm_m2_is_user_ce(s, c->client)) {
@@ -4700,21 +4702,41 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
             uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
             uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
             if (!pb || pblen == 0 || pblen > 0x40000) { continue; }
-            /* #12 cont.25: capture THIS channel's ring BAR1 page-offset for the
+            /* #12 cont.27: capture THIS channel's ring BAR1 page-offset for the
              * finishPayload forge BEFORE the pushbuffer-VAS validation below — which
              * FAILS for a GSP-managed bUseBar1 CeUtils (no VAS we hold), so chan_pdb
              * stays 0 and chan_gpfifo_bar1off is never pinned, leaving the forge's
-             * BAR1 path dark (cont.24 redir=0x0).  The decoded GP-entry pushbuffer
-             * pointer pb lies in the channel buffer JUST BELOW gpfifo_va (pb in
-             * [pbGpuVA, gpfifo_va), pbGpuVA = gpfifo_va - channelPbSize), so
-             * pb < gpfifo_va && (gpfifo_va - pb) small ties this BAR1-written ring to
-             * THIS channel without needing its VAS — channels sit 256MB+ apart so no
-             * cross-channel collision in the 1MB window.  Keep the MRU (first) match;
-             * the forge resolves finishPayload FB = walk_pdb(bar1_pdb, off+0x8004). */
-            if (!s->chan_fin_ring_found && pb < s->chan_gpfifo_va &&
-                (s->chan_gpfifo_va - pb) <= 0x100000ull) {
-                s->chan_fin_ring_off = s->bar1_wpg[best].off;
-                s->chan_fin_ring_found = true;
+             * BAR1 path dark (cont.24 redir=0x0).  The forge resolves finishPayload FB
+             * = walk_pdb(bar1_pdb, off+0x8004), so we need the ONE gpfifo RING page.
+             *
+             * cont.26's single-pb check flip-flopped onto PUSHBUFFER pages: a bUseBar1
+             * channel buffer's pushbuffer is ~100 BAR1-tracked pages whose method bytes
+             * can coincidentally decode as one in-range GP entry.  Deterministic fix:
+             * read the candidate page AS A GP-ENTRY ARRAY over the pending window
+             * [gp_get, gp_put) — the true ring has EVERY non-zero entry decoding to a
+             * pushbuffer pointer in THIS channel's buffer [gpfifo_va-0x100000, gpfifo_va)
+             * (each scrub op's pb lives in [pbGpuVA, gpfifo_va), pbGpuVA = gpfifo_va -
+             * channelPbSize); a pushbuffer page has method words that decode OUT of range
+             * -> disqualified.  Require >=2 in-range and 0 out-of-range.  Channels sit
+             * 256MB+ apart so no cross-channel collision in the window.  cand =
+             * s->bar1_wpg[best].page (read above); off = chan_gp_get*8 (page base). */
+            if (!s->chan_fin_ring_found) {
+                int rgood = 0, rbad = 0;
+                for (uint32_t k = 0; k < 16; k++) {
+                    uint64_t eo = off + (uint64_t)k * 8;
+                    if (eo + 8 > 0x1000) { break; }
+                    uint32_t f0 = (uint32_t)nvkvm_fb_read(s, cand + eo, 4);
+                    uint32_t f1 = (uint32_t)nvkvm_fb_read(s, cand + eo + 4, 4);
+                    if (!f0 && !f1) { continue; }   /* unwritten slot */
+                    uint64_t fpb = (uint64_t)(f0 & 0xFFFFFFFCu) | ((uint64_t)(f1 & 0xFFu) << 32);
+                    if (fpb && fpb < s->chan_gpfifo_va &&
+                        (s->chan_gpfifo_va - fpb) <= 0x100000ull) { rgood++; }
+                    else { rbad++; }
+                }
+                if (rgood >= 2 && rbad == 0) {
+                    s->chan_fin_ring_off = s->bar1_wpg[best].off;
+                    s->chan_fin_ring_found = true;
+                }
             }
             /* The decoded pushbuffer must resolve to REAL content (a valid method
              * header), not just any non-faulting page.  chan_translate's try-all
