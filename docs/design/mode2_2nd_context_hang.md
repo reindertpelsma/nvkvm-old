@@ -1225,3 +1225,47 @@ each spin, rebuild the guest `nvidia.ko` (src mounted /usr/src/nvidia-580.159.04
 /home/ubuntu/nvmods), re-run `cupctx2_min`. That nails the exact channel + target CTX2 waits on →
 then land that completion (DMAW into the guest sysmem page pbCpuVA reads, per cont.20) on the right
 trigger. Host-log analysis is exhausted for this question.
+
+---
+
+## cont.23 (2026-06-29) — ROOT CAUSE PROVEN via guest kprobe + host log correlation: forge writes finishPayload to FB, guest reads pbCpuVA (wrong aperture)
+
+trace_kprobe refuses the nvidia module ("Could not probe notrace function" — module built
+without -pg, so ftrace marks all fns notrace). Used the RAW `register_kprobe()` API via a tiny
+built module (`scripts/mode2_diag/cupctx2_min_kprobe2_guest.sh`, planted by addr from kallsyms)
+on `channelWaitForFinishPayload(OBJCHANNEL *pChannel /*rdi*/, NvU64 targetPayload /*rsi*/)`.
+Ran `cupctx2_min`. Result (the 4 calls of the whole run):
+```
+cwfp pChannel=0xffff8d63c292d408 target=1   ; CTX1 create scrub
+cwfp pChannel=0xffff8d63c292d408 target=2   ; CTX1 create scrub
+cwfp pChannel=0xffff8d63c292d408 target=2   ; CTX1 destroy (completes -> CTX DESTROY OK)
+cwfp pChannel=0xffff8d63f45f0a08 target=84  ; CTX2 cuCtxCreate -> HANGS (never returns)
+```
+
+**Guest ground truth:** CTX2 waits in `channelWaitForFinishPayload` on a **NEW** CeUtils channel
+object (`pChannel=...f45f0a08`, distinct from CTX1's `...292d408` — CeUtils is destroyed at
+CTX1-destroy and re-created for CTX2), for **targetPayload=84**. (CTX2 re-scrubs the global GR
+buffers CTX1-destroy freed → 84 vs CTX1's 2.)
+
+**Host correlation (same run qemu log):** the channel the emulator sees as `0xc1e00007`
+(gpfifo 0x120064000) advances gp_put 0→**84** (666 chan_execs) and the `#12 FORGE` drives its
+finishPayload to **84** — but `#12 FORGE-RESOLVE(BAR1)` pins `finFB=0x31f8004` and every write is
+to **FB**. Guest reads `READ_CHANNEL_PAYLOAD_SEMA = MEM_RD32(pbCpuVA + finishPayloadOffset)` — the
+channel buffer's own CPU mapping, a DIFFERENT location/aperture than FB 0x31f8004.
+
+**=> ROOT CAUSE (proven both ends): aperture mismatch.** The forge tracks the right channel + right
+target (84) but writes the finishPayload to FB `0x31f8004` (BAR1-shortcut resolution), while the
+guest reads it via `pbCpuVA`. The guest's sema never reaches 84 → infinite
+`channelWaitForFinishPayload`. Exactly cont.20's hypothesis, now confirmed by guest target=84 ==
+host forge=84 at different apertures. (CTX1's target-2 scrub completes because its small
+completion lands where the guest reads it; CTX2's re-created channel's finishPayload does not.)
+
+**FIX (well-defined now):** write CTX2's channel finishPayload to the location the guest's `pbCpuVA`
+actually reads — i.e. resolve gpfifo_va+finishPayloadOffset through the CHANNEL'S OWN GMMU/aperture
+(the FORGE-RESOLVE(VAS) path, aperture-aware) and write THERE, not the BAR1-shortcut FB page; or
+better, let the real CE SET_SEMAPHORE execution (chan_exec → DMAW to the channel's resolved phys)
+carry it and retire the FB content-scan forge (address-table-of-truth). VERIFY with the same kprobe:
+after fix, the cwfp(target=84) call must return (sema reaches 84) and cupctx2_min rc=0.
+
+**Repro/tools added:** `tests/mode2/cupctx2_min.c`, `scripts/mode2_diag/cupctx2_min_run_guest.sh`,
+`scripts/mode2_diag/cupctx2_min_kprobe2_guest.sh` (register_kprobe module, builds in-guest).
