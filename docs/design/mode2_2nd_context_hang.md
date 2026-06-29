@@ -1400,3 +1400,52 @@ offsets are off (likely ListNode/checked-build padding) — but it does not matt
 
 **Tools added:** `scripts/mode2_diag/cupctx2_min_kprobe3_guest.sh`,
 `scripts/mode2_diag/m571_ctx2_groundtruth_host.sh`.
+
+---
+
+## cont.26 (2026-06-29) — BAR1-aperture forge: DIRECTION PROVEN (guest CURVAL 0→84) but ring-capture heuristic is unreliable + can't validate rc=0 under m2trace slowdown.
+
+Implemented the cont.25 fix: (1) in M5.16's scan, capture THIS channel's GPFIFO ring BAR1
+page-offset into a new per-channel `chan_fin_ring_off`/`chan_fin_ring_found` even when the
+pushbuffer-VAS validation fails (GSP-managed bUseBar1 case), identified by the GP entry decoding
+to a pushbuffer pointer `pb < gpfifo_va && gpfifo_va - pb <= 0x100000`; (2) in the doorbell forge,
+for a kernel channel, ALSO write `fin_payload` to the FB page the guest's BAR1 poll reads =
+`walk_pdb(bar1_pdb, chan_fin_ring_off + (gpfifo_va&0xfff) + 0x8004)`, forward-only, alongside the
+existing sysmem `sem_wr32` (for bUseBar1=0 channels like CTX1).
+
+**RESULT — direction PROVEN:** the kprobe3 GT line for the CTX2 hang channel went from
+`CURVAL=0` (cont.25, stuck) to **`CURVAL=84`** (this build). So the BAR1 forge DOES reach the page
+the guest polls — the aperture fix is correct in principle. cupctx2_min still rc=124, for TWO
+reasons that are NOT the aperture:
+
+**(1) m2trace validation is too slow to ever pass.** CTX2's `cuCtxCreate` doesn't *enter* `cwfp(84)`
+until t=287s (m2trace logs every doorbell + fb-access → ~5–10x+ slowdown); CURVAL is already 84 at
+that entry, so it would return, but no timeout (tried 60s, 240s) catches 287s. The forge is
+m2trace-GATED, so I can't run fast (forge off) — must ungate the forge LOGIC (keep logging gated) to
+validate at speed.
+
+**(2) ring capture flip-flops → can write the WRONG (scrubber's) FB page.** `ring_off` cycles
+0x0 / 0xa0000(→FB 0x3138004) / 0x120000(→FB 0x31f8004) across doorbells; the last payloads 75–84
+logged `barFB=FAULT` (not captured). ROOT: a bUseBar1 channel buffer has a **0x64000-byte pushbuffer
+= ~100 BAR1-tracked pages**; reading each candidate page at `gp_get*8` and decoding as a GP entry,
+the PUSHBUFFER pages' method bytes coincidentally decode to a `pb` in the `< gpfifo_va` window — so
+the single-`pb` check matches pushbuffer pages, not just the one gpfifo ring page. 0x31f8004 is a
+scrubber's page (cont.23) → writing 84 there is a corruption risk that BLOCKS ungating for cup8/LLM.
+
+**NEXT (two fixes, then validate):**
+  (A) **Deterministic ring identification** (replace the single-`pb` heuristic). Options, best-first:
+      - Piggyback on however `chan_execute` already CONSUMES this channel's ring (gp_get advances to
+        84, so it reads the entries SOMEHOW) — capture the FB page it actually reads the GP entries
+        from. READ that path first (why does gp_get advance for c1e00007 with chan_pdb=0 / phys=0?).
+      - Or require the candidate page to hold a SEQUENCE of valid GP entries (consecutive 8-byte
+        pairs all decoding to pb in the same pushbuffer range) — rejects pushbuffer pages (one stray
+        in-range word won't pass).
+      - Or capture the gpfifo BAR1 page at GP_PUT-doorbell/GP-entry-WRITE time, keyed by channel.
+  (B) **Ungate the forge LOGIC from m2trace** (keep qemu_log gated) so validation runs at speed —
+      ONLY after (A) makes the write target reliable (else risk corrupting scrubber pages under
+      cup8/LLM). Then: cupctx2_min rc=0 (CURVAL→84, cwfp returns) + cup8/LLM/PyTorch no-regress.
+
+**Code state (committed, m2trace-gated, 0 default impact):** new `chan_fin_ring_off`/`_found` fields
++ M5.16 capture + forge BAR1 write. The aperture mechanism is right; the ring-ID predicate needs to
+be deterministic. Tools: `scripts/mode2_diag/cupctx2_min_kprobe3_guest.sh`,
+`m572_ctx2_barfix_verify_host.sh`.

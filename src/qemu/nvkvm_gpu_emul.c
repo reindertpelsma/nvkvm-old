@@ -326,6 +326,15 @@ struct NvkvmGpuEmul {
                                  * memdesc -> one BAR1 VA range) even when FB-fragmented, so the
                                  * VIDMEM finishPayload FB page = walk_pdb(bar1_pdb, this +
                                  * (gpfifo_va&0xfff) + 0x8004) — robust to FB non-contiguity. */
+    uint64_t chan_fin_ring_off; /* #12 cont.25: BAR1 page-offset of THIS channel's GPFIFO ring,
+                                 * captured by M5.16's scan even when the pushbuffer-VAS validation
+                                 * FAILS (the GSP-managed bUseBar1 CeUtils case: chan_pdb stays 0
+                                 * so chan_gpfifo_bar1off is NOT pinned, but the ring page is still
+                                 * identified by its GP entry decoding to a pushbuffer pointer just
+                                 * below gpfifo_va).  The forge resolves the finishPayload FB the
+                                 * guest's BAR1 poll reads = walk_pdb(bar1_pdb, this +
+                                 * (gpfifo_va&0xfff) + 0x8004).  0 = not found this chan_execute. */
+    bool     chan_fin_ring_found;
 
     /* M7 — CPU interrupt tree (raise MSI-X on LEAF_TRIGGER; ISR reads TOP/LEAF) */
     uint32_t intr_leaf[NVKVM_VF_INTR_NLEAF];     /* pending per leaf reg */
@@ -3493,12 +3502,37 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
                     uint64_t fin_va = c->gpfifo_va + 0x8004ull;
                     uint64_t redir = 0;
                     nvkvm_chan_sem_wr32(s, fin_va, c->fin_payload, &redir);
+                    /* #12 cont.25: the GROUND-TRUTHED case — a bUseBar1 CeUtils channel reads its
+                     * finishPayload through BAR1 into VIDMEM (channel_utils.c:272; kprobe proved
+                     * the 2nd-ctx hang channel polls a BAR1 GPA, value stuck at 0).  sem_wr32 above
+                     * resolves to SYSMEM/own-VAS (correct for bUseBar1=0 channels like CTX1) but the
+                     * guest never reads sysmem for a bUseBar1 channel.  So ALSO write the FB page the
+                     * guest's BAR1 poll resolves to: bar1_pdb walk of THIS channel's ring BAR1 offset
+                     * (captured by M5.16 just above, even without a VAS) + (gpfifo_va&0xfff) + 0x8004.
+                     * Forward-only; harmless for bUseBar1=0 channels (chan_fin_ring_found stays false
+                     * — their ring isn't BAR1-written).  The two writes are non-conflicting: each
+                     * channel reads exactly one aperture; the other write lands on a page nobody reads. */
+                    uint64_t fin_fb = NVKVM_GMMU_FAULT;
+                    if (s->chan_fin_ring_found && s->bar1_pdb) {
+                        uint64_t fin_b1 = s->chan_fin_ring_off + (c->gpfifo_va & 0xfffull) + 0x8004ull;
+                        bool fsys = false;
+                        uint64_t fb = nvkvm_walk_pdb(s, s->bar1_pdb, fin_b1, &fsys);
+                        if (fb != NVKVM_GMMU_FAULT && !fsys) {
+                            uint32_t cur = (uint32_t)nvkvm_fb_read(s, fb, 4);
+                            if (cur < c->fin_payload) {     /* forward-only, never rewind */
+                                nvkvm_fb_write(s, fb, c->fin_payload, 4);
+                            }
+                            fin_fb = fb;
+                        }
+                    }
                     if (s->m2_trace) {
-                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload(sem_wr32) ch[%d] "
-                                 "gpfifo=0x%llx fin_va=0x%llx payload=%u redir=0x%llx client=0x%08x\n",
-                                 s->chip->name, i, (unsigned long long)c->gpfifo_va,
-                                 (unsigned long long)fin_va, c->fin_payload,
-                                 (unsigned long long)redir, c->client);
+                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload ch[%d] gpfifo=0x%llx "
+                                 "fin_va=0x%llx payload=%u sysredir=0x%llx ring_off=0x%llx "
+                                 "barFB=0x%llx client=0x%08x\n", s->chip->name, i,
+                                 (unsigned long long)c->gpfifo_va, (unsigned long long)fin_va,
+                                 c->fin_payload, (unsigned long long)redir,
+                                 s->chan_fin_ring_found ? (unsigned long long)s->chan_fin_ring_off : 0ull,
+                                 (unsigned long long)fin_fb, c->client);
                     }
                 }
             }
@@ -4564,6 +4598,8 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     s->chan_pdb = 0;
     s->chan_gpfifo_phys = 0;
     s->chan_gpfifo_bar1off = 0;
+    s->chan_fin_ring_off = 0;          /* #12 cont.25: re-resolve per channel */
+    s->chan_fin_ring_found = false;
     if (gp_put < s->chan_gpfifo_ent && gp_put != s->chan_gp_get) {
         uint64_t eva = s->chan_gpfifo_va + (uint64_t)s->chan_gp_get * 8;
         /* M5.21: prefer the channel's OWN client VAS — authoritative, avoids the
@@ -4664,6 +4700,22 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
             uint64_t pb = (uint64_t)(e0 & 0xFFFFFFFCu) | ((uint64_t)(e1 & 0xFFu) << 32);
             uint32_t pblen = (e1 >> 10) & 0x1FFFFFu;
             if (!pb || pblen == 0 || pblen > 0x40000) { continue; }
+            /* #12 cont.25: capture THIS channel's ring BAR1 page-offset for the
+             * finishPayload forge BEFORE the pushbuffer-VAS validation below — which
+             * FAILS for a GSP-managed bUseBar1 CeUtils (no VAS we hold), so chan_pdb
+             * stays 0 and chan_gpfifo_bar1off is never pinned, leaving the forge's
+             * BAR1 path dark (cont.24 redir=0x0).  The decoded GP-entry pushbuffer
+             * pointer pb lies in the channel buffer JUST BELOW gpfifo_va (pb in
+             * [pbGpuVA, gpfifo_va), pbGpuVA = gpfifo_va - channelPbSize), so
+             * pb < gpfifo_va && (gpfifo_va - pb) small ties this BAR1-written ring to
+             * THIS channel without needing its VAS — channels sit 256MB+ apart so no
+             * cross-channel collision in the 1MB window.  Keep the MRU (first) match;
+             * the forge resolves finishPayload FB = walk_pdb(bar1_pdb, off+0x8004). */
+            if (!s->chan_fin_ring_found && pb < s->chan_gpfifo_va &&
+                (s->chan_gpfifo_va - pb) <= 0x100000ull) {
+                s->chan_fin_ring_off = s->bar1_wpg[best].off;
+                s->chan_fin_ring_found = true;
+            }
             /* The decoded pushbuffer must resolve to REAL content (a valid method
              * header), not just any non-faulting page.  chan_translate's try-all
              * fallback picks the FIRST VAS that maps pb — often a wrong aliasing
