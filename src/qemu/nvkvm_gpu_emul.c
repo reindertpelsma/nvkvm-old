@@ -261,7 +261,9 @@ struct NvkvmGpuEmul {
         bool     fin_sys;       /* #12 L3b: aperture of fin_fb — true if the finishPayload
                                  * resolved to SYSMEM (kernel CeUtils channel buffer is sysmem
                                  * by default), false = FB (VIDMEM ring).  Selects phys_rd32/
-                                 * wr32 aperture so the forge hits the page the guest reads. */
+                                 * wr32 aperture so the forge hits the page the guest reads.
+                                 * (cont.24: forge now routes through nvkvm_chan_sem_wr32, which
+                                 * resolves per-call; fin_fb/fin_sys retained but unused.) */
         uint32_t client;        /* owning RM client (hClient) — VAS scope key */
         bool     userd_sys;
         uint32_t hobject;       /* M5.12: the channel's RM handle (== host handle: shadow_fwd
@@ -3473,59 +3475,30 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             if (s->m2_trace &&
                 c->client != s->m2_gr_client &&
                 !nvkvm_m2_is_user_ce(s, c->client)) {
-                if (!c->fin_fb) {
-                    /* (A) PRIMARY: the M5.16 BAR1-offset shortcut — the PROVEN L1 path for the
-                     * GSP-managed VIDMEM ring (0xc1e00007).  The channel buffer is FB-FRAGMENTED
-                     * but CONTIGUOUS in BAR1-offset space (one memdesc), and chan_gpfifo_bar1off
-                     * is where M5.16 resolved the ring base, so the finishPayload's true FB page =
-                     * bar1_pdb walk of chan_gpfifo_bar1off + (gpfifo_va&0xfff) + 0x8004 (the BAR1
-                     * PTEs absorb the fragmentation) — the same primitive the guest's CPU uses to
-                     * read it.  Kept PRIMARY so we never regress the proven 0xc1e00007 completion
-                     * (its own-VAS walk resolves to a DIFFERENT sysmem alias — not where the guest
-                     * reads it). */
-                    if (s->chan_gpfifo_phys && s->bar1_pdb) {
-                        uint64_t fin_b1 = s->chan_gpfifo_bar1off + (c->gpfifo_va & 0xfffull) + 0x8004ull;
-                        bool fsys = false;
-                        uint64_t fb = nvkvm_walk_pdb(s, s->bar1_pdb, fin_b1, &fsys);
-                        if (fb != NVKVM_GMMU_FAULT && !fsys) {
-                            c->fin_fb = fb; c->fin_sys = false;
-                            qemu_log("nvkvm-gpu[%s] #12 FORGE-RESOLVE(BAR1) ch[%d] gpfifo=0x%llx "
-                                     "b1off=0x%llx -> finFB=0x%llx (pinned) client=0x%08x\n",
-                                     s->chip->name, i, (unsigned long long)c->gpfifo_va,
-                                     (unsigned long long)fin_b1, (unsigned long long)fb, c->client);
-                        }
-                    }
-                    /* (B) FALLBACK: resolve gpFifoVA+0x8004 through the channel's OWN VAS for a
-                     * channel M5.16 did not pin (e.g. a SYSMEM-buffer kernel CeUtils whose ring
-                     * isn't a BAR1-written vidmem page).  Aperture-aware (FB or SYSMEM), root-aware
-                     * (rsys covers sys-rooted VASes).  nvkvm_chan_own_pdb_rs uses
-                     * s->chan_client/chan_hvaspace/chan_gpfifo_va, all set to THIS channel above. */
-                    if (!c->fin_fb) {
-                        bool rsys = false;
-                        uint64_t own = nvkvm_chan_own_pdb_rs(s, &rsys);
-                        if (own) {
-                            bool fsys = false;
-                            uint64_t fp = nvkvm_walk_pdb_root(s, own, c->gpfifo_va + 0x8004ull, rsys, &fsys);
-                            if (fp != NVKVM_GMMU_FAULT) {
-                                c->fin_fb = fp; c->fin_sys = fsys;
-                                qemu_log("nvkvm-gpu[%s] #12 FORGE-RESOLVE(VAS) ch[%d] gpfifo=0x%llx "
-                                         "pdb=0x%llx -> finPHYS=0x%llx %s (pinned) client=0x%08x\n",
-                                         s->chip->name, i, (unsigned long long)c->gpfifo_va,
-                                         (unsigned long long)own, (unsigned long long)fp,
-                                         fsys ? "SYS" : "FB", c->client);
-                            }
-                        }
-                    }
-                }
-                if (c->fin_fb) {
-                    uint32_t cur = nvkvm_phys_rd32(s, c->fin_fb, c->fin_sys);
-                    if (cur < c->fin_payload) {       /* lagging -> never written; forge fwd only */
-                        nvkvm_phys_wr32(s, c->fin_fb, c->fin_sys, c->fin_payload);
-                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload ch[%d] gpfifo=0x%llx "
-                                 "finPHYS=0x%llx %s %u->%u client=0x%08x\n",
+                /* #12 cont.24: forge THIS kernel channel's finishPayload — the channel-HOST
+                 * semaphore at gpFifoVA + GPFIFO_SIZE(0x8000) + HOST_SEMA(4) = +0x8004 that
+                 * channelWaitForFinishPayload polls (channel_utils.c:344; the GPU releases it via
+                 * NVC8B5_SET_SEMAPHORE_A/B at pbGpuVA+finishPayloadOffset == gpfifo_va+0x8004).
+                 * Route through the hardened M5.18 writer nvkvm_chan_sem_wr32 — the SAME primitive
+                 * the CE SET_SEMAPHORE pushbuffer parser uses, so the forge and the real-CE release
+                 * agree on WHERE.  It resolves the VA under the writing client's OWN (client-keyed
+                 * m2_cli_vas) VAS — NOT the foreign-alias-prone content-probe the bespoke forge used
+                 * (cont.23 proved own-VAS-content-probe resolved to a sysmem page the guest never
+                 * read; cont.23's "BAR1→FB 0x31f8004" was itself a scrubber's page via the stomped
+                 * global bar1off) — AND mirrors it to the BAR1-relative page the guest polls for a
+                 * GSP-managed vidmem channel.  fin_payload is the monotonic submit count
+                 * (lastSubmittedPayload), advanced once per GPFIFO entry above; the writer is
+                 * forward-only for kernel semas (nothing else advances this one). */
+                {
+                    uint64_t fin_va = c->gpfifo_va + 0x8004ull;
+                    uint64_t redir = 0;
+                    nvkvm_chan_sem_wr32(s, fin_va, c->fin_payload, &redir);
+                    if (s->m2_trace) {
+                        qemu_log("nvkvm-gpu[%s] #12 FORGE finishPayload(sem_wr32) ch[%d] "
+                                 "gpfifo=0x%llx fin_va=0x%llx payload=%u redir=0x%llx client=0x%08x\n",
                                  s->chip->name, i, (unsigned long long)c->gpfifo_va,
-                                 (unsigned long long)c->fin_fb, c->fin_sys ? "SYS" : "FB",
-                                 cur, c->fin_payload, c->client);
+                                 (unsigned long long)fin_va, c->fin_payload,
+                                 (unsigned long long)redir, c->client);
                     }
                 }
             }

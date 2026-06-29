@@ -1269,3 +1269,76 @@ after fix, the cwfp(target=84) call must return (sema reaches 84) and cupctx2_mi
 
 **Repro/tools added:** `tests/mode2/cupctx2_min.c`, `scripts/mode2_diag/cupctx2_min_run_guest.sh`,
 `scripts/mode2_diag/cupctx2_min_kprobe2_guest.sh` (register_kprobe module, builds in-guest).
+
+---
+
+## cont.24 (2026-06-29) — the aperture is a RED HERRING: the CeUtils channel is GSP-managed (no VAS we own), so the finishPayload's physical backing is OPAQUE. Three resolutions, three wrong pages. Forge cleanly re-routed through the canonical writer (necessary but INSUFFICIENT).
+
+Implemented cont.23's stated fix (resolve the finishPayload through the channel's OWN VAS,
+aperture-aware) and TESTED it on the bench (fresh boot, NVKVM_M2TRACE=1, register_kprobe on
+`channelWaitForFinishPayload`, `cupctx2_min`). Then refined it to route the forge through the
+hardened M5.18 completion-sema writer `nvkvm_chan_sem_wr32` (client-keyed `m2_cli_vas` resolve +
+BAR1-relative redir — the SAME primitive the CE SET_SEMAPHORE pushbuffer parser uses). **Both still
+HANG (rc=124).** The fix in cont.23 is DISPROVEN as stated.
+
+**What the run proved (forge VA is right; physical resolution is the problem):**
+- The finishPayload VA the emulator forges = `gpfifo_va + 0x8004` = **0x12006c004** (gpfifo
+  0x120064000). This is provably correct: GPU releases it via `NVC8B5_SET_SEMAPHORE_A/B` at
+  `pbGpuVA + finishPayloadOffset`, and since the captured `gpfifo_va == pbGpuVA + channelPbSize`
+  and `finishPayloadOffset == channelPbSize + GPFIFO_SIZE(0x8000) + 4`, the offset reduces to
+  `+0x8004` independent of channelPbSize (channel_utils.c:242-250, 671-672). VA is NOT the bug.
+- Across THREE attempts the SAME VA 0x12006c004 resolved to THREE DIFFERENT physical pages, none of
+  which the guest reads:
+    - cont.23 (BAR1 shortcut)         -> FB 0x31f8004   (actually a c1d00001 SCRUBBER's page via the
+                                         stomped global bar1off — a mis-attribution; not c1e00007's)
+    - cont.24a (own-VAS content-probe) -> SYS 0x149e6c004  (pdb 0x3114000)
+    - cont.24b (cli_vas, client-keyed) -> SYS 0x102626004  (climbs 0x44->0x54=84; guest never sees it)
+  Forge reaches payload **84** at each page (matches the kprobe's CTX2 `target=84`), but
+  `cupctx2_min` still hangs => none of these pages is `pChannelBufferMemdesc`'s real backing.
+
+**ROOT WALL (the real cont.24 finding):** the CeUtils channel (client 0xc1e00007, gpfifo
+0x120064000) is **GSP-managed** — its instance-block PDB is EMPTY (emulator logs "M5.14 instblk PDB
+empty (GSP-managed)"; `chan_pdb=0` in every `#12-L3c SEMW`). So we hold **no authoritative VAS** for
+this channel. The HW/guest path doesn't need one: the guest CPU reads via `pbCpuVA =
+memmgrMemDescBeginTransfer(pChannelBufferMemdesc)` (channel_utils.c:276-285), i.e. straight off the
+channel-buffer **memdesc's physical pages**; the GPU writes via `pbGpuVA` through the GSP-internal
+VAS — both alias the SAME physical backing. We know NEITHER the GSP VAS nor the memdesc PA, so every
+emulator-side resolve of 0x12006c004 is a heuristic guess landing on the wrong page. `redir=0x0`
+too: `chan_gpfifo_phys` is unset for c1e00007 (M5.16 never pinned its ring), so the BAR1-relative
+mirror never fired either.
+
+**=> #12 is NOT an aperture pick.** It is: *we cannot locate the physical backing of a GSP-managed
+kernel channel's buffer.* The finishPayload, the GP entries, the pushbuffer all live in that one
+opaque memdesc.
+
+**Read-path detail that bounds the fix (channel_utils.c:272):** the CPU read uses BAR1
+(`bUseBar1` -> TRANSFER_FLAGS_USE_BAR1) OR a sysmem shadow (SHADOW_ALLOC + SHADOW_INIT_MEM that
+DMA-copies the real memdesc in). Spin-window log forensics (after the last payload=84 forge): the
+window is dominated by CTX2 GR page-table writes (10310 GRPT-WR), NOT a hot trapping BAR1 read
+(~164 plain BAR1 RD over ~47s) — consistent with the NON-BAR1 (sysmem-shadow) path, i.e. the
+channel buffer is sysmem and the read is a plain guest-RAM read (no trap; invisible). If so the
+memdesc backing is a guest-RAM GPA and a correct `pci_dma_write` there WOULD be seen — we just don't
+know the GPA.
+
+**Code state (committed, m2trace-gated, no default-path impact):** the doorbell forge no longer does
+its own bespoke (A)BAR1/(B)own-VAS resolve + `nvkvm_phys_wr32`; it now calls
+`nvkvm_chan_sem_wr32(s, gpfifo_va+0x8004, fin_payload, &redir)` — one resolver, client-keyed, shared
+with the CE-parser, address-table-aligned. This is the RIGHT substrate (once we have the true PA, it
+lands there) but is **necessary-not-sufficient**. The `fin_fb/fin_sys` struct fields are now unused
+(retained); `fin_via_vas` was added then removed within this cont.
+
+**NEXT — get the memdesc PA (two routes, pick one):**
+  (1) **Guest ground-truth (fast, decisive):** extend the register_kprobe to dump, for the hanging
+      `pChannel`, `bUseBar1` + `pChannelBufferMemdesc` -> its `_pteArray[0]`/PhysAddr (+ the current
+      finishPayload value via `pbCpuVA+finishPayloadOffset` and `slow_virt_to_phys`). Needs OBJCHANNEL
+      + MEMORY_DESCRIPTOR field offsets (objdump `channelReadChannelMemdesc` / the channel-setup fn,
+      or offsetof from the open headers). Confirms the GPA and whether it's sysmem vs BAR1.
+  (2) **RPC-snoop (the production fix, address-table-of-truth):** capture the channel-buffer
+      memdesc's PA list from the channel-alloc / MAP RPC to GSP (forward-populate the table), so the
+      forge (and the real CE SET_SEMAPHORE parse) write the guest-known backing. This is the
+      "forward-populated by RPC" path docs/design/mode2_address_table.md mandates.
+  Then VERIFY with the SAME kprobe: cwfp(target=84) returns + cupctx2_min rc=0, then cup8/LLM/PyTorch
+  no-regress.
+
+**Tools added this cont:** `scripts/mode2_diag/m570_ctx2_fix_verify_host.sh` (fresh-boot +
+kprobe2 + forge-resolution verdict greps).
