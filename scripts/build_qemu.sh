@@ -33,6 +33,9 @@ apt-get install -y \
     libglib2.0-dev \
     libpixman-1-dev \
     python3 \
+    `# QEMU 9.2 meson/configure needs these (rebuild fix 2026-07-04)` \
+    python3-venv \
+    python3-tomli \
     git \
     libslirp-dev \
     pkg-config \
@@ -60,9 +63,11 @@ cp "$REPO_ROOT/src/qemu/"*.h "$QEMU_SRC/hw/misc/"
 # ── 4. Copy ABI / common headers into hw/misc/nvkvm_inc/ ──────────────────
 echo "[4/9] Copying ABI and common headers to $QEMU_SRC/hw/misc/nvkvm_inc/..."
 mkdir -p "$QEMU_SRC/hw/misc/nvkvm_inc"
-cp "$REPO_ROOT/src/abi/nvgpu.h"          "$QEMU_SRC/hw/misc/nvkvm_inc/"
-cp "$REPO_ROOT/src/abi/uvm.h"            "$QEMU_SRC/hw/misc/nvkvm_inc/"
-cp "$REPO_ROOT/src/common/nvkvm_proto.h" "$QEMU_SRC/hw/misc/nvkvm_inc/"
+# Rebuild fix 2026-07-04: the nvkvm .c/.h include SEVERAL headers from src/abi + src/common
+# (nvgpu.h, uvm.h, nvkvm_proto.h AND nvkvm_abi.h, nvkvm_isolate_proto.h, nvkvm_ring.h, ...),
+# not just the 3 hard-coded before — an incomplete copy fails the build.  Copy ALL of them.
+cp "$REPO_ROOT/src/abi/"*.h    "$QEMU_SRC/hw/misc/nvkvm_inc/" 2>/dev/null || true
+cp "$REPO_ROOT/src/common/"*.h "$QEMU_SRC/hw/misc/nvkvm_inc/" 2>/dev/null || true
 # Linux type shim: replaces <linux/types.h> in the QEMU user-space build
 # to avoid conflicts with QEMU's own type setup in qemu/osdep.h.
 cp "$REPO_ROOT/src/qemu/nvkvm_linux_types.h" \
@@ -70,18 +75,13 @@ cp "$REPO_ROOT/src/qemu/nvkvm_linux_types.h" \
 
 # ── 5. Fix include paths in the copied files ──────────────────────────────
 echo "[5/9] Fixing include paths in copied files..."
-# virtio_nvgpu.h uses relative paths like ../../src/common/nvkvm_proto.h
-# that are correct relative to src/qemu/ but wrong inside hw/misc/.
-# Rewrite them to use the local nvkvm_inc/ sub-directory.
-sed -i \
-    's|"../../src/common/nvkvm_proto.h"|"nvkvm_inc/nvkvm_proto.h"|g' \
-    "$QEMU_SRC/hw/misc/virtio_nvgpu.h"
-sed -i \
-    's|"../../src/abi/nvgpu.h"|"nvkvm_inc/nvgpu.h"|g' \
-    "$QEMU_SRC/hw/misc/virtio_nvgpu.h"
-sed -i \
-    's|"../../src/abi/uvm.h"|"nvkvm_inc/uvm.h"|g' \
-    "$QEMU_SRC/hw/misc/virtio_nvgpu.h"
+# The nvkvm sources use relative paths like ../../src/common/foo.h and
+# ../../src/abi/bar.h that are correct relative to src/qemu/ but wrong inside
+# hw/misc/.  Rewrite EVERY such include (across all copied .c and .h) to the
+# local nvkvm_inc/ sub-directory — generalized so new headers don't break it.
+sed -i -E \
+    's|"\.\./\.\./src/(common|abi)/([A-Za-z0-9_]+\.h)"|"nvkvm_inc/\2"|g' \
+    "$QEMU_SRC/hw/misc/"*.c "$QEMU_SRC/hw/misc/"*.h
 # Replace <linux/types.h> in nvkvm_inc headers with our QEMU-compatible shim
 # to avoid conflicts with QEMU's own qemu/osdep.h type setup.
 sed -i \
@@ -121,6 +121,7 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
   'nvkvm_isolate_handlers.c',
   'nvkvm_tables.c',
   'nvkvm_present_egl.c',
+  'nvkvm_gpu_emul.c',
 ))
 """
 
@@ -157,19 +158,19 @@ path = sys.argv[1]
 with open(path, 'r') as fh:
     text = fh.read()
 
-# Find the closing brace of virtio_device_names[] and insert before it.
-# The array ends with a line that is just "};" (possibly with leading spaces).
-insert_marker = '};\n'
-entry = '    [50] = "virtio-nvgpu",\n'
-# Only insert once; guard already checked above.
-idx = text.rfind(insert_marker)
-if idx == -1:
-    print("  ERROR: could not find end of virtio_device_names[]", file=sys.stderr)
+# Rebuild fix 2026-07-04: insert our entry RIGHT AFTER the [VIRTIO_ID_GPIO] line
+# inside virtio_device_names[].  The old code used text.rfind('};') which matched
+# the LAST '};' in the file — the virtio_device_info TypeInfo, NOT the names table —
+# corrupting an unrelated struct and breaking the build.  Anchor on the real entry.
+entry = '    [VIRTIO_ID_GPIO] = "virtio-gpio",\n    [50] = "virtio-nvgpu",\n'
+m = re.search(r'^[ \t]*\[VIRTIO_ID_GPIO\][ \t]*=[ \t]*"virtio-gpio",[ \t]*\n', text, re.M)
+if not m:
+    print("  ERROR: could not find [VIRTIO_ID_GPIO] entry in virtio_device_names[]", file=sys.stderr)
     sys.exit(1)
-text = text[:idx] + entry + text[idx:]
+text = text[:m.start()] + entry + text[m.end():]
 with open(path, 'w') as fh:
     fh.write(text)
-print("  virtio.c patched successfully.")
+print("  virtio.c patched successfully (after VIRTIO_ID_GPIO).")
 PYEOF
 else
     echo "  virtio.c already contains virtio-nvgpu entry — skipping patch."
@@ -194,12 +195,16 @@ cd "$QEMU_SRC"
     --prefix="$QEMU_PREFIX"
 
 # ── 8. Build ──────────────────────────────────────────────────────────────
+# Rebuild fix 2026-07-04: QEMU 9.2's ./configure creates the build tree in
+# ./build (out-of-tree); build.ninja is NOT in $QEMU_SRC.  Run ninja against it.
 echo "[8/9] Building QEMU with ninja -j$(nproc)..."
-ninja -j"$(nproc)"
+BUILD_DIR="$QEMU_SRC/build"
+[ -f "$BUILD_DIR/build.ninja" ] || BUILD_DIR="$QEMU_SRC"   # fallback for in-tree configs
+ninja -C "$BUILD_DIR" -j"$(nproc)"
 
 # ── 9. Install ────────────────────────────────────────────────────────────
 echo "[9/9] Installing to $QEMU_PREFIX..."
-ninja install
+ninja -C "$BUILD_DIR" install
 
 echo ""
 echo "=== Build complete ==="
