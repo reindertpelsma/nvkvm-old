@@ -1498,3 +1498,65 @@ Zero default-path impact.  Keep it for when the teardown completion is needed po
 
 **Tools added:** `scripts/mode2_diag/cupctx2_hangstack_guest.sh` (+m574),
 `cupctx2_gdb_guest.sh`, `cupctx2_ctrlpoll_guest.sh`, `cupctx2_sample_guest.sh`.
+
+---
+
+## cont.29 (2026-07-04) — Fable 5 fresh-eyes: found the ACTUAL polled value (16 completion semaphores) + root-caused it (stale cross-teardown host backing, {client,VA}-keyed, client+VAs reused). cont.28 confirmed; cwfp saga (cont.22-27) refuted for good.
+
+Bench rebuilt from scratch on a fresh vast box (overlay lost); a Fable-5 subagent was pointed at
+#12 with the full ledger + "verify, don't trust me". It CONFIRMED and sharpened cont.28 and
+delivered the concrete root cause I (Opus) never reached.
+
+**PROVEN a genuine hang, not slowness:** left CTX2 spinning **22 minutes** (etimes=1350), State=R,
+all wait targets frozen. Not the nested-virt tax.
+
+**THE POLLED VALUE (finally identified):** gdb/objdump of libcuda `cuCtxCreate_v2`'s spin frame =
+a **wait-ALL on 16 per-channel completion semaphores** living in ONE sysmem pool page at guest CPU
+VA **0x20440f000** (16 slots at +0xf00..+0xff0; a `/dev/nvidiactl` mmap). All 16 read 0 → infinite
+spin. This is exactly what cont.28 said we needed and couldn't find. `channelWaitForFinishPayload`
+is confirmed TEARDOWN-only — the entire cont.22-27 finishPayload BAR1-forge was chasing the wrong
+semaphore.
+
+**ROOT CAUSE (new, evidence-backed): stale host backing reused across teardown.**
+- Guest RM client **0xc1d00003 is PERSISTENT** across both contexts (only its sub-objects are
+  freed+recreated). CTX2 reallocates its compute channels / ctx-buffers / semaphore-pool at the
+  **SAME GPU VAs** (gpfifo 0x2002xxxxx, buffers 0x203–0x204xxxxx).
+- The emulator's `va_seen` dedup set (`m2_mapped_va[]`, keyed by **{client, VA}** — verified L587:
+  `struct { uint32_t client; uint64_t va; }`) and the host FB backings it gates are **NEVER cleared
+  on teardown**. So CTX2's doorbell re-sweep finds every VA already "seen" and backs **nothing**
+  (`M6.5 enum_gr_sysmem … backed=0`), while CTX1's teardown already tore down the VAS/channels those
+  mappings pointed at. Host GPU completion-sema releases land in **stale** pages → libcuda never
+  sees the 16 fresh pool semaphores advance.
+- NOT a ring/registration/token failure: instrumented `nvkvm_m2_exec_doorbell` (L7241) — CTX2
+  **rings all 16 host channels fine** (`RING … gp_get->1`), identical to CTX1.
+
+**PARTIAL FIX — proven to move the needle (mechanism confirmed):** purge the GR-client's compute-
+aperture VAs from `va_seen` on compute-context channel free (gpfifo_va ≥ 0x2_0000_0000) so CTX2
+re-backs fresh:
+- GR-client-scoped purge → pool completions went **0/16 → 8/16** (measured live via /proc/PID/mem).
+- Broadening to ALL clients → REGRESSED back to 0/16 (the cross-client-sharing fragility the existing
+  `#12 NOTE` comments warn about — forgetting a VA shared with a live sibling client breaks working
+  mappings).
+- Poking all 16 semaphores to their target (=1) via /proc/mem did **NOT** release the wait → the 16
+  are NECESSARY BUT NOT SUFFICIENT: it is a **live** wait — the host must keep EXECUTING CTX2's
+  channels (like CTX1), not just reach 1 once.
+
+**COMPLETE FIX (scoped, not yet implemented):** on compute-context channel/ctx free, ACTIVELY tear
+down CTX1's stale host backing — free the `m2_fbback` host vidmem objects + unmap them from the host
+VAS for the freed compute VAs (so CTX2's re-back is CLEAN, not a no-op `st=0x51 ALREADY`), **scoped
+to the GR client** to avoid the cross-client regression. Then forget the `va_seen` entries so re-back
+runs. Enabling this needs `m2_fbback[]` (L449: currently only `{fb_base,size,host_qva}`) extended to
+`{client, hMem, VA}` so the teardown can find+free the right objects. VERIFY: all 16 pool semaphores
+stream to their live targets, `cupctx2_min` rc=0, and cup2 stays rc=0 (no-regression). Code sites:
+`nvkvm_m2_ctx_free_drop` L1654 (where to hook the teardown), `nvkvm_m2_va_seen` L6747, `m2_fbback`
+L449 (+ M7 REFACTOR note L606 flags this exact struct as debt to retire).
+
+**Bench notes:** deploy footgun — `cp src/qemu/*.c → /opt/qemu-src/hw/misc/` breaks the Mode-1
+`../../src/common/…` includes from the build tree; Fable added a symlink `/opt/qemu-src/src →
+/workspace/nvkvm/src` (repo-consistent, left in place). "Fresh QEMU boot per run" confirmed load-
+bearing (reload against a persistent GSP → cuInit=999). Emulator was REVERTED to clean HEAD (the
+partial fix is unproven for no-regression and one variant regresses); bench idle.
+
+**Verdict on the Fable-5 experiment:** it did NOT "break" — it produced the decisive diagnosis + a
+mechanism-proving partial fix where the Opus line had stalled. Remaining work is implementing the
+scoped active-teardown fix above.
