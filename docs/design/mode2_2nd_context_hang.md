@@ -1613,3 +1613,85 @@ the re-init-execution fix, not alone. VERIFY: cupctx2_min rc=0 + cup2 no-regress
 
 **Fable-5 experiment status:** 2 substantial rounds, each producing decisive insight (cont.29 root
 cause; cont.30 the GSP-re-boot reframe + resurrected re-init CE-scrub lead) but no green repro yet.
+
+---
+
+## cont.31 (2026-07-04) — Fable-5 round 3: built + PROVED-FIRING two prerequisite fixes (sysmem re-back on stale GPA; USERD-overlay drop on channel-free — a NEW, distinct teardown bug) but cupctx2_min STILL rc=124. GROUND TRUTH nailed: the operative block is UVM's re-init CE-channel completion — after the 2nd GSP_INIT_DONE the guest issues ZERO device work and libcuda spins on 16 UVM CE-channel tracking semaphores that jump to the 0x1_0000_00xx CANCEL sentinel (the MAX_JUMP asserts) because the emulator never executes/completes UVM's re-registration CE channels. Confirms cont.30.
+
+Ran under `NVKVM_M2CEFWD=1 NVKVM_M2TRACE=1`. Baseline #12 reproduced on clean HEAD first (rc=124).
+Diff of both fixes saved (not committed): `memory/12_cont31_fixes.patch`. Tree reverted to clean
+HEAD `dd9df80`; bench rebuilt clean + idle.
+
+**FIX 1 (built, fires, insufficient) — stale-SYSMEM re-back keyed by resolved GPA.** Extended
+`m2_mapped_va[]` (L587) `+{gpa,hmem,reback}`; added `nvkvm_m2_va_find/va_mark_gpa`, a
+`back_and_map_sys_ex(out_hmem)`, and `nvkvm_m2_host_rmfree()`. In `nvkvm_m2_leaf_flush`'s <2 MiB
+sysmem chunk path: if `{client,VA}` is already backed but resolves to a **different guest GPA now**
+(the guest tore down + re-created the mapping at the same VA — the 2nd cuCtxCreate re-allocs its
+channels/sema-pool at the SAME VAs but FRESH pages), free the stale host OS-descriptor pin (RM
+cascades the free to its map_dma, vacating the VA) and re-back at the new GPA (reback-cap 64). This
+is cont.29's "COMPLETE FIX", keyed correctly by PDB-resolved-GPA per the address-table directive.
+**PROVED FIRING:** 56–70 STALE-SYS re-backs per run incl. the whole pool page block (VA
+0x204400000..0x204417000, e.g. `va=0x20440f000 gpa 0x13eb41000 -> 0x13f34b000 OK`), host-rmfree
+rc=0 st=0. **But cupctx2_min still rc=124 and guest dmesg IDENTICAL** — sysmem staleness is a real
+prerequisite but NOT the operative block (matches cont.30's "necessary-not-operative").
+
+**FIX 2 (built, fires, insufficient) — NEW BUG: stale USERD m2_fbback overlay diverts CTX2's
+GP_PUT.** Found via a decisive CE-INSTR probe: for CTX2's re-alloc'd CE channels,
+`pageA(fb overlay)put=1` but `pageB(host USERD qva)put=0` = a **PAGE-IDENTITY DIVERGENCE** (0 in
+working CTX1, 2 in hung CTX2). Root: each channel USERD has a paired `m2_fbback` overlay (same
+fb_base→host_qva) that makes the guest's BAR1 GP_PUT write land in the host USERD object.
+`nvkvm_m2_ctx_free_drop` (L1654) removes `m2_chanbuf` on channel-free but **NEVER removed the paired
+m2_fbback overlay**. The guest RE-USES the same USERD FB addresses across teardown, so CTX2's fresh
+`back_channel_userd` APPENDS a new fbback at a HIGHER index while the STALE CTX1 fbback (same
+fb_base, dead host object) survives at a LOWER index. `nvkvm_fb_host_overlay` scans fbback in order
+→ hits the stale entry FIRST → CTX2's guest GP_PUT is diverted into the DEAD host object while the
+real host USERD (fresh m2_chanbuf qva the host GPU reads) stays GP_PUT=0 → host never fetches the
+GPFIFO, never runs the CE SET_SEMAPHORE. **Fix:** in ctx_free_drop, when removing an m2_chanbuf
+USERD, also remove its paired m2_fbback entry (matched by fb_base; swap-remove, nothing stores
+fbback indices — safe). **PROVED FIRING + PROVED-CORRECT:** 41 stale overlays dropped;
+**CTX2 divergence 2 → 0**. This is a genuine independent correctness bug (will bite once CTX2
+executes); ready to land. But cupctx2_min still rc=124 — because the divergence was in CTX1's LATE
+channel activity, NOT the CTX2 hang (see below).
+
+**★ GROUND TRUTH — the operative block is UVM re-init CE completion, upstream of both fixes:**
+- Log-region correction: the earlier "CTX2" activity (NR>139000) was actually **CTX1**'s create +
+  M6.5 re-sweeps. The TRUE CTX2 window is **after the 2nd `posted GSP_INIT_DONE`** (fn-47 UNLOADING
+  → GSP re-boot → 2nd INIT_DONE). After the 2nd INIT_DONE there are **ZERO cmdq RPCs, ZERO
+  doorbells, ZERO chan_execs, ZERO M6.5 sweeps** — the log goes silent except `SEC2 Booter Unload
+  (mbox0=0xff) -> WPR2 down` (fires RIGHT AFTER INIT_DONE) then ahci noise. Exactly cont.30.
+- gdb ground truth (prior boot, still valid): the hung thread is State=R userspace libcuda spin
+  (empty kernel stack) on a **wait-ALL over 16 entries** (poll-set descriptor @rsp: count=16,
+  entries reference per-channel objects; `0x7506b939df90` per-iter check reads a completion word).
+  The 16 sema live in a `/dev/nvidiactl` pool page (VA varies per run, ~0x2044xf000); all read 0.
+- **The 16 are UVM's per-CE-channel tracking semaphores** (dmesg proves it: `nvidia-uvm:
+  uvm_channel.c:205 ... CE 2 unexpected completed_value 0x100000029` and `uvm_gpu_semaphore.c:776
+  ... jump from 0x45 to 0x100000012`). **`0x1_0000_00xx` = the cancel/error SENTINEL UVM writes when
+  it gives up** on a CE channel whose completion never arrived. So during the 2nd `RmInitAdapter`,
+  UVM re-registers the GPU and creates its CE channels, submits scrub/init work, and **the emulator
+  never executes/completes that UVM re-init CE work** → the tracking sema never advance → UVM
+  cancels (MAX_JUMP) → the CeUtils scrubberDestruct times out (`ce_utils.c:349`) → the whole thing
+  wedges → libcuda's wait spins forever.
+
+**=> cont.31 REFINED ROOT CAUSE:** #12 = the emulator does not complete **UVM's CE-channel work
+issued during the 2nd `RmInitAdapter` GPU re-registration** (post-GSP-reboot). The 16-sema pool +
+the CeUtils finishPayload (cont.22-27) are BOTH just symptoms of that one un-executed/un-completed
+re-init CE-scrub. Both cont.31 fixes (sysmem re-back, USERD-overlay drop) are real prerequisites for
+when CTX2 *does* execute, but neither runs because CTX2 issues no device work post-reboot.
+
+**PRECISE NEXT STEP (cont.31):** stop treating symptoms; make the 2nd-boot UVM CE channels actually
+run+complete. Two concrete leads, in order:
+  1. **Why does the guest issue ZERO device work after the 2nd INIT_DONE?** Instrument the guest
+     kernel (printk in `RmInitAdapter` / the UVM GPU-add path / `nvUvmInterfaceRegisterGpu`) to find
+     exactly where it blocks BEFORE submitting UVM's CE work — is it the `SEC2 Booter Unload → WPR2
+     down` firing right after INIT_DONE (cont.12's "guest REJECTS the re-boot": is the L3a
+     mbox0==0xff unload MIS-firing during the re-boot LOAD?), or a GSP-RM control the re-init awaits?
+     If the guest never gets past re-init, the 16 sema are moot — fix the re-boot handshake first.
+  2. If the guest DOES submit UVM CE work (rings a doorbell we're dropping): forward+complete THAT
+     UVM CE channel (the finishPayload forge exists but is m2trace-gated + was cont.22-27-insufficient
+     at TEARDOWN; the load-bearing instance is the re-init scrubber). Land the 2 cont.31 prerequisite
+     fixes TOGETHER with this.
+Reapply `memory/12_cont31_fixes.patch` when reintroducing. VERIFY: cupctx2_min rc=0 + cup2 no-regress.
+
+**cont.31 experiment status:** round 3 — 2 proved-firing prerequisite fixes (one a NEW bug) + the
+sharpest root-cause statement yet (UVM re-init CE completion, with the 0x1_0000_00xx cancel-sentinel
+as the smoking gun) but still no green repro. The wall is the post-GSP-reboot re-init path.
