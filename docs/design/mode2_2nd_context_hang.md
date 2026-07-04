@@ -1695,3 +1695,82 @@ Reapply `memory/12_cont31_fixes.patch` when reintroducing. VERIFY: cupctx2_min r
 **cont.31 experiment status:** round 3 — 2 proved-firing prerequisite fixes (one a NEW bug) + the
 sharpest root-cause statement yet (UVM re-init CE completion, with the 0x1_0000_00xx cancel-sentinel
 as the smoking gun) but still no green repro. The wall is the post-GSP-reboot re-init path.
+
+---
+
+## cont.32 (2026-07-04) — Fable/Opus round 4: DISPROVES the "2nd cuCtxCreate re-boots the GSP" premise. The reigning cont.30/31 re-boot picture was an ARTIFACT of a `gsp_reloaded` state-machine MISFIRE. Fixed the handshake (correct, default-safe, DISPROVES the premise) + layered the cont.31 prereqs — STILL rc=124. The true remaining block is UVM's OWN tracking-semaphore pool (a UVM-internal RM allocation, NOT the GR-client sysmem sweep) reading a STALE/backwards value across GPU re-registration → MAX_JUMP fatal → CTX2 rings ZERO doorbells. Reverted to clean HEAD; bench idle.
+
+**What was built + tested (reverted):**
+- **Handshake fix (the task's step 1+2).** RETIRED the `gsp_reloaded` latch (DMATRFCMD-while-suspended
+  = "genuine re-boot") and rewrote the GSP-falcon STARTCPU handler to mirror `kgspTeardown_TU102` /
+  `kgspBootstrap_TU102` exactly: a STARTCPU while `gsp_suspended` is the TEARDOWN's own FWSEC-SB ucode
+  load (kgspTeardown = FWSEC-SB → SEC2 Booter Unload) — it must NOT raise WPR2 and must NOT post
+  INIT_DONE; only the SEC2 Booter Unload (SEC2 STARTCPU + MAILBOX0==0xff, already handled) lowers WPR2.
+  Also stopped lowering WPR2 in the fn-47 handler (real HW keeps WPR2 up until the guest's own Booter
+  Unload). A genuine re-boot re-posts INIT_DONE via the unconditional boot-args mailbox write
+  (kgspProgramLibosBootArgsAddr in NORMAL bootstrap), which fn-47 already re-arms (bootargs_dumped=0).
+- **+ the cont.31 prereq patch** (`docs/design/mode2_12_cont31_prereq_fixes.patch`) on top.
+
+**★ DECISIVE FINDING — there is NO pre-kill GSP re-boot on the 2nd cuCtxCreate.** With the handshake
+clean, the ONLY GSP boot in the whole run is the first one (`FWSEC ran` + `INIT_DONE seqNum 0` at
+log start). The `UNLOADING → teardown FWSEC-SB → SEC2 Booter Unload` sequence fires ONCE, at the very
+END of the log (post-SIGINT teardown). **cont.30/31's "2nd cuCtxCreate triggers a GSP re-boot → 2nd
+GSP_INIT_DONE" was the `gsp_reloaded` MISFIRE**: during the POST-KILL teardown's FWSEC-SB ucode load,
+the old latch read that DMATRFCMD as a "re-boot", raised WPR2, and re-posted a spurious 2nd
+`GSP_INIT_DONE` (the "seqNum 843/913" prior rounds saw). Removing it confirms **cont.16 was right all
+along**: the GSP stays loaded across CTX1-destroy→CTX2-create; the whole hang is pre-kill CTX2 spin.
+
+**★ WHAT CTX2 ACTUALLY DOES (trace-proven, handshake+prereqs applied):**
+- CTX2 create re-allocates its channels (the cont.31 "drop stale USERD overlay" fires 41× on the
+  freed UVM CE channels client `0x5c0000xx`, fb_base 0x422x000; and on the compute chan 0x2), and the
+  **CeUtils scrubber (client `0xc1e00007`) re-runs to finishPayload 84** (CE-INSTR gp_get 69→84) —
+  matching cont.23's "target=84". So CTX2 is NOT "zero device work" in create; the scrubber executes.
+- The 16-slot libcuda completion-sema pool (VA 0x204400000..) **IS re-backed to fresh GPAs** by the
+  cont.31 STALE-SYS path (1609 re-backs/run; e.g. `va=0x204400000 gpa 0x10230a000 -> 0x141b88000 OK`).
+  So the GR-client sysmem staleness is genuinely FIXED.
+- **BUT in the CTX2 SPIN window (after the scrubber hits 84, up to the terminal UNLOADING): ZERO
+  CE-INSTR from ANY client and ZERO `M5.22 RANG` doorbells.** CTX2 rings no doorbell and executes no
+  channel work while spinning. It is blocked in libcuda userspace BEFORE submitting the UVM CE work.
+
+**★ WHY (the true remaining root, cont.32):** guest dmesg (identical with/without the fixes) shows
+`nvidia-uvm: uvm_gpu_semaphore.c:776 ... jump from 0x45 to 0x100000012` and `... 0xd4 to 0x100000029`.
+Per source (`uvm_gpu_semaphore.c:772`): `if (new_sem_value < old_sem_value) new_value += 1ULL<<32;` —
+the `0x1_0000_00xx` is NOT a "cancel sentinel", it is UVM's **32-bit wrap-around handling of a
+BACKWARDS semaphore value**. UVM's tracking sema went 0x45 → 0x12 (DOWN). UVM's `uvm_gpu_semaphore_t`
+(CPU VA `0xffff…39000`) is a **UVM-internal RM allocation that PERSISTS across CTX1→CTX2** (UVM GPU
+registration persists — no fn-47-driven UVM teardown). Its `completed_value` holds CTX1's 0x45; CTX2's
+fresh CE channel re-init writes a low value (0x12) into the SAME pool slot → UVM sees a backwards jump
+→ `UVM_ASSERT_MSG_RELEASE` MAX_JUMP → UVM global fatal error → the CE channels are aborted before they
+run → libcuda's cuCtxCreate wait-ALL on its 16 pool sema never completes → hang. **The cont.31
+STALE-SYS re-back does NOT cover this page**: it only re-backs GR-CLIENT (`0xc1d00003`, `0xc1e0…`)
+sysmem runs swept via the GR-PT M6.5 path. UVM's tracking-sema pool is a separate UVM/`nvidia-uvm`
+allocation (different client/allocation path), never swept, never re-backed → keeps CTX1's residue.
+
+**=> cont.32 ROOT CAUSE:** #12 = UVM's persistent per-CE-channel **tracking-semaphore pool** reads a
+STALE (backwards) value when CTX2 re-registers the GPU, because the emulator never refreshes/zeroes
+that UVM-owned pool page across the CTX1→CTX2 boundary (it is outside the GR-client sysmem re-back).
+UVM's MAX_JUMP fatal then prevents CTX2 from ever submitting its CE work (0 doorbells in the spin).
+
+**PRECISE NEXT STEP (cont.32, for round 5):**
+  1. Identify the UVM tracking-sema pool page in the emulator: it is the sysmem page whose guest GPA
+     maps to UVM CPU VA `0xffff…39000` (from dmesg) and whose value goes 0x45→0x12. Instrument which
+     client/allocation owns it (it is NOT `0xc1d00003`/`0xc1e0…`; likely the UVM RM client or a
+     `UVM_*`-path OS-descriptor). Confirm it is NOT in the STALE-SYS re-back set (grep its VA/GPA).
+  2. Fix ONE of: (a) extend the STALE-SYS re-back (or a dedicated teardown hook) to cover UVM's
+     tracking-sema pool so CTX2 gets a FRESH zero page (UVM then starts a fresh completed_value and no
+     backwards jump); OR (b) find the guest-side reason UVM reuses the same tracking sema with a stale
+     value across GPU re-registration (does UVM free+realloc the pool on GPU-remove/add? if so the
+     emulator is failing to free the old host backing so the fresh alloc lands on the same GPA) and
+     make the teardown free it. The clean-handshake code (cont.32) + the cont.31 prereqs are all
+     necessary; land them TOGETHER with the UVM-pool fix. VERIFY: cupctx2_min rc=0 + cup2 no-regress.
+
+**KEEP (do not re-derive):** the cont.32 handshake fix (retire `gsp_reloaded`; STARTCPU-while-suspended
+= teardown FWSEC-SB, no WPR2 raise / no INIT_DONE; don't lower WPR2 in fn-47) is CORRECT and
+default-safe — reapply it in round 5. It disproves the re-boot premise and gives the true clean-state
+trace. RULED OUT (cont.32, trace-proven): GSP re-boot on 2nd ctx (there is none); sysmem staleness of
+the libcuda 16-sema pool (re-backed fine); USERD-overlay staleness (dropped fine). The block is the
+UVM-internal tracking-sema pool, upstream of any CTX2 doorbell.
+
+**cont.32 experiment status:** round 4 — one CORRECT handshake fix that disproves the reigning premise
++ the true root nailed (UVM tracking-sema backwards-jump from an un-refreshed UVM-owned pool page) but
+no green repro. Reverted to clean HEAD; bench rebuilt clean + idle.
