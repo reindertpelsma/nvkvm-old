@@ -1560,3 +1560,56 @@ partial fix is unproven for no-regression and one variant regresses); bench idle
 **Verdict on the Fable-5 experiment:** it did NOT "break" — it produced the decisive diagnosis + a
 mechanism-proving partial fix where the Opus line had stalled. Remaining work is implementing the
 scoped active-teardown fix above.
+
+---
+
+## cont.30 (2026-07-04) — Fable-5 implemented the cont.29 backing-teardown (it FIRES correctly) but cupctx2_min STILL hangs → cont.29 is necessary-not-operative. Decisive new fact: the 2nd cuCtxCreate triggers a GSP RE-BOOT, and CTX2 does ZERO device work — it hangs on RE-INIT completions, and the cont.22-27 CeUtils scrub gap RESURFACES in that re-init path.
+
+A Fable-5 subagent implemented the cont.29 plan faithfully and PROVED it fires, but it is not the
+operative block for the no-compute repro. Tree reverted to clean HEAD (per discipline); bench idle.
+
+**What was built (reverted, but proven to fire):** extended `m2_fbback[]` + `m2_objs[]` with
+`{client, hmem, hdev, va}`; `nvkvm_m2_ctx_backing_teardown()` on the GR client's compute-aperture
+**VASpace-free** (moved from channel-free after finding channel-free fires mid-CTX1 on a probe
+channel — cuCtxCreate creates+frees a probe channel → don't trigger on channel-free) actively frees
+host vidmem objects, munmaps CPU views (copy-back to fb_pages for coherence), drops m2_gpga, dead-
+marks m2_objs, purges the aperture's va_seen. M2TRACE at CTX1 destroy:
+`#12 CTX-BACKING-TEARDOWN client=0xc1d00003: fbback freed=32 objs freed=16 gpga dropped=16 va_seen
+purged=1553`, then CTX2 GSP re-boots cleanly (`posted GSP_INIT_DONE seqNum 913`). Still rc=124.
+
+**DECISIVE NEW FINDING — the operative block is upstream of stale backing:**
+- The **2nd cuCtxCreate triggers a full GSP RE-BOOT** (RmInitAdapter re-runs; new GSP_INIT_DONE).
+  This is why #12 is a *2nd-context* bug: CTX1 teardown drops the adapter, CTX2 re-inits it.
+- After that re-boot, **CTX2 issues ZERO device work** — 0 channel-allocs, 0 GSP RPCs, 0 doorbell
+  rings, 0 M6.5 sweeps — then hangs in the userspace 16-semaphore poll (State=R, empty kernel stack,
+  confirmed by /proc/PID/stack). CTX1 satisfies its 16 pool semaphores precisely BECAUSE it does
+  real device work at CTX1 time (channel allocs + M6.5 sweeps + doorbell RANGs → host executes →
+  releases). CTX2 never executes anything, so no releases are produced no matter how clean the
+  backing is. (This is exactly cont.29's own "necessary but not sufficient — it is a LIVE wait"
+  caveat, now shown to be the whole story for the no-compute cupctx2_min.)
+- Guest dmesg (IDENTICAL baseline and fix): UVM `update_completed_value_locked` MAX_JUMP asserts
+  (`0x45→0x100000012`, `0xd4→0x100000029`) + `scrubberDestruct: Timed out waiting for the scrub` +
+  `pCeUtils->lastCompletedPayload == lastSubmittedPayload @ ce_utils.c:349`. **The CeUtils finish-
+  payload completion (the cont.22-27 saga) RESURFACES — in the GSP RE-INIT CE-scrub path.** So
+  cont.22-27 was not entirely wrong: it chased a real completion, but at teardown; the load-bearing
+  one is the **re-init CE scrub** triggered by CTX2's GSP re-boot.
+
+**=> REFRAMED ROOT CAUSE (cont.30):** the 2nd cuCtxCreate re-boots the emulated GSP; the guest RM's
+post-reboot `RmInitAdapter` CE-scrub (and its 16-semaphore pool + CeUtils finishPayload) never
+complete because the emulator doesn't forward/complete that re-init CE-scrub work — so libcuda's
+userspace wait-ALL on the 16 pool semaphores (guest VA 0x20440f000, cont.29) spins forever. The
+stale-backing teardown (cont.29) is a real prerequisite for when CTX2 *does* re-execute, but it is
+NOT what unblocks the no-compute repro.
+
+**PRECISE NEXT STEP (Fable's):** instrument WHY CTX2 performs no device work after the GSP re-boot —
+the 16-sema poll is entered BEFORE CTX2 allocates any compute channel, so those semaphores must be
+released by CE-scrub / RM-re-init work during RmInitAdapter, not user compute. Either (a) the guest
+RM's post-reboot CE scrub submits to a GSP-managed channel whose finishPayload the emulator must
+complete (the ce_utils.c:349 gap — reuse/repair the cont.23-27 forge but fire it in the re-init
+path, on the right channel/aperture, and note the 16 pool sema at 0x20440f000), or (b) CTX2's
+re-init channel-alloc RPCs are being dropped/mishandled by the emulator after re-boot (trace the
+RPC stream post-GSP_INIT_DONE seqNum 913). Reintroduce the cont.29 backing-teardown TOGETHER with
+the re-init-execution fix, not alone. VERIFY: cupctx2_min rc=0 + cup2 no-regress.
+
+**Fable-5 experiment status:** 2 substantial rounds, each producing decisive insight (cont.29 root
+cause; cont.30 the GSP-re-boot reframe + resurrected re-init CE-scrub lead) but no green repro yet.
