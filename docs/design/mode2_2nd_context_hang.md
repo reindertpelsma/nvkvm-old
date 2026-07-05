@@ -1774,3 +1774,98 @@ UVM-internal tracking-sema pool, upstream of any CTX2 doorbell.
 **cont.32 experiment status:** round 4 — one CORRECT handshake fix that disproves the reigning premise
 + the true root nailed (UVM tracking-sema backwards-jump from an un-refreshed UVM-owned pool page) but
 no green repro. Reverted to clean HEAD; bench rebuilt clean + idle.
+
+---
+
+## cont.33 (2026-07-05) — Fable-5 round 5: DISPROVES cont.32's "un-refreshed UVM pool page" premise. Root of the MAX_JUMP is a sema-write VAS COLLAPSE (CeUtils' tracking sema resolving onto UVM's page via a stale FOREIGN chan_pdb). Fixed it (content-validated own-VAS resolution) + enabled the finishPayload forge → BOTH defining #12 kernel errors ELIMINATED (UVM MAX_JUMP + ce_utils.c:349 scrubber timeout GONE, guest dmesg fully CLEAN, cup2 no-regress PASS). BUT cupctx2_min STILL rc=124 — a residual libcuda userspace busy-spin (State=R, no kernel error) remains. Patch saved `docs/design/mode2_12_cont33_fix.patch`; tree+bench reverted to clean HEAD.
+
+**Method:** reproduced #12 on clean HEAD (rc=124). The unconditional `#12-L3 CE-SEM
+BACKWARD` diagnostic + its `#12-L3c PROBE` VAS dump (already in the emulator, NOT
+trace-gated) gave the decisive trace in ONE run — no guesswork.
+
+**★ TRUE ROOT of the UVM MAX_JUMP (sharper than cont.32).** cont.32 said the block was
+UVM's persistent tracking-sema pool reading a stale/backwards value "because the
+emulator never refreshes that UVM-owned page." **That framing is wrong.** The trace:
+- Writer = CeUtils scrubber `client 0xc1e00007`, completion sema at GPU VA `0x121000010`,
+  channel gpfifo VA `0x120064000`.
+- `#12-L3c PROBE` proved the resolution: the writer's OWN sticky VAS (`cli_vas[0]`
+  pdb=0x2efba5000) **FAULTs** on 0x121000010; the channel's real content-validated VAS
+  (own_pdb `pdb=0x2efa6c000`, which maps its gpfifo 0x120064000) resolves it to phys
+  `0x1000010` (CeUtils' OWN distinct page). But a STALE FOREIGN global `chan_pdb=0x3114000`
+  (client 0xc1d00001, left behind by a sibling channel) made `nvkvm_chan_translate` walk
+  0x121000010 under that foreign VAS → phys `0x13482a010` = **UVM's persistent per-CE-channel
+  tracking-sema page** (guest CPU VA `0xffff..3482a010`, confirmed by the dmesg assert VA).
+  CeUtils' low completion payload (0x1b..) then overwrote UVM's live value (0x72) → 32-bit
+  BACKWARD jump → `uvm_gpu_semaphore.c:776` MAX_JUMP → UVM global fatal → CTX2 aborted.
+- So it is a **two-semaphores-collapse-onto-one-phys** bug (exactly the class the L3c NOTE
+  comments warn about), NOT an un-refreshed page. Zeroing UVM's page (cont.32 fix (a)) would
+  NOT help — UVM's `completed_value` (kernel-side, 0x46) persists, so 0x46→0 is ALSO a
+  backward jump. And CTX2 REUSES the same GPA (per-boot varies), so (b) "free host backing"
+  is moot — the guest, not the host backing, picks the GPA.
+
+**★ FIX 1 (operative, PROVEN, cup2-safe) — content-validated own-VAS sema resolution.**
+In `nvkvm_chan_sem_wr32`, when `cli_vas` misses, directly re-run the GPFIFO content probe
+(pass 0 = same snooped client, pass 1 = blind: find the chan_vas[] root that maps THIS
+channel's gpfifo VA) and walk the sema VA under it — BEFORE `chan_translate`'s blind
+foreign-VAS fallback. NOTE: `nvkvm_chan_own_pdb_rs()` cannot be reused directly because it
+short-circuits to the global `s->chan_pdb` (line 4208) BEFORE reaching its own gpfifo probe
+— so at the CeUtils write it returned the foreign 0x3114000 (my first attempt, gated on
+`p==FAULT && dbg_own`, therefore did NOT help). The inline probe fixes that. **PROVEN:**
+`CE-SEM BACKWARD` count 18 → **0**; `res=gpfifo-own`, phys now `0x1000010` (CeUtils' own
+page); UVM `uvm_gpu_semaphore.c:776` MAX_JUMP + `uvm_channel.c:205` asserts **GONE** from
+guest dmesg. Confined to the sema write (global chan_pdb + gpfifo/pushbuffer xlate untouched
+— pinning a probed root globally regressed single-context init, per the L3b note).
+
+**★ FIX 2 (necessary, PROVEN) — enable the finishPayload forge for kernel CeUtils by
+default.** With FIX 1 alone the MAX_JUMP was gone but `ce_utils.c:349` "scrubberDestruct
+timed out" resurfaced (it was previously MASKED — the MAX_JUMP fatal fired first). The
+finishPayload forge (#12 L3b, `gpfifo_va+0x8004`) already exists but was `s->m2_trace`-gated
+("unvalidated as default-on"). Dropped that gate for kernel CeUtils channels ONLY (user-CE
++ GR still excluded → host executes those for real; cup8/LLM compute round-trip untouched).
+**PROVEN:** guest dmesg then goes **COMPLETELY CLEAN** — no UVM assert, no scrubber timeout,
+no Xid. Forge fires 327×/run (clients 0xc1d00001/0xc1e00007), payloads climb monotonically.
+
+**+ cont.31 prereq patch** (`mode2_12_cont31_prereq_fixes.patch`) applied cleanly on top:
+STALE-SYS sysmem re-back (71×/run, incl. the pool block VA 0x204400000..0x204417000) +
+stale-USERD-overlay drop (41×/run). Both proven-firing.
+
+**NO-REGRESSION: cup2 (single ctx, CE HtoD/DtoH round-trip) PASSES rc=0, byte-exact
+(0xabcd1234).** All three fixes are safe for the working path.
+
+**★ REMAINING BLOCK (the sole survivor).** cupctx2_min STILL rc=124. With dmesg fully clean,
+CTX2's create finishes ALL kernel work, then libcuda **busy-spins in USERSPACE** (main thread
+State=R, wchan=0, empty kernel stack — a pure completion-poll, NOT a kernel wait). Key trace
+facts that RE-FRAME cont.29's "16-sema pool" theory:
+- The parser/forge write ONLY kernel semas in the `0x120xxxxxxx/0x121xxxxxxx` range. **NOTHING
+  writes the `0x2044xxxxx` pool region** the whole run.
+- `M5.22 RANG` (host-channel doorbell forward) = **0 for the ENTIRE run, including CTX1** —
+  yet **CTX1 SUCCEEDS**. So CTX1's cuCtxCreate completes via the kernel `0x121xxx` semas
+  (parser+forge), NOT via host execution and NOT via any `0x2044` pool write.
+- ⇒ CTX1 and CTX2 have IDENTICAL clean dmesg and IDENTICAL (absent) 0x2044 writes, yet CTX1
+  passes and CTX2 hangs. **The difference must be a kernel-sema (0x121xxx) completion target
+  that CTX2's forge/parser reaches for CTX1 but not CTX2** — i.e. one more channel/payload
+  the emulator under-completes on the 2nd create. This is the precise next lead.
+
+**PRECISE NEXT STEP (cont.33, for round 6):**
+  1. **Install gdb on the guest** (NOT present — blocked this round's userspace backtrace).
+     Catch the CTX2 spin frame: identify the EXACT semaphore VA + awaited value libcuda
+     polls (cont.29 said the 16-slot pool @ ~0x2044xf000, but the trace shows nothing writes
+     it AND CTX1 passes without it — so re-confirm what CTX2 actually polls now that dmesg is
+     clean; the spin may have MOVED to a kernel-sema target the forge under-completes).
+  2. Diff CTX1 vs CTX2 kernel-sema completion in the trace: for every `SEMW`/`FORGE` target,
+     compare the MAX payload reached vs the channel's `lastSubmittedPayload`. Find the
+     channel whose completion CTX2 leaves 1-behind (the collapse-fix routed CeUtils' sema to
+     0x1000010 and it climbed to 0x39 then stopped in the FIX-1-only run — verify the forge
+     now carries it to target, and hunt any OTHER channel that stops short on CTX2).
+  3. If the awaited sema is genuinely a host-written user-CE completion (needs `RANG`),
+     determine why CTX2's user channels aren't rung (token_valid? m2_usermode_qva? the
+     0xc1d00001 exclusion mis-scoping a CTX2 channel?).
+
+**KEEP (do not re-derive):** FIX 1 (content-validated own-VAS sema resolution — kills the
+UVM MAX_JUMP collapse) and FIX 2 (kernel-CeUtils finishPayload forge default-on — kills the
+scrubber timeout) are CORRECT and cup2-safe. Re-apply `mode2_12_cont33_fix.patch` (315 lines,
+includes the cont.31 prereqs) and continue from the userspace completion-poll layer above.
+**RULED OUT (cont.33, trace-proven):** cont.32's "refresh/zero UVM pool page" (wrong — it's
+a VAS collapse, and completed_value persists so zeroing back-jumps too); a GSP re-boot on
+2nd ctx (there is exactly ONE UNLOADING, at terminal SIGINT teardown — so the cont.32
+handshake fix is NOT needed for this hang and was NOT applied this round).
