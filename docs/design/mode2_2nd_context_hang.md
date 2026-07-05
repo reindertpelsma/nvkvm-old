@@ -1,5 +1,8 @@
 # Mode-2 #12 — 2nd-CUDA-context hang: root cause (CE completion sema)
 
+Status: **RESOLVED 2026-07-05 (cont.34) — `cupctx2_min` rc=0 (CTX1 AND CTX2
+create+destroy), cup2 rc=0 byte-exact.** See cont.34 at the tail.
+
 Status: diagnosed 2026-06-17 (root cause proven end-to-end via an instrumented
 full-source guest driver). The wrap-wedge *layer* is fixed and committed
 (`37d15c5`); the CE-completion *layer* documented here is the remaining blocker.
@@ -1869,3 +1872,65 @@ includes the cont.31 prereqs) and continue from the userspace completion-poll la
 a VAS collapse, and completed_value persists so zeroing back-jumps too); a GSP re-boot on
 2nd ctx (there is exactly ONE UNLOADING, at terminal SIGINT teardown — so the cont.32
 handshake fix is NOT needed for this hang and was NOT applied this round).
+
+## cont.34 (2026-07-05) — Fable-5 round 6: #12 RESOLVED. cupctx2_min rc=0 (both contexts), cup2 rc=0.
+
+Started from round 5's validated patch (`mode2_12_cont33_fix.patch`: kernel side
+clean — UVM MAX_JUMP + scrubber timeout GONE — but a residual libcuda userspace
+busy-spin). Confirmed the round-5 baseline (clean dmesg, cupctx2_min rc=124), then
+gdb'd the CTX2 spin and diffed CTX1-vs-CTX2 execution in the emulator trace. Three
+distinct, sequential root causes — each fix advanced the host-GPU fault to the next:
+
+**THE POLLED VALUE (gdb-confirmed).** CTX2's `cuCtxCreate_v2` spins in a userspace
+wait-ALL on **16 per-channel completion semaphores** in a `/dev/nvidiactl` sysmem
+pool page at guest CPU VA **0x20440ff00..0x20440fff0** (16 slots × 0x10, target=1,
+stuck 0). The tracking-sema chain is `entry.tracker+0x9410` → `+0x20` memdesc →
+`+0x10` = the sema CPU VA. Confirmed cont.29's "16-sema pool" — but the pool is
+written by the HOST GPU's CE/GR `SET_SEMAPHORE`, not by the emulator's parser
+(zero SEMW to 0x2044xxxxx all run), so it needs REAL host execution of CTX2's
+channels, exactly like CTX1.
+
+**FIX A — reuse-vs-mint the per-client cvas + compute-aperture va_seen flush.**
+The guest RM client (0xc1d00003) PERSISTS across cuCtxDestroy→cuCtxCreate; only its
+TSGs/channels are freed+recreated at the SAME compute VAs (gpfifo 0x2002xxxxx,
+pushbuffers 0x2024xxxxx, pool 0x2044xxxxx) with FRESH guest GPAs. The old code
+minted a fresh empty host VAS for CTX2 but the global `va_seen` dedup (truthful for
+CTX1's VAS) made every re-back sweep back NOTHING → host GR channel FAULT_PDE'd on
+its own GPFIFO (empty directory). Reusing CTX1's VAS fixed the PDE but thrashed the
+STALE-SYS re-back (4000+ host-rmfree/run, unmap windows → FAULT_PTE on the pool).
+**Winning combo: mint a FRESH VAS per context (no stale collisions) + on compute-
+channel teardown FLUSH the client's compute-aperture (VA≥0x2_0000_0000) sysmem host
+pins from `m2_mapped_va` (free the pin + drop the entry)** so CTX2's fresh PT walk
+re-backs the ENTIRE working set (pushbuffers, pool, and — via the same dedup — the
+vidmem GPFIFOs) CLEANLY into the fresh VAS with zero st=0x51 collisions. Scoped to
+the freed client + compute aperture + only when a compute channel was actually freed
+→ single-context paths (cup2/cup8/LLM: no mid-run compute-channel free) untouched.
+This alone moved the fault PDE→PTE and got **8/16** pool semas completing.
+
+**FIX B (the operative one) — schedule the 2nd context's GR TSG.** The 8 STUCK
+semas belonged to the 8 rl=0 GR-family channels (chid 12-19): they RANG
+(GP_PUT=1) but the host never consumed (gp_get stuck 0), while the 8 rl=1/rl=2 COPY
+channels RAN (gp_get=1). Root: those 8 channels share the GR TSG (`m2_gr_tsg`), and
+the exec_doorbell (M5.9) ring path SKIPS scheduling the GR TSG — it assumes M5.8
+`doorbell_setup` already `GPFIFO_SCHEDULE`'d it. But doorbell_setup early-returns on
+the sticky `m2_doorbell_ready` (set in CTX1), so CTX2's FRESH GR TSG (0x5c000048)
+was **never scheduled** → its channels are off-runlist → host ignores the ring.
+Fix: in exec_doorbell, `GPFIFO_SCHEDULE` the GR TSG exactly once whenever it differs
+from the last-scheduled handle (`m2_gr_tsg_sched`, new field). The M5.33 st=0x57
+noise the old skip avoided was RE-scheduling an already-scheduled TSG — the one-shot
+guard prevents that. With this the GR channel executes (gp_get advances 0→4) and all
+16 pool semas advance → `cuCtxCreate` returns.
+
+**RESULT.** `cupctx2_min` **rc=0** — `[CTX1] OK`, `[CTX2] OK`, VERDICT PASS (2
+contexts, create→destroy→create→destroy, no compute). No-regression: **cup2 rc=0**,
+CE HtoD/DtoH byte-exact (0xabcd1234), RTX 3060 enumerated, compute=8.6. All fixes
+are teardown-scoped or 2nd-context-scoped → the single-context working path is
+untouched. Committed to `src/qemu/nvkvm_gpu_emul.c` on `consolidation` (patch:
+`mode2_12_cont34_fix.patch`, includes the round-5 cont.33 changes so the tree is
+complete).
+
+**Fix sites** (all in `nvkvm_gpu_emul.c`): `nvkvm_m2_ctx_free_drop` (compute-
+aperture sysmem-pin flush on compute-channel free; `freed_compute_chan` flag);
+`nvkvm_m2_exec_doorbell` (GR-TSG one-shot `GPFIFO_SCHEDULE`); new struct field
+`m2_gr_tsg_sched`; `nvkvm_m2_doorbell_setup` records the scheduled GR TSG; M5.25
+ring-loop skip re-keyed to `m2_gr_tsg_sched`.
