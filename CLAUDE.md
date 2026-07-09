@@ -42,7 +42,8 @@ Start here: `README.md`, `PLAN.md`, `docs/ARCHITECTURE.md`, `docs/MILESTONES.md`
 - Mode-2 internals: `mode2_memory_model.md`, `mode2_address_virtualization.md`,
   `mode2_bar2_mmu.md`, `mode2_device_data_model.md`, `mode2_m3_gsp_rpc.md`,
   `mode2_dataplane_architecture.md`, `mode2_doorbell_chid.md`, `mode2_interrupt_delivery.md`,
-  `mode2_uvm_residency.md`, `nvidia_gpu_internals.md`.
+  `mode2_uvm_residency.md`, `mode2_multiprocess_isolate.md` (per-process page-table-publication
+  isolate — the multi-process/#14 design, deferred to the Rust rewrite), `nvidia_gpu_internals.md`.
 - Feasibility / strategy: `device_simulation_feasibility.md`, `mode2_plan.md`.
 - Mode-1 / shared: `mode1_poll_relay_plan.md`, `command_buffer.md`, `gpa_window_pci_bar.md`,
   `async_event_delivery.md`, `virtual_modeset.md`, `signal_interrupt_delivery.md`.
