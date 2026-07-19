@@ -368,7 +368,7 @@ struct NvkvmGpuEmul {
      * under UVM's gpu-ops session client, nv_gpu_ops.c nvGpuOpsSetPageDirectory).  Kernel-
      * internal VASes (CeUtils scrubber etc.) never take this path — #13 uses the flag to
      * scope the CE-PT-write backing trigger to user-compute address spaces. */
-    struct { uint32_t hvas; uint32_t client; uint64_t pdb; bool root_sys; bool uvm; } chan_vas[16];
+    struct { uint32_t hvas; uint32_t client; uint64_t pdb; bool root_sys; bool uvm; } chan_vas[64]; /* #14 P0: 16->64 for N procs */
     int      chan_vas_n;
     /* #12-L3c: STICKY per-client VAS roots — same captures as chan_vas[] but NEVER
      * dropped on RM-handle free.  A GSP-managed UVM CE channel (empty instblk, hvas=0)
@@ -435,6 +435,20 @@ struct NvkvmGpuEmul {
      * (h_root, and h_object_parent when it names a client). Objects stay verbatim. */
     struct { uint32_t g, h; } m2_cmap[128];
     int      m2_cmap_n;
+    uint32_t m2_cmap_next;      /* #14 P0: MONOTONIC host-handle mint counter.  The old
+                                 * mint (0xdead0001 + m2_cmap_n) breaks once proc-exit reap
+                                 * shrinks the table: a re-mint could collide with a live
+                                 * handle.  Sequence is identical while nothing is reaped. */
+    /* #14 P0 DEFERRED reap: root-freed clients whose RESOLUTION/BACKING state
+     * (m2_cli_vas / va_map / m2_objs / m2_gpga) must NOT be reaped at the free
+     * itself — the dying context's userspace still busy-polls overlay-backed
+     * pages after its root frees (bench-proven: immediate reap hung cupctx2_min
+     * CTX2 destroy).  Consumed at the GSP queue RE-HANDSHAKE (tx-header write =
+     * the next context/process boot), when the GPU was idle-released and no
+     * poller can exist.  Bounded: on overflow the oldest hygiene is simply
+     * skipped (same as the pre-P0 never-reaped behavior). */
+    uint32_t m2_reap_pend[32];
+    int      m2_reap_pend_n;
     /* M5.3: per-mapping fresh /dev/nvidia0 isolate-fd handle allocator. Handles
      * 1=ctl, 2=gpu are fixed; on-demand context-buffer mappings draw from here
      * (nvidia binds exactly one CPU mapping per device fd, so each needs its own). */
@@ -446,7 +460,9 @@ struct NvkvmGpuEmul {
     int      m2_devvas_n;
     /* M5.3: TSG (0xa06c) handle -> engineType, so a channel that passes engineType=0
      * (NULL, "inherit") can be given its TSG's engine explicitly on the host. */
-    struct { uint32_t tsg, engine; } m2_tsgeng[64];   /* #14: 2 procs */
+    struct { uint32_t tsg, engine, client; } m2_tsgeng[64];   /* #14: 2 procs; P0: +client
+                                 * (populate-site hClient) so proc-exit reap can drop a dead
+                                 * process's entries — lookups stay tsg-keyed (byte-identical). */
     int      m2_tsgeng_n;
     /* M5.3 data-plane: the GR-client subdevice (NV20_SUBDEVICE_0 0x2080) handle, needed
      * to issue GR_GET_CTX_BUFFER_INFO on the host shadow context after the compute object
@@ -570,7 +586,7 @@ struct NvkvmGpuEmul {
      * single-process scalar, unchanged); the sweep/ring/backing paths iterate this
      * list so a 2nd process's client is a peer, not invisible.  Entries drop on
      * root client free (RM reuses handle values across process lifetimes). */
-    uint32_t m2_gr_clients[8];
+    uint32_t m2_gr_clients[16];   /* #14 P0: 8->16 for N procs */
     int      m2_gr_clients_n;
     /* #14 EARLY-ARM: user compute clients derived from DUP_OBJECT SRC (the UVM
      * handover dups the user's VASpace OUT of libcuda's client), recorded at the
@@ -586,7 +602,7 @@ struct NvkvmGpuEmul {
      * process (one dup-src client, incl. #12's client-reusing 2-context case) it
      * is inert and behavior is byte-identical.  Entries drop on root client free
      * (RM reuses handle values across process lifetimes). */
-    uint32_t m2_user_clients[8];
+    uint32_t m2_user_clients[16]; /* #14 P0: 8->16 for N procs */
     int      m2_user_clients_n;
     /* #14 piece-2: deferred completion-retry kick.  Set while servicing a guest
      * MC_SERVICE_INTERRUPTS poll (fn=76 ctrl 0x20801702) in multiproc mode;
@@ -596,7 +612,7 @@ struct NvkvmGpuEmul {
     /* M5.7: per-client NV01_MEMORY_VIRTUAL mapper over the client's GR VASpace, so the
      * execution path can map_dma FIXED the guest's working-set buffers into the host
      * channel's address space at the guest VAs (see [[mode2-mapdma-primitive]]). */
-    struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[8];
+    struct { uint32_t client, hvirt, hvas, hdev; } m2_grmap[32]; /* #14 P0: 8->32 for N procs */
     int      m2_grmap_n;
     /* M5.49b: libcuda's CE-copy clients (the user-observable data path, e.g. the
      * cuMemcpyHtoD/DtoH that produce rv).  Identified as the clients that hit the
@@ -614,7 +630,7 @@ struct NvkvmGpuEmul {
      * into THIS vas (fvirt over fvas) instead of the per-client grmapper. m2_cur_cvas is the
      * active index for the current map ops (set per-channel in the doorbell loop; -1 = use
      * the legacy per-client grmapper, e.g. CeUtils). */
-    struct { uint32_t client, tsg, hdev, fvas, fvirt; bool populated; } m2_cvas[16];
+    struct { uint32_t client, tsg, hdev, fvas, fvirt; bool populated; } m2_cvas[64]; /* #14 P0: 16->64 for N procs */
     int      m2_cvas_n;
     int      m2_cur_cvas;
     uint32_t m2_gr_channel;     /* M5.8: the host GR channel handle (c56f under GR TSG) */
@@ -1741,9 +1757,15 @@ static bool nvkvm_m2_bd_page_has(NvkvmGpuEmul *s, uint64_t page)
 
 static void nvkvm_m2_host_rmfree(NvkvmGpuEmul *s, uint32_t client, uint32_t parent,
                                  uint32_t hobj); /* #12 cont.34 fwd-decl */
+static bool nvkvm_m2_is_gr_client(NvkvmGpuEmul *s, uint32_t client);   /* P0 reap fwd-decl */
+static bool nvkvm_m2_is_user_client(NvkvmGpuEmul *s, uint32_t client); /* P0 reap fwd-decl */
 static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fObj)
 {
     bool root = (fClient == fObj);            /* client-root free: purge all of fClient */
+    /* #14 P0: capture BEFORE the drops below mutate the client lists — is this root
+     * free a user compute process's exit?  Gates the m2_objs/m2_gpga reap (see below). */
+    bool user_root = root && (nvkvm_m2_is_gr_client(s, fClient) ||
+                              nvkvm_m2_is_user_client(s, fClient));
     int dropped = 0;
     bool freed_compute_chan = false;          /* #12 cont.34: a compute-aperture chan was freed */
     /* chans[]: match the freed channel handle, or any channel of the freed client. */
@@ -1923,6 +1945,77 @@ static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t f
         }
         i++;
     }
+    /* ── #14 P0 reap hygiene (plan §2 rows 4,5,13,17,18,19,22,28,29): on a client-ROOT
+     * free, purge the freed client's entries from the never-reaped client-keyed tables so
+     * process churn cannot leak slots or alias a later process that reuses the same RM
+     * handle VALUE (RM reuses client handle values across process lifetimes).  Root-free
+     * only: mid-run handle frees (#12's sequential 2-context case keeps ONE client alive)
+     * never take these paths, so single-process behavior is byte-identical. */
+    if (root) {
+        int reaped = 0;
+        /* rows 4/5 (m2_cli_vas, va_map) + 28/29 (m2_objs, m2_gpga) are RESOLUTION/
+         * BACKING state: reaping them AT the root free hangs the dying context's own
+         * residual polls (bench-proven, cupctx2_min CTX2 destroy).  Enqueue the client
+         * for the DEFERRED reap at the next GSP queue re-handshake instead. */
+        if (s->m2_reap_pend_n < (int)ARRAY_SIZE(s->m2_reap_pend)) {
+            bool pend_seen = false;
+            for (int i = 0; i < s->m2_reap_pend_n; i++) {
+                if (s->m2_reap_pend[i] == fClient) { pend_seen = true; break; }
+            }
+            if (!pend_seen) { s->m2_reap_pend[s->m2_reap_pend_n++] = fClient; }
+        }
+        /* row 17 — m2_tsgeng[]: keyed by the P0 client field (lookups stay tsg-keyed). */
+        for (int i = 0; i < s->m2_tsgeng_n; ) {
+            if (s->m2_tsgeng[i].client == fClient) {
+                s->m2_tsgeng[i] = s->m2_tsgeng[s->m2_tsgeng_n - 1];
+                s->m2_tsgeng_n--; reaped++; continue;
+            }
+            i++;
+        }
+        /* row 18 — m2_subdev[]. */
+        for (int i = 0; i < s->m2_subdev_n; ) {
+            if (s->m2_subdev[i].client == fClient) {
+                s->m2_subdev[i] = s->m2_subdev[s->m2_subdev_n - 1];
+                s->m2_subdev_n--; reaped++; continue;
+            }
+            i++;
+        }
+        /* row 19 — m2_grmap[] (bookkeeping only; the host-side virtmem object was/is
+         * freed by the forwarded root free itself). */
+        for (int i = 0; i < s->m2_grmap_n; ) {
+            if (s->m2_grmap[i].client == fClient) {
+                s->m2_grmap[i] = s->m2_grmap[s->m2_grmap_n - 1];
+                s->m2_grmap_n--; reaped++; continue;
+            }
+            i++;
+        }
+        /* row 22 — m2_user_ce_clients[]. */
+        for (int i = 0; i < s->m2_user_ce_n; ) {
+            if (s->m2_user_ce_clients[i] == fClient) {
+                s->m2_user_ce_clients[i] = s->m2_user_ce_clients[s->m2_user_ce_n - 1];
+                s->m2_user_ce_n--; reaped++; continue;
+            }
+            i++;
+        }
+        /* row 13 — m2_cmap[] guest->host client remap: LAST (the shadow-forwarded host
+         * free of this root already consumed the mapping earlier in service_cmdq).  A
+         * later process reusing the guest value then mints a FRESH host client instead
+         * of aliasing the dead one (mint is monotonic, so no handle reuse). */
+        for (int i = 0; i < s->m2_cmap_n; ) {
+            if (s->m2_cmap[i].g == fClient) {
+                s->m2_cmap[i] = s->m2_cmap[s->m2_cmap_n - 1];
+                s->m2_cmap_n--; reaped++; continue;
+            }
+            i++;
+        }
+        if (reaped) {
+            qemu_log("nvkvm-gpu[%s] #14 P0 root-free reap client=0x%08x (user=%d): "
+                     "%d entries (tsgeng=%d subdev=%d grmap=%d cmap=%d; heavy DEFERRED "
+                     "pend=%d)\n", s->chip->name, fClient, user_root, reaped,
+                     s->m2_tsgeng_n, s->m2_subdev_n, s->m2_grmap_n, s->m2_cmap_n,
+                     s->m2_reap_pend_n);
+        }
+    }
     /* #12 NOTE (bench-disproven 2026-06-18): a naive "release this client's GPGA
      * overlays on its root-free" is UNSAFE and does NOT fix the hang.  The CeUtils scrub
      * channel (client 0xc1e00007) reads its ring/finishPayload from an emulated-FB phys
@@ -1941,6 +2034,62 @@ static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t f
                  root ? "ROOT" : "obj", fClient, fObj, dropped, s->chan_n, s->m2_chanbuf_n,
                  s->m2_devvas_n, s->m2_cvas_n, s->chan_vas_n);
     }
+}
+
+/* #14 P0 DEFERRED reap (see m2_reap_pend[]): purge the resolution/backing state of
+ * clients whose ROOT was freed, at the GSP queue RE-HANDSHAKE — the next context/
+ * process boot, after the fn-47 idle-release, when no guest poller can reference
+ * these entries (immediate reap at the free hung cupctx2_min's residual teardown
+ * polls; and the 2026-06-18 disproof shows kernel channels can read a freed
+ * client's overlays mid-run — both impossible here: the GPU was idle-released).
+ * Bookkeeping-only: host-side objects were freed by the forwarded frees / will be
+ * owned by the per-proc isolate teardown (P2).  m2_gpga[].obj_idx indexes
+ * m2_objs[], so obj removal re-points the swapped-in last entry + dirties the
+ * sorted index. */
+static void nvkvm_m2_reap_dead(NvkvmGpuEmul *s)
+{
+    if (!s->m2_reap_pend_n) { return; }
+    int reaped = 0;
+    for (int c = 0; c < s->m2_reap_pend_n; c++) {
+        uint32_t cl = s->m2_reap_pend[c];
+        for (int i = 0; i < s->m2_cli_vas_n; ) {              /* row 4 */
+            if (s->m2_cli_vas[i].client == cl) {
+                s->m2_cli_vas[i] = s->m2_cli_vas[s->m2_cli_vas_n - 1];
+                s->m2_cli_vas_n--; reaped++; continue;
+            }
+            i++;
+        }
+        for (int i = 0; i < s->va_map_n; ) {                  /* row 5 */
+            if (s->va_map[i].client == cl) {
+                s->va_map[i] = s->va_map[s->va_map_n - 1];
+                s->va_map_n--; reaped++; continue;
+            }
+            i++;
+        }
+        for (int i = 0; i < s->m2_objs_n; ) {                 /* rows 28/29 */
+            if (s->m2_objs[i].client != cl) { i++; continue; }
+            for (int g = 0; g < s->m2_gpga_n; ) {
+                if (s->m2_gpga[g].obj_idx == i) {
+                    s->m2_gpga[g] = s->m2_gpga[s->m2_gpga_n - 1];
+                    s->m2_gpga_n--; reaped++; continue;
+                }
+                g++;
+            }
+            int last = s->m2_objs_n - 1;
+            s->m2_objs[i] = s->m2_objs[last];
+            s->m2_objs_n--; reaped++;
+            for (int g = 0; g < s->m2_gpga_n; g++) {
+                if (s->m2_gpga[g].obj_idx == last) { s->m2_gpga[g].obj_idx = i; }
+            }
+            /* re-check slot i (swapped-in entry) */
+        }
+    }
+    s->m2_gpga_idx_dirty = true;
+    qemu_log("nvkvm-gpu[%s] #14 P0 deferred reap @re-handshake: %d clients, %d entries "
+             "(cli_vas=%d va_map=%d objs=%d gpga=%d)\n", s->chip->name,
+             s->m2_reap_pend_n, reaped, s->m2_cli_vas_n, s->va_map_n, s->m2_objs_n,
+             s->m2_gpga_n);
+    s->m2_reap_pend_n = 0;
 }
 
 /* ── DIAG (address-virtualization bring-up, removable) ──────────────────────
@@ -2306,7 +2455,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          * empty in our FB).  body @cmd+80: control cmd@+88 (cmd+88); params@cmd+120;
          * virtAddrLo@cmd+136, virtAddrHi@cmd+144, levels[0].physAddress@cmd+160. */
         if (fn == 76 && ldl_le_p(cmd + 88) == 0x90f10106u) {
-            if (s->chan_vas_n < 16) {
+            if (s->chan_vas_n < (int)ARRAY_SIZE(s->chan_vas)) {
                 int k = s->chan_vas_n++;
                 s->chan_vas[k].hvas = ldl_le_p(cmd + 84);   /* control hObject = VASpace */
                 s->chan_vas[k].client = ldl_le_p(cmd + 80); /* GSP_RM_CONTROL hClient (#12-L3) */
@@ -2359,7 +2508,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     dup = true; break;
                 }
             }
-            if (!dup && phys && s->chan_vas_n < 16) {
+            if (!dup && phys && s->chan_vas_n < (int)ARRAY_SIZE(s->chan_vas)) {
                 int k = s->chan_vas_n++;
                 s->chan_vas[k].hvas = hvas;
                 s->chan_vas[k].client = ldl_le_p(cmd + 80); /* GSP_RM_CONTROL hClient (#12-L3) */
@@ -3250,6 +3399,10 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                             s->q_msgcount     = ldl_le_p(txh + 12);
                             s->q_cmd_entryoff = ldl_le_p(txh + 28);
                             s->q_stat_entryoff= ldl_le_p(txh + 28);
+                            /* #14 P0: the re-handshake = the quiesced point (GPU was
+                             * idle-released; next context boots).  Purge dead-client
+                             * resolution/backing state now — never at the free. */
+                            nvkvm_m2_reap_dead(s);
                             /* #12 L3 (2026-06-20): RESET the status-queue WRITE
                              * position but PRESERVE the seqNums across a GSP
                              * re-acquire.  The driver's MESSAGE_QUEUE_INFO (and its
@@ -6134,7 +6287,7 @@ static uint32_t nvkvm_m2_client(NvkvmGpuEmul *s, uint32_t g)
     if (s->m2_cmap_n >= (int)(sizeof(s->m2_cmap) / sizeof(s->m2_cmap[0]))) {
         return g;                        /* table full -> verbatim (may collide) */
     }
-    uint32_t h = 0xdead0001u + (uint32_t)s->m2_cmap_n;
+    uint32_t h = 0xdead0001u + (s->m2_cmap_next++ & 0xffffu);  /* P0: monotonic (reap-safe) */
     s->m2_cmap[s->m2_cmap_n].g = g;
     s->m2_cmap[s->m2_cmap_n].h = h;
     s->m2_cmap_n++;
@@ -6223,7 +6376,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
     /* M5.3 data-plane: remember the NV20_SUBDEVICE_0 (0x2080) handle per GR client —
      * GR_GET_CTX_BUFFER_INFO is issued on the subdevice to enumerate the host shadow
      * context's real buffers (the data to mirror into the guest's BAR-backed buffers). */
-    if (hClass == 0x2080u && s->m2_subdev_n < 64) {
+    if (hClass == 0x2080u && s->m2_subdev_n < (int)ARRAY_SIZE(s->m2_subdev)) {
         s->m2_subdev[s->m2_subdev_n].client = hClient;
         s->m2_subdev[s->m2_subdev_n].subdev = hObject;
         s->m2_subdev_n++;
@@ -6311,7 +6464,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
                     dup = i; break;              /* already registered (replayed alloc) */
                 }
             }
-            if (gi >= 0 && (dup >= 0 || s->m2_cvas_n < 16)) {
+            if (gi >= 0 && (dup >= 0 || s->m2_cvas_n < (int)ARRAY_SIZE(s->m2_cvas))) {
                 stl_le_p(auxbuf + 8, s->m2_cvas[gi].fvas);
                 if (dup < 0) {
                     int idx = s->m2_cvas_n++;
@@ -6347,6 +6500,7 @@ static void nvkvm_m2_shadow_fwd(NvkvmGpuEmul *s, const uint8_t *cmd, uint32_t fn
         s->m2_tsgeng_n < (int)ARRAY_SIZE(s->m2_tsgeng)) {
         s->m2_tsgeng[s->m2_tsgeng_n].tsg    = hObject;
         s->m2_tsgeng[s->m2_tsgeng_n].engine = ldl_le_p(auxbuf + 12);
+        s->m2_tsgeng[s->m2_tsgeng_n].client = hClient;   /* P0: reap key only */
         s->m2_tsgeng_n++;
     }
     /* M5.3: FERMI_CONTEXT_SHARE_A (0x9067) NV_CTXSHARE_ALLOCATION_PARAMETERS has
@@ -7143,7 +7297,7 @@ static int nvkvm_m2_cvas_get(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg)
     for (int i = 0; i < s->m2_cvas_n; i++) {
         if (s->m2_cvas[i].client == client && s->m2_cvas[i].tsg == tsg) { return i; }
     }
-    if (s->m2_cvas_n >= 16) { return -1; }
+    if (s->m2_cvas_n >= (int)ARRAY_SIZE(s->m2_cvas)) { return -1; }
     uint32_t hDev = 0;
     for (int i = 0; i < s->m2_devvas_n; i++) {
         if (s->m2_devvas[i].client == client) { hDev = s->m2_devvas[i].dev; break; }
@@ -7218,7 +7372,7 @@ static uint32_t nvkvm_m2_grmapper(NvkvmGpuEmul *s, uint32_t client)
             hDev = s->m2_devvas[i].dev; hVas = s->m2_devvas[i].vas; break;
         }
     }
-    if (!hDev || !hVas || s->m2_grmap_n >= 8) {
+    if (!hDev || !hVas || s->m2_grmap_n >= (int)ARRAY_SIZE(s->m2_grmap)) {
         qemu_log("nvkvm-gpu[%s] M5.7 grmapper: no dev/vas for client 0x%08x\n",
                  s->chip->name, client);
         return 0;

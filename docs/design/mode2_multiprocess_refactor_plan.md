@@ -525,6 +525,23 @@ missing proc-exit reap to the never-reaped tables (rows 4,5,13,17,18,19,22,28,29
 existing `ctx_free_drop` (`:1744`) root-client-free path. Pure safety; single-proc identical. *Ships
 alone.*
 
+> **★ P0 SHIPPED 2026-07-19 (ladder green) — with one bench-forced amendment.** Reaping the
+> RESOLUTION/BACKING tables (rows 4,5 `m2_cli_vas`/`va_map` and 28,29 `m2_objs`/`m2_gpga`) *at* the
+> root free is NOT single-process-safe: the dying context's userspace keeps busy-polling
+> overlay-backed pages *after* its client-root frees (cupctx2_min hung at CTX2 destroy, post-fn-47;
+> A/B with reap disabled passed — deterministic). Fix: those four tables go on a pending list
+> (`m2_reap_pend[]`) consumed by `nvkvm_m2_reap_dead()` at the **GSP queue re-handshake**
+> (tx-header write = the next context/process boot, after the fn-47 idle-release — provably
+> quiesced; bench: 13 clients / 427 entries reaped there, CTX2 rebuilt cleanly). The light
+> control-plane tables (rows 13,17,18,19,22 `m2_cmap`/`m2_tsgeng`/`m2_subdev`/`m2_grmap`/
+> `m2_user_ce_clients`) reap immediately at root-free as planned. Consequences: (a) `m2_cmap`'s
+> host-handle mint is now a monotonic counter (`m2_cmap_next`) so reap can never recycle a live
+> synthetic handle; (b) `m2_tsgeng` gained a `client` field (populate-site hClient) purely as the
+> reap key; (c) mid-life multi-proc churn (proc exits while another runs → no idle-release → no
+> re-handshake) keeps the pre-P0 leak-until-idle behavior for the heavy tables — the real owner of
+> that residual is P2's per-proc isolate teardown. Ladder: cup2 rc=0, cupctx2_min rc=0, cup8
+> byte-exact rc=0, cup8_iter 5/5 rc=0, all on fresh boots.
+
 **P1 — experiment E0 + `NvkvmProc` registry keyed by PDB-grouping (identity plumbing).** Run
 **E0** (§1.4) first: log `(doorbell token, resolved channel, owning PDB)` per doorbell across 2×
 `cup8` and decide whether the CHID demux is unambiguous (expected: yes — CHIDs are fresh per
