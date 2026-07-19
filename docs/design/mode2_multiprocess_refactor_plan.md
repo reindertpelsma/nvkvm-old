@@ -202,6 +202,18 @@ across 2× `cup8` (the `:3392-3396` dedup-log already captures the token) and ch
 This resolves the round-5/6 open question, superseding the plan's previous CR3-heavy answer
 (which reached for CR3 at the doorbell + the RPC populate sites + the PT-write hook).
 
+**★ E0 RESULT — RUN 2026-07-19 on the rebuilt bench (host=580, HEAD 862c7c2-equiv): DISTINCT — CR3
+DROPPED ENTIRELY.** Two concurrent `cup8` (`NVKVM_M2CEFWD=1 NVKVM_M2TRACE=1`), `M5.11 DOORBELL` log:
+105 doorbell writes, **35 distinct tokens = 35 distinct `[11:0]` vChids — one per channel** (the token
+IS the vChid: small sequential ints `4, 12, 13, …`, `token[11:0]==chid`). Since each channel-create
+yields a fresh vChid and the two processes' channels are distinct channels, the doorbell token uniquely
+identifies the channel → (via §1.3) the owning PDB → the process, **with no CPU signal**. The current
+code even names the bug it exposes — the doorbell handler comment (`:3387`): *"Today we ignore it and
+ring the host GR token unconditionally — wrong for multi-channel."* So P1's doorbell work is **"demux
+the distinct token we already receive,"** not "add CR3." **Consequence: `nvkvm_cpukey.c` is never built;
+`cpu_synchronize_state`/`env.cr[3]` appear nowhere; the refactor keys entirely on PDB + vChid.** The CR3
+caveats below are now moot (kept only as the rationale for why CR3 was never made load-bearing).
+
 **CR3 reliability caveats (they apply only to the E0-ambiguous fallback, but they are the real
 reason CR3 must not be load-bearing):**
 
