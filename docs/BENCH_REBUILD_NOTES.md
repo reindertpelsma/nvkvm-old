@@ -31,7 +31,7 @@ Phase status (this rebuild):
       (b) step-6b virtio.c patch regex required a trailing comma after "virtio-gpio", but in
           QEMU 9.2.0 [VIRTIO_ID_GPIO] is the LAST initializer entry with NO trailing comma.
           Fixed: made comma optional in match, emit our entries with the comma.
-- [ ] 4. Build stub
+- [x] 4. Build stub DONE — make -C src/stub nvkvm_stub (156656 B) -> install /usr/lib/nvkvm/nvkvm_stub.
 - [~] 5. Guest disk IN PROGRESS:
       - base = ubuntu 24.04.4 noble cloudimg -> /opt/nvkvm-guest/ubuntu-24.04.qcow2 (+30G, 33.5G virt)
       - seed.iso built with cloud-localds; user-data (plain #cloud-config, NOT base64 this time —
