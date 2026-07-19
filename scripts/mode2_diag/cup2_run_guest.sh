@@ -29,6 +29,7 @@ if [ -n "$UVM_MAJ" ]; then
 fi
 sudo chmod 666 /dev/nvidia* /dev/nvidiactl 2>/dev/null || true
 sudo ln -sf /usr/local/nvidia-guest/lib/libcuda.so.580.159.04 /lib/x86_64-linux-gnu/libcuda.so.1
+sudo ln -sf /usr/local/nvidia-guest/lib/libcuda.so.580.159.04 /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null; sudo ldconfig 2>/dev/null
 gcc -O0 -g -o /tmp/cup2 /tmp/cup2.c -lcuda 2>&1 | tail -2
 
 echo "=== cup2 (foreground, timeout ${TIMEOUT}s) ==="
