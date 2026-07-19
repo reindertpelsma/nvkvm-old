@@ -66,7 +66,14 @@ Phase status (this rebuild):
       validated with **host driver 580.159.04**; on host 575 the emulator's CE VAS resolution faults
       and cuCtxCreate hangs. DECISION REVISED: must install 580 on the host after all. The .run
       refused earlier due to the apt-managed 575 driver -> now purging the apt 575 set + installing
-      the 580 .run (mechanics per multi_driver_validated). [IN PROGRESS]
+      the 580 .run (mechanics per multi_driver_validated).
+      DID IT: rmmod nvidia*, `apt-get purge` the whole nvidia-driver-575/dkms/utils/libnvidia-*575
+      set (kept container-toolkit + nvidia-modprobe, harmless), then
+      `sh NVIDIA-580.run --silent --no-x-check --no-nouveau-check --dkms -m=kernel-open` -> RC=0.
+      **HOST NOW ON 580.159.04** (nvidia-smi healthy, open modules loaded, RTX 3060 responsive).
+      /usr/src/nvidia-580.159.04 + /usr/lib/firmware/nvidia/580.159.04 (guest 9p shares) intact.
+      >>> DRIVER DECISION FINAL = **580.159.04 INSTALLED ON HOST** (matches known-good baseline).
+      Re-running cup2 on host=580 next.
 - [ ] 7. Baseline: cupctx2_min (#12) / cup8 / cup8_iter (#13)
 
 GOTCHA (this rebuild): the FIRST provision-boot launch died because the heredoc that wrote
