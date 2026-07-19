@@ -1,7 +1,7 @@
 # nvkvm Mode-2 bench rebuild status
 
 ---
-## REBUILD 2026-07-19 (box #45305458 @ 70.30.158.46:27130) — IN PROGRESS
+## REBUILD 2026-07-19 (box #45305458 @ 70.30.158.46:27130) — ✅ COMPLETE (all baselines green)
 Fresh BLANK vast box (RTX 3060 GA106, host 575.51.03, kernel 6.8.0-59, /dev/kvm present,
 21 cores / 49GB / 138G free). Goal: single-process baseline GREEN at emulator source = 862c7c2
 (local HEAD c861451 = 862c7c2 + 2 docs-only commits; nvkvm_gpu_emul.c byte-identical to 862c7c2).
@@ -84,7 +84,21 @@ Phase status (this rebuild):
       [x] cupctx2_min (#12) rc=0 — CTX1 create+destroy OK, CTX2 create+destroy OK, VERDICT PASS
           (2 contexts). #12 fix (f5bb32f in 862c7c2) confirmed. 0 faults this boot.
       [x] cup8 rc=0 — 2048^2 matmul byte-exact (bad=0 maxerr=0) VERDICT PASS (host GR matmul at scale)
-      [ ] cup8_iter (#13, 5 iters)
+      [x] cup8_iter (#13) rc=0 — ITER0 N=512 PASS, ITER1 N=1024 PASS, ITER2 N=1536 PASS (the old
+          #13 hang point), ITER3 N=2048 PASS, ITER4 N=768 PASS. VERDICT PASS (iters=5 fails=0).
+   [x] 7. Baseline DONE — ALL THREE GREEN on host=580. Host GPU healthy (0% util, 1 MiB), no Xid.
+
+=== REBUILD COMPLETE 2026-07-19 — ALL SUCCESS CRITERIA MET ===
+cup2 rc=0 (smoke) | cupctx2_min rc=0 (#12, 2 ctx) | cup8 rc=0 (2048^2 byte-exact) |
+cup8_iter rc=0 (#13, 5/5 iters). Driver decision FINAL = 580.159.04 installed on the host
+(575 host deterministically hangs cuCtxCreate's CE VAS resolution; 580 passes — host-driver-version
+dependency is real and must match the known-good 580 baseline).
+WORKING BOOT+TEST (host): pkill -9 -f "qemu-system-x86_6[4]"; sleep 5; verify none;
+  rm -f /opt/nvkvm-guest/mode2-overlay.qcow2;
+  NVKVM_M2CEFWD=1 nohup bash /workspace/nvkvm/scripts/run_mode2_vm.sh >/tmp/m0_qemu.log 2>&1 & disown;
+  wait for ssh -p 2223; then stage tests from nvkvm_src 9p (/mnt/nvsrc) + re-add libcuda.so symlink
+  (ln -sf /usr/local/nvidia-guest/lib/libcuda.so.580.159.04 /usr/lib/x86_64-linux-gnu/libcuda.so;
+  ldconfig) and run scripts/mode2_diag/<test>_run_guest.sh. FRESH boot per GPU test.
 
 GOTCHA (this rebuild): the FIRST provision-boot launch died because the heredoc that wrote
 /tmp/boot_provision.sh was in the SAME command as `pkill -9 -f qemu-system-x86_64` — pkill's regex
