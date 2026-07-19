@@ -30,6 +30,7 @@ if [ -n "$UVM_MAJ" ]; then
 fi
 sudo chmod 666 /dev/nvidia* /dev/nvidiactl 2>/dev/null || true
 sudo ln -sf "$GUESTLIB/libcuda.so.580.159.04" /lib/x86_64-linux-gnu/libcuda.so.1
+sudo ln -sf "$GUESTLIB/libcuda.so.580.159.04" /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null; sudo ldconfig 2>/dev/null
 
 gcc -O0 -g -o /tmp/cup8_iter /tmp/cup8_iter.c -lcuda -lm 2>&1 | tail -3
 echo "=== cup8_iter bg (ITERS=${ITERS:-5}) + progress/stack probe ==="

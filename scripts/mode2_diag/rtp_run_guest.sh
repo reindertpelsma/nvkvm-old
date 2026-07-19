@@ -46,6 +46,7 @@ case "${1:-setup}" in
     fi
     sudo chmod 666 /dev/nvidia* /dev/nvidiactl 2>/dev/null || true
     sudo ln -sf "$GUESTLIB/libcuda.so.580.159.04" /lib/x86_64-linux-gnu/libcuda.so.1
+sudo ln -sf "$GUESTLIB/libcuda.so.580.159.04" /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null; sudo ldconfig 2>/dev/null
     # PIN: hold /dev/nvidia0 open in a detached process => first+only RmInitAdapter,
     # held across the dvp and rtp ssh sessions, no last-client-close de-init/WPR2 churn.
     setsid bash -c 'exec 9<>/dev/nvidia0; echo $$ > '"$PINFD"'; sleep 900' >/dev/null 2>&1 &
