@@ -614,6 +614,27 @@ client-scoped pick is a no-op for one process). *Ships alone.* **After P3, 2× `
 "one reliably passes" without the transition-window fragility of round-3** (because P1/P2 armed
 per-process separation from process *start*, not at the 2nd `0xc7c0`).
 
+> **★ P3 BANKED 2026-07-19 — behavioral target already MET at P1; mechanical re-keying folds into
+> P4-4a (tree stays green).** Empirically, **the P3 target outcome is already satisfied by the P1
+> committed state:** across 5 fresh-boot 2× `cup8` runs the **winner ALWAYS completes rc=0
+> byte-exact** (A or B), and single-process is byte-identical (ladder green) — i.e. "one reliably
+> passes, single-proc untouched." The reason: the data plane **already separates by
+> distinct-per-proc client** (v3: `m2_mapped_va` is `(client,va)`-keyed, `m2_cli_vas`/`va_map`
+> client-keyed, per-client `cvas`/`grmapper` host VASes; P1 registered distinct PDBs per proc,
+> e.g. `0x3401000`/`0x3402000`). So converting rows 3,4,5,20,25,27,31 from client-key to PDB-key
+> is a **single-process no-op AND a 2-proc no-op for the winner** (distinct clients already
+> disambiguate the same guest VA) — pure hot-path churn on the load-bearing #12/#13 backing/sema
+> resolvers for **zero behavioral change**, which the "correctness over green-test-hacks" mandate
+> says not to do speculatively. **The loser's flaky hang is NOT a P3 data-plane-aliasing bug — it
+> is the P4 §4 wall** (its own `PD0[1]` leaf is never published into its PDB's FB shadow because
+> its PT-writer push starves; evidence: the loser sits in a busy `MC_SERVICE_INTERRUPTS`/backing
+> re-sweep loop with its compute-aperture VAs `st=0x51 ALREADY-MAPPED`, never completing). That is
+> exactly what **P4-4a (per-PDB PT capture)** consumes the per-VAS sub-tables *for*; re-keying them
+> without 4a's consumer would be dead code. **Decision:** land the rows-3/4/5/20/25/27/31 per-VAS
+> re-keying **together with P4-4a**, where it becomes load-bearing, rather than as a standalone
+> single-proc no-op. Tree stays green at P1 (which meets the P3 acceptance behavior). See
+> `mode2_14_P3.patch` for the row-by-row re-keying spec + the P4-4a coupling.
+
 **P4 — per-process page-table publication (THE crux, §4).** 4a per-PDB PT capture, 4b default-on
 #12-safe ring-pin, 4c per-process PT-writer scheduling, 4d delete the content-pick fallback.
 **Riskiest phase** (R-P4-2). Verify `cup2`/`cupctx2_min`/`cup8`/`cup8_iter` **and** 2× `cup8` both
