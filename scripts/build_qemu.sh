@@ -79,8 +79,11 @@ echo "[5/9] Fixing include paths in copied files..."
 # ../../src/abi/bar.h that are correct relative to src/qemu/ but wrong inside
 # hw/misc/.  Rewrite EVERY such include (across all copied .c and .h) to the
 # local nvkvm_inc/ sub-directory — generalized so new headers don't break it.
+# Rebuild fix 2026-07-19: the previous sed used '|' as BOTH the s/// delimiter AND
+# inside the regex alternation (common|abi), so GNU sed parsed the alternation '|'
+# as end-of-command -> "unknown option to `s'".  Use '#' as the delimiter instead.
 sed -i -E \
-    's|"\.\./\.\./src/(common|abi)/([A-Za-z0-9_]+\.h)"|"nvkvm_inc/\2"|g' \
+    's#"\.\./\.\./src/(common|abi)/([A-Za-z0-9_]+\.h)"#"nvkvm_inc/\2"#g' \
     "$QEMU_SRC/hw/misc/"*.c "$QEMU_SRC/hw/misc/"*.h
 # Replace <linux/types.h> in nvkvm_inc headers with our QEMU-compatible shim
 # to avoid conflicts with QEMU's own qemu/osdep.h type setup.
@@ -162,11 +165,15 @@ with open(path, 'r') as fh:
 # inside virtio_device_names[].  The old code used text.rfind('};') which matched
 # the LAST '};' in the file — the virtio_device_info TypeInfo, NOT the names table —
 # corrupting an unrelated struct and breaking the build.  Anchor on the real entry.
-entry = '    [VIRTIO_ID_GPIO] = "virtio-gpio",\n    [50] = "virtio-nvgpu",\n'
-m = re.search(r'^[ \t]*\[VIRTIO_ID_GPIO\][ \t]*=[ \t]*"virtio-gpio",[ \t]*\n', text, re.M)
+# Rebuild fix 2026-07-19: in QEMU 9.2.0 the [VIRTIO_ID_GPIO] entry is the LAST in the
+# initializer and has NO trailing comma ("virtio-gpio" then "};").  Make the trailing
+# comma optional in the match, and always emit our own entries WITH the needed comma.
+m = re.search(r'^([ \t]*)\[VIRTIO_ID_GPIO\][ \t]*=[ \t]*"virtio-gpio",?[ \t]*\n', text, re.M)
 if not m:
     print("  ERROR: could not find [VIRTIO_ID_GPIO] entry in virtio_device_names[]", file=sys.stderr)
     sys.exit(1)
+indent = m.group(1)
+entry = '%s[VIRTIO_ID_GPIO] = "virtio-gpio",\n%s[50] = "virtio-nvgpu",\n' % (indent, indent)
 text = text[:m.start()] + entry + text[m.end():]
 with open(path, 'w') as fh:
     fh.write(text)

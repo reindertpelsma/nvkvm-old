@@ -1,6 +1,33 @@
 # nvkvm Mode-2 bench rebuild status
 
-Started: fresh vast.ai host (70.30.158.46:18577), driver 575.51.03, kernel 6.8.0-59.
+---
+## REBUILD 2026-07-19 (box #45305458 @ 70.30.158.46:27130) — IN PROGRESS
+Fresh BLANK vast box (RTX 3060 GA106, host 575.51.03, kernel 6.8.0-59, /dev/kvm present,
+21 cores / 49GB / 138G free). Goal: single-process baseline GREEN at emulator source = 862c7c2
+(local HEAD c861451 = 862c7c2 + 2 docs-only commits; nvkvm_gpu_emul.c byte-identical to 862c7c2).
+NOTE: /workspace/bench-archive did NOT survive on this box — VBIOS rsync'd from local
+(/workspace/bench-archive/ga106_vbios.rom md5 48df40a04432aca6a35bee2785857eba).
+
+Phase status (this rebuild):
+- [x] 0. Repo rsync'd to /workspace/nvkvm; VBIOS -> /opt/nvkvm-guest/ga106_vbios.rom (md5 OK)
+- [x] 1. Host apt deps DONE (added qemu-utils cloud-image-utils genisoimage swtpm; box is Ubuntu 22.04/jammy host)
+- [ ] 2. Host NVIDIA 580.159.04 open source (for guest build) / driver decision
+- [x] 3. Build QEMU DONE — /opt/qemu-nvkvm/bin/qemu-system-x86_64 lists m2fwd/m2exec/m2cefwd.
+      TWO MORE build_qemu.sh bugs found+fixed (committed):
+      (a) step-5 sed used '|' as BOTH s-delimiter and regex-alternation (common|abi) -> "unknown
+          option to s". Fixed: delimiter -> '#'.
+      (b) step-6b virtio.c patch regex required a trailing comma after "virtio-gpio", but in
+          QEMU 9.2.0 [VIRTIO_ID_GPIO] is the LAST initializer entry with NO trailing comma.
+          Fixed: made comma optional in match, emit our entries with the comma.
+- [ ] 4. Build stub
+- [ ] 5. Guest disk (kernel 6.8.0-117 pin, 580 open modules, libcuda)
+- [ ] 6. Mode-2 smoke cup2 rc=0
+- [ ] 7. Baseline: cupctx2_min (#12) / cup8 / cup8_iter (#13)
+
+Prior rebuild log (box 18577, for reference) preserved below.
+---
+
+## PRIOR REBUILD (box 70.30.158.46:18577), driver 575.51.03, kernel 6.8.0-59.
 Goal: rebuild Mode-2 bench to reproduce bug #12.
 
 ## Phases
