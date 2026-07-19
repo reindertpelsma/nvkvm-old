@@ -285,6 +285,13 @@ struct NvkvmGpuEmul {
          * changed) so discovery resumes; self-heals the same way the sweep already does. */
         uint32_t stable_subs;   /* consecutive submissions with newpushbufs==0 */
         bool     resident;      /* working set fully resident -> skip the walk */
+        /* #14 P1: the guest vChid, recovered from the channel-alloc USERD_INDEX flags
+         * (GSP-client CPU-RM encodes its already-decided ChID there so "Physical RMAPI
+         * uses our ChID", kernel_channel.c:2688: vchid = flags[20:12]*8 + flags[10:8]).
+         * E0 proved the doorbell token[11:0] == vChid, distinct per channel — this is
+         * the doorbell -> channel demux key (plan §1.4).  P1: resolution+logging only. */
+        uint32_t vchid;
+        bool     vchid_valid;
     } chans[NVKVM_MAX_CHANS];
     int chan_n;
     uint32_t chan_client;       /* working-set: client of the channel chan_exec runs */
@@ -449,6 +456,26 @@ struct NvkvmGpuEmul {
      * skipped (same as the pre-P0 never-reaped behavior). */
     uint32_t m2_reap_pend[32];
     int      m2_reap_pend_n;
+    /* ── #14 P1: the per-process registry (plan §3) ─────────────────────────────
+     * One entry per live guest CUDA process.  PRIMARY identity = the process's
+     * PDB-set (the GR/UVM VASes guest kernel RM created for it), grouped via the
+     * dup-edge chain (user compute client = the dup SRC; its UVM gpu-ops client =
+     * the dup DST) — NO CR3 anywhere (E0: the doorbell token vChid is distinct per
+     * channel, plan §1.4).  Kernel/GSP/scrubber clients (CeUtils, guest-RM internal)
+     * never join a proc — they are the implicit SYSTEM class (m2_sys becomes explicit
+     * in P2 with the per-proc isolates).  P1 = registry + logging ONLY: nothing
+     * consumes these yet, so behavior is byte-identical. */
+#define NVKVM_MAX_PROCS       16
+#define NVKVM_PROC_MAX_VAS     8
+#define NVKVM_PROC_MAX_CLIENTS 8
+    struct nvkvm_proc {
+        bool     live;
+        uint32_t clients[NVKVM_PROC_MAX_CLIENTS]; /* [0] = the anchoring user compute client */
+        int      clients_n;
+        uint64_t pdbs[NVKVM_PROC_MAX_VAS];        /* the PDB-set ("the GPU's CR3"s) */
+        int      pdbs_n;
+    } m2_proc[NVKVM_MAX_PROCS];
+    int m2_proc_n;
     /* M5.3: per-mapping fresh /dev/nvidia0 isolate-fd handle allocator. Handles
      * 1=ctl, 2=gpu are fixed; on-demand context-buffer mappings draw from here
      * (nvidia binds exactly one CPU mapping per device fd, so each needs its own). */
@@ -1759,6 +1786,11 @@ static void nvkvm_m2_host_rmfree(NvkvmGpuEmul *s, uint32_t client, uint32_t pare
                                  uint32_t hobj); /* #12 cont.34 fwd-decl */
 static bool nvkvm_m2_is_gr_client(NvkvmGpuEmul *s, uint32_t client);   /* P0 reap fwd-decl */
 static bool nvkvm_m2_is_user_client(NvkvmGpuEmul *s, uint32_t client); /* P0 reap fwd-decl */
+static int  nvkvm_m2_proc_get(NvkvmGpuEmul *s, uint32_t anchor);          /* P1 fwd-decl */
+static int  nvkvm_m2_proc_find_by_client(NvkvmGpuEmul *s, uint32_t client);/* P1 fwd-decl */
+static void nvkvm_m2_proc_add_client(NvkvmGpuEmul *s, int pi, uint32_t client);/* P1 */
+static void nvkvm_m2_proc_add_pdb(NvkvmGpuEmul *s, uint32_t owner, uint64_t pdb);/* P1 */
+static void nvkvm_m2_proc_drop_client(NvkvmGpuEmul *s, uint32_t client);  /* P1 fwd-decl */
 static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t fObj)
 {
     bool root = (fClient == fObj);            /* client-root free: purge all of fClient */
@@ -1766,6 +1798,9 @@ static void nvkvm_m2_ctx_free_drop(NvkvmGpuEmul *s, uint32_t fClient, uint32_t f
      * free a user compute process's exit?  Gates the m2_objs/m2_gpga reap (see below). */
     bool user_root = root && (nvkvm_m2_is_gr_client(s, fClient) ||
                               nvkvm_m2_is_user_client(s, fClient));
+    /* #14 P1: drop this client from the per-process registry (anchor free reaps the
+     * proc).  Registry-only; nothing keys on it yet, so this is a no-op for behavior. */
+    if (root) { nvkvm_m2_proc_drop_client(s, fClient); }
     int dropped = 0;
     bool freed_compute_chan = false;          /* #12 cont.34: a compute-aperture chan was freed */
     /* chans[]: match the freed channel handle, or any channel of the freed client. */
@@ -2471,6 +2506,9 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                     uint32_t own14 = nvkvm_m2_vas_dup_owner(s, s->chan_vas[k].client,
                                                             s->chan_vas[k].hvas);
                     if (own14) { nvkvm_m2_cli_vas_add(s, own14, s->chan_vas[k].pdb, false); }
+                    /* #14 P1: attribute this PDB to the owning process (registry-only). */
+                    nvkvm_m2_proc_add_pdb(s, own14 ? own14 : s->chan_vas[k].client,
+                                          s->chan_vas[k].pdb);
                 }
                 qemu_log("nvkvm-gpu[%s] M5: VAS hObject=0x%08x client=0x%08x PDB=0x%llx\n",
                          s->chip->name, s->chan_vas[k].hvas, s->chan_vas[k].client,
@@ -2520,6 +2558,8 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                 {
                     uint32_t own14 = nvkvm_m2_vas_dup_owner(s, s->chan_vas[k].client, hvas);
                     if (own14) { nvkvm_m2_cli_vas_add(s, own14, phys, rsys); }
+                    /* #14 P1: attribute this UVM PDB to the owning process (registry-only). */
+                    nvkvm_m2_proc_add_pdb(s, own14 ? own14 : s->chan_vas[k].client, phys);
                 }
                 qemu_log("nvkvm-gpu[%s] M5.30 SET_PAGE_DIR UVM-VAS hVASpace=0x%08x "
                          "PDB=0x%llx aperture=%u root=%s (candidate %d)\n",
@@ -2572,6 +2612,12 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                              "(dup-src early-arm)%s\n", s->chip->name,
                              s->m2_user_clients_n - 1, s_cli,
                              s->m2_user_clients_n > 1 ? "  -> MULTIPROC ARMED" : "");
+                }
+                /* #14 P1: the dup SRC anchors a process; the dup DST (its UVM gpu-ops
+                 * client) joins that process.  Registry-only (nothing keys on it yet). */
+                {
+                    int pi = nvkvm_m2_proc_get(s, s_cli);
+                    nvkvm_m2_proc_add_client(s, pi, d_cli);
                 }
             }
         }
@@ -2647,6 +2693,16 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
                         s->chans[cslot].fin_fb      = 0;   /* #12: re-resolve on (re)alloc */
                         s->chans[cslot].fin_sys     = false; /* #12 L3b: re-resolve aperture */
                         s->chans[cslot].token_valid = false;
+                        /* #14 P1: recover the guest vChid from the alloc flags.  A GSP-client
+                         * CPU-RM encodes its already-decided ChID into USERD_INDEX so the
+                         * physical RMAPI reuses it (kernel_channel.c:2688):
+                         *   chid = flags[20:12]*8 + flags[10:8]
+                         * (numChannelsPerUserd = 1<<DRF_SIZE(USERD_INDEX_VALUE=10:8) = 8).
+                         * E0: doorbell token[11:0] == this vChid; it's the demux key (P1: log). */
+                        uint32_t cflags = ldl_le_p(cmd + 132);   /* NV_CHANNEL_ALLOC_PARAMS.flags */
+                        s->chans[cslot].vchid = ((cflags >> 12) & 0x1ffu) * 8u +
+                                                ((cflags >> 8) & 0x7u);
+                        s->chans[cslot].vchid_valid = true;
                     }
                 }
                 qemu_log("nvkvm-gpu[%s] M5: channel alloc class=0x%04x gpFifoVA="
@@ -3544,9 +3600,21 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
          * vChid->sChid demux. No behavior change. */
         if (s->m2_crashwin && (!s->m2_last_db_valid || s->m2_last_db_token != (uint32_t)val)) {
             s->m2_last_db_token = (uint32_t)val; s->m2_last_db_valid = true;
-            qemu_log("nvkvm-gpu[%s] M5.11 DOORBELL token=0x%08x (chid-field guesses: [3:0]=%u "
-                     "[11:0]=%u [27:0]=0x%x); chan_n=%d\n", s->chip->name, (uint32_t)val,
-                     (uint32_t)val & 0xf, (uint32_t)val & 0xfff, (uint32_t)val & 0x0fffffff, s->chan_n);
+            /* #14 P1 E0 demux: token[11:0] == guest vChid (E0 result).  Resolve it to a
+             * channel (chans[].vchid) and thence to the owning process (registry).  P1 =
+             * logging only; the DEMUX itself (ring only this channel's token) is P4.  A
+             * distinct (vchid -> single channel -> single proc) mapping across 2x cup8 is
+             * the acceptance signal that PDB+vChid keying needs no CR3 (plan §1.4). */
+            uint32_t vchid = (uint32_t)val & 0xfffu;
+            int mch = -1;
+            for (int i = 0; i < s->chan_n; i++) {
+                if (s->chans[i].vchid_valid && s->chans[i].vchid == vchid) { mch = i; break; }
+            }
+            int mpi = (mch >= 0) ? nvkvm_m2_proc_find_by_client(s, s->chans[mch].client) : -1;
+            qemu_log("nvkvm-gpu[%s] M5.11 DOORBELL token=0x%08x vChid=%u -> chan[%d] "
+                     "client=0x%08x proc=%d (chan_n=%d proc_n=%d)\n", s->chip->name,
+                     (uint32_t)val, vchid, mch,
+                     mch >= 0 ? s->chans[mch].client : 0, mpi, s->chan_n, s->m2_proc_n);
         }
         /* M5.6 EXECUTION-PLANE INVENTORY: once cuCtxCreate has built the GR context
          * (crashwin armed) and starts submitting work, dump the EXACT working set the
@@ -4813,6 +4881,91 @@ static bool nvkvm_m2_multiproc(NvkvmGpuEmul *s)
      * cuCtxCreate UVM-registration (fn=21), BEFORE any of its channels/mappings
      * exist; the 0xc7c0 list is kept as a belt-and-braces late signal. */
     return s->m2_gr_clients_n > 1 || s->m2_user_clients_n > 1;
+}
+
+/* ── #14 P1: the per-process registry (plan §3) ─────────────────────────────────
+ * A process is anchored by its user COMPUTE client (the dup SRC — kernel/UVM clients
+ * only ever appear as dup DST, bench-verified §1.3).  A process may accrue several
+ * clients (its UVM gpu-ops dup-dst client, CE-copy clients) and several PDBs (a
+ * process holds several VASes).  P1 builds+logs this; nothing keys on it yet, so
+ * single-process behavior is byte-identical (one anchor client → one proc).  The
+ * SYSTEM class (kernel/GSP/scrubber) has NO proc — it is the implicit remainder. */
+static int nvkvm_m2_proc_find_by_client(NvkvmGpuEmul *s, uint32_t client)
+{
+    if (!client) { return -1; }
+    for (int i = 0; i < s->m2_proc_n; i++) {
+        if (!s->m2_proc[i].live) { continue; }
+        for (int c = 0; c < s->m2_proc[i].clients_n; c++) {
+            if (s->m2_proc[i].clients[c] == client) { return i; }
+        }
+    }
+    return -1;
+}
+
+/* Get-or-create the proc anchored by user compute client `anchor`. */
+static int nvkvm_m2_proc_get(NvkvmGpuEmul *s, uint32_t anchor)
+{
+    int pi = nvkvm_m2_proc_find_by_client(s, anchor);
+    if (pi >= 0) { return pi; }
+    if (s->m2_proc_n >= NVKVM_MAX_PROCS) { return -1; }
+    pi = s->m2_proc_n++;
+    struct nvkvm_proc *p = &s->m2_proc[pi];
+    memset(p, 0, sizeof(*p));
+    p->live = true;
+    p->clients[p->clients_n++] = anchor;
+    qemu_log("nvkvm-gpu[%s] #14 P1 PROC[%d] created anchor-client=0x%08x (proc_n=%d)\n",
+             s->chip->name, pi, anchor, s->m2_proc_n);
+    return pi;
+}
+
+/* Associate an additional client (dup-dst UVM/CE) with an existing proc. */
+static void nvkvm_m2_proc_add_client(NvkvmGpuEmul *s, int pi, uint32_t client)
+{
+    if (pi < 0 || pi >= s->m2_proc_n || !client) { return; }
+    struct nvkvm_proc *p = &s->m2_proc[pi];
+    for (int c = 0; c < p->clients_n; c++) {
+        if (p->clients[c] == client) { return; }
+    }
+    if (p->clients_n >= NVKVM_PROC_MAX_CLIENTS) { return; }
+    p->clients[p->clients_n++] = client;
+    qemu_log("nvkvm-gpu[%s] #14 P1 PROC[%d] += client=0x%08x (clients_n=%d)\n",
+             s->chip->name, pi, client, p->clients_n);
+}
+
+/* Associate a PDB with the proc owning `owner_client` (its GR/UVM VAS root). */
+static void nvkvm_m2_proc_add_pdb(NvkvmGpuEmul *s, uint32_t owner_client, uint64_t pdb)
+{
+    if (!pdb) { return; }
+    int pi = nvkvm_m2_proc_find_by_client(s, owner_client);
+    if (pi < 0) { return; }
+    struct nvkvm_proc *p = &s->m2_proc[pi];
+    for (int i = 0; i < p->pdbs_n; i++) {
+        if (p->pdbs[i] == pdb) { return; }
+    }
+    if (p->pdbs_n >= NVKVM_PROC_MAX_VAS) { return; }
+    p->pdbs[p->pdbs_n++] = pdb;
+    qemu_log("nvkvm-gpu[%s] #14 P1 PROC[%d] += PDB=0x%llx (via client=0x%08x, pdbs_n=%d)\n",
+             s->chip->name, pi, (unsigned long long)pdb, owner_client, p->pdbs_n);
+}
+
+/* Drop a client (and, on the anchor, the whole proc) at root-free. */
+static void nvkvm_m2_proc_drop_client(NvkvmGpuEmul *s, uint32_t client)
+{
+    int pi = nvkvm_m2_proc_find_by_client(s, client);
+    if (pi < 0) { return; }
+    struct nvkvm_proc *p = &s->m2_proc[pi];
+    if (p->clients[0] == client) {
+        qemu_log("nvkvm-gpu[%s] #14 P1 PROC[%d] reaped (anchor-client=0x%08x freed)\n",
+                 s->chip->name, pi, client);
+        p->live = false; p->clients_n = 0; p->pdbs_n = 0;
+        return;
+    }
+    for (int c = 0; c < p->clients_n; c++) {
+        if (p->clients[c] == client) {
+            p->clients[c] = p->clients[p->clients_n - 1];
+            p->clients_n--; break;
+        }
+    }
 }
 
 /* #14: (client, tsg)-keyed GPFIFO_SCHEDULE tracking — see the m2_tsg_sched struct

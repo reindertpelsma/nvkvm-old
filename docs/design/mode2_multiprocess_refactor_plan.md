@@ -559,6 +559,24 @@ registry + logging only, so behavior is byte-identical. **Simpler than the old P
 `cpu_synchronize_state` on the RPC path at all, and in the expected E0 outcome no new TU and no
 CPU-state read anywhere. *Ships alone; verify the per-process PDB-groups + E0's verdict in the log.*
 
+> **★ P1 SHIPPED 2026-07-19 (ladder green + E0 re-confirmed live).** Built the `m2_proc[]`
+> registry (`struct nvkvm_proc { clients[]; pdbs[]; live }`, cap `NVKVM_MAX_PROCS=16`) keyed by
+> **PDB-grouping via the dup-edge chain** — a proc is anchored on the dup SRC (user compute
+> client), joined by the dup DST (its UVM gpu-ops client), and accretes PDBs at the
+> `RESERVED_PDES`/`SET_PAGE_DIRECTORY` capture sites (`nvkvm_m2_proc_get/add_client/add_pdb`,
+> reaped by `drop_client` at anchor root-free). Recovered the guest **vChid** at channel-alloc
+> from the `USERD_INDEX` flags (`chid = flags[20:12]*8 + flags[10:8]`, per open-driver
+> `kernel_channel.c:2688` GSP-client ChID plumbing; stored `chans[].vchid`). Extended the M5.11
+> DOORBELL log to resolve `token[11:0]=vChid → chans[] → owning proc`. **All keying is
+> registry+logging only — nothing consumes it — so single-process is byte-identical (ladder:
+> cup2/cupctx2_min/cup8/cup8_iter all rc=0 on fresh boots).** **Live E0 verdict (2× cup8, both
+> rc=0 byte-exact): the demux is CLEAN** — 2 procs registered with the plan's exact PDBs
+> (PROC[0]=0xc1d00004→PDB 0x3401000, PROC[1]=0xc1d00005→PDB 0x3405000); every one of ~40 distinct
+> vChids maps to exactly ONE channel and ONE proc, zero collisions. CR3 confirmed unnecessary;
+> `nvkvm_cpukey.c` never built. (Note: 2× cup8 already both-passed here — P1/P2 arming separation
+> from process start, ahead of the plan's "P3 = one reliably passes" expectation; not yet
+> load-bearing, since no table keys on the registry until P3.)
+
 **P2 — per-process host isolate.** For each `NvkvmProc`, create its own isolate via the existing
 `nvkvm_isolate_create(..., session_id=ordinal, ...)` (the infra exists,
 `NVKVM_ISOLATE_MAX=4096`); route that process's forwarded control/alloc/map ioctls to *its* isolate
