@@ -589,6 +589,23 @@ are a *robustness/blast-radius* structure here — the security boundary is thei
 (§1.2), which one isolate or N preserve equally. **Single-process:** exactly one `NvkvmProc` +
 `m2_sys` → one isolate as today, byte-identical. *Ships alone.*
 
+> **★ P2 BANKED 2026-07-19 — deferred to land WITH P4 (tree stays green at P1; see
+> `mode2_14_P2.patch`).** Standalone P2 is a *regression*, not "ships alone": the **execution
+> plane is not isolate-split until P4**. `nvkvm_m2_doorbell_setup`/`exec_doorbell` ring **one**
+> host doorbell page (`m2_usermode_qva`, from the base isolate's `AMPERE_USERMODE_A`) with the
+> first GR channel's token (`m2_gr_channel`/`m2_gr_token`/`m2_doorbell_ready` — singletons, plan
+> rows 23/32 = explicit P4 work). If P2 puts proc[1]'s host channels/objects in a *separate*
+> isolate, the base doorbell page never rings proc[1]'s host channel → its work never runs →
+> this **regresses the P1 result** (2× `cup8` both-pass), which works *only because* both procs'
+> control AND execution share one isolate so the single doorbell reaches both. P2's control-split
+> and P4's execution-split are **mutually dependent** for a 2nd process to run on its own isolate;
+> they must land together. The banked design (a "current isolate context" activated per RPC/
+> channel at dispatch entry — byte-identical for one process by construction, avoids threading a
+> ctx through ~20 forwarding fns) + the P4 co-requisites are in `mode2_14_P2.patch`. **Security is
+> unaffected** (§1.2: an isolate's security = its unprivilege + QEMU, identical for 1 or N
+> isolates), so deferral loses no security property. **P3 is independent of the isolate split**
+> (it keys data-plane *tables* by PDB, on the shared isolate) and is taken next.
+
 **P3 — PDB-key the data-plane tables.** Move rows 3,4,5,20,25,27,31 onto the per-VAS (PDB) sub-tables
 of `NvkvmProc`. Formalize `m2_cpt` (row 31, already pdb-keyed) and `m2_fbback` (row 25) as per-VAS.
 Resolve every channel to its PDB via the v3 dup-chain and select backing/mapping/sema by PDB.
