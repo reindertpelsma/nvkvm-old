@@ -46,7 +46,15 @@ Phase status (this rebuild):
         pinned to the 117 advanced menuentry id; apt-mark hold on the 4 kernel pkgs; unattended-
         upgrades removed. Rebooted -> `uname -r` = 6.8.0-117-generic CONFIRMED.
       - 580 open modules: mounted ogkm 9p, cp -a to /root/nv580src, `make -j4 modules
-        SYSSRC=/lib/modules/6.8.0-117/build` (4G swap added). [BUILDING]
+        SYSSRC=/lib/modules/6.8.0-117/build` (4G swap added). NVBUILD_RC=0.
+        vermagic=6.8.0-117-generic, version 580.159.04. Staged 4 .ko ->
+        /home/ubuntu/nvmods/{nvidia,nvidia-uvm,nvidia-modeset,nvidia-drm}.ko (ubuntu:ubuntu).
+      - guest userspace staged: /usr/local/nvidia-guest/lib/{libcuda,ptxjitcompiler,allocator,
+        nvvm}.so.580.159.04 (+ .so.1/.so symlinks via ldconfig, ld.so.conf.d entry) + cuda.h
+        -> /usr/include/cuda.h (CUDA_VERSION 12060).
+      - Clean `poweroff` to persist base qcow2. run_mode2_vm.sh boots this base with a persistent
+        mode2-overlay.qcow2 + shares ogkm/nvfw/nvkvm_src.
+   [x] 5. Guest disk DONE.
 - [ ] 6. Mode-2 smoke cup2 rc=0
 - [ ] 7. Baseline: cupctx2_min (#12) / cup8 / cup8_iter (#13)
 
