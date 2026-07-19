@@ -1,11 +1,14 @@
 # Mode-2 multi-process refactor — implementation plan
 
-**Status:** design / ready-to-implement (2026-07-19). Branch `consolidation`.
+**Status:** design / ready-to-implement (2026-07-19; **rev 2 same day** — the index decision is
+corrected to **PDB-primary / CR3-minimal-or-none** after the PDB-vs-CR3 security review with the
+owner; the earlier "two-key, CR3 = the security key" framing was wrong, see §1). Branch
+`consolidation`.
 **Deliverable of:** the "two+ concurrent guest CUDA processes work on Mode-2" task.
 **Baseline:** `v3` (commit `862c7c2`) — single-process byte-identical, one-process-reliably-concurrent.
 **Companions (read these; this plan applies them, it does not re-derive them):**
-`docs/design/mode2_multiprocess_isolate.md` (the #14 synthesis — the wall + the two-key
-conclusion), `docs/design/mode2_address_table.md` (§13 = "VAS identity is PDB, never the client
+`docs/design/mode2_multiprocess_isolate.md` (the #14 synthesis — the wall; its *two-key security*
+conclusion is **superseded** by §1 here), `docs/design/mode2_address_table.md` (§13 = "VAS identity is PDB, never the client
 handle"; §3/§6 the one forward-populated table, MISS=FAULT), `docs/design/mode2_forwarding_model.md`
 (emulate-kernel / passthrough-userspace, unprivileged-host-ops only),
 `docs/design/mode2_isolate_consolidation_plan.md` (the per-client→per-isolate spine),
@@ -23,23 +26,27 @@ Where a citation may have drifted it is marked "ASSUMPTION — verify."
 The emulator holds ~30 keyed tables + ~9 scalar singletons + one host isolate inside a single
 per-device struct `NvkvmGpuEmul` (`:127`). Today they are keyed by the **guest RM client handle**
 (which two processes reuse with *identical values*) or are outright singletons. The refactor
-re-keys them on a **two-level process identity**:
+re-keys them on a **process identity whose primary — and expected only — key is the PDB**:
 
-- **PDB** (page-directory-base = "the GPU's CR3", `mode2_address_table.md` §13) — the **data-plane
-  address-space key**. Client-independent, already distinct per process
-  (`0x3401000` vs `0x3405000`), and it is the *destination FB address* of every CE page-table
-  write, so which process a PT-write belongs to is knowable **without any CPU signal**. This is
-  the key for: mappings, backing, page-table capture, VAS selection, sema resolution.
-- **vCPU CR3** (`env.cr[3]` at the trapping doorbell/submission, `mode2_isolation_cr3_key`) — the
-  **exec-identity + security-isolate key**. It answers "*which guest process is ringing this
-  doorbell / issued this RPC*" at the one moment PDB is ambiguous (identical guest VAs → the
-  content-pick can't choose), and it is the boundary key for a per-process **host isolate**
-  (unprivileged sandbox). CR3 is **not read anywhere today** — adding it is the load-bearing new
-  mechanism (round-5 `mode2_14_cr3.patch` proved it readable and correct; it was banked, not
-  landed).
+- **PDB** (page-directory-base = "the GPU's CR3", `mode2_address_table.md` §13) — the **primary
+  key for BOTH the data plane AND the isolate grouping**. Client-independent, already distinct per
+  process (`0x3401000` vs `0x3405000`), always present GPU-side (no `cpu_synchronize_state`), and
+  it is the *destination FB address* of every CE page-table write, so which process a PT-write
+  belongs to is knowable **without any CPU signal**. This is the key for: mappings, backing,
+  page-table capture, VAS selection, sema resolution, **and** grouping a process's VASes/clients
+  into its per-process container + host isolate.
+- **vCPU CR3** is demoted to a **minimal, optional disambiguator** — defense-in-depth at exactly
+  one *reliable* spot (the **userspace doorbell** trap, where the vCPU is running libcuda so CR3
+  really is the process's page-table root), and used **only if** the doorbell token/CHID proves
+  ambiguous — experiment **E0**, §1.4. CR3 is **not a security requirement**: the isolate's
+  security comes from it being *unprivileged* (+ QEMU's host/cross-VM boundary), not from the key
+  choice, and intra-guest isolation is the guest kernel's job (`access_model_split`, §1.2). At
+  kernel-context RPCs CR3 is unreliable under PTI anyway (§1.3) — the earlier "stamp CR3 at the
+  alloc/VAS-create RPCs" step is **dropped**.
 
-The map is: **PDB carries the address plane; CR3 carries the exec/security plane.** A per-process
-container `NvkvmProc { cr3; isolate; pdb-set; per-VAS sub-tables }` is looked up by CR3 on the hot
+The map is: **PDB carries the address plane AND the exec/grouping plane; CR3 is at most a
+doorbell tiebreak.** A per-process container `NvkvmProc { pdb-set; isolate; per-VAS sub-tables;
+optional cr3 }` is looked up by **doorbell token → CHID → channel → owning PDB** on the hot
 doorbell trap and by PDB (via the v3 dup-edge chain) on the data plane; the GSP falcon, RPC ring,
 BAR page-dirs, interrupt tree, and kernel/scrubber channels stay **device-global** (the "system
 isolate").
@@ -54,7 +61,14 @@ mechanical re-keying that v3 partly did.
 
 ## 1. The index decision
 
-### 1.1 Why two keys, not one
+**Corrected 2026-07-19 (PDB-vs-CR3 security review with the owner): PDB / GR-VAS is the PRIMARY
+key for both the data plane and the isolate grouping; CR3 is minimal-or-none — a defense-in-depth
+disambiguator used at MOST at the userspace doorbell, and only if experiment E0 (§1.4) proves it
+necessary.** The earlier framing ("two keys; CR3 carries the security plane because PDB is
+guest-controlled ⇒ spoofable") — and `mode2_multiprocess_isolate.md`'s two-key conclusion — is
+superseded: the spoofing argument was wrong (§1.2).
+
+### 1.1 Why PDB is the primary key — data plane
 
 The owner's instinct — index per **"GR VA-space / segment"** — is *exactly* the PDB key, and it is
 correct for the **data plane**. `mode2_address_table.md` §13 nails the precise form: a channel does
@@ -65,8 +79,8 @@ not name its VAS directly (`kernel_channel.c:1030`: `hVASpace` comes from the ct
 (`0x3401000`/`0x3405000`), so per-PDB keying makes "same VA in two processes" a *disambiguation*,
 not a collision (§3/§13, line ~66/255/287).
 
-But PDB alone is insufficient at exactly one point, proven across six #14 rounds
-(`mode2_14_concurrent_apps` rounds 4–6, `mode2_multiprocess_isolate.md` §"remaining wall"):
+What remains of the round-5/6 wall (`mode2_14_concurrent_apps` rounds 4–6,
+`mode2_multiprocess_isolate.md` §"remaining wall") under pure PDB-keying:
 
 - The two processes' `hVASpace=0` GR channels reach us with **empty instance blocks** (GSP-managed),
   so the emulator cannot read the channel's PDB from a handle. It falls back to a *content-pick*:
@@ -75,18 +89,62 @@ But PDB alone is insufficient at exactly one point, proven across six #14 rounds
   process B's channel under process A's PDB → FAULT → B never completes.
 - v3's dup-edge chain (GR channel → `chan_client` → `m2_dup` → UVM VAS → PDB) recovers the owning
   **client** and thereby the PDB *for channel-registration and backing*, and it works: it eliminates
-  the cross-process pushbuffer FAULT (round 2). **But** the page-table *publication* — the CE writing
-  the loser's `PD0[1]` leaf into FB — is not attributable via any handle graph; it is a raw physical
-  CE copy. The only thing that distinguishes the two identical-VA PT-write *pushes at exec time* is
-  the **vCPU CR3 of the process that submitted them** (round 5 confirmed distinct CR3s per process,
-  each correlating to its own PDB).
+  the cross-process pushbuffer FAULT (round 2). The page-table *publication* — the CE writing the
+  loser's `PD0[1]` leaf into FB — is attributed by its **destination FB address' owning PDB**
+  (§4.1-4a), also with no CPU signal.
 
-So: **PDB is the resolution key everywhere the binding is already recorded; CR3 is the key at the
-two moments the binding is being *produced or executed* and PDB is not yet inferable** — (a) the
-doorbell/submission trap (which process is ringing), and (b) attributing a CE PT-write push to a
-process's ring so it is scheduled and captured under that process's PDB.
+Round 5 believed the only signal distinguishing two identical-VA submissions at exec time was the
+**vCPU CR3** of the submitter. **Corrected:** the doorbell already carries a GPU-side identity —
+the work-submit **token encodes the guest vChid/CHID** (`:3386-3396`), and CHIDs (unlike the
+reused RM handles) are fresh per channel-create. If E0 (§1.4) confirms per-process distinctness,
+the doorbell → CHID → channel → owning-PDB chain resolves the submitter **with no CR3 at all**.
 
-### 1.2 Precise resolution rules
+### 1.2 Why PDB is ALSO the isolate-grouping key — the security correction
+
+The old plan treated CR3 as *necessary* for the security boundary ("PDB is guest-controlled ⇒
+spoofable ⇒ the isolate must key on CR3"). That reasoning is wrong, on four counts:
+
+1. **An isolate's security comes from it being UNPRIVILEGED, not from its key.** Whatever an
+   isolate is keyed on — PDB, CR3, or client handle — it can only issue *unprivileged* host GPU
+   ops (`mode2_forwarding_model.md`; QEMU owns the host/cross-VM boundary). The host boundary is
+   therefore preserved under PDB-keying exactly as under CR3-keying.
+2. **The threat model** (`access_model_split`, `mode2_isolation_cr3_key` — the owner's model, and
+   it is the standard virtualization one): the **guest kernel is the authority for intra-guest
+   (process-to-process) isolation** — it enforces ALL intra-VM access rights; QEMU + the
+   unprivileged isolates enforce ONLY the host/cross-VM boundary. By level: a compromised guest
+   *userspace* process → owns its own process and at most (chained) its own isolate; a compromised
+   single *isolate* → that process's userspace/contexts, no host reach beyond unprivileged ops; a
+   compromised guest *kernel* → all guest userspace (which it already owned), but strictly NO
+   escape to host/QEMU/cross-VM.
+3. **PDB is set up by the guest KERNEL RM, not by userspace.** Every PDB the emulator sees was
+   created and bound by guest kernel RM (SET_PAGE_DIRECTORY / channel-alloc RPCs, instance-block
+   writes); the guest kernel blocks userspace from forging those. So a compromised guest
+   *userspace* process CANNOT fabricate/spoof another process's PDB — the old plan's spoofing
+   claim fails at the userspace level.
+4. **PDB-keying survives a compromised guest KERNEL, too.** A compromised kernel *can* forge PDBs
+   and reshuffle which isolate its traffic routes to — but every isolate is unprivileged
+   (point 1), so it gains nothing host-side; and it already owns all guest processes (point 2), so
+   there is no intra-guest escalation either. The "no host escape" invariant holds unchanged.
+
+Two further observations settle the *grouping* granularity:
+
+5. **Sharing a GR VAS ⟹ sharing GPU memory ⟹ mutual trust already implied.** Two guest processes
+   sharing a VA space do not isolate from each other on the GPU no matter what we do; mapping them
+   to one isolate loses nothing. And forcing *untrusted* processes to share a VAS requires
+   guest-kernel cooperation — a kernel which, if compromised, already owns both (point 4). So
+   VAS-keyed isolates create **no new cross-process leak**: "one isolate shared by all processes
+   on the same GR VAS" is sound.
+6. **A process may hold several GR VA spaces**, so strictly per-VAS isolates would OVER-isolate —
+   never *less* secure, but they would split one process's VASes across isolates and complicate
+   that process's shared host state (guest-RAM share, handle namespace, `m2_cmap`).
+   Per-**process** grouping (one isolate per PDB-*set*) is therefore preferred — but note this is
+   a **correctness/simplicity** argument, NOT a security one. If per-process grouping ever proves
+   hard, falling back to per-VAS isolates is safe.
+
+**Consequence:** the isolate key = the process's PDB-set (§3), associated via the doorbell/CHID
+demux + the v3 dup-edge chain. CR3 is not needed for security anywhere.
+
+### 1.3 Precise resolution rules
 
 **Data-plane op (mapping / backing / sema resolve / PT capture) → PDB.** Resolve the owning PDB via
 the v3 chain, in order (mirrors `mode2_address_table.md` §13 resolution order):
@@ -101,34 +159,59 @@ the v3 chain, in order (mirrors `mode2_address_table.md` §13 resolution order):
 A miss is a **fault**, never a blind content-pick (§6). (The blind pass-1 in `chan_execute` `:5271`
 becomes dead once every VAS is PDB-attributed; delete it — see P5.)
 
-**Exec/security op (doorbell ring, submission MMIO, alloc/VAS-create RPC) → CR3.** Read
-`nvkvm_current_guest_cr3()` at:
+**Exec op (doorbell ring / submission MMIO) → doorbell token (CHID), not CR3.** The guest writes
+its work-submit token at the doorbell trap (`nvkvm_bar0_write`, `off==NVKVM_VF_DOORBELL`, `:3386`);
+on Ampere the token encodes the guest vChid+runlist (NVC36F `GET_WORK_SUBMIT_TOKEN`, `:3388`).
+Today the emulator dedup-logs the token and **ignores** it, walking every channel (`:240`,
+`:3389-3391`). The demux becomes: token → CHID → `chans[]` entry → owning PDB/proc (rules above).
+No `cpu_synchronize_state`, no CPU-state read at all.
 
-- the doorbell trap (`nvkvm_bar0_write`, `off==NVKVM_VF_DOORBELL`, `:3386`) — tag the ring/submission
-  with the ringing process;
-- `SET_PAGE_DIRECTORY` / `RESERVED_PDES` / channel-alloc RPCs (where `chan_vas[]` and `chans[]` are
-  populated, `:2310/:2363/:2477`) — stamp `chan_vas[i].cr3` / `chans[i].cr3`, binding each captured
-  VAS/channel to its process at creation (so non-doorbell control paths route too, per
-  `mode2_isolation_cr3_key`);
-- the CE page-table-write hook (P4) — attribute the PT-write push to a process's ring.
+**Kernel-context RPCs (SET_PAGE_DIRECTORY / RESERVED_PDES / channel-alloc, populate sites
+`:2310/:2363/:2477`) → the handle/dup-edge graph, not CR3.** The old plan stamped CR3 here — its
+shakiest step, now **dropped**: these RPCs execute in guest **kernel** context, where under PTI the
+live CR3 is the *kernel* CR3 and does not cleanly identify the userspace process. Attribution at
+these sites already works via the client/dup-edge graph → PDB (v3; the round-2 cross-process FAULT
+was eliminated this way). Forwarded alloc/control RPC attribution likewise: `hClient` → dup-graph
+→ proc (`mode2_isolate_consolidation_plan` note), no CR3.
 
-**When PDB suffices vs when CR3 is needed (the round-5/6 open question, resolved here):**
+### 1.4 The residual CR3 surface + experiment E0 (the round-5/6 open question, resolved)
 
 | Situation | Key | Rationale |
 |---|---|---|
 | Record a VA→phys binding at bind time | **PDB** | §4/§13; the CE-write destination is already per-PDB |
 | Resolve a channel's pushbuffer/sema at exec | **PDB** (via dup-chain) | already works post-v3 (round-2 FAULT eliminated) |
-| Capture a CE PT-write into the FB shadow | **PDB** (from the write's destination FB address) | §4.2; destination address alone attributes it |
-| Choose which process's channel a doorbell rings | **CR3** | identical VAs/handles → PDB not inferable from content |
-| Schedule the PT-writer channel so its leaf push isn't starved | **CR3** | the "2nd starvation path"; ring/scheduling identity (P4) |
-| Pick the host isolate (unprivileged sandbox) | **CR3** | `mode2_isolation_cr3_key`; the security boundary |
-| Attribute a forwarded alloc/control RPC to a process | **CR3 at the RPC**, fallback `hClient` | the cmdq is one shared queue; CR3 stamped at VAS/chan-alloc binds it (`mode2_isolate_consolidation_plan` note) |
+| Capture a CE PT-write into the FB shadow | **PDB** (from the write's destination FB address) | §4.1-4a; destination alone attributes it |
+| Choose which process's channel a doorbell rings | **doorbell token → CHID → channel → PDB** | E0; GPU-side identity, no CPU signal |
+| Schedule the PT-writer channel (starvation, §4.1-4c) | **per-(PDB, channel)** ring/TSG scheduling | channel identity suffices once the doorbell demuxes by CHID |
+| Pick the host isolate | **the process's PDB-set** | §1.2 — grouping choice, not a security key |
+| Doorbell demux **iff CHID proves ambiguous** | **CR3 at the userspace doorbell** (only) | the one reliable CR3 spot: the vCPU is running libcuda → CR3 = the process's page-table root |
 
-**Assumption to verify during P1:** that PDB-from-CE-write-destination is sufficient to attribute
-every PT *capture* to a process (leaving CR3 only for exec-identity + ring scheduling + security).
-`mode2_multiprocess_isolate.md` §"open questions" flags this as unresolved. The plan is structured so
-that if capture-by-destination is sufficient (likely), CR3 is only needed at the doorbell + ring; if
-not, P4 already has CR3 at the PT-write hook to fall back on.
+**Experiment E0 — THE deciding experiment (run first; folds into P1): is the doorbell token/CHID
+distinct per process's channel?** Round 1 saw the two processes reuse identical guest RM *handles*
+(`0x5c000019`), which killed handle-keying. But CHIDs are not handles: each channel-create yields a
+fresh channel (the `chans[]` registry grows per-create, `:2484`; the guest token encodes vChid,
+`:3388`), so the doorbell → CHID → channel → owning-PDB chain (via the §1.3 rules) is **likely
+unambiguous with no CR3 at all**. E0 = log `(token, resolved channel, owning PDB)` per doorbell
+across 2× `cup8` (the `:3392-3396` dedup-log already captures the token) and check for collisions.
+
+- **If distinct (expected):** the ENTIRE refactor keys on PDB/VAS; CR3 is dropped even for
+  correctness — `nvkvm_cpukey.c` is never built.
+- **If ambiguous:** add the CR3 read at the **userspace doorbell only** — the single place it
+  earns its keep — as the tiebreak.
+
+This resolves the round-5/6 open question, superseding the plan's previous CR3-heavy answer
+(which reached for CR3 at the doorbell + the RPC populate sites + the PT-write hook).
+
+**CR3 reliability caveats (they apply only to the E0-ambiguous fallback, but they are the real
+reason CR3 must not be load-bearing):**
+
+- CR3 is reliable ONLY at the **userspace doorbell** (vCPU executing libcuda → CR3 is the process
+  root). At kernel-context RPCs it is the *kernel* CR3 under PTI — never read it there (§1.3).
+- CR3 values are **reused across process exit** → the `NvkvmProc` must be reaped on exit before a
+  new process recycles the value (P0 reap, `ctx_free_drop`).
+- Mask PCID/PTI bits: `env.cr[3] & ~0xfff` (round-5 `mode2_14_cr3.patch`).
+- `cpu_synchronize_state(current_cpu)` is not free (round 5: an unbudgeted per-doorbell sync timed
+  out CTX2-create) → budget it / cache per-vCPU-at-exit if the fallback is ever engaged.
 
 ---
 
@@ -143,12 +226,12 @@ converted from process-blind → client-keyed.
 
 | # | Global (file:line) | Tracks | Scope today | NEW key | Lifecycle | v3? |
 |---|---|---|---|---|---|---|
-| 1 | `chans[64]` / `chan_n` (`:288`, append `:2484`) | per-channel GPFIFO/USERD/token/tsg/payload | `(client,gpFifoVA)`-keyed, cap 64 | **PDB** (+ `cr3` stamp field) | drop in `ctx_free_drop` `:1750` | key+cap (v3) |
+| 1 | `chans[64]` / `chan_n` (`:288`, append `:2484`) | per-channel GPFIFO/USERD/token/tsg/payload | `(client,gpFifoVA)`-keyed, cap 64 | **PDB** (+ per-channel CHID/token for the doorbell demux, §1.4) | drop in `ctx_free_drop` `:1750` | key+cap (v3) |
 | 2 | `chan_*` scalars (`:220-234,290,399`) | "currently executing channel" scratch | singleton scratch, loaded per iter (`:3510`) | **per-`NvkvmProc` scratch OR pass explicitly** (see §3.3) | per-iter | — |
-| 3 | `chan_vas[16]` / `_n` (`:371`, append `:2310/:2363`) | snooped VAS roots `{hvas,client,pdb,root_sys,uvm}` | `client`-keyed, **cap 16 ⚠ under-sized** | **PDB** (add `cr3` field); grow cap | drop `:1915` | partial (v3) |
+| 3 | `chan_vas[16]` / `_n` (`:371`, append `:2310/:2363`) | snooped VAS roots `{hvas,client,pdb,root_sys,uvm}` | `client`-keyed, **cap 16 ⚠ under-sized** | **PDB**; grow cap | drop `:1915` | partial (v3) |
 | 4 | `m2_cli_vas[64]` / `_n` (`:383`, add `:1711`) | **sticky** per-client VAS roots for sema resolve | `client`-keyed, never freed | **PDB** | **make reapable** at proc-exit | — |
 | 5 | `va_map[1024]` / `_n` (`:302`, append `:2083`) | PROMOTE_CTX VA→phys side-table | `client`-keyed, **never reaped** | **PDB** | **add reap** at proc-exit | — |
-| 6 | `m2_dup[64]` / `_n` (`:397`, append `:2401`) | DUP_OBJECT ownership edges (process attribution graph) | `(dst,src)` client/obj | **keep client-graph; add `cr3` of dup-src** | drop `:1872` | **NEW (v3)** |
+| 6 | `m2_dup[64]` / `_n` (`:397`, append `:2401`) | DUP_OBJECT ownership edges (process attribution graph) | `(dst,src)` client/obj | **keep client-graph** (the proc-attribution edge, §1.3) | drop `:1872` | **NEW (v3)** |
 | 7 | `m2_gr_clients[8]` / `_n` (`:573`, append `:6545`) | all user GR compute clients (≈1/proc) | client list | **subsumed into `NvkvmProc` set** | drop `:1887` | **NEW (v3)** |
 | 8 | `m2_user_clients[8]` / `_n` (`:589`, append `:2421`) | early-arm dup-src user clients | client list | **subsumed into `NvkvmProc` set** | drop `:1895` | **NEW (v3)** |
 | 9 | `m2_gr_client` scalar (`:567`, set `:6549`) | legacy FIRST GR client | singleton (proc-0 only) | **delete** (replaced by per-proc set) | never cleared | — |
@@ -168,23 +251,24 @@ Infra note (`nvkvm_isolate.h`): the isolate table already supports `NVKVM_ISOLAT
 isolates + a `session_id` param. Mode-2 only ever creates **one** (`nvkvm_isolate_create(...,1,...)`).
 The machinery for per-process isolates **already exists** — Mode-2 just never used it. This is the
 `mode2_isolate_consolidation_plan.md` "one host isolate per guest RM client" spine; here we make the
-grouping **per guest process (CR3)** rather than per hClient (over-isolation per hClient is also
-acceptable per `mode2_isolation_cr3_key`, but per-CR3 matches Mode-1 and coalesces a process's
-clients).
+grouping **per guest process — its PDB-set, associated via the doorbell/CHID demux + dup-edge
+chain (§1.2 point 6, §1.4)** — rather than per hClient (finer-grained over-isolation, per hClient
+or per VAS, is also safe — §1.2 points 5-6 — but per-process coalesces a process's clients,
+simplifies its shared host state, and matches Mode-1).
 
 ### 2.C Device / VAS / TSG forwarding bookkeeping (control path)
 
 | # | Global | Tracks | Scope today | NEW key | Lifecycle | v3? |
 |---|---|---|---|---|---|---|
 | 16 | `m2_devvas[32]` / `_n` (`:445`, append `:6237`) | `{client,dev,vas}` forwarded VASpaces | client-keyed | **per-`NvkvmProc`** (PDB via VAS) | drop `:1808` | — |
-| 17 | `m2_tsgeng[64]` / `_n` (`:449`, append `:6350`) | TSG→engineType | tsg-keyed, never reaped | **per-`NvkvmProc`** (`(cr3,tsg)`) | **add reap** | cap (v3) |
+| 17 | `m2_tsgeng[64]` / `_n` (`:449`, append `:6350`) | TSG→engineType | tsg-keyed, never reaped | **per-`NvkvmProc`** (`(proc,tsg)`) | **add reap** | cap (v3) |
 | 18 | `m2_subdev[64]` / `_n` (`:455`, append `:6229`) | `{client,subdev}` | client-keyed, never reaped | **per-`NvkvmProc`** | **add reap** | — |
 | 19 | `m2_grmap[8]` / `_n` (`:599`, append `:7282`) | `{client,hvirt,hvas,hdev}` GR virtmem mapper | client-keyed, **cap 8 ⚠** | **per-`NvkvmProc`** | never reaped → **reap** | — |
-| 20 | `m2_cvas[16]` / `_n` + `m2_cur_cvas` (`:617`, append `:7169`) | per-`(client,tsg)` fresh host VAS | `(client,tsg)`-keyed, cap 16 | **PDB / `(cr3,tsg)`** | drop `:1827` | — |
-| 21 | `m2_tsg_sched[16]` / `_n` (`:632`, mark `:4677`) | which `(client,tsg)` GR TSGs were scheduled | `(client,tsg)`-keyed | **`(cr3/PDB,tsg)`** | drop `:1903` | **NEW (v3)** |
+| 20 | `m2_cvas[16]` / `_n` + `m2_cur_cvas` (`:617`, append `:7169`) | per-`(client,tsg)` fresh host VAS | `(client,tsg)`-keyed, cap 16 | **PDB / `(proc,tsg)`** | drop `:1827` | — |
+| 21 | `m2_tsg_sched[16]` / `_n` (`:632`, mark `:4677`) | which `(client,tsg)` GR TSGs were scheduled | `(client,tsg)`-keyed | **`(PDB,tsg)`** | drop `:1903` | **NEW (v3)** |
 | 22 | `m2_user_ce_clients[16]` / `_n` (`:607`, append `:7272`) | libcuda CE-copy clients | client list, never reaped | **per-`NvkvmProc`** | **add reap** | — |
 | 23 | `m2_gr_channel`, `m2_gr_tsg` scalars (`:620`) | host GR channel/TSG handles | singleton (proc-0) | **per-`NvkvmProc`** | set once | — |
-| 24 | `m2_gr_reply[64]` + meta (`:640`) | captured host `0xc7c0` alloc reply for RPC forge | singleton (last-alloc) | **per-`NvkvmProc`** (keyed by requesting CR3) | overwritten | — |
+| 24 | `m2_gr_reply[64]` + meta (`:640`) | captured host `0xc7c0` alloc reply for RPC forge | singleton (last-alloc) | **per-`NvkvmProc`** (keyed by requesting proc) | overwritten | — |
 
 ### 2.D Data-plane memory backing (hot fb + control)
 
@@ -206,8 +290,9 @@ per-`mode2_forwarding_model.md` are emulated (not forwarded) or forwarded throug
 
 - **GSP falcon + RPC ring:** `mbox0/1`, `sec_mbox0`, `fwsec_ran`, `gsp_suspended/reloaded`, `q_*`,
   `stat_seqnum`, `cmd_readptr` (`:151-195`). One faked GSP per VM; the RPC ring is one shared queue
-  (its cursors are inherently global). CR3 is stamped *onto records populated from* RPCs (VAS/chan
-  alloc), not onto the ring itself.
+  (its cursors are inherently global). Process attribution of records populated *from* RPCs
+  (VAS/chan alloc) comes from the handle/dup-edge graph → PDB (§1.3), **never from CR3** — the RPC
+  path runs in guest kernel context where CR3 is unreliable.
 - **VRAM + BAR page-dirs:** `fb_pages` (GHashTable), `bar0_window`, `bar1_pdb`, `bar2_pdb`,
   `bar2_inst_block`, `bar2_virtual` (`:203-214`). HW/GPU-global.
 - **Interrupt tree:** `intr_leaf[]`, `intr_leaf_en[]`, `intr_top/_en`, `gsp_swgen0_pending`
@@ -256,11 +341,14 @@ v3:** `chan_vas[16]`, `m2_grmap[8]`, `m2_cvas[16]` (fine at 2 procs, not many).
 ### 3.1 The per-process container
 
 ```c
-/* one per live guest CUDA process; identity = vCPU CR3 (guest userspace address space) */
+/* one per live guest CUDA process; PRIMARY identity = its PDB-set (the GR/UVM VASes the guest
+ * kernel RM created for it), grouped via the doorbell/CHID demux + v3 dup-edge chain (§1.2-1.4).
+ * cr3 exists ONLY for the E0-ambiguous doorbell-tiebreak fallback; 0 = unused. */
 typedef struct NvkvmProc {
-    uint64_t cr3;                 /* env.cr[3] & ~0xfff — the process key                     */
     uint32_t isolate_id;          /* its own unprivileged host isolate (session_id = ordinal) */
     uint32_t ctl_h, gpu_h; int gpu_fd;   /* per-proc ctl/gpu handles + registration state     */
+    uint64_t cr3;                 /* OPTIONAL doorbell tiebreak (env.cr[3] & ~0xfff), §1.4;
+                                   * never load-bearing for security (§1.2); 0 = unused       */
 
     /* address plane: PDBs owned by this process (a process may hold several VASes) */
     struct NvkvmVas {
@@ -294,19 +382,23 @@ NvkvmProc *m2_sys;                     /* the SYSTEM isolate: GSP/scrubber/kerne
 ```
 
 The **system pseudo-process** (`m2_sys`) owns all group-E kernel/GSP/scrubber state and the system
-isolate; kernel threads (kernel CR3, never ring the usermode doorbell) route here
-(`mode2_isolation_cr3_key`).
+isolate; kernel/GSP/scrubber traffic routes here by **traffic class** (kernel RM clients, scrubber/
+CeUtils channels — the same line the v3 finishPayload exclusion `:3837` already draws), not by CR3
+(the `mode2_isolation_cr3_key` "kernel threads → system isolate" outcome, reached without reading
+CR3).
 
 ### 3.2 Lookup on the hot path (must be cheap)
 
-- **By CR3 (doorbell / submission trap):** linear scan of `m2_proc[0..n]` on `cr3` (n≤~4; a scan is
-  cheaper than a hash and the array is L1-resident). Cache the last-hit index (`m2_proc_last`) —
-  bursts of doorbells come from one process. `nvkvm_current_guest_cr3()` itself is the cost, **not**
-  the lookup: `cpu_synchronize_state(current_cpu)` is not free (round 5: unbudgeted per-doorbell sync
-  timed out CTX2-create). **Mitigation:** read CR3 **once per submission burst** and cache it per
-  vCPU at the last KVM exit (`mode2_multiprocess_isolate.md` §open-questions), or budget the sync
-  (round 5 budgeted the first ~400). ASSUMPTION — verify the cached-at-exit CR3 is valid at the
-  doorbell trap.
+- **By doorbell token / CHID (doorbell / submission trap):** decode the vChid from the written
+  token (`:3388`, `:3394` logs the candidate fields), match it to the `chans[]` entry, follow the
+  channel's PDB attribution (§1.3) to `(NvkvmProc*, NvkvmVas*)`. A linear scan of `chans[]`
+  (n≤64, L1-resident) or a direct CHID index; cache the last-hit — bursts of doorbells come from
+  one channel. **No `cpu_synchronize_state` on the hot path at all** — the old plan's per-doorbell
+  CR3-read cost (round 5: an unbudgeted sync timed out CTX2-create) disappears in the expected E0
+  outcome. Only in the E0-ambiguous fallback does `nvkvm_current_guest_cr3()` enter, with the §1.4
+  mitigations (budget the sync / cache CR3 per-vCPU-at-last-exit / read once per burst; ASSUMPTION
+  — verify a cached-at-exit CR3 is valid at the doorbell trap). ASSUMPTION — verify the token's
+  vChid field decode against the GA100 HAL (E0 does this).
 - **By PDB (data plane):** the channel already resolves to a client via v3's dup-chain; extend that
   to yield `(NvkvmProc*, NvkvmVas*)` by PDB. `chan_vas[]`/`m2_cpt[]` are already PDB/client-tagged, so
   this is a field lookup, not new walking. Per-VAS binding lookup is the existing GPGA binary-search
@@ -362,8 +454,9 @@ executes. (b) A **second** starvation path: the leaf push is dropped even *witho
 **Step 4a — per-PDB PT-write capture (attribution).** Key the `ce_fb_write_hook` capture
 (`m2_gr_pt_set` row 30 / `m2_cpt` row 31) by the **destination FB address' owning PDB**. Since the
 CE write's destination *is* a physical page inside a specific process's page-directory range, the PDB
-is derivable from the destination alone — **no CR3 needed for capture** (resolves the §1.2 open
-question in the affirmative for capture). Each process's PD leaves then populate its own tree's
+is derivable from the destination alone — **no CR3 needed for capture, and (per §1.2) none needed
+for security either**: the attribution signal is entirely GPU-side, exactly the address-table
+directive (`mode2_address_table_of_truth`). Each process's PD leaves then populate its own tree's
 shadow. A capture whose destination maps to no known PDB is a **fault-log**, never guessed (§6).
 
 **Step 4b — per-process ring-pin (schedule, path-a).** Adopt round-5's ring-pin (proven to reach 2×
@@ -381,12 +474,13 @@ be **on by default** (not `multiproc()`-gated), removing the round-5 "gated ⇒ 
 dropped with the ring healthy. Hypotheses (`mode2_multiprocess_isolate.md` §open): the push is
 dropped at (i) doorbell scheduling (the loser's PT-writer TSG sits off-runlist), or (ii) CE-copy
 resolution (the push resolves under the wrong PDB and is skipped). Per-process channel scheduling —
-each process's PT-writer/compute channels schedulable independently, keyed by the process (CR3 at the
-doorbell that submits the PT-write, or PDB of the target) — makes no process's pushes starvable by
-another's. Concretely: extend `m2_tsg_sched` (row 21) + the doorbell re-sweep (`exec_doorbell`
-`:8337`) to iterate **per `NvkvmProc`** and schedule each process's PT-writer TSG, and use the CR3 at
-the PT-write submission to attribute the push to a process's ring when the destination-PDB is
-ambiguous.
+each process's PT-writer/compute channels schedulable independently, **keyed on channel/PDB**
+(the submitting channel via the doorbell CHID demux §1.4, or the destination-PDB of the write) —
+makes no process's pushes starvable by another's. Concretely: extend `m2_tsg_sched` (row 21) + the
+doorbell re-sweep (`exec_doorbell` `:8337`) to iterate **per `NvkvmProc`** and schedule each
+process's PT-writer TSG. Only if E0 showed the CHID ambiguous does the CR3-at-the-userspace-
+doorbell tiebreak (§1.4) enter to attribute a submission to a process's ring — never CR3 at the
+PT-write hook itself (that path can run in kernel context, where CR3 is unreliable, §1.3).
 
 **Step 4d — resolve, don't guess.** With 4a+4b+4c, each process's leaf PTEs land in its own PDB's
 shadow, and exec is a **pure per-PDB table lookup** (`address_table.md` §3/§6); the blind content-pick
@@ -395,13 +489,15 @@ shadow, and exec is a **pure per-PDB table lookup** (`address_table.md` §3/§6)
 ### 4.2 Open risks (P4)
 
 - **R-P4-1:** capture-by-destination might not attribute *every* PT-write (e.g. a shared identity-map
-  scratch page). Mitigation: CR3 at the PT-write hook as the tiebreak (already stamped, §1.2).
+  scratch page). Mitigation: attribute via the submitting channel (doorbell CHID demux, §1.4);
+  the CR3-at-the-userspace-doorbell tiebreak only as last resort if E0 showed ambiguity. No CR3 at
+  the PT-write hook (kernel-context CR3 is unreliable, §1.3).
 - **R-P4-2:** the 2nd starvation path's root (4c-i vs 4c-ii) is *unconfirmed* — round 5 only observed
   it. P4 must begin with a per-channel exec trace (`mode2_multiprocess_isolate.md` §open q1) to
   decide. This is the single most uncertain step in the whole plan.
-- **R-P4-3:** `cpu_synchronize_state` cost if CR3 is needed per PT-write (thousands/sec). Mitigation:
-  prefer destination-PDB attribution (4a); only fall to CR3 for the ambiguous minority; cache CR3
-  per-vCPU-at-exit.
+- **R-P4-3:** `cpu_synchronize_state` cost — only if the E0 fallback is engaged (doorbell-only,
+  §1.4). Mitigation: destination-PDB attribution (4a) + the CHID demux keep CR3 entirely off the
+  path in the expected case; if engaged, budget the sync / cache CR3 per-vCPU-at-exit.
 
 ---
 
@@ -417,23 +513,34 @@ missing proc-exit reap to the never-reaped tables (rows 4,5,13,17,18,19,22,28,29
 existing `ctx_free_drop` (`:1744`) root-client-free path. Pure safety; single-proc identical. *Ships
 alone.*
 
-**P1 — introduce `NvkvmProc` + CR3, no re-keying yet (identity plumbing).** Add
-`nvkvm_cpukey.c` (`specific_ss`, the round-5 `mode2_14_cr3.patch` TU — `nvkvm_gpu_emul.c` is
-target-independent `system_ss` and can't read `X86CPU`; add to `meson.build` as `specific_ss.add`).
-Add `nvkvm_current_guest_cr3()` (`cpu_synchronize_state(current_cpu); env.cr[3] & ~0xfff`, the
-`vapic.c` pattern), **budgeted** (first ~400 syncs) / cached-per-vCPU-at-exit. Stamp `cr3` onto
-`chan_vas[]`/`chans[]`/`m2_dup[]` at their populate sites; build the `m2_proc[]` registry (create on
-first distinct CR3 at a VAS/chan alloc; `m2_sys` for kernel CR3). **No table is re-keyed yet** — CR3
-is recorded and logged only, so behavior is byte-identical (this is exactly what round 5 proved
-readable). *Ships alone; verify distinct CR3s per process in the log.*
+**P1 — experiment E0 + `NvkvmProc` registry keyed by PDB-grouping (identity plumbing).** Run
+**E0** (§1.4) first: log `(doorbell token, resolved channel, owning PDB)` per doorbell across 2×
+`cup8` and decide whether the CHID demux is unambiguous (expected: yes — CHIDs are fresh per
+channel-create, unlike the reused RM handles `0x5c000019`). Build the `m2_proc[]` registry keyed by
+**PDB-grouping**: create a proc on first sight of a new owning-PDB group via the dup-edge chain
+(GR client ↔ UVM VAS ↔ PDB, `:4700/:4720`); route kernel/GSP/scrubber traffic to `m2_sys`
+(identified by traffic class — kernel RM clients / scrubber channels — not by CR3). **Only if E0
+shows ambiguity:** add `nvkvm_cpukey.c` (`specific_ss`, the round-5 `mode2_14_cr3.patch` TU —
+`nvkvm_gpu_emul.c` is target-independent `system_ss` and can't read `X86CPU`; `meson.build`
+`specific_ss.add`) with `nvkvm_current_guest_cr3()` (`cpu_synchronize_state(current_cpu);
+env.cr[3] & ~0xfff`, the `vapic.c` pattern), read at the **userspace doorbell only**,
+budgeted/cached per §1.4. **No CR3 stamping at the `chan_vas`/`chans`/`m2_dup` populate sites**
+(dropped — kernel-context RPCs, CR3 unreliable there, §1.3). **No table is re-keyed yet** —
+registry + logging only, so behavior is byte-identical. **Simpler than the old P1:** no
+`cpu_synchronize_state` on the RPC path at all, and in the expected E0 outcome no new TU and no
+CPU-state read anywhere. *Ships alone; verify the per-process PDB-groups + E0's verdict in the log.*
 
-**P2 — per-process host isolate (security boundary).** For each `NvkvmProc`, create its own isolate
-via the existing `nvkvm_isolate_create(..., session_id=ordinal, ...)` (the infra exists,
+**P2 — per-process host isolate.** For each `NvkvmProc`, create its own isolate via the existing
+`nvkvm_isolate_create(..., session_id=ordinal, ...)` (the infra exists,
 `NVKVM_ISOLATE_MAX=4096`); route that process's forwarded control/alloc/map ioctls to *its* isolate
-(rows 11–15,16,18,19,26 → per-proc). Kernel/GSP/scrubber traffic → `m2_sys`'s isolate. Expose the
-guest-RAM share into each isolate (risk R3). This is the `mode2_isolate_consolidation_plan.md` spine
-re-grouped per-CR3. **Single-process:** exactly one `NvkvmProc` + `m2_sys` → one isolate as today,
-byte-identical. *Ships alone.*
+(rows 11–15,16,18,19,26 → per-proc). **Grouping key = the process's PDB-set**, with channels/clients
+joined to the proc via the doorbell/CHID demux + dup-edge chain — NOT CR3-at-RPC (per-process
+rather than per-VAS is a §1.2-point-6 simplicity choice; per-VAS fallback is safe). Kernel/GSP/
+scrubber traffic → `m2_sys`'s isolate. Expose the guest-RAM share into each isolate (risk R3).
+This is the `mode2_isolate_consolidation_plan.md` spine re-grouped per-process. Note the isolates
+are a *robustness/blast-radius* structure here — the security boundary is their unprivilege + QEMU
+(§1.2), which one isolate or N preserve equally. **Single-process:** exactly one `NvkvmProc` +
+`m2_sys` → one isolate as today, byte-identical. *Ships alone.*
 
 **P3 — PDB-key the data-plane tables.** Move rows 3,4,5,20,25,27,31 onto the per-VAS (PDB) sub-tables
 of `NvkvmProc`. Formalize `m2_cpt` (row 31, already pdb-keyed) and `m2_fbback` (row 25) as per-VAS.
@@ -478,10 +585,17 @@ robust 2× and defer 4c) keeps every earlier phase's gains.
   `access_model_split`): the emulate-vs-forward decision is made *before* keying and is unchanged by
   it. Kernel/GSP/scrubber → `m2_sys` (emulated / forged as today); userspace GR/compute → per-proc
   isolate (forwarded as today). §3.4 draws the line exactly where the forwarding model does.
-- **Cross-VM/host boundary is QEMU's job; intra-VM is the guest kernel's** (`access_model_split`): P2
-  makes the per-process isolate the *host-side* sandbox (cross-trust-domain), and does **not** add
-  intra-VM access checks in QEMU (the reverted H-1 lesson). CR3 keys *which sandbox*, not *access
-  rights*.
+- **Cross-VM/host boundary is QEMU's job; intra-VM is the guest kernel's** (`access_model_split`):
+  P2's per-process isolate is *host-side* sandboxing (cross-trust-domain) and does **not** add
+  intra-VM access checks in QEMU (the reverted H-1 lesson). **The keying is not the boundary** —
+  the corrected model (§1.2): each isolate is unprivileged, so PDB-keying preserves the host
+  boundary identically to any other key (points 1/4); PDB is set up by guest *kernel* RM, so guest
+  userspace cannot spoof another process's PDB (point 3); a compromised guest kernel can reshuffle
+  isolate routing but gains no host reach and no intra-guest escalation it did not already have
+  (point 4); and same-VAS processes already share GPU memory, so a shared isolate leaks nothing
+  new (point 5). The isolate key selects *which sandbox*, never *access rights* — and the residual
+  CR3 caveats (reuse-on-exit reap, PTI/PCID masking, doorbell-only reliability, §1.4) apply only
+  to the optional doorbell tiebreak, not to any security property.
 - **One forward-populated table, MISS=FAULT** (`address_table.md`): P3/P4/P5 move resolution *toward*
   the table-of-truth (delete the cascade), never away. No phase adds a reverse-resolve.
 
@@ -502,12 +616,14 @@ phase is written to be verifiable independently so work can resume from any phas
 ### 6.3 Top risks + mitigations
 
 - **R1 — single-process regression.** The #1 danger (round 3's always-on refusal regressed #12).
-  *Mitigation:* every phase is byte-identical for one process by construction (one CR3 → one
+  *Mitigation:* every phase is byte-identical for one process by construction (one PDB-group → one
   `NvkvmProc`; one PDB per VAS → filters are no-ops); the regression floor (6.2.1) gates every phase;
   P4's ring-pin is #12-safe by pin-invalidate-at-channel-free (§4.1), removing round 5's tension.
-- **R2 — hot-path CR3 cost.** `cpu_synchronize_state` per doorbell timed out CTX2-create (round 5).
-  *Mitigation:* budget it / cache CR3 per-vCPU-at-last-exit / read once per submission burst; prefer
-  destination-PDB attribution over CR3 wherever possible (P4-4a).
+- **R2 — E0 comes out ambiguous.** If the doorbell token/CHID cannot uniquely attribute a ring
+  (§1.4), the CR3-at-doorbell fallback engages and its costs return (`cpu_synchronize_state` per
+  doorbell timed out CTX2-create in round 5). *Mitigation:* scope CR3 strictly to the userspace
+  doorbell; budget the sync / cache CR3 per-vCPU-at-last-exit / read once per submission burst;
+  prefer destination-PDB attribution everywhere else (P4-4a). Expected case: CR3 is never read.
 - **R3 — GPA-arena / isolate resource exhaustion.** N per-process isolates each carving mappings +
   the guest-RAM share (§2.G, `multiproc_collision_blocker`). *Mitigation:* adopt the resolved Mode-1
   fixes (per-fd arena, MAP_FIXED, slot-recycle, single-window heap); reject overlapping arenas at
@@ -527,11 +643,15 @@ onto the clean Rust core (`rewrite_horizon_target`):
 
 **Maps cleanly to Rust structures (the plan's shape *is* the Rust shape):**
 
-- `NvkvmProc` → `struct Proc { cr3: Cr3, isolate: Isolate, vas: HashMap<PdbRoot, Vas> }`; the device
-  holds `procs: HashMap<Cr3, Proc>` + `system: Proc`. The §3.2 "linear scan + last-hit cache"
-  hand-optimization disappears — a `HashMap` (or `SmallVec` for N≤4) is idiomatic and the borrow
-  checker enforces the "load scratch per iteration, never read across" discipline §3.3 that C leaves
-  to convention.
+- `NvkvmProc` → `struct Proc { vases: HashMap<PdbRoot, Vas>, isolate: Isolate,
+  cr3: Option<Cr3> /* E0-fallback doorbell tiebreak only */ }`; the device holds
+  `procs: Vec<Proc>` + `system: Proc`, indexed by `PdbRoot → proc` on the data plane and by
+  `chid → channel → proc` at the doorbell. **PDB-primary keying maps 1:1 onto the Rust core**: all
+  keys are GPU-side inputs (PDBs, CHIDs, FB addresses), so the core stays target-independent —
+  exactly the `mode2_language_rust` boundary (no `X86CPU`/vCPU dependency in the logic core). The
+  §3.2 "linear scan + last-hit cache" hand-optimization disappears — a `HashMap` (or `SmallVec`
+  for N≤4) is idiomatic and the borrow checker enforces the "load scratch per iteration, never
+  read across" discipline §3.3 that C leaves to convention.
 - The per-VAS table → `HashMap<PdbRoot, IntervalMap<VaRange, Binding>>` behind one `RwLock` per VAS
   (`address_table.md` §12) — two populate entry points (RPC, PT-capture), one lookup, no heuristics.
   The row-2 `chan_*` global scratch simply does not exist (§3.3(B) is the default).
@@ -546,8 +666,10 @@ onto the clean Rust core (`rewrite_horizon_target`):
 - The `multiproc()` gate (`:4657`) and its six gated divergences exist *only* to keep single-process
   byte-identical while the tables are half-re-keyed. In Rust every path is per-`Proc` from the ground
   up, so the gate never exists — P5's "delete the gate" is free.
-- The `nvkvm_cpukey.c` `specific_ss` TU split (target-independent `system_ss` can't see `X86CPU`) is a
-  QEMU-build-system scar; in the Rust core CR3 is just a field read from the vCPU snapshot.
+- The `nvkvm_cpukey.c` `specific_ss` TU split (target-independent `system_ss` can't see `X86CPU`)
+  is a QEMU-build-system scar — and post-correction it is built **only** in the E0-ambiguous
+  fallback. In the Rust core the optional CR3 tiebreak is just an `Option<Cr3>` field fed from the
+  vCPU snapshot at the shell boundary; in the expected E0 outcome it does not exist at all.
 - The flat fixed-capacity arrays (`chan_vas[16]`, `m2_grmap[8]`, `m2_mapped_va[65536]`, …) and their
   P0 cap-bumps are pure C artifacts; Rust collections grow.
 - The global `chan_*` scratch funnel (§3.3) is a C-only hazard; there is no equivalent to retrofit.
