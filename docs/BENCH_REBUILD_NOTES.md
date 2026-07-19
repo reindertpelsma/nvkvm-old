@@ -55,7 +55,18 @@ Phase status (this rebuild):
       - Clean `poweroff` to persist base qcow2. run_mode2_vm.sh boots this base with a persistent
         mode2-overlay.qcow2 + shares ogkm/nvfw/nvkvm_src.
    [x] 5. Guest disk DONE.
-- [ ] 6. Mode-2 smoke cup2 rc=0
+- [~] 6. Mode-2 smoke cup2 — FIRST ATTEMPT FAILED on host=575, DRIVING A HOST-DRIVER SWAP TO 580.
+      cup2 boots the Mode-2 VM fine: emulated GA106 at 00:07.0, host isolate spawned, MEMTEST
+      PASS, OS_DESCRIPTOR guest-RAM pin rc=0. cuInit OK, RTX 3060 detected (compute 8.6, 11909MiB),
+      cuDeviceTotalMem OK — then HANGS at cuCtxCreate's CE path -> **rc=124 (timeout), DETERMINISTIC
+      across 2 fresh boots**. QEMU log = wall of `DIAG vas[N] hvas=.. pdb=.. eva=.. -> FAULT`
+      (260-600 faults) during the CE MEMSET/COPY setup = the address-table VA->phys resolution
+      MISSES. cup2 busy-polls (State=Rl, 100% CPU, NOT D-state; guest dmesg CLEAN, no Xid; host GPU
+      healthy). => This is the host-driver-version dependency: the known-good baseline (862c7c2) was
+      validated with **host driver 580.159.04**; on host 575 the emulator's CE VAS resolution faults
+      and cuCtxCreate hangs. DECISION REVISED: must install 580 on the host after all. The .run
+      refused earlier due to the apt-managed 575 driver -> now purging the apt 575 set + installing
+      the 580 .run (mechanics per multi_driver_validated). [IN PROGRESS]
 - [ ] 7. Baseline: cupctx2_min (#12) / cup8 / cup8_iter (#13)
 
 GOTCHA (this rebuild): the FIRST provision-boot launch died because the heredoc that wrote
