@@ -80,7 +80,11 @@ Phase status (this rebuild):
       GUEST GOTCHA: each fresh overlay lacks /usr/lib/x86_64-linux-gnu/libcuda.so (unversioned, needed
       by `gcc -lcuda`); re-add `ln -sf /usr/local/nvidia-guest/lib/libcuda.so.580.159.04
       /usr/lib/x86_64-linux-gnu/libcuda.so; ldconfig` after each fresh boot (or bake into base).
-- [~] 7. Baseline: cupctx2_min (#12) / cup8 / cup8_iter (#13) — each on a FRESH boot.
+- [~] 7. Baseline (each FRESH boot, host=580):
+      [x] cupctx2_min (#12) rc=0 — CTX1 create+destroy OK, CTX2 create+destroy OK, VERDICT PASS
+          (2 contexts). #12 fix (f5bb32f in 862c7c2) confirmed. 0 faults this boot.
+      [ ] cup8 (2048^2 matmul byte-exact)
+      [ ] cup8_iter (#13, 5 iters)
 
 GOTCHA (this rebuild): the FIRST provision-boot launch died because the heredoc that wrote
 /tmp/boot_provision.sh was in the SAME command as `pkill -9 -f qemu-system-x86_64` — pkill's regex
