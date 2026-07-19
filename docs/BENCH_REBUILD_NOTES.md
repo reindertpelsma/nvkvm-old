@@ -83,7 +83,7 @@ Phase status (this rebuild):
 - [~] 7. Baseline (each FRESH boot, host=580):
       [x] cupctx2_min (#12) rc=0 — CTX1 create+destroy OK, CTX2 create+destroy OK, VERDICT PASS
           (2 contexts). #12 fix (f5bb32f in 862c7c2) confirmed. 0 faults this boot.
-      [ ] cup8 (2048^2 matmul byte-exact)
+      [x] cup8 rc=0 — 2048^2 matmul byte-exact (bad=0 maxerr=0) VERDICT PASS (host GR matmul at scale)
       [ ] cup8_iter (#13, 5 iters)
 
 GOTCHA (this rebuild): the FIRST provision-boot launch died because the heredoc that wrote
