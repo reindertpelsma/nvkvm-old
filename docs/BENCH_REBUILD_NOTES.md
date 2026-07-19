@@ -32,9 +32,29 @@ Phase status (this rebuild):
           QEMU 9.2.0 [VIRTIO_ID_GPIO] is the LAST initializer entry with NO trailing comma.
           Fixed: made comma optional in match, emit our entries with the comma.
 - [ ] 4. Build stub
-- [ ] 5. Guest disk (kernel 6.8.0-117 pin, 580 open modules, libcuda)
+- [~] 5. Guest disk IN PROGRESS:
+      - base = ubuntu 24.04.4 noble cloudimg -> /opt/nvkvm-guest/ubuntu-24.04.qcow2 (+30G, 33.5G virt)
+      - seed.iso built with cloud-localds; user-data (plain #cloud-config, NOT base64 this time —
+        no passwd-escaping issue since keys are ssh-ed25519 one-liners) has BOTH pubkeys
+        (local root@test-real-amd64-host for `ssh vg`; vh root@ubuntu for harness `ssh -p 2223`),
+        ssh_pwauth:true + ubuntu:nvkvm fallback, and BAKES /etc/modprobe.d/nvkvm-blacklist.conf.
+      - provisioning boot: used the nvkvm qemu (no distro qemu on box) as a PLAIN boot on port 2222
+        (no -device nvkvm-gpu-emul), shares nvkvm_src + ogkm 9p. Launch via
+        /opt/nvkvm-guest/boot_provision.sh with `setsid ... </dev/null & disown` + wait loop in ONE
+        ssh session (short-nohup gets orphaned — ssh_aliases gotcha).
+      - kernel 6.8.0-117: apt-installed image+headers+modules(+extra)+build-essential; GRUB_DEFAULT
+        pinned to the 117 advanced menuentry id; apt-mark hold on the 4 kernel pkgs; unattended-
+        upgrades removed. Rebooted -> `uname -r` = 6.8.0-117-generic CONFIRMED.
+      - 580 open modules: mounted ogkm 9p, cp -a to /root/nv580src, `make -j4 modules
+        SYSSRC=/lib/modules/6.8.0-117/build` (4G swap added). [BUILDING]
 - [ ] 6. Mode-2 smoke cup2 rc=0
 - [ ] 7. Baseline: cupctx2_min (#12) / cup8 / cup8_iter (#13)
+
+GOTCHA (this rebuild): the FIRST provision-boot launch died because the heredoc that wrote
+/tmp/boot_provision.sh was in the SAME command as `pkill -9 -f qemu-system-x86_64` — pkill's regex
+matched (and the session churn meant) the script never got written, so setsid launched a nonexistent
+path. Fix: write the boot script to a PERSISTENT path (/opt/nvkvm-guest/boot_provision.sh) in a
+SEPARATE command from any pkill, use the `[4]` regex, then launch.
 
 Prior rebuild log (box 18577, for reference) preserved below.
 ---
