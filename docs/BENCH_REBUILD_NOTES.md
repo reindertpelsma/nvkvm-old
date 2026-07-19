@@ -11,7 +11,19 @@ NOTE: /workspace/bench-archive did NOT survive on this box — VBIOS rsync'd fro
 Phase status (this rebuild):
 - [x] 0. Repo rsync'd to /workspace/nvkvm; VBIOS -> /opt/nvkvm-guest/ga106_vbios.rom (md5 OK)
 - [x] 1. Host apt deps DONE (added qemu-utils cloud-image-utils genisoimage swtpm; box is Ubuntu 22.04/jammy host)
-- [ ] 2. Host NVIDIA 580.159.04 open source (for guest build) / driver decision
+- [x] 2. DRIVER DECISION = **575-host + 580-source** (task fallback path).
+      The 580.159.04 .run REFUSED to install (`--silent`) because the vast box ships the 575
+      driver via apt/dpkg ("installed through packages") and the .run cancels on an alternate
+      installation; no override flag exists in `--help`. Purging the apt 575 set on a rented GPU
+      box risks bricking host GPU access, so per the runbook fallback I kept 575 RUNNING on the
+      host and staged the 580 open SOURCE for the guest build (ABI auto-detect handles 575-host
+      per multi_driver_validated: "575.51.03 -> profile 570: matmul PASS"). Reloaded 575
+      (nvidia-smi = 575.51.03, healthy) after the failed install, then `--extract-only`'d 580.
+      Staged from the extracted tree:
+        - /usr/src/nvidia-580.159.04/  = kernel-open source (nv-kernel.o_binary present) [ogkm 9p]
+        - /usr/lib/firmware/nvidia/580.159.04/{gsp_ga10x,gsp_tu10x}.bin              [nvfw 9p]
+        - /workspace/nvkvm/host-libs-580/{libcuda,ptxjitcompiler,allocator,nvvm}.so.580.159.04
+          + cuda.h (cudart 12.6 redist, CUDA_VERSION 12060)  [pulled into guest via nvkvm_src 9p]
 - [x] 3. Build QEMU DONE — /opt/qemu-nvkvm/bin/qemu-system-x86_64 lists m2fwd/m2exec/m2cefwd.
       TWO MORE build_qemu.sh bugs found+fixed (committed):
       (a) step-5 sed used '|' as BOTH s-delimiter and regex-alternation (common|abi) -> "unknown
