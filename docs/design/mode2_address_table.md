@@ -113,6 +113,21 @@ invalidate" is trustworthy for *all* VAs. This is the #11-open item in §11.
 
 ## 5. The coherence event: TLB invalidate (two transports, both observed)
 
+> **★ CORRECTION (2026-07-22, audit S3 — #14 round-6, decisive).** The invalidate model in this
+> section governs the **kernel/UVM/RM paths** (where the two transports DO appear). It does **NOT**
+> fire on the **Mode-2 GSP-emulated compute path**: `mode2_14_concurrent_apps` round-6 measured
+> **both** transports = **0 occurrences** there (`INVALIDATE_TLB` RPC fn=200 = 0; `MEM_OP`/
+> `MMU_TLB_INVALIDATE` pushbuffer method = 0), *and* `DMA_FILL_PTE_MEM` (§4.1) = 0. On that path the
+> compute working-set's leaf PTEs are published **exclusively through the CE page-table-write data
+> plane** (kernel-RM CeUtils physical CE copies into PD pages — the #13 mechanism, commit `b83d0b4`).
+> So the address table has **two co-equal populate sources**, not "RPC + read-at-invalidate":
+> **(1)** bind-time RPC/ioctl bindings (§4.1); **(2)** the **observed CE-PT-write**, attributed by
+> its destination-FB-address → owning PDB, latched and decoded **at the CE release semaphore** (the
+> commit point that replaces the absent invalidate). This is the rewrite's `nvkvm-mmu` "CE-write
+> capture feed," equal to the RPC source (`mode2_rust_rewrite_architecture.md` L3). §4.2's
+> "read-at-invalidate is load-bearing" and §11's "always-invalidate is universal" (open item #1)
+> are therefore **false for the GSP-emulated compute path** — resolved to the CE-write-hook there.
+
 Both carry the **PDB address** (so we know which VAS to refresh) and **membar**
 bits (the fence, §5.1). Both are observable to us.
 

@@ -502,6 +502,15 @@ on VER3) is a thin `Arch` impl. The #13-class silent-drop bug is designed out: `
      CC — which defeats the unprivileged-forwarding premise). This should be **stated in the product
      positioning**, not treated as a fixable bug: the product's addressable market is
      **non-CC GPUs** (all GeForce; datacenter parts with CC disabled).
+   - **★ But CC-off IS reachable on datacenter parts you control (decision #11 — good news for the
+     market).** CC is an **opt-in, per-GPU/VM mode that ships OFF by default even on H100/Blackwell**
+     (`bOsCCEnabled` default; gated behind `gpuIsCCEnabledInHw_HAL` / Protected-PCIe). So an operator
+     who **controls the host GPU configuration** can run **CC-OFF on datacenter silicon** and Mode-2
+     works there exactly as on GeForce. The wall is **only** "guest demands CC **and** host enforces
+     CC" — which you hit only if the product's value-prop *is* confidential compute (it is not). Net:
+     the addressable market is **non-CC GPUs = all GeForce + any datacenter part in an
+     operator-controlled CC-off deployment**, not merely consumer parts. **ASSUMPTION — verify** no
+     future consumer *or* datacenter default flips CC on.
 
 3. **The behavioral RE residual is per-*generation*, not per-*version*.** Turing↔Ampere GSP dialect,
    Ampere→Hopper VER3 walker + PCF encode/decode, MIG runlist multiplicity — these land as new `Arch`

@@ -19,6 +19,37 @@ branch `consolidation`) unless prefixed. Uncertain claims are marked "ASSUMPTION
 
 ---
 
+## Governing decisions (owner + Opus, 2026-07-22)
+
+This document is now reconciled against the **13 settled rewrite decisions** (memory
+`mode2_rewrite_design_decisions`) and the pre-Rust consistency audit
+(`mode2_rewrite_consistency_audit.md`). Two of those decisions govern **every** tradeoff below and
+belong at the top:
+
+**★ PRIORITY LADDER (decision #8).** Rank every tradeoff in this order:
+
+> **catastrophic SECURITY boundaries  >  correctness COMPREHENSIVENESS  >  other security  >
+> performance PARITY  >  misc / nice-to-haves.**
+
+This is an **intentional reorder** of the C-era rule (`priority_order_feedback`:
+correctness→security→perf) now that security is a **core product requirement**: the three host
+boundaries below rank *above* even correctness breadth, and perf-parity ranks *below* correctness
+(unchanged). When two goals collide, the higher rung wins.
+
+**★ MULTI-PROCESS and SECURITY are CORE, designed in from line 1 (decision #9).** Not features,
+not add-ons, not a later phase. The retrofit of per-process separation onto a single-process C
+emulator is *exactly* what stalled the C at #14 (Part 1). In the rewrite, `Proc` is the type-system
+spine (§4.3) and the three risk boundaries (§4.3.5) are a design requirement, so there is no
+"arm per-process mode" moment and no threat model bolted on afterward.
+
+The other decisions are folded at their natural sites: hexagonal core (#1/#2 → §4.2), (b)-authoritative
+resolution (#3 → §4.3.1 + `mode2_address_table.md`), protocol-not-trace (#4 → §4.5, `mode2_forwarding_model.md`),
+CC scope (#5/#11 → `mode2_abi_agnostic_layer.md` §5), trap-minimization + the faked-reg taxonomy
+(#6/#12 → §4.4), the completion-plane hypothesis (#7 → §4.3.2, honestly hedged), testing-first-class
+(#10 → §4.5 + `mode2_rust_testing_strategy.md`), and the new-private-repo strategy (#13 → §4.5).
+
+---
+
 ## TL;DR
 
 Single-process Mode-2 works at host parity (CUDA, LLM, PyTorch; byte-exact; #12 and #13
@@ -35,7 +66,7 @@ already landed in C; what remains is making four planes per-process *coherently*
 is a ground-up structural property, not a patch.
 
 The rewrite is therefore: a **Mode-2-only Rust core** that is a pure state machine over
-guest-supplied bytes — no QEMU, no OS calls — behind a **6-capability hypervisor-adapter
+guest-supplied bytes — no QEMU, no OS calls — behind a **small hypervisor-adapter
 trait** (QEMU is one backend; cloud-hypervisor another), decomposed into ~10 crates with
 the **per-process boundary as the type system's spine**: every process owns its VAS
 tables (keyed by PDB), its channels (keyed by vChid), its unprivileged host isolate, its
@@ -179,6 +210,19 @@ is still gated behind `any_completed=false`, and even ungated
 batch SWGEN0 gate serializes both processes' completions behind one drain — the fix
 helped (the loser advanced into its matmul) but could not reliably carry **two
 independent** cuCtxCreate completions.
+
+**★ Honest caveat (audit N1): #14's exact mechanism is NOT conclusively root-caused.** The
+completion-delivery localization above is the round-8 *top-entry* conclusion; a **co-equal round-8
+trace** (`mode2_14_concurrent_apps`, the eight-star bottom entry, same day) *re-localized* the wall
+to the **GR-compute execution plane** — the loser's user-CE finishPayload advances to payload=2 then
+stops because the loser's later GR *matmul* never runs to completion on the host, suspected to be the
+scalar one-shot GR exec plane (`m2_gr_channel`/`m2_gr_token`/`doorbell_setup`, ⚠4) only ever serving
+the first process. The two traces were never merged (they describe different loser states across
+different boots). **The rewrite deliberately does not depend on which localization is correct: it
+makes the execution plane per-`Proc` (§4.3.1) AND the completion plane per-`Proc` (§4.3.2), so either
+fork is covered by construction.** The first exec/completion port milestone must reproduce the
+loser-hang and disambiguate the two forks on the bench — treat #14 as an open hypothesis, not a
+solved problem.
 
 ## 1.4 Why this is not patchable incrementally
 
@@ -495,11 +539,22 @@ judged on — it is also what makes trace-replay differential testing possible (
 
 ## 4.1 (a) Hypervisor-agnostic — the VMM adapter boundary
 
-The core needs exactly **six capabilities** from a hypervisor. Notably absent: vCPU
+The core needs a small, fixed set of capabilities from a hypervisor (**eight**, below —
+count is not the invariant; hypervisor-agnosticism is). Notably absent: vCPU
 register access — E0 settled that the doorbell demux is vChid-keyed (GPU-side
 identity), so the adapter needs **no CPU-state introspection at all**. This is a real
 shrinkage: round 5 showed CR3 reads require target-specific build plumbing and a
 non-free `cpu_synchronize_state`; dropping the capability keeps every backend thin.
+
+**Trait growth vs. the original 6 (audit C2, decision #6).** The trap-minimization/passthrough
+architecture (§4.4, decision #6) adds two capabilities the first draft's six lacked: a **read-only /
+read-native memslot** mode (the `gsp_falcon` rom-device overlay pattern — timer/status reads served
+from RAM, writes still fault) and the **memory-lock primitive** (revoke a live untrapped page →
+next access faults + waits → atomic update → restore → release) needed to keep the (iv-b) *dynamic*
+faked-regs updatable under passthrough without a per-read trap. Both stay hypervisor-agnostic
+(userfaultfd / memslot revoke-restore, **not** host `mprotect`). **ASSUMPTION — verify:**
+cloud-hypervisor / rust-vmm expose a userfaultfd-style revoke-restore with a fault callback (QEMU
+does).
 
 ```rust
 /// Everything the Mode-2 core may ask of the hypervisor. Object-safe; one instance
@@ -538,6 +593,22 @@ pub trait Vmm: Send {
     //    at quiesce, timers for poll-kick budgets).
     fn defer(&mut self, after: Duration, event: CoreEvent);
     fn now(&self) -> Instant;
+
+    // 7. Read-native overlay (decision #6, faked-reg iv-a + the passthrough taxonomy):
+    //    back a page/range with RAM the core keeps current so guest READS are served
+    //    without a VMM op (the gsp_falcon rom-device pattern), while a chosen write
+    //    sub-range still traps to mmio_write. `prot`/`ReadOnly` on map_guest may cover
+    //    the simple case; this names the read-native-RAM + write-trap split explicitly.
+    fn map_read_native(&mut self, gpa: u64, len: u64, backing: HostRegion,
+                       write_trap: Option<Range<u64>>) -> Result<SlotId, VmmError>;
+
+    // 8. Memory-lock primitive (decision #6, faked-reg iv-b): update live untrapped
+    //    data race-free. revoke -> the next guest access faults and blocks on a mutex
+    //    -> the core updates atomically -> restore -> release. Delivered as a
+    //    fault CoreEvent; cheap only when updates are rare vs reads (TLB-shootdown cost).
+    //    Hypervisor-agnostic (userfaultfd / memslot revoke-restore), never host mprotect.
+    fn lock_region(&mut self, slot: SlotId, on_fault: CoreEventKind) -> Result<(), VmmError>;
+    fn unlock_region(&mut self, slot: SlotId) -> Result<(), VmmError>;
 }
 ```
 
@@ -561,7 +632,7 @@ Backends:
 - **`nvkvm-vmm-ch`** — cloud-hypervisor (rust-vmm): fully-safe path, PCI + VFIO
   present, the microVM-GPU story. (Firecracker is structurally out — no PCI bus by
   design, `rewrite_horizon_target`.)
-- A bespoke VMM remains possible because the trait is six capabilities, not "QEMU."
+- A bespoke VMM remains possible because the trait is a handful of capabilities, not "QEMU."
 
 Threading model (explicit, because C left it implicit): the adapter serializes all
 `Device` entry points per device (QEMU's BQL gives this for free; cloud-hypervisor
@@ -752,6 +823,22 @@ re-post is precisely what that experiment lacked. If a residual starvation remai
 the next suspect is per-proc TSG scheduling fairness (P4-4c), for which the
 per-`Proc` `ExecPlane` is already the right structure.
 
+**★ On decision #7's "passthrough dissolves #14" (audit C3 — read honestly).** Decision
+#7 hypothesizes that making completion semaphores *real shared pages* (host GPU writes
+them, guest userspace polls them at the right GPA via a memslot) removes the delivery
+step and so **dissolves the #14 wall by construction**. That is true **only for the
+busy-poll-a-shared-sema variant**. The wall round-8 *actually traced* is different: the
+loser spins in **`MC_SERVICE_INTERRUPTS` (fn=76) reading interrupt LEAF regs
+`0xb81008..` that stay 0** — it is in the guest **kernel** waiting for an **interrupt**
+(os-event `POST_EVENT` + the single SWGEN0 edge), not polling a shared sema value.
+Decision #7's own caveat concedes this path is *not* dissolved (*"the blocking/
+interrupt-driven wait path still needs per-proc interrupt handling; only busy-poll
+dissolves"*). **So the load-bearing #14 fix is the per-process `CompletionQueue` +
+poll-driven re-delivery above — NOT passthrough.** Passthrough semas remain a worthwhile
+*first-milestone measurement* (they may remove a class of user-CE busy-poll
+serialization), but this design does not bet on them closing #14; the interrupt-delivery
+plane is fixed structurally, per-`Proc`.
+
 ### 4.3.3 Per-process GPA arenas
 
 `GpaSpace` owns the device's guest-physical window (BAR-exposed, finishing #55's
@@ -792,25 +879,51 @@ per-proc costs address space, not RAM.
   across the boundary (L10). Isolate process reaped via the Mode-1 reaper path;
   a dead isolate never wedges another proc (test ladder's isolation smoke).
 
-### 4.3.5 Threat model (stated)
+### 4.3.5 Threat model — the three boundaries that MUST hold (decision #9)
 
-- **Host / cross-VM boundary (the security boundary):** the VMM (memory-safe core +
-  QEMU/CH) + the *unprivileged, sandboxed* isolates. A fully compromised guest —
-  kernel included — can, at worst, drive N unprivileged host GPU sessions; no host
-  reach beyond what any unprivileged host process has. Identical for 1 or N isolates
-  (plan §1.2: unprivilege, not the key, is the boundary).
-- **Intra-guest (process-to-process):** the **guest kernel** is the authority
-  (`access_model_split`) — it built the PDBs and blocks userspace from forging them.
-  Per-process isolates add **defense-in-depth/blast-radius**: a bug in our
-  forwarding of process A cannot touch process B's host handles/mappings (separate
-  host processes, separate fd tables, separate handle namespaces), and one process's
-  crash/exit reaps cleanly without perturbing others. We claim process-grade — not
-  VM-grade — isolation between guest processes, and say so in the security model.
-- **The core's own attack surface:** every guest-controlled byte (RPC messages,
-  pushbuffer methods, page tables, doorbell tokens) is parsed in safe Rust inside
-  the core, with `nvkvm-abi`-typed decoding — the round-trip through codegen'd
-  types replaces today's hand-offset `ldl_le_p` spelunking. MISS=FAULT (L1) is also
-  a security property: no guessing means no confused-deputy resolution.
+Security and multi-process are **core design requirements from line 1**, not add-ons
+(decision #9; §"Governing decisions"). They rank at the **top of the priority ladder**
+(decision #8): the *catastrophic* boundaries below outrank even correctness
+comprehensiveness. The C stalled at #14 precisely because per-process separation was
+*retrofitted*; the rewrite designs it in, so the threat model is a property of the type
+system (`Proc` owns four planes + its own unprivileged isolate), not a bolt-on.
+
+**The three boundaries that must hold** (decision #9 — finer than the C-era
+single-kernel-boundary; each is a design requirement, not a hope):
+
+1. **guest USERSPACE process compromised** → must NOT reach the guest kernel, NOT the
+   hypervisor/host, NOT another guest process — **and it should be HARD even to reach
+   its OWN isolate** (defense-in-depth: the isolate is hardened *against the very process
+   it serves* — untrusted-parser posture, seccomp, no `PROT_EXEC`, least-privilege RAM
+   share). This is the boundary the guest-controlled-byte attack surface must respect.
+2. **an ISOLATE compromised** → reaches only the guest process(es) it serves; NOT the
+   guest kernel, NOT the hypervisor/host. The **unprivileged sandbox** is the
+   load-bearing host boundary: whatever an isolate is keyed on (PDB-set), it can issue
+   only *unprivileged* host GPU ops (plan §1.2 pts 1/4 — unprivilege, not the key, is
+   the boundary; a `0x1b` on a Case-2 control is "wrong layer," never "gain privilege").
+   Per-process isolates give **blast-radius containment**: a bug forwarding process A
+   cannot touch process B's host handles/mappings (separate host processes, fd tables,
+   handle namespaces), and one process's crash/exit reaps cleanly.
+3. **the guest KERNEL compromised** → must NOT reach the hypervisor/host, NOT other VMs
+   (standard VM isolation; **we add no escape**). The guest kernel is already the
+   authority for intra-guest (process-to-process) rights (`access_model_split`) — it
+   built the PDBs and blocks userspace from forging them; a compromised kernel already
+   owns all guest userspace, and can reshuffle isolate routing, but every isolate is
+   unprivileged so it gains **no host reach** and no intra-guest escalation it didn't
+   already have. We do **not** add intra-VM access checks in the VMM (the reverted H-1
+   lesson — wrong layer, breaks guest-mediated sharing like CUDA IPC).
+
+We claim **process-grade** (not VM-grade) isolation *between* guest processes, and say so
+in the product security model. Same-VAS processes already share GPU memory, so a shared
+isolate for them leaks nothing new (plan §1.2 pt 5).
+
+**The core's own attack surface (boundary 1's enforcement):** every guest-controlled byte
+(RPC messages, pushbuffer methods, page tables, doorbell tokens) is parsed in **safe
+Rust** inside the core with `nvkvm-abi`-typed decoding — the round-trip through codegen'd
+types replaces today's hand-offset `ldl_le_p` spelunking. **MISS=FAULT (L1) is itself a
+security property:** no guessing means no confused-deputy resolution across contexts. The
+untrusted per-process translation runs *inside* the sandbox (§4.3.4), so a parser bug is
+both memory-safe *and* sandbox-contained.
 
 ## 4.4 What the register/MMU model keeps from the C (the passthrough posture)
 
@@ -822,12 +935,42 @@ passthrough") applied with its own caution note (riskiest pillar):
   keeps current (the `gsp_falcon` rom-device overlay pattern, `:136`, which killed
   the nested-virt poll storm). `nvkvm-regs` encodes this as a declarative page policy
   table, not ad-hoc MemoryRegions.
-- Page tables: **shadow-on-invalidate/at-release, never PTE-write-trap**
-  (`mode2_memory_model.md`) — with the L3 correction that on this path the "commit
-  points" are the CE release semaphore + the doorbell, since the classic invalidate
-  transports don't fire; the capture feed is the CE-write hook.
+- **The page taxonomy (decision #6), as the policy table's four classes:**
+  **(i)** host-GPU-written / guest-read (completion semas, stats, PTIMER) → **memslot
+  passthrough, no trap**; **(ii)** guest-written whose *effect* we must observe
+  (doorbell, instance blocks) → **trap on write**; **(iii)** guest↔guest we don't care
+  (userspace pushbuffers + userspace semaphores) → **full passthrough**; **(iv)** we
+  fabricate (faked GSP/boot regs) → **shadow**, split two ways:
+  - **(iv-a) STATIC read-once/read-only faked regs** (GFW_BOOT constants, most GSP boot
+    handshake regs) → map a **read-only RAM page** with the expected contents, **no
+    trap** (`Vmm::map_read_native`, §4.1 cap 7). This is the big trap reduction — most
+    boot regs are (iv-a).
+  - **(iv-b) DYNAMIC faked regs the guest polls where our answer evolves** (the
+    `0x110094` `NV_PGSP_FALCON_DEBUGINFO` poll, `execfwd` m581) → **trap**, OR
+    async-update-before-op, OR the **memory-lock primitive** (§4.1 cap 8) —
+    least-trapping rule that's still correct per-reg.
+- **★ Page tables are NOT in class (ii) (audit C1):** decision #6's taxonomy text lists
+  "PTE writes" under trap-on-write, but the proven design does the **opposite** —
+  **shadow-on-invalidate/at-release, NEVER a PTE write-trap** (`mode2_memory_model.md`
+  §"Page tables"; `mode2_dataplane_architecture.md` §"PDB tables: never trap
+  per-access"; a per-write PTE trap is precisely the vmexit storm, `execfwd` m580). PT
+  pages are **RAM-backed** and the guest writes them natively; we capture via the
+  **CE-write hook** (L3 — the CE copy/fill path that bypasses `fb_write`) and decode at
+  the commit point. On the GSP-emulated compute path the "commit points" are the **CE
+  release semaphore + the doorbell**, since the classic invalidate transports don't fire
+  (#13/#14 round-6; `mode2_address_table.md` §5 note). "PTE pages = trap-on-write" is a
+  taxonomy-wording error, not the design.
 - Data plane: shared physical pages for USERD/GPFIFO/pushbuffer/sema (L4), doorbell
   trap+translate as the only hot-path mediation — the proven parity recipe.
+- **★ Nested-virt honesty (audit N2):** the "~zero VMM traps steady-state" target
+  (decision #6) is a **bare-metal** property — `mode2_baremetal_32` measured *zero*
+  Mode-2 overhead (49.9 vs 47.5 t/s). Under **nested virt**, nested EPT still forces a
+  vmexit on BAR-page accesses even for a memslot-backed/read-native page (`execfwd`
+  m582–m584: the rom-device dropped the QEMU op but **not** the exits); the passthrough
+  win is masked there. The nested path's real fix is to avoid the hot MMIO surface
+  entirely (Mode-1's virtio/ioctl model, which hit parity under the same nesting), not
+  memslot-backing. The primary target (operator-controlled host) is bare-metal, where
+  the win is real.
 
 ## 4.5 Migration realism
 
@@ -885,7 +1028,7 @@ doorbell-driven-only completion delivery.
   either outcome feeds the same Rust structure.
 - **R3 — second-system effect / scope creep** (Windows guests, vGPU, multi-arch on
   day one). *Mitigation:* the trait seams exist (RmBackend at RM-verb level, Vmm at
-  6 capabilities) but only Linux-host + QEMU-backend + GA10x + the tested driver
+  ~8 capabilities) but only Linux-host + QEMU-backend + GA10x + the tested driver
   versions are *claimed*; everything else is an adapter slot, unbuilt
   (`rewrite_horizon_target`'s "enabled but unbuilt" posture).
 - **R4 — hybrid-phase drag:** the strangler seam (Rust GSP inside C QEMU device)

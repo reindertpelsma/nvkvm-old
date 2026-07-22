@@ -1,5 +1,15 @@
 # Mode-2 multi-process — the per-process page-table-publication isolate
 
+> **★ SUPERSEDED IN PART (2026-07-22, audit S1).** This doc's **two-key security conclusion**
+> (§"The remaining wall" / §"The design" point 3: *"vCPU CR3 = the security-isolate + exec-identity
+> key"*) is **retired**. Experiment **E0** (`mode2_multiprocess_refactor_plan.md` §1.4, run
+> 2026-07-19) dropped vCPU CR3 **entirely**: process identity = **PDB (data plane) + vChid (exec
+> plane)**, both GPU-side, no `cpu_synchronize_state`, and `nvkvm_cpukey.c` was never built. An
+> isolate's security comes from being **unprivileged**, not from its key (plan §1.2; rewrite decision
+> #9). Read the *wall* analysis (rounds 5–6, page-table publication) as still valid; read every
+> "CR3" as "PDB-set + vChid." The refactor plan and `mode2_rust_rewrite_architecture.md` are the
+> current design.
+
 **Status (2026-07-09):** foundation landed (`v3`, commit `862c7c2`); full 2-process concurrency
 DEFERRED to a per-process page-table-publication isolate — the natural first feature of the Rust
 rewrite ([[rewrite_horizon_target]]). This doc synthesizes what six Fable rounds proved so the design
@@ -55,15 +65,17 @@ tree (resolves only under the winner's). Two independent findings pin why:
    proving the direction, but (a) ungated it regressed #12 (stale pin consumed at libcuda driver-unload)
    and (b) the 2nd path remained on role-swapped boots.
 
-**Conclusion:** the two keys are distinct and both real —
+**Conclusion (CORRECTED 2026-07-19 by E0 — see the superseded banner at top):** the two keys are
+both **GPU-side**; vCPU CR3 is **not used**.
 - **PDB = the data-plane address-space key** (`mode2_address_table.md`: "the GPU's CR3", client-
   independent; the CE-write *destination FB address* is already per-PDB, so which process a PT-write
   belongs to is known without any CPU signal).
-- **vCPU CR3 = the security-isolate + exec-identity key** (`mode2_isolation_cr3_key`): which guest
-  process is *ringing the doorbell / executing*. Bench-proven readable via
-  `cpu_synchronize_state(current_cpu); env.cr[3]` (needs its own target-specific TU — `nvkvm_cpukey.c` —
-  since `nvkvm_gpu_emul.c` is target-independent `system_ss`; must be budgeted, `cpu_synchronize_state`
-  is not free). The two processes carry distinct CR3s each correlating to their own PDB.
+- **vChid = the exec-identity key** (E0, `mode2_multiprocess_refactor_plan.md` §1.4): the doorbell
+  work-submit token encodes `token[11:0] = vChid`, fresh per channel-create, so
+  doorbell → vChid → channel → owning PDB → process resolves *which process is executing* with **no
+  CPU signal**. `nvkvm_cpukey.c` / `cpu_synchronize_state` / `env.cr[3]` were **never built** — the
+  earlier "distinct CR3 per process" observation is retained only as the rationale for why CR3 was
+  never made load-bearing.
 
 ## The design: per-process page-table-publication isolate
 
@@ -79,8 +91,10 @@ process's own page tables**, reliably, so every process's leaf PTEs land in its 
    PDB (already per-PDB via the write's FB address), so each process's PD0 leaves populate its own tree.
    Resolve every channel to its PDB via the v3 dup-edge chain; a table MISS is a FAULT, never a guess.
 3. **Per-process host isolate (security).** Orthogonal but required for the Mode-1 boundary: one host
-   sandbox per guest process, keyed on vCPU CR3 at the trapping doorbell/submission
-   (`mode2_isolation_cr3_key`); kernel/GSP traffic → the system isolate; reap on process exit.
+   sandbox per guest process, **keyed on the process's PDB-set** (grouped via the doorbell/vChid
+   demux + the dup-edge chain — E0 dropped vCPU CR3 entirely, `mode2_multiprocess_refactor_plan.md`
+   §1.4); kernel/GSP traffic → the system isolate; reap on process exit. The isolate's security is
+   its **unprivilege**, not the key (audit S1 / decision #9).
 
 **Why this is the Rust rewrite's job, not more C:** the emulator's single-process assumptions are woven
 through channel registration, VAS selection, backing, and scheduling. v3 gates the divergences, but a
