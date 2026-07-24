@@ -1,5 +1,12 @@
 # Mode-2 Phase B: forward GR/compute to a real host GPU (host parity)
 
+> **Rewrite note (2026-07-24):** the Rust rewrite's execution/forwarding plane — the
+> `Engine`/GR-context/pushbuffer/completion/forward abstractions designed *into* the core
+> — is specified in the rewrite repo at `nvkvm-rs/docs/design/execution_plane.md` (which
+> mines this doc + `mode2_compute_forwarding.md`/`mode2_forwarding_model.md`/
+> `mode2_address_table.md`). The rewrite repo owns its design docs going forward; this
+> doc remains the C-era ground truth for the forward-not-emulate approach.
+
 Decision (user, 2026-06-03): **do B.** Pure-emulation Mode-2 is complete through
 boot + GSP-RPC + BAR2/GMMU + CE + interrupts; it stalls at the GR (compute) engine
 golden-context bootstrap because GR state is produced by FECS/GPCCS microcode on
