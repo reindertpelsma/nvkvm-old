@@ -732,11 +732,15 @@ from the ground up.
 pub struct Gpu {
     gsp: Gsp,                       // device-global: falcon FSM, msg queues
     regs: Regs,                     // device-global: BAR0/intr tree
-    procs: Slab<Proc>,              // 1 per live guest CUDA process
+    rmgraph: RmGraph,               // ★ SOURCE OF TRUTH: the RM resource graph
+                                    //   (client→device→VASpace→TSG→ctxshare→channel +
+                                    //   DUP_OBJECT edges), built from RM_ALLOC/DUP/FREE.
+                                    //   Everything below is a PROJECTION of it (§4.3.1a).
+    procs: Slab<Proc>,              // 1 per live guest CUDA process (derived grouping)
     system: Proc,                   // kernel RM / scrubber / CeUtils traffic
-    by_pdb: HashMap<Pdb, ProcId>,   // data-plane routing (accreted at SET_PAGE_DIR/
-                                    //   RESERVED_PDES via the dup-edge chain — P1)
-    by_vchid: HashMap<VChid, (ProcId, ChanId)>, // exec-plane routing (E0)
+    by_pdb: HashMap<Pdb, ProcId>,   // data-plane routing — DERIVED (channel's declared
+                                    //   hVASpace → PDB), not accreted from event order
+    by_vchid: HashMap<VChid, (ProcId, ChanId)>, // exec-plane routing (E0) — derived
     gpa: GpaSpace,                  // the window; hands out per-proc Arenas
 }
 
@@ -778,6 +782,68 @@ Routing rules (= plan §1.3, now structural):
 
 One process ⇒ one `Proc` — single-process is the N=1 case of the only code path.
 No `multiproc()` gate, no arming window (L9), byte-identical trivially.
+
+### 4.3.1a The RM resource graph — protocol-not-observed-order, the exact NVIDIA boundaries
+
+`by_pdb`, `by_vchid`, and the `Proc` grouping above must NOT be *accreted from observed
+event order* ("saw a `SET_PAGE_DIR` then a doorbell → associate them" — the C's fragility,
+L1). They are **derived from a faithfully-modelled RM resource graph**, whose every edge is
+**declared in the protocol** and therefore order-independent (principle #4, L1). There is no
+GPU concept of a CPU *process*; NVIDIA's real boundary objects are the RM resource hierarchy,
+authoritative in the open source at `resource_list.h` (the `RS_ENTRY` registry) — the graph
+the rewrite mirrors:
+
+```
+RmClientResource (hClient)          # handle namespace + access rights; NOT a process key
+                                    #   (values reused across processes; N per process)
+  └── Device (NV01_DEVICE_0)        # parent = client
+        ├── Subdevice
+        ├── VASpace (FERMI_VASPACE_A, parent=Device)   ★ THE MEMORY BOUNDARY = PDB
+        │                                                (GMMU keys page tables by PDB;
+        │                                                 this is what #14 faults on)
+        └── TSG  (KernelChannelGroupApi / KEPLER_CHANNEL_GROUP_A, parent=Device)
+              │        alloc params DECLARE hVASpace + engineType (nvos.h:2904)
+              ├── CtxShare / subcontext (VEID)         # binds a channel ↔ a VASpace
+              └── Channel (KernelChannel / <ARCH>_CHANNEL_GPFIFO_A, parent = Device | TSG)
+                       NV_CHANNEL_ALLOC_PARAMS DECLARE hVASpace + hContextShare + engineType
+```
+
+**Every ownership edge is a declared protocol fact, not an inference:**
+- a **Channel** names its `hVASpace` and `hContextShare` in `NV_CHANNEL_ALLOC_PARAMS`
+  (`resource_list.h:320`, `nvos.h:1627`) → we know its VASpace *at alloc*, never by guessing;
+- a **TSG** names its `hVASpace` + `engineType` (`nvos.h:2904`);
+- every object names its **`hParent`** (the RS parent-child constraint is enforced by RM:
+  `resource_list.h` `RS_LIST(classId(...))`);
+- **`DUP_OBJECT`** (`NVOS55`: `hClientSrc/hObjectSrc → hClient/hParent/hObject`) is the *only*
+  cross-client transfer edge — this is how UVM aliases the compute client's VASpace into its
+  own client, and it is the protocol-correct source of the process grouping (the v3 dup-edge
+  chain, now first-class).
+
+**Derivation rules (deterministic, order-independent):**
+- **`Vas` (PDB) = the address-plane owner.** A channel resolves to its VASpace via its declared
+  `hVASpace` (or, for a `hVASpace=0` GSP-managed channel, via its TSG/ctxshare's VASpace) →
+  PDB → `Vas`. `#14`'s fix lives *here*: each `Vas` owns its own disjoint `backing`, so two
+  processes' identical guest VAs (distinct `Vas`, distinct PDB) can never collide (the proven
+  `FAULT_PDE` root, 2026-07-24 experiment). **The address plane keys on VASpace, never on `Proc`**
+  — a process holds several VASpaces (compute + UVM); routing address ops through `Proc` would
+  hit the wrong page tables.
+- **`Channel` (vChid) = the exec-plane owner** (doorbell demux, E0).
+- **`Proc` = the grouping node** for isolate + GPA-arena + lifecycle only. Its membership is
+  *derived*: the client-ownership tree + `DUP_OBJECT` edges determine which clients/VASpaces/
+  channels belong to one guest process. Never inferred from timing.
+
+**Arch-invariance (ties to the ABI two-axis model, `mode2_abi_agnostic_layer.md`):** the graph
+*shape* is invariant Turing→Blackwell; only the leaf **class IDs** change per generation
+(`TURING_`/`AMPERE_`/`HOPPER_`/`BLACKWELL_CHANNEL_GPFIFO_A`, `resource_list.h:381-414`). So the
+`RmGraph` structure lives in the **core** (Axis-B-invariant); the class-ID recognition is a
+codegen'd **ABI** table (Axis A). Building the graph is `Arch`/`Abi`-parameterised, not
+hard-coded — a new architecture adds class-ID rows, not graph logic.
+
+**This is what "sets it in stone by protocol":** the `RmGraph` is the shared spine of *both* the
+process model here *and* the protocol-contract state machine (#4) — one authoritative model of
+"who owns what," read from `RM_ALLOC` / `DUP_OBJECT` / `FREE`, from which every routing map is a
+pure projection. A reordered or retried guest yields the *same* graph, so it yields the *same*
+`Proc`/`Vas`/`Channel` boundaries — the correctness property #14 needs.
 
 ### 4.3.2 Per-process completion delivery — the direct fix for the Part-1 wall
 
