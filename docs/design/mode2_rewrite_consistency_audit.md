@@ -216,7 +216,18 @@ passthrough experiment as a first-milestone *measurement* (it may still remove a
 serialization for user-CE completions), but the load-bearing #14 fix is the per-process completion
 queue, and the docs must not imply passthrough alone closes #14.
 
-### N1 — #14's root cause is not conclusively single-pinned ?
+### N1 — #14's root cause is not conclusively single-pinned ✔ RESOLVED 2026-07-24
+
+> **★ RESOLVED (disambiguation experiment, commit `6de85e7`).** The fork is settled by a REAL HOST Xid:
+> **(b) EXECUTION.** The loser's GR channel (host chid 14) `FAULT_PDE ACCESS_TYPE_VIRT_WRITE` on the host
+> GPU (HOSTget stuck 109/110); its completion legitimately does not exist because the work FAULTED.
+> Delivery ruled out (every poll `gsp_swgen0_pending=0`, gate open, no pending-undelivered completion).
+> ROOT = the loser's identical guest VAs are never published into its OWN host GR VAS → host faults past
+> the shared prefix. So round-8's "completion-delivery" (top entry below) was a **symptom**; rounds 4-6
+> (host-VAS publication) were the real track. **Load-bearing rewrite fix = per-Proc ExecPlane (host-VAS
+> separation + per-proc GPA arenas), NOT the CompletionQueue.** This was the last open technical risk in
+> the design set → CLOSED.
+
 
 **The finding.** The prompt asks whether the "dissolves #14" hypothesis is *consistent with the
 traced mechanism*. Digging in, the deeper problem is that **round 8 itself contains two contradictory
