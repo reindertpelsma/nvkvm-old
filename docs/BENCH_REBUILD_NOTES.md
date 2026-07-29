@@ -31,6 +31,11 @@ pairings (zero symmetric difference) — they are writes carrying guest physical
 move every boot. The 2 differing replies are the same two elements every time (`seq=3 fn=228`,
 `seq=165 fn=76`), both wall-clock-bearing. Instrument: `scripts/mode2_diag/rec_replydiff.py`.
 
+**The non-capture path is unaffected, positively.** One fresh boot at `819282d` with the recorder
+OFF and full forwarding (`bench_boot.sh`, `m2cefwd=on`): `cup2` **rc=0**, `CE rv=0xabcd1234` byte
+exact, `cuCtxCreate` OK, `cuDeviceTotalMem` 11909 MiB. The continuation read is inside
+`if (nvkvm_rec_on() && ...)`, so this is what "changes only what we witness" means in practice.
+
 **Traps this cost, worth not rediscovering:**
 - ★ **A single-stream positional diff of two traces is useless.** The guest's PTIMER/mailbox poll
   loop desynchronises around record ~139 900 and then ~220 000 of 360 000 records "differ". That

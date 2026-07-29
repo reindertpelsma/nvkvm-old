@@ -107,7 +107,11 @@ superset, appended after `GSP_INIT_DONE`.
 - Emulator source for **`cap1b`**: commit **`819282d`**, `nvkvm_gpu_emul.c` md5
   **`2132bbdbf98ab85449e9513c9c230bbf`**, recorder md5 unchanged. Property vector
   `trace=1 m2fwd=0 m2exec=0 m2hostsem=0 m2cefwd=0 m2cexec=0 m2opaque=0 m2trace=0 m2romregs=0`,
-  mask `0xffffffffffffffff`, `hermetic=yes`.
+  mask `0xffffffffffffffff`, `hermetic=yes`. Installed binary md5
+  `b21892d86716574acf29828663b31c68`.
+  ★ `819282d` is the binding, not `HEAD` — later commits touch this file, so
+  `md5sum src/qemu/nvkvm_gpu_emul.c` at HEAD is expected to differ. Check with
+  `git show 819282d:src/qemu/nvkvm_gpu_emul.c | md5sum`.
 
 ★ **The first four headers have an EMPTY `emulator-src-commit` line** — the bench tree is not a
 git checkout and `git rev-parse` yielded nothing, silently. A bench claim without a source

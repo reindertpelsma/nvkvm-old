@@ -2594,7 +2594,9 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
          *
          * Why the guest cannot tell:
          *   - gated on nvkvm_rec_on() (the m2rec property), so a non-capture
-         *     run is bit-identical to before — not one extra instruction;
+         *     run behaves exactly as before.  The cost when off is a load of a
+         *     file-static bool and one predictable branch — the same guard every
+         *     other recorder call site in this file uses;
          *   - pci_dma_read is a pure read of guest RAM: no dirty bits, no
          *     queue pointer moves, no reply, no status, no state of `s`
          *     touched.  `cont` is a dead local;
