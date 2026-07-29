@@ -2574,6 +2574,54 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         if (nvkvm_dmar(pdev, gpa, cmd, sizeof(cmd)) != MEMTX_OK) {
             break;
         }
+        /* ── #90 GSP-D6: WITNESS the continuation elements (RECORDER ONLY) ──
+         *
+         * A GSP_MSG_QUEUE message spans ceil((48 + rpc.length) / 4096) queue
+         * elements.  The C acts on element 0 ONLY and consumes the rest
+         * silently (see the elemCount advance at the bottom of this loop), so
+         * it never READS them — and what is never read is never recorded.  A
+         * replay of a *correct* implementation, which does read them, then
+         * cannot be answered from this trace: it stops dead at the first
+         * multi-element command (`GSP_RM_CONTROL` rpc.length=8276, elemCount=3
+         * — record 141976 of `cap1_coldboot_hermetic`), because the capture
+         * holds no observation of the continuation slots while they were live.
+         *
+         * So read them here purely so nvkvm_dmar's recorder chokepoint
+         * witnesses them, and then THROW THE BYTES AWAY.  This is deliberately
+         * NOT a fix for GSP-D6: the C still acts on element 0 alone and still
+         * produces byte-identical replies.  GSP-D6 remains a real, recorded
+         * divergence; it is merely now an *observable* one.
+         *
+         * Why the guest cannot tell:
+         *   - gated on nvkvm_rec_on() (the m2rec property), so a non-capture
+         *     run is bit-identical to before — not one extra instruction;
+         *   - pci_dma_read is a pure read of guest RAM: no dirty bits, no
+         *     queue pointer moves, no reply, no status, no state of `s`
+         *     touched.  `cont` is a dead local;
+         *   - the addresses are (cmd_readptr + i) % q_msgcount, i.e. strictly
+         *     inside the same ring the guest itself allocated and whose slot 0
+         *     we just read — the read can never escape into an MMIO region
+         *     that element 0's own read could not already have hit;
+         *   - a failing read is ignored rather than breaking the loop, so even
+         *     a bad address changes no control flow.
+         * The only guest-visible effect would be timing, which the guest has no
+         * architected way to observe here (the RPC is completed by our reply,
+         * not by a deadline). */
+        if (nvkvm_rec_on() && (nvkvm_rec_mask() & NVKVM_REC_M_GUEST_RD)) {
+            uint64_t wmsglen = 48ull + (uint64_t)ldl_le_p(cmd + 56);
+            uint64_t welems  = (wmsglen + 4095ull) / 4096ull;
+            if (welems > s->q_msgcount) {
+                welems = s->q_msgcount;   /* a garbage rpc.length must not run away */
+            }
+            for (uint64_t wi = 1; wi < welems; wi++) {
+                uint8_t cont[4096];
+                uint32_t cslot = (uint32_t)((s->cmd_readptr + wi) % s->q_msgcount);
+                uint64_t cgpa = s->q_shmem + s->q_cmd_base + s->q_cmd_entryoff +
+                                (uint64_t)cslot * s->q_msgsize;
+                /* return value deliberately ignored; bytes deliberately dropped */
+                (void)nvkvm_dmar(pdev, cgpa, cont, sizeof(cont));
+            }
+        }
         uint32_t fn = ldl_le_p(cmd + 60);
         /* Async one-way init RPCs expect NO response — echoing them shows up in
          * the driver as "Unexpected RPC event" and desyncs the seqNum.  Consume

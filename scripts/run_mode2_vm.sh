@@ -62,7 +62,15 @@ if [ -n "${NVKVM_M2REC:-}" ]; then
         echo "guest-fw: ${NVFW}"
         echo "guest-kernel-pin: $(ls /opt/nvkvm-guest/drivers 2>/dev/null | head -3 | tr '\n' ' ')"
         echo "vbios: ${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom} md5=$(md5sum "${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}" 2>/dev/null | cut -d' ' -f1)"
-        echo "emulator-src-commit: $(cd "$(dirname "$0")/.." && git rev-parse HEAD 2>/dev/null)"
+        # ★ A bench claim without a SOURCE REVISION is worthless: this bench
+        # silently served a binary built from 862c7c2 for weeks.  The bench tree
+        # is not a git checkout, so `git rev-parse` yields nothing there — fall
+        # back to a `.srcrev` file written by whoever synced the tree, then to
+        # $NVKVM_SRCREV, and say "UNKNOWN" out loud rather than emit a blank.
+        _srcrev="$(cd "$(dirname "$0")/.." && git rev-parse HEAD 2>/dev/null)"
+        [ -n "$_srcrev" ] || _srcrev="$(head -1 "$(dirname "$0")/../.srcrev" 2>/dev/null)"
+        [ -n "$_srcrev" ] || _srcrev="${NVKVM_SRCREV:-UNKNOWN}"
+        echo "emulator-src-commit: $_srcrev"
         echo "emulator-src-md5: $(md5sum "$(dirname "$0")/../src/qemu/nvkvm_gpu_emul.c" 2>/dev/null | cut -d" " -f1) nvkvm_gpu_emul.c"
         echo "recorder-src-md5: $(md5sum "$(dirname "$0")/../src/qemu/nvkvm_m2_rec.c" 2>/dev/null | cut -d" " -f1) nvkvm_m2_rec.c"
         echo "qemu: $("$QEMU" --version 2>/dev/null | head -1)"
