@@ -44,7 +44,29 @@ apt-get install -y \
     libepoxy-dev \
     libgbm-dev \
     libegl-dev \
-    libdrm-dev
+    libdrm-dev \
+    `# the isolate stub is embedded via xxd -i (bench-rebuild fix 2026-07-29)` \
+    xxd
+
+# ── 1b. Build the isolate STUB and its embed header ───────────────────────
+# Bench-rebuild fix 2026-07-29: this step did not exist, and its absence is
+# SILENT. src/qemu/nvkvm_isolate.c embeds the stub behind
+#     #ifdef NVKVM_STUB_EMBEDDED
+#     #include "nvkvm_stub_bin.h"
+# so with neither the define nor the generated header the QEMU build SUCCEEDS
+# with stub_elf = NULL, stub_elf_len = 0, and silently falls back to
+# /usr/lib/nvkvm/nvkvm_stub at runtime. On a fresh box that path does not
+# exist, so fexecve fails and every isolate device-open returns -ENOENT:
+#     nvkvm-gpu[GA106] M5.1: open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF
+# i.e. Mode-2 comes up with forwarding OFF and NOTHING says why. The failure
+# looks like a missing /dev node (it is not — the nodes are present and
+# world-writable) and it reproduces identically with NVKVM_ISOLATE_NO_HARDEN=1,
+# which is what rules out the pivot_root / dev-dirfd path as the cause.
+echo "[1b/9] Building the isolate stub (nvkvm_stub + nvkvm_stub_bin.h)..."
+make -C "$REPO_ROOT/src/stub"
+install -d /usr/lib/nvkvm
+install -m 0755 "$REPO_ROOT/src/stub/nvkvm_stub" /usr/lib/nvkvm/nvkvm_stub
+echo "  stub installed at /usr/lib/nvkvm/nvkvm_stub (runtime fallback)"
 
 # ── 2. Clone QEMU 9.2 stable ──────────────────────────────────────────────
 if [ ! -d "$QEMU_SRC" ]; then
@@ -72,6 +94,10 @@ cp "$REPO_ROOT/src/common/"*.h "$QEMU_SRC/hw/misc/nvkvm_inc/" 2>/dev/null || tru
 # to avoid conflicts with QEMU's own type setup in qemu/osdep.h.
 cp "$REPO_ROOT/src/qemu/nvkvm_linux_types.h" \
    "$QEMU_SRC/hw/misc/nvkvm_inc/linux_types_compat.h"
+# The generated stub blob lives in src/stub/, NOT src/qemu/, so the *.h copy
+# above does not pick it up. nvkvm_isolate.c includes it by bare name, so it
+# must land in hw/misc/ alongside the sources (bench-rebuild fix 2026-07-29).
+cp "$REPO_ROOT/src/stub/nvkvm_stub_bin.h" "$QEMU_SRC/hw/misc/"
 
 # ── 5. Fix include paths in the copied files ──────────────────────────────
 echo "[5/9] Fixing include paths in copied files..."
@@ -199,6 +225,10 @@ cd "$QEMU_SRC"
     `# it does not use virtio-gpu GL virgl.` \
     --disable-virglrenderer \
     --disable-vnc \
+    `# Bench-rebuild fix 2026-07-29: WITHOUT this define nvkvm_isolate.c takes` \
+    `# its #else branch (stub_elf = NULL) and the build still SUCCEEDS — the` \
+    `# breakage only shows at runtime as "open ctl/gpu FAILED r1=-2 r2=-2".` \
+    --extra-cflags=-DNVKVM_STUB_EMBEDDED \
     --prefix="$QEMU_PREFIX"
 
 # ── 8. Build ──────────────────────────────────────────────────────────────
