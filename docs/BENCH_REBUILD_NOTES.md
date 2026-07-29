@@ -1,6 +1,55 @@
 # nvkvm Mode-2 bench rebuild status
 
 ---
+## 2026-07-29 (task #96) — `cap1b`: GSP-D6 made observable, reply stream proven unchanged
+
+**SOURCE REVISION.** Emulator `819282d` (`nvkvm_gpu_emul.c` md5 `2132bbdbf98ab85449e9513c9c230bbf`),
+built and installed here: `/opt/qemu-nvkvm/bin/qemu-system-x86_64` md5
+`b21892d86716574acf29828663b31c68`. The three control/after captures in this section all ran on
+binaries whose source md5 was verified byte-identical to the local commit. Before the change the
+bench served `cced661c16f6856801d16dae151bc2f0` = `dc7aaaf`/`264caa2` (binary
+`d7dd2573b87b9c1a9ccc6bb73d9a96dd`).
+
+**What changed.** `nvkvm_m3_service_cmdq` now READS the continuation elements of a multi-element
+GSP message and discards them, so the recorder witnesses them. Gated on `nvkvm_rec_on()` — a
+non-capture run is bit-identical. GSP-D6 (act on element 0 only) is untouched and still a
+divergence; only the *observability* changed. See `traces/mode2_c_reference/README.md`.
+
+**The proof, and the reason it needs three captures.** Two captures of the SAME binary are not
+identical here — measured, not assumed. Noise floor (`before_A` vs `before_B`, both `dc7aaaf`)
+versus the after-run (`before_B` vs `cap1b`):
+
+| projection | control | after |
+|---|---|---|
+| `MmioWrite` | 216 520 / 216 520, 460 differ | 216 520 / 216 520, **460 differ** |
+| `GuestWrite` CONTENT | 859 / 859, 2 differ | 859 / 859, **2 differ** |
+| `IrqRaise` | identical | identical |
+| `GuestRead` | 629 / 629 | 629 / **661** |
+
+★ The 460 differing `MmioWrite` positions are the **identical index set** across all three
+pairings (zero symmetric difference) — they are writes carrying guest physical addresses, which
+move every boot. The 2 differing replies are the same two elements every time (`seq=3 fn=228`,
+`seq=165 fn=76`), both wall-clock-bearing. Instrument: `scripts/mode2_diag/rec_replydiff.py`.
+
+**Traps this cost, worth not rediscovering:**
+- ★ **A single-stream positional diff of two traces is useless.** The guest's PTIMER/mailbox poll
+  loop desynchronises around record ~139 900 and then ~220 000 of 360 000 records "differ". That
+  is the projection failing, not the device. Diff each KIND as its own subsequence — those are
+  stable across boots even though their interleaving is not.
+- ★ **Guest physical addresses move every boot.** The GSP message queues landed at `0x128c41000`,
+  `0x124641000`, `0x127601000` in three consecutive runs. Any GPA-absolute comparison is noise.
+- ★ **`nvidia-smi -q | head -40` SIGPIPEs `nvidia-smi` mid-enumeration** and silently truncates
+  the RPC stream — and `$?` after the pipeline is `head`'s, so it reports `rc=0`. The original
+  `cap1` has 563 `GuestWrite`s; the untruncated run has 859. Never pipe the workload.
+- `emulator-src-commit` was **blank** in all four original capture headers: the bench tree is not
+  a git checkout, so `git rev-parse` yielded nothing, silently. `run_mode2_vm.sh` now falls back
+  to `/workspace/nvkvm/.srcrev` then `$NVKVM_SRCREV` and prints `UNKNOWN` rather than a blank.
+  **Update `.srcrev` whenever you sync `src/qemu/` to the bench.**
+- Deploying just this file is a plain `cp /workspace/nvkvm/src/qemu/nvkvm_gpu_emul.c
+  /opt/qemu-src/hw/misc/` — it has no `../../src/common/*.h` includes, so it needs none of the
+  `nvkvm_inc/` rewriting the other nvkvm sources do. `ninja && ninja install` in `/opt/qemu-src/build`.
+
+---
 ## 2026-07-29 (task #95) — #14 validated on HW at `fc4164d`; ★ the "cup8_iter 5/5 green" line below is WRONG
 
 First hardware run of the post-`862c7c2` emulator (`#14 P0`/`P1` had never executed on a GPU —
