@@ -48,6 +48,31 @@ IMG="$OVL"
 
 rm -f "$QLOG" "$SERIAL"
 
+# ── #90: §6 replay-trace provenance ──────────────────────────────────────
+# The recorder writes this verbatim into the trace file header.  An oracle whose
+# provenance is not in the artefact stops being an oracle the moment the bench
+# dies, so this is composed HERE (where the versions actually are) rather than
+# guessed by a reader later.  Only costs anything when NVKVM_M2REC is set.
+if [ -n "${NVKVM_M2REC:-}" ]; then
+    export NVKVM_M2REC_PROV="$(
+        echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "bench-host: $(hostname) $(uname -srm)"
+        echo "host-driver: $(cat /proc/driver/nvidia/version 2>/dev/null | head -1)"
+        echo "guest-driver-source: ${OGKM} (NVVER=${NVVER})"
+        echo "guest-fw: ${NVFW}"
+        echo "guest-kernel-pin: $(ls /opt/nvkvm-guest/drivers 2>/dev/null | head -3 | tr '\n' ' ')"
+        echo "vbios: ${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom} md5=$(md5sum "${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}" 2>/dev/null | cut -d' ' -f1)"
+        echo "emulator-src-commit: $(cd "$(dirname "$0")/.." && git rev-parse HEAD 2>/dev/null)"
+        echo "emulator-src-md5: $(md5sum "$(dirname "$0")/../src/qemu/nvkvm_gpu_emul.c" 2>/dev/null | cut -d" " -f1) nvkvm_gpu_emul.c"
+        echo "recorder-src-md5: $(md5sum "$(dirname "$0")/../src/qemu/nvkvm_m2_rec.c" 2>/dev/null | cut -d" " -f1) nvkvm_m2_rec.c"
+        echo "qemu: $("$QEMU" --version 2>/dev/null | head -1)"
+        echo "nvidia-smi:"
+        nvidia-smi --query-gpu=name,uuid,driver_version,vbios_version,memory.total,pci.bus_id \
+                   --format=csv 2>/dev/null | sed 's/^/  /'
+        echo "extra: ${NVKVM_M2REC_NOTE:-}"
+    )"
+fi
+
 echo "Mode-2 VM:"
 echo "  QEMU     : $QEMU"
 echo "  Image    : $IMG  (snapshot — base preserved)"
@@ -77,7 +102,7 @@ exec "$QEMU" \
     \
     `# Mode-2 emulated NVIDIA GPU — put it directly on root slot 7 so the` \
     `# guest RM-generated gpuId encodes as 0x7, matching the forwarded host GPU.` \
-    -device nvkvm-gpu-emul,addr=0x7,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2HOSTSEM:+,m2hostsem=on}${NVKVM_M2CEFWD:+,m2cefwd=on}${NVKVM_M2CEXEC:+,m2cexec=on}${NVKVM_M2OPAQUE:+,m2opaque=on}${NVKVM_M2TRACE:+,m2trace=on}${NVKVM_M2ROMREGS:+,m2romregs=on}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
+    -device nvkvm-gpu-emul,addr=0x7,vbios="${NVKVM_VBIOS:-/opt/nvkvm-guest/ga106_vbios.rom}"${NVKVM_M2FWD:+,m2fwd=on}${NVKVM_M2FWD_OFF:+,m2fwd=off}${NVKVM_M2EXEC:+,m2exec=on}${NVKVM_M2EXEC_OFF:+,m2exec=off}${NVKVM_M2RING:+,m2ring=on}${NVKVM_M2HOSTSEM:+,m2hostsem=on}${NVKVM_M2CEFWD:+,m2cefwd=on}${NVKVM_M2CEXEC:+,m2cexec=on}${NVKVM_M2OPAQUE:+,m2opaque=on}${NVKVM_M2TRACE:+,m2trace=on}${NVKVM_M2ROMREGS:+,m2romregs=on}${NVKVM_M2REC:+,m2rec=on}${NVKVM_M2RECFILE:+,m2recfile=$NVKVM_M2RECFILE}${NVKVM_M2RECMASK:+,m2recmask=$NVKVM_M2RECMASK}${NVKVM_M2SEMVAL:+,m2semval=$NVKVM_M2SEMVAL}${NVKVM_M2SEMPAGE:+,m2sempage=$NVKVM_M2SEMPAGE} \
     \
     `# Open driver source + GSP firmware (RO) + repo, all over 9p.` \
     -virtfs local,path="$OGKM",mount_tag=ogkm,security_model=mapped,readonly=on \

@@ -116,6 +116,7 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
 # PCI device, always built into the x86_64 softmmu target.
 system_ss.add(when: ['CONFIG_PCI'], if_true: files(
   'nvkvm_gpu_emul.c',
+  'nvkvm_m2_rec.c',
 ))
 """
 
@@ -135,6 +136,29 @@ print("  meson.build patched successfully.")
 PYEOF
 else
     echo "  meson.build already contains virtio_nvgpu.c — skipping patch."
+fi
+
+# #90: a tree patched before the replay-trace recorder existed has the old
+# one-file PCI block.  The guard above is on virtio_nvgpu.c, so it will never
+# re-run — add the recorder separately, idempotently.  Without this an
+# already-provisioned bench links with an undefined nvkvm_rec_emit.
+if ! grep -q "nvkvm_m2_rec.c" "$MESON_BUILD"; then
+    echo "  adding nvkvm_m2_rec.c to the PCI block..."
+    python3 - "$MESON_BUILD" <<'PYEOF'
+import sys
+path = sys.argv[1]
+lines = open(path).readlines()
+# Anchor on the emulator's own entry wherever it sits — provisioned benches have
+# hand-extended this block, so an exact whole-block match would not survive.
+for i, l in enumerate(lines):
+    if l.strip() == "'nvkvm_gpu_emul.c',":
+        lines.insert(i + 1, l.replace('nvkvm_gpu_emul.c', 'nvkvm_m2_rec.c'))
+        open(path, 'w').writelines(lines)
+        print("  nvkvm_m2_rec.c added after nvkvm_gpu_emul.c.")
+        break
+else:
+    sys.exit("FATAL: no 'nvkvm_gpu_emul.c' entry to anchor on in " + path)
+PYEOF
 fi
 
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────

@@ -51,6 +51,8 @@
 #include "mode2_compute_ctrls_ga106.h" /* captured GA106 cuInit compute-cap ctrls */
 #include "virtio_nvgpu.h"   /* M5: Mode-1 forwarding stack (isolate API + NVOS structs) */
 #include "exec/cpu-common.h" /* M6.0: qemu_ram_foreach_block/get_fd — guest-RAM memfd for item-4 */
+#include "sysemu/sysemu.h"  /* #90: qemu_add_exit_notifier — a killed QEMU still flushes */
+#include "nvkvm_m2_rec.h"   /* #90: the §6 replay-trace recorder (m2rec=on) */
 
 /* ── Chip identity ─────────────────────────────────────────────────────────
  *
@@ -772,7 +774,108 @@ struct NvkvmGpuEmul {
     /* knobs */
     bool     trace;          /* log every BAR0 access                        */
     uint64_t access_count;   /* monotonically increasing, for the trace      */
+
+    /* ── #90: the §6 replay-trace recorder ────────────────────────────────
+     * A NEW property, deliberately NOT a reuse of m2trace: m2trace is not
+     * observationally neutral (it sets m2_gpga_idx_audit=3000000, sets
+     * m2_crashwin, and causes two extra nvkvm_fb_read calls), so turning it on
+     * changes what the device DOES.  m2rec only observes. */
+    bool     m2rec;          /* enable the recorder                          */
+    char    *m2recfile;      /* output path (default /tmp/m0_rec.bin)        */
+    uint64_t m2recmask;      /* the DECLARED FILTER, NVKVM_REC_M_*           */
+    Notifier m2rec_exit;     /* flush a killed QEMU's dense prefix           */
 };
+
+/* ── #90: §6 replay-trace emit helpers ─────────────────────────────────────
+ *
+ * Every one of these is a no-op (one predictable branch on a file-static bool)
+ * when the recorder is off.  There are NO counter caps here — see R2 in
+ * nvkvm_m2_rec.h: the consumer's differential compares stream POSITIONS, so a
+ * cap does not shorten a trace, it corrupts every position after it.
+ *
+ * ★ Which BAR index each region reports:
+ *     bar=0  the BAR0 register aperture (incl. the m2romregs falcon overlay)
+ *     bar=1  PCI BAR1 — the FB aperture ("BAR1" in RM terms)
+ *     bar=3  PCI BAR3 — the 32 MiB GPU-virtual window ("BAR2" in RM terms)
+ *   i.e. the PCI BAR index, not RM's naming, because that is what a replay
+ *   harness sees trapping. */
+
+/* The exact QEMU_CLOCK_VIRTUAL sample the last PTIMER read was derived from.
+ * Stashed by nvkvm_reg_read so the Clock record carries the SAME ns the served
+ * value came from, rather than a second, later sample. */
+static uint64_t g_nvkvm_rec_ptimer_ns;
+
+/* Region bit for a BAR0 offset — the declared filter's second axis. */
+static inline uint64_t nvkvm_rec_bar0_region(hwaddr off)
+{
+    if (off >= NV_PROM_DATA_BASE && off < NV_PROM_DATA_BASE + NV_PROM_DATA_SIZE) {
+        return NVKVM_REC_M_PROM;
+    }
+    if (off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE) {
+        return NVKVM_REC_M_PRAMIN;
+    }
+    if (off == NV_PTIMER_TIME_0_GA10X || off == NV_PTIMER_TIME_1_GA10X) {
+        return NVKVM_REC_M_PTIMER;
+    }
+    return NVKVM_REC_M_BAR0;
+}
+
+static inline void nvkvm_rec_mmio(uint8_t kind, uint64_t kindbit, uint8_t bar,
+                                  uint64_t region, hwaddr off, unsigned size,
+                                  uint64_t val)
+{
+    if (!nvkvm_rec_on() || !(nvkvm_rec_mask() & region)) {
+        return;
+    }
+    nvkvm_rec_emit(kindbit, kind, bar, (uint8_t)size, (uint64_t)off, val, NULL, 0);
+}
+
+static inline void nvkvm_rec_mmio_rd(uint8_t bar, uint64_t region, hwaddr off,
+                                     unsigned size, uint64_t val)
+{
+    nvkvm_rec_mmio(NVKVM_REC_MMIO_RD, NVKVM_REC_M_MMIO_RD, bar, region, off,
+                   size, val);
+}
+
+static inline void nvkvm_rec_mmio_wr(uint8_t bar, uint64_t region, hwaddr off,
+                                     unsigned size, uint64_t val)
+{
+    nvkvm_rec_mmio(NVKVM_REC_MMIO_WR, NVKVM_REC_M_MMIO_WR, bar, region, off,
+                   size, val);
+}
+
+/* GAP-I6: the FULL payload, not the first 8 bytes.  The 4096-byte queue
+ * elements ARE the GSP reply protocol; recording v0 recorded nothing. */
+static inline void nvkvm_rec_guest_wr(uint64_t gpa, const void *buf, uint64_t len)
+{
+    if (!nvkvm_rec_on()) {
+        return;
+    }
+    nvkvm_rec_emit(NVKVM_REC_M_GUEST_WR, NVKVM_REC_GUEST_WR, 0xFF, 0, gpa, 0,
+                   buf, (uint32_t)len);
+}
+
+static inline void nvkvm_rec_guest_rd(uint64_t gpa, const void *buf, uint64_t len)
+{
+    if (!nvkvm_rec_on()) {
+        return;
+    }
+    nvkvm_rec_emit(NVKVM_REC_M_GUEST_RD, NVKVM_REC_GUEST_RD, 0xFF, 0, gpa, 0,
+                   buf, (uint32_t)len);
+}
+
+/* a=0 -> MSI-X with b=vector; a=1 -> legacy INTx with b=level.  Matches the
+ * rewrite's IrqSpec::{Msix(u16), IntxLevel(bool)}. */
+static inline void nvkvm_rec_irq_msix(uint32_t vec)
+{
+    nvkvm_rec_emit(NVKVM_REC_M_IRQ, NVKVM_REC_IRQ, 0xFF, 0, 0, vec, NULL, 0);
+}
+
+static inline void nvkvm_rec_irq_intx(int level)
+{
+    nvkvm_rec_emit(NVKVM_REC_M_IRQ, NVKVM_REC_IRQ, 0xFF, 0, 1, (uint64_t)level,
+                   NULL, 0);
+}
 
 /* ── BAR0 register aperture ────────────────────────────────────────────────*/
 
@@ -833,7 +936,28 @@ static MemTxResult nvkvm_dmaw(PCIDevice *dev, dma_addr_t gpa, const void *buf, d
         qemu_log("nvkvm-gpu[GA106] M5.15 DMAW gpa=0x%llx len=%llu v0=0x%llx site=%p\n",
                  (unsigned long long)gpa, (unsigned long long)len, (unsigned long long)v0, caller);
     }
+    /* #90 GAP-I6: record the WHOLE payload.  The old DIAG above keeps only the
+     * first 8 bytes, which throws away exactly the thing that matters — the
+     * 4096-byte GSP queue elements are the reply protocol. */
+    nvkvm_rec_guest_wr(gpa, buf, len);
     return pci_dma_write(dev, gpa, buf, len);
+}
+
+/* #90 GAP-I7: the guest-RAM READ chokepoint the C never had.
+ *
+ * All 8 pci_dma_read sites go through here, so a replay can answer a DMA read
+ * — without which no trace is hermetic (§6.1).  The bytes recorded are the
+ * bytes RETURNED, and nothing is recorded when the read failed: a failed read
+ * returned no bytes, and inventing a record for it would put a phantom in the
+ * stream.  This wrapper mirrors nvkvm_dmaw exactly and changes no behaviour. */
+static MemTxResult nvkvm_dmar(PCIDevice *dev, dma_addr_t gpa, void *buf,
+                              dma_addr_t len)
+{
+    MemTxResult r = pci_dma_read(dev, gpa, buf, len);
+    if (r == MEMTX_OK) {
+        nvkvm_rec_guest_rd(gpa, buf, len);
+    }
+    return r;
 }
 
 /* NVKVM-DPLANE (cup6 diag): quantify where the bulk cuMemcpyHtoD 64MB actually
@@ -1393,10 +1517,15 @@ static uint64_t nvkvm_reg_read(NvkvmGpuEmul *s, hwaddr off, unsigned size)
     /* M3 — PTIMER (GPU ns clock). Real monotonic counter from QEMU's virtual
      * clock so RM timeout loops actually elapse (constant value => infinite
      * spin). TIME_0 low 32 (5-bit aligned), TIME_1 high 32. */
+    /* #90: stash the exact sample so the Clock record carries the ns the served
+     * value was derived from, not a second (later) sample.  One store; the
+     * served value is bit-for-bit what it was before. */
     case NV_PTIMER_TIME_0_GA10X:
-        return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & 0xFFFFFFE0u;
+        g_nvkvm_rec_ptimer_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return (uint32_t)g_nvkvm_rec_ptimer_ns & 0xFFFFFFE0u;
     case NV_PTIMER_TIME_1_GA10X:
-        return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >> 32);
+        g_nvkvm_rec_ptimer_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return (uint32_t)(g_nvkvm_rec_ptimer_ns >> 32);
     /* PTIMER PLM fully lowered: tmrSetCurrentTime_GV100 needs WRITE_PROTECTION
      * _LEVEL0=ENABLE (bit4) or it NV_ASSERT(0)s (timer_gv100.c:80). */
     case NV_PTIMER_TIME_PRIV_LEVEL_MASK: return 0xFFFFFFFFu;
@@ -1472,6 +1601,15 @@ static void nvkvm_gsp_falcon_sync(NvkvmGpuEmul *s)
     stl_le_p(p + 0x100, NV_PFALCON_FALCON_CPUCTL_HALTED_TRUE);
     stl_le_p(p + 0x118, NV_PFALCON_DMATRFCMD_IDLE_VAL);           /* DMATRFCMD idle */
     /* DEBUGINFO (0x94) stays 0 — same as the old default-return; the win is that it no longer traps. */
+
+    /* #90 / §6.2: with m2romregs=on this page is served from RAM, so the guest's
+     * reads of IRQSTAT / MAILBOX0 / CPUCTL / DMATRFCMD — the most-read registers
+     * in the system — NEVER TRAP and can never appear as MmioRead.  Snapshot the
+     * page every time it is re-synced so the trace at least contains what those
+     * reads would have returned.  Has no TraceEvent counterpart; see
+     * NVKVM_REC_OVERLAY in nvkvm_m2_rec.h.  Moot when m2romregs=off. */
+    nvkvm_rec_emit(NVKVM_REC_M_OVERLAY, NVKVM_REC_OVERLAY, 0, 0,
+                   0x00110000ull, 0, p, 0x1000);
 }
 
 /* PROM window: return VBIOS bytes (little-endian dword at the aligned offset).
@@ -1493,7 +1631,7 @@ static bool nvkvm_prom_read(NvkvmGpuEmul *s, hwaddr off, unsigned size,
     return true;
 }
 
-static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
+static uint64_t nvkvm_bar0_read_inner(void *opaque, hwaddr off, unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
     uint64_t prom;
@@ -1525,6 +1663,32 @@ static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
                  s->chip->name, (unsigned long long)s->access_count++,
                  (unsigned long long)off, size, (unsigned long long)val,
                  nm ? "  " : "", nm ? nm : "");
+    }
+    return val;
+}
+
+/* #90 GAP-I1: the ONE place a BAR0 read is recorded, with the value ACTUALLY
+ * RETURNED.
+ *
+ * The body above has three early returns that bypassed every existing trace —
+ * the PROM/VBIOS window and the two NV_XVE LINK_* registers — so ~1 MiB of
+ * streamed VBIOS and the value that gates UVM_REGISTER_GPU have never appeared
+ * in any C log.  Wrapping is what makes "the value served" true by
+ * construction, rather than true at three of four return sites. */
+static uint64_t nvkvm_bar0_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t val = nvkvm_bar0_read_inner(opaque, off, size);
+    if (nvkvm_rec_on()) {
+        uint64_t region = nvkvm_rec_bar0_region(off);
+        /* PTIMER: emit the clock sample the value came from FIRST, so the
+         * stream reads "here is the time, and here is what the guest was told
+         * about it". */
+        if (region == NVKVM_REC_M_PTIMER &&
+            (nvkvm_rec_mask() & NVKVM_REC_M_PTIMER)) {
+            nvkvm_rec_emit(NVKVM_REC_M_CLOCK, NVKVM_REC_CLOCK, 0xFF, 0,
+                           g_nvkvm_rec_ptimer_ns, 0, NULL, 0);
+        }
+        nvkvm_rec_mmio_rd(0, region, off, size, val);
     }
     return val;
 }
@@ -1672,8 +1836,10 @@ static void nvkvm_gsp_raise_swgen0(NvkvmGpuEmul *s)
         PCIDevice *pd = &s->parent_obj;
         if (msix_enabled(pd)) {
             msix_notify(pd, 0);
+            nvkvm_rec_irq_msix(0);          /* #90 */
         } else {
             pci_set_irq(pd, 1);
+            nvkvm_rec_irq_intx(1);          /* #90 */
         }
     }
 }
@@ -2363,11 +2529,13 @@ static uint32_t nvkvm_m2_vas_dup_owner(NvkvmGpuEmul *s, uint32_t vas_client,
                                        uint32_t vas_hobj);
 static bool nvkvm_m2_dup_src_client(NvkvmGpuEmul *s, uint32_t client);
 static bool nvkvm_m2_vas_foreign(NvkvmGpuEmul *s, int v, uint32_t client);
-static bool nvkvm_m2_is_gr_client(NvkvmGpuEmul *s, uint32_t client);
-static bool nvkvm_m2_is_user_client(NvkvmGpuEmul *s, uint32_t client);
+/* nvkvm_m2_is_gr_client / _is_user_client are already forward-declared above
+ * (the P0-reap block).  Re-declaring them here is a -Werror=redundant-decls
+ * build failure under the bench's QEMU 9.2 configure — which is why every
+ * emulator source from 3710b8e onward has never been compiled on it. */
 static bool nvkvm_m2_multiproc(NvkvmGpuEmul *s);
-static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
-                             unsigned size); /* #14 poll-kick fwd-decl */
+static void nvkvm_bar0_write_inner(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size, bool from_guest); /* #14 poll-kick fwd-decl */
 static bool nvkvm_m2_tsg_sched_check(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg);
 static void nvkvm_m2_tsg_sched_mark(NvkvmGpuEmul *s, uint32_t client, uint32_t tsg);
 static uint32_t nvkvm_m2_pdb_gr_owner(NvkvmGpuEmul *s, uint64_t pdb);
@@ -2384,7 +2552,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         return;
     }
     uint8_t wpb[4];
-    if (pci_dma_read(pdev, s->q_shmem + s->q_cmd_base + 16, wpb, 4) != MEMTX_OK) {
+    if (nvkvm_dmar(pdev, s->q_shmem + s->q_cmd_base + 16, wpb, 4) != MEMTX_OK) {
         return;
     }
     uint32_t cmd_writeptr = ldl_le_p(wpb);
@@ -2403,7 +2571,7 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
         uint8_t cmd[4096];
         uint64_t gpa = s->q_shmem + s->q_cmd_base + s->q_cmd_entryoff +
                        (uint64_t)slot * s->q_msgsize;
-        if (pci_dma_read(pdev, gpa, cmd, sizeof(cmd)) != MEMTX_OK) {
+        if (nvkvm_dmar(pdev, gpa, cmd, sizeof(cmd)) != MEMTX_OK) {
             break;
         }
         uint32_t fn = ldl_le_p(cmd + 60);
@@ -3365,8 +3533,13 @@ static void nvkvm_m3_service_cmdq(NvkvmGpuEmul *s)
      * multiproc mode (see the fn=76 hook). */
     if (s->m2_poll_kick) {
         s->m2_poll_kick = false;
-        nvkvm_bar0_write(s, NVKVM_VF_DOORBELL,
-                         s->m2_last_db_valid ? s->m2_last_db_token : 0, 4);
+        /* #90 ORD-3: this doorbell is FABRICATED — the guest never wrote it.
+         * from_guest=false, so the recorder does not inject a phantom
+         * MmioWrite into a stream a replay is supposed to be able to feed
+         * back in. */
+        nvkvm_bar0_write_inner(s, NVKVM_VF_DOORBELL,
+                               s->m2_last_db_valid ? s->m2_last_db_token : 0, 4,
+                               false);
     }
 }
 
@@ -3387,7 +3560,7 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
 
     for (int i = 0; i < 16; i++) {
         uint8_t e[LIBOS_REGION_STRIDE];
-        if (pci_dma_read(pdev, gpa + (uint64_t)i * LIBOS_REGION_STRIDE,
+        if (nvkvm_dmar(pdev, gpa + (uint64_t)i * LIBOS_REGION_STRIDE,
                          e, sizeof(e)) != MEMTX_OK) {
             qemu_log("nvkvm-gpu[%s] M3:  region[%d] read failed\n",
                      s->chip->name, i);
@@ -3414,7 +3587,7 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
          * is at sharedMemPhysAddr + statQueueOffset. */
         if (id8 == 0x0000524d41524753ULL /* "RMARGS" */) {
             uint8_t a[32];
-            if (pci_dma_read(pdev, pa, a, sizeof(a)) == MEMTX_OK) {
+            if (nvkvm_dmar(pdev, pa, a, sizeof(a)) == MEMTX_OK) {
                 uint64_t shmem = ldq_le_p(a + 0);
                 uint32_t ptec  = ldl_le_p(a + 8);
                 uint64_t cmdoff = ldq_le_p(a + 16);
@@ -3434,7 +3607,7 @@ static void nvkvm_m3_dump_bootargs(NvkvmGpuEmul *s)
                  * yet).  GSP is the TX side of the status queue. */
                 if (shmem && statoff) {
                     uint8_t txh[32];
-                    if (pci_dma_read(pdev, shmem + cmdoff, txh, sizeof(txh))
+                    if (nvkvm_dmar(pdev, shmem + cmdoff, txh, sizeof(txh))
                             == MEMTX_OK) {
                         stl_le_p(txh + 16, 0); /* writePtr = 0 */
                         if (nvkvm_dmaw(pdev, shmem + statoff, txh,
@@ -3501,10 +3674,27 @@ static uint64_t nvkvm_walk_pdb(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
 static uint64_t nvkvm_walk_pdb_root(NvkvmGpuEmul *s, uint64_t pdb, uint64_t va,
                                     bool root_sys, bool *out_sys);
 
-static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
-                             unsigned size)
+/* #90 ORD-2 + ORD-3.
+ *
+ * ORD-2: this function used to log itself LAST, at the bottom of a ~800-line
+ * body, AFTER every side effect — which inverts causality in the trace: the
+ * doorbell's consequences (queue service, DMA reads, DMA writes, IRQ) appeared
+ * BEFORE the write that caused them.  The recorder's MmioWrite is therefore
+ * emitted at the TOP, before anything happens.
+ *
+ * ORD-3: this function is also RE-ENTERED INTERNALLY with a fabricated doorbell
+ * (the #14 poll-kick) that the guest never wrote.  `from_guest` distinguishes
+ * the two; only a real guest write is recorded, and exactly once.  The
+ * m2romregs rom-device thunk (nvkvm_gsp_falcon_write) IS a real guest write, so
+ * it comes in through the wrapper below with from_guest=true. */
+static void nvkvm_bar0_write_inner(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size, bool from_guest)
 {
     NvkvmGpuEmul *s = opaque;
+
+    if (from_guest && nvkvm_rec_on()) {
+        nvkvm_rec_mmio_wr(0, nvkvm_rec_bar0_region(off), off, size, val);
+    }
 
     /* M6: BAR0 PRAMIN window write -> sparse FB backing; window-base register. */
     if (off >= NVKVM_PRAMIN_BASE && off < NVKVM_PRAMIN_BASE + NVKVM_PRAMIN_SIZE) {
@@ -4145,8 +4335,10 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
             PCIDevice *pd = &s->parent_obj;
             if (msix_enabled(pd)) {
                 msix_notify(pd, 0);   /* single stall vector; ISR demuxes via TOP/LEAF */
+                nvkvm_rec_irq_msix(0);      /* #90 */
             } else {
                 pci_set_irq(pd, 1);
+                nvkvm_rec_irq_intx(1);      /* #90 */
             }
             qemu_log("nvkvm-gpu[%s] M7: INTR trigger vec=%u -> leaf[%u] bit%u "
                      "subtree%u, MSI raised\n", s->chip->name, vec, leaf, bit, subtree);
@@ -4163,6 +4355,7 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
         }
         if (s->intr_top == 0 && !msix_enabled(&s->parent_obj)) {
             pci_set_irq(&s->parent_obj, 0);
+            nvkvm_rec_irq_intx(0);          /* #90: deassert is observable too */
         }
         return;
     }
@@ -4313,6 +4506,14 @@ static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
     /* M0: writes are observed only.  M1/M2 add the state machine. */
 }
 
+/* The MemoryRegionOps entry point: every write arriving here came from the
+ * guest (#90 ORD-3). */
+static void nvkvm_bar0_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    nvkvm_bar0_write_inner(opaque, off, val, size, true);
+}
+
 static const MemoryRegionOps nvkvm_bar0_ops = {
     .read       = nvkvm_bar0_read,
     .write      = nvkvm_bar0_write,
@@ -4344,7 +4545,7 @@ static const MemoryRegionOps nvkvm_gsp_falcon_ops = {
  * virtual aperture (its own page tables in FB, root = bar1_pdb from
  * GspStaticConfigInfo.bar1PdeBase + the UPDATE_BAR_PDE(BAR_1) root entry), so a
  * BAR1 offset is a GPU VA: GMMU-VER2-walk it to FB/sysmem (nvkvm_walk_pdb). */
-static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
+static uint64_t nvkvm_baraperture_read_inner(void *opaque, hwaddr off, unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
     if (!s->bar1_pdb) {
@@ -4365,7 +4566,7 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
     uint64_t rv;
     if (sys) {
         uint8_t b[8] = {0};
-        if (pci_dma_read(&s->parent_obj, pa, b, size) != MEMTX_OK) return 0;
+        if (nvkvm_dmar(&s->parent_obj, pa, b, size) != MEMTX_OK) return 0;
         rv = ldn_le_p(b, size);
     } else {
         s->m2_cur_gva = off ? off : 0;       /* CRASHWIN: report the guest GPU VA */
@@ -4404,7 +4605,7 @@ static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
     return rv;
 }
 
-static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
+static void nvkvm_baraperture_write_inner(void *opaque, hwaddr off, uint64_t val,
                                     unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
@@ -4485,6 +4686,23 @@ static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
                      (unsigned long long)pa, (unsigned long long)val, size);
         }
     }
+}
+
+/* #90: BAR1 (the FB aperture) — wrapped so the recorded read carries the value
+ * ACTUALLY SERVED across all of the body's early returns (walk faults return 0
+ * from three separate places). */
+static uint64_t nvkvm_baraperture_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t val = nvkvm_baraperture_read_inner(opaque, off, size);
+    nvkvm_rec_mmio_rd(1, NVKVM_REC_M_BAR1, off, size, val);
+    return val;
+}
+
+static void nvkvm_baraperture_write(void *opaque, hwaddr off, uint64_t val,
+                                    unsigned size)
+{
+    nvkvm_rec_mmio_wr(1, NVKVM_REC_M_BAR1, off, size, val);
+    nvkvm_baraperture_write_inner(opaque, off, val, size);
 }
 
 static const MemoryRegionOps nvkvm_aperture_ops = {
@@ -4624,7 +4842,7 @@ static uint64_t nvkvm_pt_rd64(NvkvmGpuEmul *s, uint64_t addr, bool sys)
 {
     if (sys) {
         uint8_t b[8];
-        if (pci_dma_read(&s->parent_obj, addr, b, 8) != MEMTX_OK) return 0;
+        if (nvkvm_dmar(&s->parent_obj, addr, b, 8) != MEMTX_OK) return 0;
         return ldq_le_p(b);
     }
     if (s->m2_recording_gr_pt) {          /* M5.10 PERF: this vidmem addr is a GR-VAS PT page */
@@ -5235,7 +5453,7 @@ static uint32_t nvkvm_phys_rd32(NvkvmGpuEmul *s, uint64_t phys, bool sys)
 {
     if (sys) {
         uint8_t b[4];
-        if (pci_dma_read(&s->parent_obj, phys, b, 4) != MEMTX_OK) return 0;
+        if (nvkvm_dmar(&s->parent_obj, phys, b, 4) != MEMTX_OK) return 0;
         return ldl_le_p(b);
     }
     return (uint32_t)nvkvm_fb_read(s, phys, 4);
@@ -6311,7 +6529,7 @@ static void nvkvm_chan_execute(NvkvmGpuEmul *s)
     s->chan_gp_get = gp_put;
 }
 
-static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
+static uint64_t nvkvm_bar2_read_inner(void *opaque, hwaddr off, unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
     /* PHYSICAL mode (or not yet bound) = identity FB access; VIRTUAL = GMMU walk.
@@ -6324,7 +6542,7 @@ static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
     return nvkvm_fb_read(s, pa, size);
 }
 
-static void nvkvm_bar2_write(void *opaque, hwaddr off, uint64_t val,
+static void nvkvm_bar2_write_inner(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
 {
     NvkvmGpuEmul *s = opaque;
@@ -6333,6 +6551,21 @@ static void nvkvm_bar2_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     nvkvm_fb_write(s, pa, val, size);
+}
+
+/* #90: PCI BAR3 == RM "BAR2", the 32 MiB GPU-virtual GMMU window. */
+static uint64_t nvkvm_bar2_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t val = nvkvm_bar2_read_inner(opaque, off, size);
+    nvkvm_rec_mmio_rd(3, NVKVM_REC_M_BAR2, off, size, val);
+    return val;
+}
+
+static void nvkvm_bar2_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    nvkvm_rec_mmio_wr(3, NVKVM_REC_M_BAR2, off, size, val);
+    nvkvm_bar2_write_inner(opaque, off, val, size);
 }
 
 static const MemoryRegionOps nvkvm_bar2_ops = {
@@ -9370,6 +9603,14 @@ static int nvkvm_m2_find_guest_ram(RAMBlock *rb, void *opaque)
     return 0;
 }
 
+/* #90: flush on ANY QEMU exit path, not only device unrealize — a killed QEMU
+ * must still leave a usable DENSE PREFIX (the only kind of truncation that is
+ * not fatal for a positional differential). */
+static void nvkvm_rec_exit_notify(Notifier *n, void *opaque)
+{
+    nvkvm_rec_close();
+}
+
 static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 {
     NvkvmGpuEmul *s = NVKVM_GPU_EMUL(pci_dev);
@@ -9387,6 +9628,71 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
     s->m2_gpga_idx_mismatch = 0;
     s->m2_gpga_idx_dirty = true;
     s->access_count = 0;
+
+    /* ── #90: bring the §6 replay-trace recorder up BEFORE any BAR exists ──
+     * so that not one access can precede the stream.  The header carries the
+     * exact property vector, the declared filter, and free-text provenance
+     * (NVKVM_M2REC_PROV, filled in by scripts/run_mode2_vm.sh with the guest
+     * kernel vermagic, the host driver version and an nvidia-smi summary).  An
+     * oracle whose provenance is not in the artefact stops being an oracle the
+     * moment the bench dies. */
+    if (s->m2rec) {
+        uint64_t props =
+            (s->trace      ? NVKVM_REC_P_TRACE     : 0) |
+            (s->m2fwd      ? NVKVM_REC_P_M2FWD     : 0) |
+            (s->m2exec     ? NVKVM_REC_P_M2EXEC    : 0) |
+            (s->m2hostsem  ? NVKVM_REC_P_M2HOSTSEM : 0) |
+            (s->m2cefwd    ? NVKVM_REC_P_M2CEFWD   : 0) |
+            (s->m2cexec    ? NVKVM_REC_P_M2CEXEC   : 0) |
+            (s->m2opaque   ? NVKVM_REC_P_M2OPAQUE  : 0) |
+            (s->m2_trace   ? NVKVM_REC_P_M2TRACE   : 0) |
+            (s->m2romregs  ? NVKVM_REC_P_M2ROMREGS : 0);
+        /* ★ Hermeticity is a property of the RUN, and it is not ours to assume:
+         * with m2fwd/m2exec on, nvkvm_m2_share_guest_ram MAP_FIXEDs guest RAM
+         * into the stub and the HOST GPU DMAs into it directly — bytes that are
+         * guest-visible and pass through neither nvkvm_dmaw nor nvkvm_dmar nor
+         * any QEMU path.  Such a trace cannot be closed over by a replay.  Say
+         * so in the artefact rather than leaving a reader to infer it. */
+        bool hermetic = !s->m2fwd && !s->m2exec;
+        if (!hermetic) {
+            props |= NVKVM_REC_P_NONHERMETIC;
+        }
+        const char *extern_prov = getenv("NVKVM_M2REC_PROV");
+        g_autofree char *prov = g_strdup_printf(
+            "nvkvm mode-2 §6 replay trace\n"
+            "chip=%s\n"
+            "props: trace=%d m2fwd=%d m2exec=%d m2hostsem=%d m2cefwd=%d "
+            "m2cexec=%d m2opaque=%d m2trace=%d m2romregs=%d\n"
+            "mask=0x%016llx\n"
+            "hermetic=%s%s\n"
+            "vbios=%s\n"
+            "---\n%s\n",
+            chip->name, s->trace, s->m2fwd, s->m2exec, s->m2hostsem,
+            s->m2cefwd, s->m2cexec, s->m2opaque, s->m2_trace, s->m2romregs,
+            (unsigned long long)s->m2recmask,
+            hermetic ? "yes" : "NO",
+            hermetic ? ""
+                     : "  (m2fwd/m2exec on: the HOST GPU writes guest RAM behind "
+                       "this recorder; NOT replayable, decision planes only)",
+            s->vbios_path ? s->vbios_path : "(none)",
+            extern_prov ? extern_prov : "(no NVKVM_M2REC_PROV in the environment)");
+        const char *path = s->m2recfile && s->m2recfile[0]
+                         ? s->m2recfile : "/tmp/m0_rec.bin";
+        if (nvkvm_rec_open(path, props, s->m2recmask, prov,
+                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL))) {
+            s->m2rec_exit.notify = nvkvm_rec_exit_notify;
+            qemu_add_exit_notifier(&s->m2rec_exit);
+            info_report("nvkvm-rec: recording to %s (mask=0x%016llx, %s)",
+                        path, (unsigned long long)s->m2recmask,
+                        hermetic ? "hermetic" : "NON-HERMETIC");
+        } else {
+            /* Fail loudly: a capture campaign that silently produced no file is
+             * worse than one that did not start. */
+            error_setg(errp, "nvkvm-rec: could not open trace sink %s", path);
+            return;
+        }
+    }
+
     s->prom_reads = 0;
     s->mbox0 = 0;
     s->mbox1 = 0;
@@ -9548,6 +9854,12 @@ static void nvkvm_gpu_emul_realize(PCIDevice *pci_dev, Error **errp)
 static void nvkvm_gpu_emul_exit(PCIDevice *pci_dev)
 {
     NvkvmGpuEmul *s = NVKVM_GPU_EMUL(pci_dev);
+    if (s->m2rec) {
+        info_report("nvkvm-rec: %llu records",
+                    (unsigned long long)nvkvm_rec_count());
+        qemu_remove_exit_notifier(&s->m2rec_exit);
+        nvkvm_rec_close();          /* #90 */
+    }
     msix_unuse_all_vectors(pci_dev);
     msix_uninit(pci_dev, &s->msix, &s->msix);
     g_free(s->vbios);
@@ -9571,6 +9883,17 @@ static Property nvkvm_gpu_emul_props[] = {
     DEFINE_PROP_BOOL("m2opaque", NvkvmGpuEmul, m2opaque, false), /* M5.62: skip GPFIFO walk when a userspace channel is fully resident (ring-only). Default OFF (perf experiment) */
     DEFINE_PROP_BOOL("m2trace", NvkvmGpuEmul, m2_trace, false), /* M5.63: high-volume per-doorbell/fb-access DIAG qemu_log. Default OFF (perf: synchronous log I/O overhead) */
     DEFINE_PROP_BOOL("m2romregs", NvkvmGpuEmul, m2romregs, false), /* M5.64: GSP-falcon rom-device overlay (reads from RAM, no vmexit) — 0x110094 poll-storm fix. Default OFF (A/B) */
+    /* #90: the §6 replay-trace recorder.  A NEW property on purpose — m2trace
+     * is NOT observationally neutral (it arms the GPGA index audit, sets
+     * m2_crashwin, and adds two nvkvm_fb_read calls), so it changes what the
+     * device DOES.  m2rec only observes. */
+    DEFINE_PROP_BOOL("m2rec", NvkvmGpuEmul, m2rec, false),
+    DEFINE_PROP_STRING("m2recfile", NvkvmGpuEmul, m2recfile),
+    /* The DECLARED FILTER (NVKVM_REC_M_*), written verbatim into the file
+     * header.  Default = everything.  Never sample, never cap: the consumer's
+     * differential is positional, so a drop corrupts every later position; only
+     * a filter both recorders can apply identically is legitimate. */
+    DEFINE_PROP_UINT64("m2recmask", NvkvmGpuEmul, m2recmask, NVKVM_REC_M_ALL),
     DEFINE_PROP_UINT64("m2semval", NvkvmGpuEmul, m2semval, 0), /* M5.14 DIAG: ctx-poll sentinel */
     DEFINE_PROP_UINT64("m2sempage", NvkvmGpuEmul, m2sempage, 0x2efbaf000ull), /* M5.14 page */
     DEFINE_PROP_STRING("vbios", NvkvmGpuEmul, vbios_path),
