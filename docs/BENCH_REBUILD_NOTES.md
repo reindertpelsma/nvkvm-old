@@ -98,6 +98,47 @@ LADDER RESULT 2026-07-29 — ALL GREEN, one fresh boot each, host 580.159.04 ope
 Bench is unblocked for #90 (C reference traces) and #47.
 
 ---
+## 2026-07-29 (later) — #90 capture campaign: ★ the bench had never compiled anything past 862c7c2
+
+Recording the four §6 reference traces (`traces/mode2_c_reference/`) turned up a build fact
+nobody had written down.
+
+**★ Every emulator revision from `3710b8e` onward fails to build here, and always has.**
+`nvkvm_gpu_emul.c` gained a **duplicate forward declaration** of `nvkvm_m2_is_gr_client` /
+`nvkvm_m2_is_user_client` in `3710b8e` (#14 P0). The bench's QEMU 9.2 configure carries
+`-Werror=redundant-decls`, so:
+
+    error: redundant redeclaration of 'nvkvm_m2_is_gr_client' [-Werror=redundant-decls]
+
+⇒ the green ladder recorded above ran at **862c7c2**, and `#14 P0/P1` (`3710b8e`, `9ff481b`,
+`65281f2`) had **never run on hardware**. Fixed in the #90 commit; both were then re-validated
+in the act of capturing (`cup2` rc=0, `cup8` 2048² `bad=0 maxerr=0`, recorder on).
+
+**Trap: syncing `src/qemu/` wholesale into `/opt/qemu-src/hw/misc/` breaks the build.**
+The provisioned tree has its `#include "../../src/common/*.h"` paths **rewritten** to
+`nvkvm_inc/*.h`, and it has more of them rewritten than `build_qemu.sh` step 5 documents
+(`nvkvm_isolate_proto.h`, `nvkvm_abi.h`, `nvkvm_ring.h`, plus `nvkvm_handle.c` and
+`nvkvm_isolate.c`, not only `virtio_nvgpu.h`). Copy only the files you changed, or re-run the
+rewrite over every `*.c`/`*.h` afterwards.
+
+**Trap: `meson.build` here is hand-extended**, listing ~10 nvkvm sources in one block rather
+than the two blocks `build_qemu.sh` generates. Its "already patched?" guard is on
+`virtio_nvgpu.c`, so a NEW source file is never added by re-running the script. `build_qemu.sh`
+now has a separate idempotent step that anchors on the `'nvkvm_gpu_emul.c'` line wherever it
+sits.
+
+**Capturing a trace** — `scripts/mode2_diag/rec_capture.sh` (host side) does the safe restart
+with full `m2*` control (`bench_boot.sh` forces `m2cefwd=on`, which is wrong for a hermetic
+capture). The trace file is only complete after QEMU **exits**; a live file is a usable dense
+prefix. `sudo poweroff` in the guest is the clean way to end a capture. Decode with
+`scripts/mode2_diag/rec_dump.py`.
+
+**Also measured**, worth knowing before someone debugs it as a regression: with a fresh overlay
+the guest reaches ssh in **10-14 s** here, not 20-25 s, and `nvidia-smi -q` enumerates the
+emulated GA106 **with `m2fwd=off`** — the fake-boot path alone gets all the way to
+`GSP_INIT_DONE`.
+
+---
 ## REBUILD 2026-07-19 (box #45305458 @ 70.30.158.46:27130) — ✅ COMPLETE (all baselines green)
 Fresh BLANK vast box (RTX 3060 GA106, host 575.51.03, kernel 6.8.0-59, /dev/kvm present,
 21 cores / 49GB / 138G free). Goal: single-process baseline GREEN at emulator source = 862c7c2
