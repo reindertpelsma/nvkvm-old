@@ -1,6 +1,92 @@
 # nvkvm Mode-2 bench rebuild status
 
 ---
+## 2026-07-29 (task #95) — #14 validated on HW at `fc4164d`; ★ the "cup8_iter 5/5 green" line below is WRONG
+
+First hardware run of the post-`862c7c2` emulator (`#14 P0`/`P1` had never executed on a GPU —
+see the `-Werror=redundant-decls` section below).  **Every result here carries its revision**,
+because the whole reason this task existed is that the bench silently served a stale binary.
+
+**SOURCE REVISION — how it was established, do this every time.**  Local `consolidation` HEAD
+`fc4164d`; bench `/workspace/nvkvm` and the deployed `/opt/qemu-src/hw/misc/` were verified
+byte-identical to it (`md5sum` over every `src/{qemu,common,abi}` file — only `nvkvm_handle.c`,
+`nvkvm_isolate.c`, `virtio_nvgpu.h` differ, and only by the `nvkvm_inc/` include rewrite).
+`touch nvkvm_gpu_emul.c && ninja` reproduced the installed binary **bit-for-bit**
+(`qemu-system-x86_64` md5 `d7dd2573b87b9c1a9ccc6bb73d9a96dd`, emulator source md5
+`cced661c16f6856801d16dae151bc2f0`) — which is what proves the running binary is that source.
+`NVKVM_STUB_EMBEDDED` is *not* defined in this build, so the isolate uses the on-disk fallback
+`/usr/lib/nvkvm/nvkvm_stub`; keep it rebuilt or forwarding silently degrades (commit `4f52877`).
+
+**★★ CORRECTION: `cup8_iter` (#13) is NOT reliably green, at ANY revision.**  The
+"LADDER RESULT 2026-07-29 — ALL GREEN … cup8_iter rc=0 … (#13 stays fixed)" line further down
+this file was a **single lucky sample** and does not reproduce.  Measured, one fresh boot each:
+
+| revision | cup8_iter (ITERS=5) | result |
+|---|---|---|
+| `fc4164d` (HEAD)  | 3 runs | **1 PASS / 2 HANG** |
+| `862c7c2` (old baseline, A/B rebuild) | 3 runs | **0 PASS / 3 HANG** |
+
+The hang is always the same: `ITER 0/1/2` (N=512/1024/1536) pass byte-exact, then **ITER 3
+(N=2048) never completes**; the process sits `State=R` (busy-poll, not a D-state wedge) and the
+**host** logs `Xid 31 … MMU Fault … FAULT_PDE ACCESS_TYPE_VIRT_WRITE` against the isolate
+(engine varies: `CE2 HUBCLIENT_CE0`, `GRAPHICS GPC1/GPC2 GPCCLIENT_T1_2`).
+⇒ **`fc4164d` is NOT a regression on `862c7c2`** — it is marginally better.  #13's memory entry
+("RESOLVED") and this file's green ladder both overstate it: at 2048² inside a multi-iteration
+process the fix holds only ~1 run in 4.  Standalone `cup8` at N=2048 passes byte-exact both
+before and after five host Xids, so the GPU is not degraded and the effect is real.
+
+**Baseline at `fc4164d`, one fresh boot each** — `cup2` rc=0 (CE `rv=0xabcd1234` byte-exact),
+`cupctx2_min` rc=0 (#12 stays fixed), `cup8` 2048² `bad=0 maxerr=0` (host GPU util 10%),
+`cup8_iter` as above.
+
+**★ #14 — TWO CONCURRENT CUDA APPS: REPRODUCES at `fc4164d`, 2/2 runs, deterministic.**
+Exactly one process finishes 2048² byte-exact; the other **hangs in `cuCtxCreate`** — which is
+precisely the behaviour commit `65281f2` documents ("Baseline = P1 … 2× concurrent = winner
+reliably passes").  Only `#14 P0`+`P1` ever landed; P2/P3 are BANKED, P4 was reverted, there is
+no P5/P6.  **#14 is an open, explicitly-deferred problem, not a completed refactor.**
+
+Where it stops, measured (`scripts/mode2_diag/mp14_run_guest.sh`, added by this task):
+- loser: `State=R`, `wchan=0`, **empty kernel stack, not in a syscall** ⇒ spinning in libcuda
+  userspace, *not* stuck in an RM ioctl.  Guest dmesg clean, no guest Xid, no host Xid.
+- emulator: the loser's guest RM spins forever on GSP RPC `fn=76 ctrl=0x20801702`
+  (`NV2080_CTRL_CMD_MC_SERVICE_INTERRUPTS`) — the completion poll.  The spin starts the instant
+  the winner's client is root-freed (`#14 P1 PROC[n] reaped`), i.e. when the last doorbell any
+  process will ever ring has been rung.  Exactly the `r8b` starvation banked in `65281f2`.
+- the `m2_poll_kick` (piece-2, `nvkvm_gpu_emul.c:3003`/`:3534`) *does* fire and re-rings the
+  last doorbell token, and it does not help — re-running the service re-walks a channel the
+  loser's VAS still cannot resolve.
+- **identical-VA collision, confirmed in the address table.**  Neither user process's own PDB
+  ever resolves the channel VA: `pdb=0x3401000` 0 hits / 307 walks, `pdb=0x3405000` 0/268
+  (run 2; 0/273 and 0/308 in run 1).  *All* successful resolution goes through the shared VASes
+  `pdb=0x2efa6c000` (FB, 319) and `pdb=0x3118000` (SYS, 36).  Both processes' compute channels
+  carry the same client and execute with `chan_pdb=own_pdb=0x3118000`; the GPFIFO VA
+  `0x120064000` is used by both.
+
+**★ NEW latent defect in P1, found only because P0/P1 finally ran on hardware.**
+`nvkvm_m2_proc_add_client()` (`nvkvm_gpu_emul.c:5140`) has **no cross-proc uniqueness check**,
+and the comment at `:2767` asserts "kernel-internal clients … only ever appear on the DST side"
+— which is true, but the code then assumes each process has *its own* dup-DST client.  Hardware
+says otherwise: **both processes' dup edges share ONE dst client** (`0xc1d00001`), so it is
+registered into both procs:
+
+    #14 P1 PROC[0] += client=0xc1d00001 (clients_n=2)
+    #14 P1 PROC[1] += client=0xc1d00001 (clients_n=2)
+
+`nvkvm_m2_proc_find_by_client()` returns the FIRST match ⇒ every lookup through that client
+resolves to `PROC[0]`, and `nvkvm_m2_proc_drop_client()` unlinks it from `PROC[0]` only, leaving
+`PROC[1]` holding a freed client.  Its one consumer today is the M5.11 doorbell-demux log
+(`:3803`), which keys on `s->chans[].client` — exactly the shared client — so **P1's
+"distinct vChid→chan→proc across 2× cup8" acceptance signal was measuring an aliased mapping.**
+NOT fixed here: #14 is deferred to the Rust rewrite and patching a banked C feature would be a
+redesign.  **The design lesson is load-bearing for the rewrite's per-Proc ExecPlane:** a `Proc`
+cannot be modelled as *a set of RM clients* — the guest's single `nvidia-uvm` gpu-ops client is
+global.  Key on the anchor (dup-SRC) client only, or on `(client, PDB)` / `(client, vChid)`.
+
+Harness added: `scripts/mode2_diag/mp14_run_guest.sh` — N concurrent `cup8`s on one fresh GSP;
+unlike `cup8_concurrent_run_guest.sh` it reports *where* a hang is (last CUDA API line,
+`/proc/PID/syscall` decoded to `ioctl(fd)` → device node, `wchan`, kernel stack, R-vs-D).
+
+---
 ## 2026-07-29 — "Mode-2 guest boot failure" on the freshly rebuilt bench: ★ THERE WAS NO BOOT FAILURE
 
 Reported symptom: "QEMU exits cleanly during guest boot, /tmp/m0_serial.log stops at ~4.1 s,
@@ -95,6 +181,10 @@ LADDER RESULT 2026-07-29 — ALL GREEN, one fresh boot each, host 580.159.04 ope
 - cup8 rc=0 — 2048² matmul `bad=0 maxerr=0 C[0]=2048` VERDICT PASS
 - cup8_iter rc=0 — ITER0 512 / ITER1 1024 / ITER2 1536 / ITER3 2048 / ITER4 768, all
   `bad=0 maxerr=0`, VERDICT PASS (iters=5 fails=0) (#13 stays fixed)
+  ★★ **THIS LINE IS A SINGLE LUCKY SAMPLE — see the task-#95 section at the top of this file.**
+  Re-measured the same day: 0 PASS / 3 runs at this very revision (`862c7c2`), 1 PASS / 3 at
+  `fc4164d`. cup8_iter hangs at ITER3 (N=2048) with a host `Xid 31 … FAULT_PDE`. Do not cite
+  it as evidence that #13 is fixed.
 Bench is unblocked for #90 (C reference traces) and #47.
 
 ---
