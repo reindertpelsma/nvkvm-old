@@ -16,3 +16,19 @@ working (c7c0 crash fixed); next blocker is first-compute pushbuffer FAULT.
 7. Run cup2 SINGLE (no nvidia-smi first — that double-boots GSP -> "WPR2 already up").
 
 mid-GPU-op fault wedges the guest -> pkill qemu on the host to recover; the host GPU is unaffected.
+
+## Before you debug a "guest boot failure" (2026-07-29 — this cost a day)
+
+Boot/restart with `bench_boot.sh` + `bench_wait.sh` (two SEPARATE commands), and rule these out
+first — all three have masqueraded as a boot failure:
+
+1. **"Never opens SSH on 2223"** is almost always an ssh AUTH failure on the BENCH HOST, not a
+   boot failure. Every `*_host.sh` here runs a bare `ssh -p 2223 ubuntu@localhost` with no `-i`,
+   so root must have an `~/.ssh/config` pointing `localhost` at the guest key. Check the tail of
+   /tmp/m0_serial.log: if it ends at `nvkvm-guest login:` the guest booted fine.
+   See docs/BENCH_REBUILD_NOTES.md (2026-07-29) for the exact config block.
+2. **"Serial log stops at ~4 s"** — the guest needs ~20-25 s to reach a login prompt and the
+   serial file lags. Wait the full timeout before calling it a hang.
+3. **"QEMU exited"** — verify with `pgrep -x qemu-system-x86`, NOT `pgrep -x qemu-system-x86_64`.
+   comm is truncated to 15 chars so the `_64` form never matches and always reports "not running"
+   even with a live QEMU.

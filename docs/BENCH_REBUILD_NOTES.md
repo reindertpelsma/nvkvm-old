@@ -1,6 +1,103 @@
 # nvkvm Mode-2 bench rebuild status
 
 ---
+## 2026-07-29 — "Mode-2 guest boot failure" on the freshly rebuilt bench: ★ THERE WAS NO BOOT FAILURE
+
+Reported symptom: "QEMU exits cleanly during guest boot, /tmp/m0_serial.log stops at ~4.1 s,
+the guest never reaches userspace and never opens SSH on 2223." Every part of that turned out
+to be an artefact of how the bench was being *observed*. Ladder is green (see bottom).
+
+**What was actually true.** The QEMU from the "failed" boot was still running 2 h 34 min later.
+Its serial log ran all the way to `cloud-final.service` / `cloud-init.target` / a
+`nvkvm-guest login:` prompt at t=21.9 s. The forwarding path was up on every boot (M5.1 isolate
+ready, M6.1 SHARED, MEMTEST PASS, M5.3 rc=0). Kernel was the pinned 6.8.0-117-generic and
+/home/ubuntu/nvmods held all four .ko.
+
+**Root cause of "never opens SSH": a missing ssh identity on the BENCH HOST, not the guest.**
+`/root/.ssh` on the bench had `guest_key`/`guest_key.pub` (the keypair baked into seed.iso's
+`ssh_authorized_keys`) but **no default identity** — no `id_ed25519`, no `id_rsa`, no
+`~/.ssh/config`. Every one of the ~30 harness scripts under `scripts/mode2_diag/*_host.sh`
+runs a **bare** `ssh -p 2223 ubuntu@localhost` with no `-i`, so ssh offered no key at all and
+the guest answered `Permission denied (publickey,password)`. Read as "the guest never came up".
+Proof: with `-i /root/.ssh/guest_key` the exact same live guest logged in immediately.
+
+FIX (bench host, one time per rebuild) — `/root/.ssh/config`:
+
+    Host guest vg
+        HostName 127.0.0.1
+        Port 2223
+        User ubuntu
+        IdentityFile /root/.ssh/guest_key
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+        LogLevel ERROR
+
+    Host localhost 127.0.0.1
+        IdentityFile /root/.ssh/guest_key
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+        LogLevel ERROR
+
+The second block is the load-bearing one: it makes every existing bare
+`ssh -p 2223 ubuntu@localhost` / `scp -P 2223` in the repo work unmodified. **Add this to the
+guest-disk phase of any future rebuild** — it is as much a part of "the bench works" as the
+qcow2 is. `chmod 600 /root/.ssh/config`.
+
+**Root cause of "stops at 4.1 s": looking too early.** This guest needs ~20-25 s to reach a
+login prompt, and QEMU's `-serial file:` output is buffered/lazy, so a peek a few seconds in
+shows the log frozen mid kernel-init (`clk: Disabling unused clocks`, `RAS: Correctable Errors
+collector initialized`, ...) with no further growth. Measured on a fresh overlay this run: the
+log sat at t=7.9 s and did not move for ~30 s, then jumped straight to a login prompt at
+t=20.9 s. Do not conclude "hang" from a log that has merely not caught up.
+
+**★ TRAP: the documented verify step is a guaranteed false negative.**
+`pgrep -x qemu-system-x86_64` and `pgrep -a qemu-system-x86_64` match `/proc/PID/comm`, which
+the kernel truncates to 15 chars — `qemu-system-x86`. The `_64` form can therefore **never**
+match. Measured with a live QEMU (pid 476684, up 2 h 34 m):
+
+    $ pgrep -a qemu-system-x86_64   -> (nothing)
+    $ pgrep -x qemu-system-x86_64   -> rc=1
+    $ pgrep -x qemu-system-x86      -> 476684
+
+So "verify pgrep is empty before launching" always passes, you launch a second QEMU, it loses
+the race for the hostfwd port and dies with `Could not set up host forwarding rule
+'tcp::2223-:22'`. **Verify with `pgrep -x qemu-system-x86`** (and independently with
+`ss -tln | grep 2223`, which does not lie). The `[4]` bracket form is still required for
+`pkill -f` so it does not match its own command line.
+
+**Not confirmed: the SIGHUP theory.** Launching `bash /root/boot_mode2.sh >log 2>&1 &` from an
+ssh command that then returns did NOT kill QEMU — it survived the session teardown and booted
+to a login prompt. `run_mode2_vm.sh` `exec`s QEMU with `-display none` and no controlling tty.
+Detached launch is still the right habit, but a non-detached launch is not what was breaking
+this bench.
+
+**Also ruled out** (all checked, all clean): no assert/segfault/abort/OOM; QEMU exit status
+never observed because QEMU never exited; PCI enumeration and MSI-X fine (the blacklist is
+baked in and the emulated GA106 at 00:07.0 is pristine); 9p mounts fine; `-no-reboot`
+semantics irrelevant (not passed); host driver healthy 580.159.04 throughout, 0 Xid.
+
+**Cosmetic noise worth knowing:** with `-d unimp,guest_errors` the q35 machine's unused
+ich9-ahci emits a steady `ahci: IRQ#2 level:1` into /tmp/m0_qemu.log — 13929 of 13938 lines in
+one 2.5 h run. Harmless, but it buries the nvkvm markers; always
+`grep -a 'nvkvm-gpu\|M5\.\|MEMTEST'` rather than `tail` the QEMU log.
+
+**Added to the repo this session:** `scripts/mode2_diag/bench_boot.sh` (kill -> real verified
+wait on the truncated comm AND on port 2223 -> fresh overlay -> detached launch) and
+`scripts/mode2_diag/bench_wait.sh` (block for ssh, then print the M5.1/M6.1/MEMTEST/M5.3
+markers, and tell you to suspect ssh AUTH if the serial log ends at a login prompt). Use these
+two as SEPARATE commands instead of hand-rolling the restart.
+
+LADDER RESULT 2026-07-29 — ALL GREEN, one fresh boot each, host 580.159.04 open, guest STOCK
+(unpatched; `mode2_uvm_complete_proof.patch` was NOT needed):
+- cup2 rc=0 — cuInit / RTX 3060 compute 8.6 11909 MiB / cuCtxCreate / cuMemAlloc /
+  CE HtoD+DtoH `rv=0xabcd1234` byte-exact PASS
+- cupctx2_min rc=0 — CTX1 create+destroy OK, CTX2 create+destroy OK, VERDICT PASS (#12 stays fixed)
+- cup8 rc=0 — 2048² matmul `bad=0 maxerr=0 C[0]=2048` VERDICT PASS
+- cup8_iter rc=0 — ITER0 512 / ITER1 1024 / ITER2 1536 / ITER3 2048 / ITER4 768, all
+  `bad=0 maxerr=0`, VERDICT PASS (iters=5 fails=0) (#13 stays fixed)
+Bench is unblocked for #90 (C reference traces) and #47.
+
+---
 ## REBUILD 2026-07-19 (box #45305458 @ 70.30.158.46:27130) — ✅ COMPLETE (all baselines green)
 Fresh BLANK vast box (RTX 3060 GA106, host 575.51.03, kernel 6.8.0-59, /dev/kvm present,
 21 cores / 49GB / 138G free). Goal: single-process baseline GREEN at emulator source = 862c7c2
