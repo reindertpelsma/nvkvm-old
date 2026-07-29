@@ -2,6 +2,21 @@
 
 **Author**: Reindert Pelsma
 
+> ### ⚠ Status, 2026-07-29 — this is the RESEARCH ARTIFACT
+>
+> The **product** is now **`kayfabe`**, a clean-slate Mode-2-only Rust rewrite
+> (`/workspace/nvkvm-rs`, GitHub `reindertpelsma/kayfabe`). This repository is
+> **deliberately kept alive** as its **standing differential oracle** — it is the
+> only implementation a real NVIDIA driver has ever accepted end-to-end, so it can
+> answer questions no amount of Rust-side testing can.
+>
+> It was **rebuilt from source on fresh hardware on 2026-07-29** and reproduced
+> `cuCtxCreate → 2048² matmul` at **`bad=0 maxerr=0` on a stock, unpatched guest**.
+> Its recorded reference captures live in **`traces/mode2_c_reference/`**.
+>
+> Everything below describes the C artifact and remains accurate about it. For what
+> is being built now, and what "done" means, start at `CLAUDE.md`.
+
 WSL2-style NVIDIA GPU ioctl forwarding for KVM/QEMU VMs on commodity hardware,
 without vGPU licensing or full PCI passthrough.
 
