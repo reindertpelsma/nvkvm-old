@@ -1,6 +1,112 @@
 # nvkvm Mode-2 bench rebuild status
 
 ---
+## 2026-07-30 (task #104) — #13 root-cause candidate `enum_gr_sysmem(root_sys)`: ★ REFUTED. No patch landed.
+
+**The hypothesis.** `nvkvm_m2_enum_gr_sysmem` (`nvkvm_gpu_emul.c:8836`) passes a hardcoded `false`
+as the root aperture to `nvkvm_m2_pt_enum`, where its neighbour `nvkvm_m2_populate_cvas` (`:8876`,
+fixed as M5.36) passes the *resolved* `root_sys`. Since `nvkvm_m2_pdb_is_compute` (`:8574`) returns
+true unconditionally for UVM-managed roots, and UVM roots are the ones that *can* be sysmem-rooted,
+a sys-rooted compute VAS would be mis-walked to **0 leaves** → nothing backed → host `Xid 31
+FAULT_PDE`. Predicted signature in the existing `M6.5 enum_gr_sysmem:` log line: **`comp=1 runs=0`**.
+
+**★ REFUTED on two independent grounds. The one-token change is a provable no-op on this workload.**
+
+1. **No root is ever sysmem-rooted.** `grep -a "root=SYS"` returns **zero hits in every log ever
+   captured on this bench** — 5 hanging runs, 1 passing run from task #95, and 9 fresh runs today.
+   Every `M5.30 SET_PAGE_DIR UVM-VAS` line, in every run, is `aperture=0 root=FB`, for both UVM
+   roots (`hVASpace=0xcaf00005 PDB=0x3400000`, `hVASpace=0xcaf00062 PDB=0x3401000`). So
+   `chan_vas[v].root_sys == false` for all of them and the hardcoded `false` is already the
+   resolved value. Note this contradicts the comment at `:2740` ("the UVM root is *typically* in
+   SYSMEM") — on GA106 + 580.159.04 open, measured, it never is.
+2. **`comp=1 runs=0` is not a failure signature.** It is a near-constant of both outcomes:
+
+   | run | verdict | sweeps | `comp=1` | `comp=1 runs=0` |
+   |---|---|---|---|---|
+   | `c8iter_r2` | **PASS** | 165 | 99 | **40** |
+   | `c8iter`, `c8iter_r3` (`fc4164d`) | HANG | 160 | 96 | **38** |
+   | `ab862_1/2/3` (`862c7c2`) | HANG | 160 | 96 | **38** |
+   | 9 fresh runs today | PASS | 165 | 99 | **40** |
+
+   The **passing** run has *more* `comp=1 runs=0` than the hangs. The 5-sweep delta is just the
+   pass completing two more iterations. Steady `runs=0` producers are `vas=0x5c000008
+   pdb=0x3110000` (33/33 sweeps, both outcomes) plus a few early sweeps of the two UVM roots
+   before their tables are populated — all FB-rooted, all benign.
+
+**Four-way verdict on the faulting address: NOT IN OUR TABLE (capture gap) — in 5/5 hangs.**
+Mapping each hang to its host `Xid` and searching its QEMU log for the faulting VA at exact,
+2 MiB and 512 MiB granularity: **zero hits, in all five.** The instrument is not blind — the same
+logs print `M6.5 back_sys VA=0x…` / `M5.7 back_and_map[…] VA=0x…` for VAs in the same range and
+format. So this is consistent with the hypothesis's *conclusion* (we never recorded the mapping)
+but not with its *mechanism*, which is inert.
+
+**★ What the data says instead — a second, never-enumerated VA region 260 MiB below the working set.**
+The geometry is startlingly regular across all five hangs. Backed 0x7-half span is always
+`0x…2400000 .. 0x…3b33000` (23.2 MiB); every fault lands **below** it, never inside:
+
+| run | faulting VA | engine | backed span base | `base − 0x10400000` | offset into it |
+|---|---|---|---|---|---|
+| `c8iter` | `0x77ad7f000000` | CE2 HUBCLIENT_CE0 | `0x77ad80400000` | `0x77ad70000000` | `+0xf000000` |
+| `c8iter_r3` | `0x7024d200a000` | GRAPHICS GPC2 | `0x7024e2400000` | `0x7024d2000000` | `+0xa000` |
+| `ab862_1` | `0x7984f4009000` | GRAPHICS GPC1 | `0x798502400000` | `0x7984f2000000` | `+0x2009000` |
+| `ab862_2` | `0x7b9072009000` | GRAPHICS GPC1 | `0x7b9082400000` | `0x7b9072000000` | `+0x9000` |
+| `ab862_3` | `0x785ab2009000` | GRAPHICS GPC1 | `0x785ac2400000` | `0x785ab2000000` | `+0x9000` |
+
+There is a 256 MiB-aligned region at exactly `span_base − 0x10400000` that we back **nothing** in,
+and three of the four GRAPHICS faults are a bare `+0x9000`/`+0xa000` into it. The passing run backs
+the *same* single 23.2 MiB region and nothing below — i.e. the pass is not "we captured more", it is
+"the guest never reached down there". **Next probe should identify what CUDA puts 260 MiB below the
+cuMemAlloc working set and why only some runs touch it** (kernel local-memory/stack backing store
+grown at the first N=2048 launch is the obvious candidate, and would explain ITER 3).
+
+**No error path is involved.** In every hang: `back_sys` failures 0, budget truncation 0,
+`STALE-SYS` 0, and the #13 CE-PT-write trigger `#13 PT-SYNC@release` fires 38–40× with
+`backed>0` every time (47× in the pass — it runs longer). Everything the emulator attempts,
+it completes. The bug is purely that an access arrives for a VA it was never told about.
+
+**★★ #13 DID NOT REPRODUCE AT ALL TODAY — 9/9 PASS — while #14 still reproduces on demand.**
+This is why no patch was landed even speculatively: there is currently no failing measurement to
+fix against.
+
+| revision | emulator md5 | binary md5 | runs | result |
+|---|---|---|---|---|
+| `c9cfe01` (HEAD) | `0e2ac537ebb0f68bad59514f69037ac7` | `cd61bc8c5d0c9c7cb15847387ff7f9c1` | 5 × `ITERS=5` | **5 PASS / 0 HANG** |
+| `fc4164d` | `cced661c16f6856801d16dae151bc2f0` | `d7dd2573b87b9c1a9ccc6bb73d9a96dd` | 3 × `ITERS=5` | **3 PASS / 0 HANG** |
+| `fc4164d` | ″ | ″ | 1 × `ITERS=16` | **PASS** (all 16, incl. three N=2048) |
+
+The `fc4164d` binary was rebuilt to `d7dd2573b87b9c1a9ccc6bb73d9a96dd` — **bit-for-bit the binary
+task #95 measured 1 PASS / 2 HANG on.** Same host boot session (up since Jul 28), same host driver
+load (Jul 29 11:03), same guest kernel 6.8.0-117, same harness. At #95's ~25 % pass rate, 9/9 green
+has probability ~4e-6, so the rate genuinely changed; the variable is environmental and not yet
+identified. `c9cfe01` vs `fc4164d` is *not* it — their only code delta is inside
+`if (nvkvm_rec_on() && …)` and the recorder is off (`NVKVM_M2REC` unset ⇒ no `m2rec` property).
+
+**★ Instrument check, and the reason the above is trustworthy: `mp14_run_guest.sh MP14_N=2` still
+reproduces #14 exactly as #95 recorded it** — `pass=1 fail=1`, loser stalled at `cuCtxCreate`,
+4 host Xids. Bench, harness, GPU and binary are all healthy; #13's non-reproduction is a real
+observation about #13, not a broken rig.
+
+**Evidence preserved.** #95's raw logs were still in the bench's `/tmp` and are the only extant
+recording of a #13 hang; copied to **`vh:/root/hang_evidence_20260729/`** (6.7 MB, 15 files:
+`{c8iter,c8iter_r2,c8iter_r3,ab862_1..3}_{delta.txt,guest.log}`, both emulator sources,
+`host_xids_jul29.txt`). `/tmp` on this bench is not durable — do not leave the next hang there.
+
+**Traps worth not rediscovering:**
+- `bench_boot.sh` does `rm -f $OVL`, so the guest overlay is wiped every boot: **re-`scp` the test
+  `.c` *and* the runner script on every cycle**, not just the first.
+- Mapping a hang to its Xid is by wall-clock: the `*_guest.log` mtime is written at the *end* of the
+  run, ~2 min *after* the Xid. Do not assume the nearest-later Xid.
+- Two Xid classes are live here and must not be conflated: `#13` = `GRAPHICS GPC*
+  GPCCLIENT_T1_2` / `CE2 HUBCLIENT_CE0`, `FAULT_PDE VIRT_**WRITE**`, VA `0x7xxx_xxxxxxxx`
+  (a guest UVM device VA); `#14`/concurrent = `*_PBDMA* HUBCLIENT_ESC`, `VIRT_**READ**`,
+  VA `0x2_00xxxxxx`. Grepping "Xid" alone mixes them.
+- Bench state left as found: emulator source `0e2ac537ebb0f68bad59514f69037ac7` (= `c9cfe01`'s
+  `nvkvm_gpu_emul.c`, unchanged by this task) deployed and installed as binary
+  `cd61bc8c5d0c9c7cb15847387ff7f9c1`; `.srcrev` = `c9cfe01`; no QEMU running. **This task landed
+  no source change**, so the md5s above remain valid for any later commit that does not touch
+  `src/qemu/`. Trust the md5, not the commit id.
+
+---
 ## 2026-07-29 (task #96) — `cap1b`: GSP-D6 made observable, reply stream proven unchanged
 
 **SOURCE REVISION.** Emulator `819282d` (`nvkvm_gpu_emul.c` md5 `2132bbdbf98ab85449e9513c9c230bbf`),
