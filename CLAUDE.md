@@ -77,8 +77,16 @@ were not HEAD's.
   *intent* to unprivileged host userspace ops; never replay privileged GSP-internal controls;
   correctness = observable end-states only.
 - **★ Address table (the data-plane core, read with the forwarding model):** `mode2_address_table.md`
-  — one authoritative per-VAS VA→GPGA table, forward-populated (RPC + PDB-read-at-invalidate),
-  never reverse-resolved; the table IS the guest's TLB; miss = fault. `mode2_2nd_context_hang.md`
+  — one authoritative per-VAS VA→GPGA table, forward-populated, never reverse-resolved; the table
+  IS the guest's TLB; miss = fault.
+  ⚠ **Two CO-EQUAL populate sources, and NOT "RPC + read-at-invalidate"** — that phrasing was
+  refuted by §5's ★ CORRECTION (2026-07-22, audit S3) and must not be repeated: on the **Mode-2
+  GSP-emulated compute path both invalidate transports measured ZERO** (`INVALIDATE_TLB` RPC
+  fn=200 = 0; `MEM_OP`/`MMU_TLB_INVALIDATE` pushbuffer method = 0), as did `DMA_FILL_PTE_MEM`.
+  The sources are **(1)** bind-time RPC/ioctl bindings and **(2)** the **observed CE page-table
+  write**, attributed by destination-FB-address → owning PDB and latched at the **CE release
+  semaphore** — the commit point that *replaces* the absent invalidate. Read-at-invalidate still
+  governs the kernel/UVM/RM paths, where the transports do appear. `mode2_2nd_context_hang.md`
   = the #12 bug it dissolves (GSP-managed CE channel finishPayload, root-caused).
 - Mode-2 compute path: `mode2_compute_forwarding.md`, `mode2_gr_forwarding.md`,
   `mode2_cuctxcreate_resume.md` (+ `_problem.md`), `mode2_execfwd_keystone_plan.md`.
