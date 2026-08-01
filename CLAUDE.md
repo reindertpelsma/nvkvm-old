@@ -45,7 +45,17 @@ no amount of Rust-side testing can.
 - **`scripts/mode2_diag/bench_boot.sh` / `bench_wait.sh`** — the correct boot + wait sequence,
   with the traps encoded inline. `rec_capture.sh` / `rec_dump.py` drive and decode captures.
 
-**Two operational traps that cost real cycles — both measured:**
+**Three operational traps that cost real cycles — all measured:**
+- ★★★ **The serial log is NOT where the driver's output is.** Measured 2026-08-01:
+  `grep -ci nvrm /workspace/bench/run_*_serial.log` returns **0** for every boot of that night,
+  while older boots (`run_t135a_serial.log`) contain it. The guest driver is `modprobe`d over
+  ssh *after* boot, so its `dmesg` goes to whoever ran the command and **nowhere else** — six
+  consecutive rung claims had their only evidence inside a session transcript. The serial log
+  still exists, is ~70 KB, is freshly timestamped and is named after the boot, so **every
+  signal says the evidence is there**; only grepping for the content shows it is not.
+  ⇒ Persist `dmesg` to `run_<tag>_dmesg.log` beside the serial log, and **assert it is
+  non-empty and contains `NVRM`** — a harness that writes an empty file and exits 0 is worse
+  than none, because the file's existence reads as capture.
 - ★★ `pgrep -x qemu-system-x86_64` **can never match** (`/proc/PID/comm` truncates to 15 chars
   ⇒ `qemu-system-x86`), so any "verify none running" built on it passes **vacuously**. Use
   `pgrep -x qemu-system-x86` **and** `ss -tln | grep 2223`.
