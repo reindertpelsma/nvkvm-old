@@ -136,7 +136,24 @@ were not HEAD's.
 | `cap2b_stalequeue_nofn47` | 862 940 | no | ★ **the real negative** — 378 GSP elements parsed from arbitrary guest RAM, answered `NV_OK` |
 | `cap3_matmul_forwarding` | 532 824 | no | decision planes; `cup8` at `bad=0 maxerr=0` |
 
-★ **Four measured limits before trusting any diff** (full text in
+★★★ **FIFTH LIMIT, and it is different in kind — the oracle is POSITIVELY WRONG here, not blind**
+(measured 2026-08-01 against a real GA106, `../nvkvm-rs/traces/real_ga106/`). The captured control
+table `src/qemu/mode2_initctrl_ga106.h` has **56 rows, of which 11 (19.6%) carry `dlen = 0`** — the
+reply body was never captured. **Every `dlen=0` row checked against real hardware is CONTRADICTED**
+(`0x20802a08`, `0x20802a06`, `0x2080017e`, `0x20800af3`, `0x20800a4b`, `0x20800aac`), while **every
+row carrying a body matches BYTE FOR BYTE**.
+⇒ `0x20802a08` (`CE_GET_FAULT_METHOD_BUFFER_SIZE`) decodes from its empty row as **size 0**; a real
+GA106 returns **20480**. RM DMAs CE fault records into a buffer of exactly that size, so trusting the
+empty row was a **buffer overrun with a hardware writer**, not merely a wrong number.
+⊘ **An empty capture is evidence of NOTHING, not evidence of emptiness.** Treat `dlen=0` as
+*unmeasured* and refuse it; do not decode it to zeros. ★ And note how it survived: a gate demanding
+a `C:` citation was **satisfied** by a row that cited the empty body *as corroboration* — **citing
+the oracle is not the oracle being right.** A citation gate checks a claim is *sourced*, never that
+the source says what the claim says.
+★ This **scopes** the oracle rather than devaluing it: the 45 rows with bodies matched exactly. The
+oracle is trustworthy precisely where it captured something.
+
+★ **Four further measured limits before trusting any diff** (full text in
 `../nvkvm-rs/docs/design/c_rust_trace_differential.md`): the **completion plane has NO C
 oracle** — the C *forges* completions, so a green diff says nothing about it; **the diff can
 never be green end-to-end** because the C has no refusal vocabulary; **forwarding-mode traces
