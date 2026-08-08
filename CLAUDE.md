@@ -59,11 +59,16 @@ no amount of Rust-side testing can.
 - ★★ `pgrep -x qemu-system-x86_64` **can never match** (`/proc/PID/comm` truncates to 15 chars
   ⇒ `qemu-system-x86`), so any "verify none running" built on it passes **vacuously**. Use
   `pgrep -x qemu-system-x86` **and** `ss -tln | grep 2223`.
-- ★★ The bench needs a `~/.ssh/config` mapping `localhost`/`127.0.0.1` to the guest key,
-  because ~30 `scripts/mode2_diag/*_host.sh` run a **bare** `ssh -p 2223 ubuntu@localhost`.
-  Without it a perfectly healthy guest reads as "never booted". The guest also needs
-  **~20–25 s** to reach a login prompt and `-serial file:` output **lags** — a slow boot is not
-  a crash.
+- ★★ ⊘ **CORRECTED 2026-08-08 — this trap is HARNESS-SPECIFIC and does NOT apply to the Rust
+  bench.** The `~/.ssh/config` mapping `localhost`/`127.0.0.1` to the guest key matters only for
+  the ~30 `scripts/mode2_diag/*_host.sh` that run a **bare** `ssh -p 2223 ubuntu@localhost`.
+  ⊘ **On the kayfabe bench `vh` there is no such file and none is needed** — `gssh_nv` reaches the
+  guest as **`ubuntu@192.168.77.2` over the tap**, not `localhost:2223`. Repeating the ssh-config
+  advice there sends people to fix a file that was never in the path.
+  ★ What DOES still hold, and is what actually reads as "never booted": the guest needs
+  **~20–25 s** to reach a login prompt, `-serial file:` output **lags**, and ⊘ **`nvktap0` does
+  not survive a host reboot** while QEMU requires it to pre-exist — a guest can be sitting at a
+  login prompt while the harness reports it never answered. A slow boot is not a crash.
 
 ⚠ **Any bench claim must carry the SOURCE REVISION it was measured at.** The bench silently
 served a binary built from `862c7c2` for weeks — every newer revision failed
