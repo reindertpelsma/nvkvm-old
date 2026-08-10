@@ -66,8 +66,10 @@ GUEST NOISE FLOOR — measured, and ZERO
   tokens 0x07-0x0e at 14:22:04, and then nothing at all for the remaining ~175 s until the
   timeout kills the workload. Two instruments that share no code agree on the instant.
 
-  Progress measure: the guest completes 220 of cuCtxCreate's 479 ioctls (46%) before the
-  spin. cuInit and every device query complete correctly (dev stage, prog rc=0).
+  Progress measure: cuCtxCreate's first ioctl is A[129] on the host and B[94] here (the dev
+  stage is 129 records there and 94 here), so the guest completes B[94..314] = **221 of
+  cuCtxCreate's 479 ioctls (46.1%)** before the spin, and then emits 175 MC_SERVICE_INTERRUPTS.
+  cuInit and every device query complete correctly (dev stage, prog rc=0).
 
 ★★ THE 0x56 CENSUS — the census the host reference makes possible
   Hardware issues exactly ONE non-OK status in the whole program: 0x2080012f
