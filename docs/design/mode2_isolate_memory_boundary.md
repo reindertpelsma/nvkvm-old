@@ -128,13 +128,29 @@ reactor from the start**, or it becomes the tenth blocking site on a path that a
 
 ## 4. Fallbacks and configuration
 
-**Unprivileged userns is not always available.** A very common deployment is a default Docker
-container with namespaces disabled but `/dev/kvm` exposed. ⇒ **UID or UID-range separation, with the
-VMM holding `CAP_SETUID`, should be a first-class mode rather than a degraded fallback.**
+### ★★ UID separation and userns COMPOSE — and UID is the common case, not the fallback
 
-⚠ **UID separation and the memory boundary are orthogonal; neither substitutes for the other.** Once
-the memfd is passed by `SCM_RIGHTS`, DAC no longer applies to it — UIDs buy procfs/signal/ptrace
-separation, not memory separation.
+⊘ **An earlier revision of this page called UID separation a "fallback for when unprivileged userns is
+unavailable". That has the availability backwards.**
+
+- **`CAP_SETUID` is in Docker's DEFAULT capability set.** A container running a VM has it already.
+- **Unprivileged userns inside a container is the thing that needs extra cooperation from the host** —
+  relaxed seccomp/AppArmor profiles, or capabilities granted at `docker run`. For a container whose
+  whole job is running a VM with `/dev/kvm` exposed, **`CAP_SETUID` may be genuinely sufficient and is
+  the cheaper ask.**
+
+⇒ **The design is: a distinct UID per isolate ALWAYS (cheap, default-available), PLUS userns when it
+is available (strictly more).** They stack; this is not a ladder with one rung chosen.
+
+⊘ **And a second correction: UID separation is NOT orthogonal to the memory boundary — it is what
+stops the boundary being bypassed laterally.** The `SCM_RIGHTS`-passed memfd is beyond DAC, true. But
+if isolate *A* can `ptrace` isolate *B*, or read `/proc/B/mem`, then every `mmap` check applied to *A*
+is moot: *A* simply reads *B*'s already-approved mapping. **UID separation is what makes the per-`Proc`
+mmap authorization mean anything at all.**
+
+⚠ And it matters most in exactly the configuration where the memory boundary is weakest: with seccomp
+**disabled** (the documented opt-out), UID separation is the only thing still standing between
+isolates.
 
 **Both are disableable, and both default ON.** ⚠ **The risk inverts when you do that**: this project's
 own history is that **default-off paths never run** — the C's `m2hostsem`, `m2cexec` and `m2cefwd` were
