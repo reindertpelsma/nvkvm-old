@@ -9,6 +9,7 @@ an old capture.
 Sub-commands
   summary  A.jsonl                 per-opcode census of one capture
   show     A.jsonl [--grep RE]     human-readable decode of records
+  replies  A.jsonl                 per-control: does RM actually WRITE a reply body?
   diff     A.jsonl B.jsonl         align the two streams and name the FIRST divergence
 
 Divergence kinds reported by `diff`:
@@ -380,6 +381,57 @@ def summary(recs):
                 r["i"], r["op"], r.get("rc"), r.get("f_post", {}).get("status", 0) or 0))
 
 
+def replies(recs):
+    """Which controls actually WRITE a reply body, and how many bytes move.
+
+    ★ This is the query that answers the C oracle's FIFTH LIMIT directly. The
+    captured C control table has 11 of 56 rows at dlen=0 -- reply body never
+    captured -- and every one checked against real hardware was CONTRADICTED
+    (CLAUDE.md). Here the host is asked the same question with the body present
+    on BOTH sides of the call, so "wrote nothing" is a MEASUREMENT and not a
+    missing capture: `changed=0` with `psize=N` means RM was handed N bytes and
+    returned them unaltered; `psize=0` means there was no body to write.
+    ⊘ An empty capture is evidence of nothing. An unchanged captured body is
+    evidence of something.
+    """
+    agg = OrderedDict()
+    for r in recs:
+        if r.get("t") != "ioctl" or r.get("nr") not in (0x2A, 0x2B):
+            continue
+        if "ppre" not in r:
+            continue
+        a, b = unhex(r["ppre"]), unhex(r["ppost"])
+        n = min(len(a), len(b))
+        changed = sum(1 for i in range(n) if a[i] != b[i])
+        first = next((i for i in range(n) if a[i] != b[i]), None)
+        key = r["op"]
+        e = agg.setdefault(key, {"calls": 0, "psize": r.get("psize"), "got": len(a),
+                                 "changed": 0, "first": first, "trunc": 0, "bad": 0})
+        e["calls"] += 1
+        e["changed"] = max(e["changed"], changed)
+        if r.get("trunc"):
+            e["trunc"] += 1
+        if r.get("rc", 0) != 0 or (r.get("f_post", {}).get("status") or 0) != 0:
+            e["bad"] += 1
+        if first is not None and (e["first"] is None or first < e["first"]):
+            e["first"] = first
+    print("%-46s %5s %7s %6s %8s %7s %s" %
+          ("op", "calls", "psize", "got", "changed", "first", "flags"))
+    for op, e in agg.items():
+        flags = []
+        if e["trunc"]:
+            flags.append("TRUNC=%d(UNMEASURED TAIL)" % e["trunc"])
+        if e["bad"]:
+            flags.append("nonzero-status=%d" % e["bad"])
+        if e["psize"] and e["got"] < e["psize"]:
+            flags.append("SHORT-READ")
+        if e["psize"] and not e["changed"] and not e["trunc"]:
+            flags.append("pure-IN (RM wrote nothing)")
+        print("%-46s %5d %7s %6d %8d %7s %s" %
+              (op, e["calls"], e["psize"], e["got"], e["changed"],
+               "-" if e["first"] is None else e["first"], " ".join(flags)))
+
+
 def show(recs, pat, limit):
     rx = re.compile(pat) if pat else None
     n = 0
@@ -408,6 +460,7 @@ def main():
     s = sub.add_parser("summary"); s.add_argument("a")
     s = sub.add_parser("show"); s.add_argument("a"); s.add_argument("--grep")
     s.add_argument("--limit", type=int, default=40)
+    s = sub.add_parser("replies"); s.add_argument("a")
     s = sub.add_parser("diff"); s.add_argument("a"); s.add_argument("b")
     s.add_argument("-n", type=int, default=25)
     s.add_argument("--strict", action="store_true",
@@ -420,6 +473,8 @@ def main():
         summary(load(args.a)); return 0
     if args.cmd == "show":
         show(load(args.a), args.grep, args.limit); return 0
+    if args.cmd == "replies":
+        replies(load(args.a)); return 0
     return diff(load(args.a), load(args.b), args)
 
 

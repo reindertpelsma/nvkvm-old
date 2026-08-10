@@ -10,6 +10,10 @@ PROVENANCE (a bench claim without its revision is not a claim)
   host driver   580.173.02  (open; /proc/driver/nvidia/version)
   host kernel   6.8.0-136-generic
   CUDA          12.6.2 (nvcc 12.6.r12.6), libcuda.so.580.173.02
+  capture opts  NVDIFF_MAXBUF=65536 -- ⚠ the default 8192 TRUNCATES 27 records
+                (UVM_MAP_EXTERNAL_ALLOCATION is 9264 B, control 0x20803002 is 13344 B).
+                These captures are UNtruncated; `nvdiff.py summary` prints a "!!
+                TRUNCATED" banner if any capture is not.
   instrument    tests/mode2/nvdiff/nvdiff_shim.c  md5 480e45c41de971910918438fb582f167
   workload      tests/mode2/nvdiff/nvd_prog.c     md5 7af4c3ec2b702cf04ae00d68a6596c4d
   uvm table     tests/mode2/nvdiff/uvm_sizes.h    md5 c9a0c5da3aabe32f8852f15e72405b63
@@ -44,6 +48,21 @@ MEASURED, and the reason this reference is worth having
     that no ioctl trace on either side can see.
   * First ioctl of cuCtxCreate on this host: nvidiactl RM_CONTROL cmd=0x20803601,
     at index 129 (see nvd_selftest.sh's positive control).
+  * ★★ EXACTLY ONE ioctl in the whole program returns a non-OK status, and it is
+    NOT in cuCtxCreate: record 86, nvidiactl RM_CONTROL cmd=0x2080012f, NV status
+    0x56 = NV_ERR_NOT_SUPPORTED (ogkm-580.159.04 .../inc/nvstatuscodes.h:115),
+    inside cuInit, and libcuda proceeds. All 479 ioctls of cuCtxCreate return
+    NV_OK on real hardware. So on this path "0x56 is the forgiven status" is not a
+    heuristic: hardware issues it once, in cuInit, on 0x2080012f, and nowhere else.
+    Any OTHER 0x56 our side emits is a divergence from hardware, whatever the
+    caller does next.
+  * ★ `nvdiff.py replies` answers, per control, whether RM actually WRITES a reply.
+    24 of the 64 distinct controls are pure-IN: a non-zero paramsSize whose body RM
+    returns completely unaltered (e.g. 0x20810108 hands over 992 bytes and gets 992
+    identical bytes back; 0x0080170d 24 bytes x16 calls; 0x20808159 332 bytes).
+    Because the body is captured on BOTH sides, "wrote nothing" here is a
+    MEASUREMENT — the opposite of the C table's dlen=0 rows, which are unmeasured.
+    Smallest reply in the set: 0x20808162, paramsSize=1, the single byte 0x00 -> 0x01.
 
 NOISE FLOOR (host vs host, same binary, 12 pairings across 6 stages)
   opcode alignment      exact — equal record counts, ratio 1.000000, zero MISSING/EXTRA
