@@ -173,11 +173,45 @@ sourced dependency on a physical card, and it belongs at the TOP of the estimate
 | `userd_chid_oracle` | `"GA106"` (`:423`) | **yes — and the flip is a NO-OP**, because both HALs are `_GM107`. That *is* the measurement |
 | `pushbuffer_abi_oracle` | `"GA106"` (`:334`) | **partially** — also needs class headers `clc56f.h` → `clc46f.h` |
 
-⊘ **Not covered by any oracle, now or after arch #2: rows 10 (debug fuse) and 12 (the PIO ucode
-load)** — *the two items that actually diverge on the boot path.*
+⊘ **Not covered by any oracle we had WHEN THIS WAS WRITTEN: rows 10 (debug fuse) and 12 (the PIO
+ucode load)** — *the two items that actually diverge on the boot path.*
 
 ★★★ **That asymmetry is the honest summary of this audit: the oracles cover what does not vary, and
 do not cover what does.**
+
+---
+
+### ⊘⊘ CORRECTION, same day (2026-08-10) — "no oracle exists or could" for row 12 is REFUTED, by a tree we already had
+
+The owner asked whether **NVIDIA's Rust driver, `nova`**, might serve as an independent oracle.
+**It is already vendored** — `research_clones/linux/drivers/gpu/nova-core/` — and it answers row 12
+directly:
+
+- `nova-core/falcon/hal.rs:15-16` — `mod ga102;` / `mod tu102;`: **the exact Turing-vs-Ampere split**.
+- `nova-core/falcon/hal.rs:63` — *"The only chipsets supporting PIO are those **< GA102**, and PIO is
+  the **preferred** method for…"* ⇒ **an independent statement of row 12's rule**, and it is
+  *sharper* than ogkm's HAL split, which only showed that the symbol differed.
+- `nova-core/regs.rs:381,392,402,411` — `NV_PFALCON_FALCON_IMEMC / IMEMD / DMEMC / DMEMD` modelled in
+  full, with strides (`[4, stride = 16]`, `[8, stride = 8]`) and field definitions.
+- `nova-core/regs.rs:494` — *"RISC-V status register for debug (**Turing and GA100 only**)"*,
+  independently confirming **row 7**.
+
+⇒ ★★★ **Rows 10 and 12 are NOT beyond oracle reach. They were beyond the reach of the oracles this
+audit thought to look at** — and the distinction matters, because the first phrasing closes an
+investigation and the second opens one.
+
+★★ **And the deeper correction: our oracles were never independent.** The standing finding is that
+**every oracle we own was made by `nvidia-smi`**, and all three share one cause. `nova` is a
+**from-scratch reimplementation by different people reading the same hardware** — the first source we
+have that can disagree with `ogkm` for a reason other than our own misreading. ⇒ It is an
+**anti-overfitting** instrument, which is a different and scarcer thing than a second confirmation.
+
+⚠ **Two limits, stated so this is not oversold:** `nova` covers the **boot/GSP** plane and does not
+do compute, so it says **nothing** about our current wall (`cuCtxCreate` GR completion) — it is an
+oracle for ground we have already crossed. And it is **GPL-2.0**, where `ogkm` is dual MIT/GPL;
+given the standing commitment to public release at Mode-1 parity, **the usage posture must be
+decided before anything is derived from it** — read it for *hardware facts*, which are not
+copyrightable, not for code.
 
 ---
 
