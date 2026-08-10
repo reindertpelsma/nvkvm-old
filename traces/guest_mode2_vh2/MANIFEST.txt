@@ -1,6 +1,14 @@
 GUEST CAPTURES — the "what ACTUALLY happens" half of the ioctl differential
 ============================================================================
-The first firing of the host<->guest differential oracle against a live Mode-2 guest.
+The FIRST firing of the host<->guest differential oracle against a live Mode-2 guest.
+
+★ SUPERSEDED-BUT-KEPT. traces/guest_mode2_vh2_s2/ is the SECOND firing, taken with the
+  same instrument at kayfabe 28cf456 (this one is 954f926), after the two-item worklist
+  below was served. This directory is the "before" half of that comparison and must not
+  be deleted. Headline of the re-run: the progress fraction is UNCHANGED at 221/479, and
+  the 0x56 census went 3 -> 1, i.e. to hardware's own census exactly.
+  ⊘ And one of the two ids below is WRONG: `0x2080200a` never reaches the device. See
+  the second firing's MANIFEST and `kayfabe_abi::perfboost`.
 Diff these against traces/host_reference_ga106/<stage>_r1.jsonl.zst.
 
 PROVENANCE (a bench claim without its revision is not a claim)
