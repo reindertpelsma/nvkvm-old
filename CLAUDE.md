@@ -45,7 +45,16 @@ no amount of Rust-side testing can.
 - **`scripts/mode2_diag/bench_boot.sh` / `bench_wait.sh`** — the correct boot + wait sequence,
   with the traps encoded inline. `rec_capture.sh` / `rec_dump.py` drive and decode captures.
 
-**Three operational traps that cost real cycles — all measured:**
+**Four operational traps that cost real cycles — all measured:**
+- ★★★ **A KILLED background job is indistinguishable from a RUNNING one, if absence-of-result is
+  your only check.** Measured 2026-08-10: a detached bench job was **killed by SIGTERM at the ssh
+  timeout**, leaving a **zero-byte** output file — and that state was read as *"still in flight"*
+  **three times**, then reported to the owner as a pending measurement. ⇒ **Zero bytes is not
+  "not yet"; it is a state that needs its own check.** Have the job write a **start marker and an
+  exit-status line**, and treat *"file exists but has no terminator"* as **DIED**, never as
+  *"running"*. ⚠ Same class as the serial-log trap below and as the `dlen=0` oracle rows: **an
+  empty artefact reads as benign, and only inspecting its content distinguishes "nothing happened"
+  from "nothing was recorded".**
 - ★★★ **The serial log is NOT where the driver's output is.** Measured 2026-08-01:
   `grep -ci nvrm /workspace/bench/run_*_serial.log` returns **0** for every boot of that night,
   while older boots (`run_t135a_serial.log`) contain it. The guest driver is `modprobe`d over
