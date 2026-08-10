@@ -41,13 +41,36 @@ Mode 2 reaching Mode 1's capability set. That bar is what §3 above names, and i
 Four properties. Each is **cheap to preserve now and expensive to restore later**, and all four are
 worth having *even if paravirtual is never built* — see the last section.
 
-1. ★★★ **The isolate's security principal must be SUPPLIABLE, not only OBSERVABLE.** The C keys on
-   **`mm` — address-space identity, not tgid** — and says why: *"tgids get recycled"*, and
-   `CLONE_VM`-without-`CLONE_THREAD` tasks *"can already read/write each other's memory directly, so
-   they are ONE security domain"* (`C: src/guest/nvkvm_session.c:28-48`). kayfabe's key is **CR3**,
-   which is the *same principal*. ⇒ The seam is probably the right shape already; what matters is
-   whether `Proc` identity is abstract over its **derivation**. A paravirtual module **knows** its
-   `mm` and would supply it; the emulated path **observes** CR3.
+1. ★★★ **What establishes the association between a `ProcId` and a guest process?**
+
+   ⊘⊘ **CORRECTION (2026-08-10, same day): an earlier revision of this page said "kayfabe's key is
+   CR3, which is the same principal as the C's `mm`, so the seam is probably already the right
+   shape." That is VOID.** `kayfabe-arch/src/lib.rs:191`, verbatim:
+
+   > *"E0 (proven on the bench, 2026-07-19): the work-submit token identifies the target channel; the
+   > core demuxes on the decoded `VChid` — **no CPU-state (CR3) read exists anywhere in the
+   > design**."*
+
+   CR3 occurs four times in the tree and **none is a key**: two describe the **GPU's** page-directory
+   base metaphorically as *"the GPU's CR3"*, one is an unused field in a vCPU struct, and the fourth
+   is the line above saying it is not used. `ProcId` is `ProcId(self.next_proc)` — an **internally
+   minted counter**, not derived from any guest register. ⚠ The claim came from a memory dated
+   **2026-06-03** that was **superseded on the bench six weeks later**, and it was cited **from its
+   filename** rather than its contents.
+
+   ⇒ **The real question, and it is sharper than the one it replaces.** The C's principal is `mm` —
+   address-space identity, not tgid, *"because tgids get recycled"* and `CLONE_VM`-without-
+   `CLONE_THREAD` tasks *"can already read/write each other's memory directly, so they are ONE
+   security domain"* (`C: src/guest/nvkvm_session.c:28-48`). Ours is an **opaque counter**, which is
+   **abstract over its derivation by construction** — arguably *better* for this axis than CR3 would
+   have been. So the audit must ask not *"what is the key"* but:
+
+   > **What ESTABLISHES the association between a `ProcId` and a guest process?**
+
+   If that association is made at the **doorbell / `VChid` demux**, it is emulated-only and the seam
+   **is** at risk. If it is made through the **RM client graph**, a forwarding path shares it.
+   ⊘ Do not assume either — `proc_is_not_a_set_of_rm_clients` says a `Proc` is *not* simply a set of
+   RM clients, so the answer is neither obvious nor already written down.
 2. The forwarding ports (`kayfabe-fwd`, `IsolateFactory` / `Isolate` / `RmBackend`) must not **name or
    assume a device-model caller in their types**. A virtio transport must drive the same ports.
 3. Nothing should assume a **single guest-visible device** — two present at once, guest picks which
