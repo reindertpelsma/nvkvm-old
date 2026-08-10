@@ -296,6 +296,50 @@ transcription.
 observability of the ring is default-OFF**. Every `RANG`, `USERD-WR` and `FORGE` line the design docs
 quote came from a **non-default build**.
 
+## 5c. ★★★★★ WHY PASSTHROUGH IS CORRECT BY CONSTRUCTION — the semaphore is embedded in the work
+
+Sourced from NVIDIA, 2026-08-10. This is the load-bearing argument for §1's split, and it is stronger
+than any efficiency case.
+
+> **A completion payload is not derivable from the work.** It is a number the guest's *software*
+> invented, kept in its own driver state, and embedded as a **literal immediate** in the pushbuffer.
+> The hardware reproduces it only because it is in the bytes.
+
+`uvm_channel.c:1508-1512` computes `new_payload = (NvU32)(++tracking_sem.queued_value)`, and that exact
+value becomes the `SET_SEMAPHORE_PAYLOAD` immediate at `uvm_turing_ce.c:70-72`. RM does the same from
+`lastSubmittedPayload` (`channel_utils.c:839`).
+
+⇒ **If the host GPU executes the guest's bytes, the payload is automatically right. If anything
+re-encodes, re-orders or re-generates the work, the payload is unrecoverable** — not hard to compute,
+*impossible*: it is private software state we never see.
+
+★★★★ **And the argument does not stop at payloads. Everything that makes a release CORRECT is a
+literal in the same bytes:**
+
+| what | where it lives | what happens if we re-derive it |
+|---|---|---|
+| the **payload** | `SET_SEMAPHORE_PAYLOAD` / `SET_REPORT_SEMAPHORE_C` immediate | unrecoverable; a guess eventually goes backwards |
+| the **flush scope** | `LAUNCH_DMA.FLUSH_ENABLE`/`FLUSH_TYPE`, `SET_REPORT_SEMAPHORE_D.FLUSH_DISABLE` | a release becomes visible before the data it gates — NVIDIA fixed a real Ampere bug here |
+| the **interrupt arming** | `LAUNCH_DMA.INTERRUPT_TYPE`, `SET_REPORT_SEMAPHORE_D.AWAKEN_ENABLE` | the wake never fires — the exact `cuCtxCreate` hang |
+| the **structure size** | `SEMAPHORE_TYPE` / `STRUCTURE_SIZE` | 4 bytes written where 16 were promised; stale timestamp at +8 |
+| the **target VA** | the semaphore address fields | resolved in the *executing channel's* VAS — **no aperture override exists in any of the three classes** |
+
+⇒ ★★★★★ **The rule generalises: anything the guest encoded in its bytes is correct only if we run its
+bytes.** Re-encoding is not a performance choice with a correctness cost attached — it is a
+correctness choice, and it loses every time.
+
+**And it yields a falsifiable invariant we can gate on:** *no code path may compute or write a
+semaphore value for a guest-userspace channel.* If we ever find ourselves able to predict a payload,
+we are on the wrong path. ⊘ Writing a **kernel** channel's completion stays legitimate (§5) — that
+channel is ours, and its payload is ours to know.
+
+⚠ **The failure mode if we get this wrong is not gradual.** UVM keeps the hardware's 32-bit payload in
+the low half of a 64-bit counter, so **any decrease is read as a 2³² wrap forward**, exceeds
+`UVM_GPU_SEMAPHORE_MAX_JUMP`, and trips `UVM_ASSERT_MSG_RELEASE` — **compiled into release builds** —
+which calls `uvm_global_set_fatal_error`. UVM is then dead for that GPU. No retry, no recovery, on the
+**first** occurrence. ⇒ **Exactly one writer per semaphore, forever, values non-decreasing.** A bridged
+or lagging second writer is a one-shot kill, and that is the measured `M5.38` incident.
+
 ## 6. Faults: prevent, don't handle
 
 `mode2_doorbell_chid.md` item 4, owner, 2026-06-05:
