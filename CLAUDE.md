@@ -51,10 +51,19 @@ no amount of Rust-side testing can.
   timeout**, leaving a **zero-byte** output file — and that state was read as *"still in flight"*
   **three times**, then reported to the owner as a pending measurement. ⇒ **Zero bytes is not
   "not yet"; it is a state that needs its own check.** Have the job write a **start marker and an
-  exit-status line**, and treat *"file exists but has no terminator"* as **DIED**, never as
-  *"running"*. ⚠ Same class as the serial-log trap below and as the `dlen=0` oracle rows: **an
-  empty artefact reads as benign, and only inspecting its content distinguishes "nothing happened"
-  from "nothing was recorded".**
+  exit-status line**, so *"file exists but has no terminator"* is detectable at all.
+  ⚠ Same class as the serial-log trap below and as the `dlen=0` oracle rows: **an empty artefact
+  reads as benign, and only inspecting its content distinguishes "nothing happened" from "nothing
+  was recorded".**
+  ⊘⊘ **CORRECTED within the hour, and the correction is the load-bearing half: `143` and `124` mean
+  OPPOSITE things and arrive as the same word.** `143` = **SIGTERM, the job itself killed**, nothing
+  written ⇒ dead. `124` = **the LAUNCHER's `ssh`/`timeout` expired** while the detached job **kept
+  running fine** (measured: 3 `cargo test` processes still alive, results still accumulating).
+  ⇒ **A nonzero exit from the thing that STARTED the work tells you nothing about the work.** Never
+  infer "died" from an empty file alone — that reading would have declared a healthy job dead.
+  Check the work **directly**: process liveness **and** the terminator line. ⚠ And note the
+  composition — that liveness check is exactly where the `pgrep` trap below fails in **both**
+  directions, so it needs the bracket trick *and* an `ss`/port check, not a bare `pgrep`.
 - ★★★ **The serial log is NOT where the driver's output is.** Measured 2026-08-01:
   `grep -ci nvrm /workspace/bench/run_*_serial.log` returns **0** for every boot of that night,
   while older boots (`run_t135a_serial.log`) contain it. The guest driver is `modprobe`d over
