@@ -56,9 +56,17 @@ no amount of Rust-side testing can.
   ⇒ Persist `dmesg` to `run_<tag>_dmesg.log` beside the serial log, and **assert it is
   non-empty and contains `NVRM`** — a harness that writes an empty file and exits 0 is worse
   than none, because the file's existence reads as capture.
-- ★★ `pgrep -x qemu-system-x86_64` **can never match** (`/proc/PID/comm` truncates to 15 chars
-  ⇒ `qemu-system-x86`), so any "verify none running" built on it passes **vacuously**. Use
-  `pgrep -x qemu-system-x86` **and** `ss -tln | grep 2223`.
+- ★★ **`pgrep` fails in BOTH directions, and both are now measured.** `pgrep -x qemu-system-x86_64`
+  **can never match** (`/proc/PID/comm` truncates to 15 chars ⇒ `qemu-system-x86`), so any "verify
+  none running" built on it passes **vacuously**. Use `pgrep -x qemu-system-x86` **and**
+  `ss -tln | grep 2223`.
+  ⇒ ★★ And the mirror image, measured **three times on 2026-08-10**: `pgrep -f <literal>`
+  **always matches the asker**, because the pattern is in the searching command's own
+  `/proc/PID/cmdline`. Twice it made a **finished** boot read as still-running for minutes.
+  `boot_capture.sh` documents this *inside* the script; it applies just as much to anyone
+  driving the bench from outside it. Fix = the bracket trick: `pgrep -f '[b]uild_qom_shim'`.
+  ⚠ Note the two failures are opposite: one **never** fires, one **always** does — so a waiter
+  and a "nothing is running" check need different fixes, and neither is safe by default.
 - ★★ ⊘ **CORRECTED 2026-08-08 — this trap is HARNESS-SPECIFIC and does NOT apply to the Rust
   bench.** The `~/.ssh/config` mapping `localhost`/`127.0.0.1` to the guest key matters only for
   the ~30 `scripts/mode2_diag/*_host.sh` that run a **bare** `ssh -p 2223 ubuntu@localhost`.
