@@ -238,6 +238,64 @@ audit found **nine** sites on the doorbell path that can block, only two of whic
 
 ---
 
+## 5b. ⊘ WHAT THE C ACTUALLY BUILT — corrections to §§2, 3 and 6 of this page
+
+★★★★ **Read this before treating anything above as "the C already did it".** A full audit of the C's
+source (2026-08-10) found that **four items this page and `mode2_doorbell_chid.md` describe as the C's
+solution were planned and not built, or built differently.** The June page is a *build plan*; only some
+of it landed.
+
+**⊘ C1 — There is NO KVM memslot anywhere in the Mode-2 data plane, so "the guest's write lands
+directly" is false.** BAR1 is fully trapping: every guest USERD access is a **VM exit** →
+`bar1_pdb` GMMU walk → `nvkvm_fb_write` → the `m2_fbback` overlay → `stl_le_p` into the host mmap.
+One physical host page, two views — but the guest view is **mediated by a trap on every access**.
+`nvkvm_mmap_host.c`'s memslot machinery (including its `KVM_MEM_READONLY` support) **is never called**
+from the device. ⇒ **The C never achieved the no-exit hot path.** `mode2_forwarding_model.md:114-118`
+describes the untrapped shared page as the intended end state; **it was not built.**
+
+**⊘ C2 — The doorbell is NOT a token lookup.** The C **never translates the guest's token** — the
+written value is used only for gated logging. Ringing is **GP_PUT-driven demux**: on any doorbell
+write, scan every registered channel and ring the host token of each whose `GP_PUT` advanced. This was
+deliberate and *measured*: `mode2_doorbell_chid.md:391-399` records that guest token `0x10001` matched
+**no** host token, so *"doorbell pass-through is INCORRECT"*. ⇒ The body is a **linear scan over 64
+channels**, not an O(1) lookup. Any perf argument that assumes a table lookup is arguing about code
+that does not exist.
+⚠ And **T18** says the alternative is closed: legacy-vGPU host-allocates-chid needs
+`NV_PMC_BOOT_1.VGPU == _VF`; `_PV` falls through to bare-metal and the `IS_VIRTUAL_WITHOUT_SRIOV`
+paths are dead in the open build. **Trap-and-translate is mandatory.**
+
+**⊘ C3 — The ring gate of §6 was never built.** `:4162`: *"Unconditional (the **m2ring gate was
+removed**)"*. What replaced it is **ordering, not gating**: `nvkvm_m2_exec_doorbell` runs the
+working-set sweep and the per-entry pushbuffer walk **before** the ring, in the same function, on the
+same doorbell — *"so the full working set, incl. the semaphore the host must write, is FIXED-mapped
+into the host VAS before any ring (else a ring faults the host GPU on the SEM_RELEASE target →
+**cuInit=999**)"*. Plus a **token defer** that gates on *schedulability*, not on mapping. **"Fully
+mapped" is never computed anywhere.** ⇒ §6's principle (don't fault) is right; the mechanism is
+*sweep-then-ring in one handler*, and `mode2_forwarding_model.md:148` still lists the real gate as
+**future work**.
+
+**⊘ C4 — For userspace channels the C is a DOUBLE WRITER in the shipped config.** `nvkvm_chan_execute`
+parses **every** channel including GR and software-writes `COMPUTE_REPORT_SEM` / `SEM_RELEASE` /
+`CE_SEM_RELEASE`. Suppression requires `m2hostsem`, **default OFF** — an A/B never promoted. The C
+**never observes the host's completion**: it reads host `GP_PUT`/`GP_GET` at ring time only for a
+trace-gated log, and delivers the os-event on **its own** bookkeeping. ⇒ The `:4265` line quoted in §1
+(*"User-CE / GR channels are excluded"*) scopes **only the kernel finishPayload forge**. It is **not**
+a statement that userspace completions were left to the host.
+⚠ Worse, this was deliberate: `M5.38` records that letting the host's writes reach the guest semaphore
+made *"the LAGGING bridged host channel write stale payloads over the live value ~40 s late"*,
+tripping UVM's wrap detector. So in the green config the host's completions were **deliberately kept
+out of the guest's semaphore**.
+
+⇒ ★★★★★ **Consequence for the plan.** "Parity, like Mode-2 C did" is a **lower bar than it sounds**:
+the C traps every USERD access, scans channels per doorbell, and still writes compute semaphores in
+software. Genuine passthrough — an untrapped USERD page and host-owned completions — is **new work,
+not a port**. That is achievable and it is the right target; it must simply not be costed as
+transcription.
+
+⚠ **And one asymmetry to carry into the Rust port:** in the C **the ring is default-ON and the
+observability of the ring is default-OFF**. Every `RANG`, `USERD-WR` and `FORGE` line the design docs
+quote came from a **non-default build**.
+
 ## 6. Faults: prevent, don't handle
 
 `mode2_doorbell_chid.md` item 4, owner, 2026-06-05:
