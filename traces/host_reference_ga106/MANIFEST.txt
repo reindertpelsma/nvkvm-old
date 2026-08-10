@@ -84,3 +84,32 @@ NOISE FLOOR (host vs host, same binary, 12 pairings across 6 stages)
      does not say what our emulation is permitted to do differently and still be
      correct. A divergence is a lead, not automatically a defect.
   4. The GSP RPC layer is NOT captured (see the scoping note in the harness).
+
+⊘⊘ TWO CORRECTIONS TO THE PROVENANCE BLOCK ABOVE — both refuted by the captures themselves
+   on 2026-08-10, at the first firing of the differential against a live guest. Neither
+   invalidates a single reply body; both change how the DIFF must be read.
+
+   ⊘ CORRECTION A — the reference host is a **FIVE-GPU** rig, not the single GPU named above.
+     MEASURED from the captures, no re-run needed: record 1 is nvidiactl CARD_INFO, and its
+     reply carries FIVE populated nv_ioctl_card_info entries (buses 0xc4, 0x41, 0x02, 0x82,
+     0x81; device ids 10de:2504 x2 and 10de:2503 x3). `env_ctx.txt` corroborates it from the
+     other side: devnodes = /dev/nvidia0 /dev/nvidia2 /dev/nvidia3 /dev/nvidia4 /dev/nvidia7.
+     libcuda then reports `devices=1`, so the workload's own stdout gives no hint of this at
+     all — the enumeration is entirely inside cuInit.
+     ⇒ CONSEQUENCE, and it is large: a diff against any single-GPU subject shows four extra
+     GPUs' worth of enumeration as MISSING calls, and the reference's chosen GPU is minor
+     **7**, so `nvidia7:REGISTER_FD` mis-aligns against `nvidia0:REGISTER_FD` on the device
+     node's NAME. The FIRST divergence by index is therefore CARD_INFO and it is a property
+     of the rented box. ⊘ Rank by kind, not by index.
+     ★ The 0x2504 die is still a GA106 and every claim about class/control COVERAGE, reply
+     bodies and the single 0x56 stands unchanged. This scopes the reference; it does not
+     devalue it — the same shape as the C oracle's FIFTH LIMIT.
+
+   ⊘ CORRECTION B — the reference driver is the **CLOSED** module, not "(open)" as written.
+     `env_ctx.txt` records `NVRM version: NVIDIA UNIX x86_64 Kernel Module 580.173.02`. The
+     open module announces itself as `NVIDIA UNIX **Open** Kernel Module for x86_64` — which
+     is exactly what the Mode-2 guest prints for its 580.159.04. So every host<->guest diff
+     is cross-driver (closed 580.173.02 vs open 580.159.04) as well as cross-version, and
+     CLAUDE.md's "the open driver is stricter, treat it as canonical" applies to the GUEST
+     side of the comparison, not the reference side. A divergence may be a version or
+     variant difference; the reference cannot by itself tell you which.
