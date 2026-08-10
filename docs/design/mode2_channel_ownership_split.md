@@ -113,11 +113,59 @@ On Turing+ with GSP-RM:
 what we can accept without honouring precisely. This is what makes host-side scheduling — shared with
 other host CUDA processes and other VMs, and therefore unpredictable — **hideable**.
 
-⚠ **The real risk is not scheduling; it is the guest's WATCHDOG.** If the guest believes a channel
-should have run and it did not (because the host was busy elsewhere), the guest's RM can declare a
-channel timeout and enter robust-channel recovery — which *is* correctness-visible. ⇒ Scheduling
-latency is a perf property **until it trips a guest timeout**, at which point it becomes a
-correctness one. Track the guest's timeout policy, not its priorities.
+⚠ I claimed the real risk was the guest's **watchdog** — that a guest could declare a channel dead
+because our scheduling was slow. **That is refuted, and the refutation is structural.**
+
+### ★★★★ The guest CPU-RM cannot time out a channel at all on GSP hardware
+
+`R580 kernel_gsp.c:541-544`, NVIDIA's own comment, verbatim:
+
+> *"**RC error handling ("Channel Teardown sequence") is executed in GSP-RM.** Client notifications, OS
+> interaction etc happen in CPU-RM (Kernel RM)."*
+
+The guest side is a **pure receiver** of `NV_VGPU_MSG_EVENT_RC_TRIGGERED`. ⇒ **In Mode 2, GSP-RM is
+us. We are the only party that can declare a channel dead.** "The guest times out because our
+scheduling was slow" is, for the FIFO path, **structurally impossible**.
+
+Three supporting refutations, all cited:
+- **The RC watchdog is OFF by default and never watches app channels.** `RmInitAdapter` enables then
+  immediately disables it (`osinit.c:2160,2165`), and NVIDIA's comment says *"**CUDA wants the
+  watchdog disabled**"* (`kernel_rc_watchdog.c:136-137`). It only re-arms on an explicit client
+  request, and what it watches is RM's *own private* `FERMI_TWOD_A` notifier pushbuffer.
+- **UVM has no timeout.** `uvm_spin_loop` returns `NV_ERR_TIMEOUT_RETRY` only to print every 30 s and
+  then loops forever; every UVM wait exits solely on a **non-zero error notifier** — i.e. on an RC
+  somebody else declared. UVM cannot originate a timeout.
+- ⊘ **The emulation 60× timeout multiplier is a dead knob** — `IS_EMULATION`/`IS_SIMULATION` have
+  **no writer** anywhere in `src/nvidia/`. We cannot buy slack by claiming to be an emulator.
+
+### ★★★ What DOES have a clock: the GSP RPC poll — and it is a budget on OUR service latency
+
+`_kgspRpcRecvPoll` waits **1.5 × the RM default** (`kernel_gsp.c:2372-2378`). The default is
+`osGetTimeoutParams` (`os.c:1961-2014`): **4 s in graphics mode, 30 s in compute mode** — so the poll
+budget is **6 s / 45 s**. Mode flips to compute when the guest allocates a `GR_OBJECT_TYPE_COMPUTE`
+class object (`kernel_graphics_context.c:3183-3185`), **which is an RPC we service**.
+
+⇒ ★★★★ **The entire `cuCtxCreate` path runs at the 6 s budget**, and only afterwards does it become
+45 s. Escalation is: `NV_ERR_TIMEOUT` returned and *"we will soldier on"* → **Xid 119** → on the
+**third consecutive** timeout, `gpuMarkDeviceForReset` and **RC of every channel**.
+
+⇒ ★★★★★ **The exposure is our own RPC service tail latency, NOT GPU sharing.** None of these clocks
+measures GPU execution time; they all measure round-trip latency **to us**. Contention with other
+host processes or VMs affects the former, not the latter — unless our service loop is itself blocked
+behind it.
+
+**⇒ THE HARD DESIGN CONSTRAINT THIS PRODUCES, and it binds §5:** *never do long synchronous work
+inside an RPC reply path.* A **real scrub** (case 2 above) issued synchronously during `cuCtxCreate`
+has **6 seconds**, total, including everything else in that RPC. ⇒ The scrub must start the host
+operation and return, with the completion bridged asynchronously — which is the same conclusion the
+vCPU-thread constraint reaches from the other direction. Two independent arguments, one rule.
+
+**Recommendation: change nothing about the timeouts; measure instead.** Instrument per-RPC service
+latency and assert p99 ≪ 6 s during `cuCtxCreate`, ≪ 45 s after. ⊘ Extending them is not available
+anyway: the only lever is a **guest registry key**, which breaks the stock-guest property that is this
+project's headline claim. ⚠ And it would be a **guest-side availability loss we inflict**: a guest that
+cannot time out on GSP RPC cannot detect that we have stopped answering — Xid 119 and the three-strike
+reset are its *last* wedge detector once the above refutations are accounted for.
 
 ---
 
