@@ -39,13 +39,38 @@ useful fact on this page.
 same requirement and found the largest fd-backed RAMBlock at realize time.
 
 ⇒ Two ways to get there, and the choice is an ⊘ **OPEN** one:
-- **(A) Launch-time.** Require the memfd backend on the QEMU command line and adopt it. Simple,
-  zero new QEMU surface, but it is a **deployment constraint** on every VMM we support.
-- **(B) Adapter capability.** Extend the host trait to expose *(RAMBlock fd, offset)* for a machine
-  RAM region. More code, no deployment constraint, and it is the shape the KVM backend already has.
+- **(A) Launch-time.** Require `memory-backend-memfd,share=on` and take the descriptor. **Measured
+  2026-08-10 on a real bench:** with the flag, fd 14, **2 GiB, `rw-s`, openable from another
+  process**, containing `Linux version` / `nvkvm-guest` / `systemd` / `nvidia` — **live guest
+  memory**. Without it, no such fd and no `rw-s` mapping ≥ 1 GiB at all. Both configurations print a
+  **byte-identical** `memory plane realized` line, so the flag is **observationally neutral**;
+  default stays off. ★ And it is *free*, not merely faster, for a reason worth stating: a memfd is
+  pathless but is an **open fd in the shim's own process**, reachable via `/proc/self/fd`.
+- **(B) Adapter capability.** Expose *(RAMBlock fd, offset)* for a machine RAM region. No deployment
+  constraint, and it is what ships for any VMM whose command line we do not control.
 
-★ (B) is the better long-term answer and (A) is the faster first boot. They are not exclusive —
-(A) unblocks the first passthrough rung, (B) is what ships.
+⊘⊘ **CORRECTION (2026-08-10) — an earlier revision of this page said "have the shim adopt the memfd
+as one of its own windows." That is STRUCTURALLY IMPOSSIBLE, not merely unbuilt.**
+`kayfabe-vmm-qemu/src/lib.rs:1173-1181` refuses guest DRAM on **two independent grounds** before it
+ever looks at a backing: it is *"not inside any realized BAR"*, and — verbatim —
+
+> *"★★★ The reservation BAR must be one the hypervisor does **NOT** back. **This is the whole §1.5
+> safety argument, asked rather than assumed.**"*
+
+⇒ Adopting guest RAM as a window would require **deleting that check**, i.e. deleting the
+memslot-safety argument. **The crossing needs a concept that is not a window.** ⚠ Same family as
+[[same-class-id-opposite-directions]]: a prescription that points at removing a boundary in order to
+enable a capability.
+
+⊘ Two smaller corrections to the same revision: *"the KVM backend already has the right shape"*
+invites porting a shape across — the two `export_ram` bodies are **the same code**, ~85 % identical;
+the difference is **ownership**, not shape. And *"every reply is read with an fd allowance of zero"*
+reads as "flip a 0 to a 1" — in fact there is **no `recvmsg` reader on the request path at all**.
+
+⚠ **A latent bug found before the first caller could arm it:** `export_ram` and `register_backing`
+share **one `exports` Vec and one token index space** on *both* backends, so a `RamHandle.token` is a
+valid `HostRegion.id` and would `MAP_FIXED` **guest RAM into a guest window**. Inert only because
+`export_ram` has no callers. **Fix it before wiring the first one.**
 
 ---
 
