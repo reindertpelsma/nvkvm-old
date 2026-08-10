@@ -140,6 +140,40 @@ were not HEAD's.
   semantics; the open driver is stricter, treat it as canonical. Both closed + open drivers must
   work.
 
+## ★★★ The LIVE oracle — `tests/mode2/nvdiff/` + `traces/host_reference_ga106/`
+
+★ Every other oracle here is **static** — recorded captures answer only the questions someone thought
+to record. This one is **queryable**: the same CUDA program traced on a **real host** and in **our
+guest**, diffed. It replaces *"I infer the wall"* with *"we diverge at record N, on this id."*
+
+- `nvdiff_shim.c` — `LD_PRELOAD` recorder; every `/dev/nvidia*` ioctl with the parameter buffer
+  **on both sides of the call**. ⊘ `strace` is **not** a floor here: without a before/after pair you
+  cannot tell *"RM wrote nothing"* from *"we didn't capture the reply"*.
+- `nvdiff.py` — align + classify (MISSING / EXTRA / SIZE / STATUS / VALUE). `nvd_prog.c` — staged
+  workload (`ce` is the `cup2` shape). `scripts/mode2_diag/nvdiff_run_guest.sh` — the guest half.
+- **Noise floor MEASURED ZERO** over 12 pairings / 6 stages, and `nvd_selftest.sh` checks the differ
+  for **detection** offline with no GPU: it must find exactly **479** divergences (`dev` vs `ctx`) and
+  **5** (`ctx` vs `alloc`). ⚠ Run it before trusting any diff.
+
+**What it has already established, all measured:**
+- The guest runs in **lockstep** with hardware to `UVM_MAP_EXTERNAL_ALLOCATION` — **221 of
+  `cuCtxCreate`'s 479 ioctls (46.1 %)** — then calls `0x20801702` ×175 until killed. ★ Hardware calls
+  that id **zero times** in the whole program.
+- ★★ **Hardware returns non-OK EXACTLY ONCE in 613 records** (`0x2080012f`, in `cuInit`). So *"`0x56`
+  is the forgiven status"* is no longer a heuristic — **every other `0x56` we emit is a divergence**.
+- **A kernel launch costs zero RM ioctls** — the `launch` and `ce` stages are byte-identical. ⊘ This
+  oracle bounds the **control plane only**; a green diff says nothing about doorbells or completions.
+- `GPU_GET_NAME_STRING` returns the right size and **23 zero bytes** where hardware returns
+  `"NVIDIA GeForce RTX 3060"` — which is why `nvidia-smi` prints `ERR!` in the Name column.
+
+⚠ **Two rules it taught, both paid for:**
+- ★ **RANK DIVERGENCES BY KIND, NEVER BY INDEX.** The first *by index* was `CARD_INFO` — environmental,
+  because the reference host is a **five-GPU rig** running the **closed** driver.
+- ★ **An ioctl number is not a length because its bits parse as one.** Trusting `_IOC_SIZE` produced
+  **2672** phantom divergences: nvidia-uvm numbers are raw integers, and `UVM_INITIALIZE = 0x30000001`
+  decodes as `size = 12288` against a **16-byte** struct — so ~500 bytes of unrelated stack were being
+  recorded as "the parameter" and diffed.
+
 ## Reference traces (the oracle's output — `traces/mode2_c_reference/`)
 
 | capture | records | hermetic? | what it is for |
