@@ -148,6 +148,28 @@ POSITIVE PROOF of unbackedness or of danglingness.** "We have no record of this 
 either — this tree has already had orphan-generation lifetime bugs where our record and reality
 disagreed.
 
+### ★★★★ OWNER RULING (2026-08-10) — staging, and the constraint proof alone does not give you
+
+> *"Cases 1 and 3 are **pure optimisation** that require **both hard proof and a lock** to prevent a
+> race falsifying the proof during the optimised scrub — like a free. **If that fails, case 2 always
+> applies.** … Start with 'always really scrub': **yes, 100%**. Cases 1 and 3 are purely a shortcut."*
+
+⇒ **Build order is settled: case 2 only, first.** Cases 1 and 3 are a later, separately-justified
+optimisation and must never be the path of first resort.
+
+★★★★ **And the lock requirement is a distinct constraint from the proof, easy to miss.** A proof of
+unbackedness or danglingness is a statement about **an instant**; the optimised action (a free, or
+skipping the scrub) takes **time**. Between proving and acting, the guest can allocate into the page,
+take a reference, or map it — **falsifying the proof after it was correctly obtained**. ⇒ The proof and
+the optimised action must be **under one lock**, and **failure to take that lock is not a reason to
+retry the optimisation — it is a fall-through to case 2.** A correct proof is not sufficient; it must
+still be true at the moment of the act.
+
+⚠ This is a **TOCTOU on a security boundary**, and this tree has already produced the general form of
+it once — *"a correct capture can answer the wrong question: the question was about a LIFETIME, the
+instrument sampled one instant."* The scrub optimisation is exactly that shape, with a data leak as
+the consequence rather than a wasted rung.
+
 ### The general pattern for an emulated kernel channel
 
 > We write the semaphore, and optionally send an interrupt if an os-event is set. If a **real** host
