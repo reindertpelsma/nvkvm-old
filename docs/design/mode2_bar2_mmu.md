@@ -1,5 +1,22 @@
 # Mode-2 M6: BAR2 GMMU page-walk (address-virtualization keystone)
 
+> ### STATUS — 2026-08-11 (w258 doc-hygiene sweep) / **ANSWERED 2026-06-03 — "NEXT" below is STALE by ~2 months**
+>
+> ⊘ **The literal string "Status: NEXT" below has read as current for two months.** It was true
+> for about 28 minutes. Determined from git history, not from the prose:
+>
+> - ★ **The gate was cracked the same day.** `acaabbf` (2026-06-03, 28 min after this doc's only
+>   commit `d155d74`) wired the VER2 walk to PCI BAR3; `fc067d0` (2026-06-03) is *"**BAR2 GMMU
+>   works — kbusVerifyBar2 PASSES (address-virt gate cracked)**"*. The "remaining sub-test" this
+>   doc names as the open item is closed.
+> - ⊘ **The mechanism below also changed.** This doc proposes capturing the instance block via the
+>   `0x1714` write. `da6a366` records that attempt as *"instblk PRAMIN-snoop attempt (**did NOT
+>   fire**)"*, and `af05c87` re-sourced the PDB from `GspStaticConfigInfo.bar2PdeBase` instead.
+>   ⇒ Read the walk description as background; do not implement the capture step.
+>
+> ⇒ Mode-2 went far past this rung: the C artifact reproduced `cuCtxCreate → 2048² matmul` at
+> `bad=0 maxerr=0` on a stock guest (`CLAUDE.md`; `traces/mode2_c_reference/cap3_matmul_forwarding`).
+
 Status: NEXT. The fake-boot + full GSP RPC/control replay is complete (the stock
 driver runs to `kbusVerifyBar2`). The BAR0 PRAMIN window + sparse FB backing are
 implemented (commit 8de2074) and the **first** kbusVerifyBar2 sub-test (BAR0

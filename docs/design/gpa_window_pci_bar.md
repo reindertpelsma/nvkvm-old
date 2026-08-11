@@ -1,5 +1,19 @@
 # Design: GPA window as a 64-bit PCI BAR (#55)
 
+> ### STATUS — 2026-08-11 (w258 doc-hygiene sweep) / **LIVE — BUILT, and the design still matches the code**
+>
+> Verified from git history, not from this doc's prose. The terminal "IMPLEMENTED (2026-05-30)"
+> section still describes HEAD: `src/qemu/virtio_nvgpu_pci.c:108-114` uses `memory_region_init_io`
+> (explicitly *not* `_ram_ptr`) plus `pci_register_bar(..., NVKVM_BAR_WINDOW, ...)` and
+> `window_base_get`. Last content commit `e540bb6` (2026-05-30).
+>
+> ★ **One challenge was raised and then withdrawn, and neither event is recorded below.**
+> `6d6b9c2` (2026-06-02) reported *"GPA window is UC in EPT (MMIO BAR), guest-side unfixable"* —
+> which would have refuted this design. It was **refuted itself 3.9 hours later** by `d1247f7`
+> (2026-06-02), which fixed it **guest-side** with `nvkvm_force_range_wb()` and left the BAR
+> design untouched. ⇒ The design stands; the doc simply never absorbed the UC-in-EPT consequence
+> or its fix, so a reader meeting `6d6b9c2` first would wrongly conclude this doc was dead.
+
 ## Problem
 
 nvkvm maps host GPU memory into the guest by installing host buffers as KVM

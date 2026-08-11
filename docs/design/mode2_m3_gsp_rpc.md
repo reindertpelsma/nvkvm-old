@@ -1,5 +1,27 @@
 # Mode-2 M3 — GSP-RPC emulation spec (the keystone)
 
+> ### STATUS — 2026-08-11 (w258 doc-hygiene sweep) / **ANSWERED 2026-06-03 — the GOAL was met; the METHOD below was ruled out**
+>
+> ⊘ **This doc was TRUE when written and is kept for its protocol reference, but do not follow
+> its "next concrete code step".** Determined from git history, not from the prose.
+>
+> - ★ **The goal was reached.** "Make `RmInitAdapter` succeed … post `GSP_INIT_DONE`" is
+>   **ANSWERED** by `855ce3a` (2026-06-03) — *"M4 MILESTONE — stock 580 driver inits on emulated
+>   GA106, nvidia-smi sees it"*.
+> - ⊘⊘ **The method this doc proposes was REFUTED 63 minutes after the doc's own last commit.**
+>   Its closing step — *"hardcode the GA106 constructed-falcon table response for cmd
+>   `0x208001b0`"* — is exactly what `aac4484` (2026-06-03) rules out: *"**rule OUT response
+>   fabrication** … GET controls need REAL FINN-serialized responses … revert non-working
+>   empty-falcon hack"*.
+> - ⇒ **The path actually taken was CAPTURE, not fabrication**: `e142889` → `0de4b94`
+>   (*"regen replay table from STREAMED capture, 56 controls"*), which is the table now living in
+>   `src/qemu/mode2_initctrl_ga106.h`.
+>
+> ⚠ And read that table's own limit before trusting it: **11 of its 56 rows carry `dlen = 0`**,
+> and every empty row checked against a real GA106 is **contradicted** (see `CLAUDE.md`, "FIFTH
+> LIMIT"). An empty capture is evidence of nothing — which is the same failure mode, one layer on,
+> as the fabrication `aac4484` ruled out.
+
 Goal: make `RmInitAdapter` succeed by emulating just enough of the GSP-RM
 message protocol to post **GSP_INIT_DONE**, so the stock driver believes it has
 a live GPU. Entry state in [[mode2_m2_results.md]]. Structures below are from

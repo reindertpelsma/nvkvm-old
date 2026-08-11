@@ -1,5 +1,22 @@
 # Signal / interrupt delivery during forwarded ioctls — DESIGN (not yet implemented)
 
+> ### STATUS — 2026-08-11 (w258 doc-hygiene sweep) / **BUILT 2026-05-30 — the title and the status line below are both STALE**
+>
+> ⊘ **"not yet implemented" / "implementation deferred" has been false since the day after this
+> doc was written.** Determined from git history, not from the prose.
+>
+> - ★ **`bbc7ef7` (2026-05-30, one day later) — "#73: signal/interrupt delivery during forwarded
+>   ioctls"** implements this design end to end across guest / QEMU / stub: `NVKVM_REQ_INTERRUPT`,
+>   `ISOLATE_CMD_INTERRUPT`, per-worker `worker_inflight_txn[]`, a `SIGUSR1` handler installed
+>   **without** `SA_RESTART`, and `tgkill` allowed in the seccomp filter.
+> - ★ **It was measured on real hardware** (RTX 3060): a `SIGTERM` kill completes in **3.4–3.5 s**
+>   against **28 s** before. The correctness argument below is therefore settled, not pending.
+> - ⚠ **One detail below does NOT match the build**: this doc specifies `pthread_kill`; the
+>   implementation uses **`tgkill`**. Follow the code.
+>
+> ⇒ Keep this doc for its rationale (why interruptibility is *correctness*, not polish). Do not
+> cite it as an open milestone.
+
 Status: **design captured, implementation deferred** (its own milestone). This is
 *correctness*, not polish: without it a guest process that is Ctrl-C'd, times out,
 or is SIGSTOP'd mid-GPU-call behaves differently from native Linux (the call can't
