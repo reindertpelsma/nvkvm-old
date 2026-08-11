@@ -64,22 +64,67 @@ so `RingOwner::HandedIn` maps *nothing of ours* into the guest's space. It is **
 **one caller — the R31 probe**. Promoting it to the doorbell path removes the residual **as a
 side effect of work the execution plane needs anyway**.
 
-### ⊘ Ruling 2 (kernel CE VA spaces need not exist) does NOT dissolve this
+### ⊘⊘ RETRACTED — "ruling 2 does not dissolve this" was MY BAD RELAY (owner, 2026-08-11)
 
-Two code facts refute the premise:
-1. **Every CE copy this tree can issue is VIRTUAL, by a standing refusal** — `ce_pushbuffer` ORs
-   `LAUNCH_SRC_VIRTUAL | LAUNCH_DST_VIRTUAL` (`rm.rs:1930`); the `_PHYSICAL` variants exist only
-   as decode-side constants, refused by name (*"nothing in this project's threat model permits
-   it"*). ⇒ Kernel CE work needs **a** host VA space. The ruling can delete the **guest's** space,
-   never **a** space.
-2. **No producer of an executor-space mapping starts anywhere but the guest space** —
-   `map_dma_both` runs `raw_map_dma(guest_range, …)` **first** and feeds RM's returned address
-   into the shadow. The VMM translation the ruling invokes exists in `AddressTable::resolve`, but
-   **no verb consumes it that way.**
+★ **I wrote that ruling 2 was "refuted on two code facts". It was not, and the owner caught it.**
 
-⚠ **Applied literally today, ruling 2 turns kernel-channel forwarding OFF**: with no `host_vas`,
-`plan_doorbell` returns `FwdFault::NoVas` and `plan_ce` returns `FwdFault::NoHostVas` — hard
-refusals. It does not reroute; it refuses.
+**The error is a CONFLATION OF TWO SPACES.** Fact 1 — *"every CE copy this tree can issue is
+VIRTUAL (`LAUNCH_SRC_VIRTUAL | LAUNCH_DST_VIRTUAL`, `rm.rs:1930`; the `_PHYSICAL` variants refused
+by name), therefore kernel CE work needs **a** host VA space"* — is **true, and it is about the
+SCRATCHPAD's space**, i.e. the owner's *managed* channel. It says **nothing** about whether the
+**guest kernel channel's** VAS must exist on the host. Those are different spaces, and I relayed a
+claim about one as if it settled the other.
+
+**The owner's reasoning, which stands:** a guest kernel channel is **emulated** — we manage its
+USERD / ring / pushbuffer / semaphore in fake framebuffer, and the guest kernel believes it is
+driving a real GPU while it is driving us. Its VAS need not exist on the real GPU because
+**(1)** the channel does not exist there either, and **(2)** we intercept the commands *and every
+operand that can carry a VA*, so we translate them ourselves. Real GPU work derived from a kernel
+command runs on a **separate scratchpad channel with different VAs**, which we maintain with our
+own GPFIFO / ring / USERD / pushbuffer / semaphore.
+
+⚠ **And "applied literally today it turns forwarding OFF" was not an argument either.** With no
+`host_vas`, `plan_doorbell` returns `FwdFault::NoVas` and `plan_ce` returns `FwdFault::NoHostVas`
+— but that is a statement about **today's wiring**, which routes kernel CE through the guest's host
+VAS. A ruling that says *stop doing X* necessarily breaks code that does X. ⇒ **That is the work,
+not a refutation.**
+
+### ★ What SURVIVES from that pass — a finding, not an objection
+
+**Fact 2 is real and worth keeping**: `map_dma_both` runs `raw_map_dma(guest_range, …)` **first**
+and feeds RM's returned address into the shadow, so today **operands enter the executor space
+THROUGH the guest space**. The VMM translation the ruling invokes exists in
+`AddressTable::resolve`, and **no verb consumes it that way.** ⇒ The mapping path is **built the
+wrong way round for the emulated axis**. That is a thing to fix.
+
+★★ **And the undecodability objection does not reach the ruling**, for a reason worth stating: the
+MME defeats every method allowlist (guest microcode whose output is commands), which kills
+"decode everything" **in general** — but it bites only on graphics/compute, which under the
+owner's split is **passthrough and never decoded**. ⇒ **You only have to fully intercept what you
+emulate, and you emulate only the kernel's channels.** The two-axis split is what makes the
+interception claim survivable.
+
+### ⇒ THE MISSING DECLARATION (owner, 2026-08-11) — and it is measured absent
+
+> **Every channel we present to the guest is one of two kinds** — **passthrough** (unprivileged
+> userspace) or **emulated** (privileged kernel). **Every channel we allocate on the host** is one
+> of two kinds — **passthrough** (unprivileged guest userspace, isolated) or **managed** (usually
+> scratchpad; need not be isolated).
+
+✔ **MEASURED 2026-08-11 — this abstraction is NOT in the Rust core:**
+- `kayfabe_core::gpu::Channel` (`gpu.rs:369`) carries `id`, `key`, `gpu`, `vchid`, `vas_pdb`,
+  `vas_origin` — **no kind, and no privilege axis at all.**
+- The **guest-facing** axis exists only as a *derivation*: `ClientKind::{Kernel, User}` on the
+  owning client, reachable via `by_pdb → ProcId`. Never on the channel.
+- The **host-side** axis exists only as `RingOwner::{Ours, HandedIn}` (`rm.rs:527`) and
+  `RingSource::{Ours, Guest}` (`rm.rs:681`) — both declared **without `pub`**, private to one
+  file, so **the core cannot speak them**, and both describe the **ring**, not the channel.
+
+★★★ **The cost is already paid and measured**: `forwarding_plane_owns_ce`'s `proc != SYSTEM_PROC`
+term **is** the guest-facing axis. Its absence cost **12 boots** of `RmInitAdapter` `NV_ERR_TIMEOUT`,
+and it was fixed by **inlining the derivation into one gate** rather than by declaring the kind.
+⇒ Same shape as the GPGA region kind (`gpga_region_kinds.md`) and the dropped channel `engineType`:
+**the tree derives what the guest declared.**
 
 ### ⚠ NEW, `[NOT MEASURED]` — an exposure the separation itself created
 
