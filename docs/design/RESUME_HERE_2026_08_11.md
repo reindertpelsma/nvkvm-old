@@ -25,6 +25,53 @@ fetch the guest's own ring.
 
 ---
 
+### ★★★★★ UPDATE, LATE 2026-08-11 — THAT RUNG WAS BUILT, AND IT IS ONE LEG OF THREE
+
+**Settled at the code, not inferred.** Making the host GPU execute the guest's GR work needs
+**three** legs, and the doorbell is the third:
+
+| leg | what it is | state |
+|---|---|---|
+| **A — the RING** | the host GR channel must be **born** over the guest's GPFIFO | ⚠ verb **BUILT** (`alloc_channel_over_guest_ring`, w230) — **ONE caller, the R31 probe.** The production birth path gives every GR channel `RingSource::Ours(None)` |
+| **B — the CURSOR** | `GP_PUT` must be a word the **guest** advances ⇒ the guest's **USERD**, handed to RM **at creation** | ⊘ **NOT BUILT.** ★★★ RM **ZEROES** a caller-supplied USERD (#250) — adopting at first doorbell wipes the cursor that rang it |
+| **C — the DOORBELL** | trap, translate guest token → host token, ring | ✔ **BUILT** `b734995`, branch `hostgr-passthrough-server`, default-off behind `KAYFABE_GR_ROUTE=passthrough` |
+
+**Why C alone moves nothing**: a channel born `RingSource::Ours(None)` has its `gpFifoOffset` on
+**our** ring object and its `GP_PUT` in **our** USERD, and the only writer of that word
+(`submit_entry`, `rm.rs:4330`) refuses a handed-in ring **by name** (`RING_NOT_OURS`).
+⇒ `GP_PUT == GP_GET` forever. Ringing the doorbell points hardware at a queue that is empty and
+always will be.
+
+★★★ **The tree already said this and nobody was reading it.** `GuestRing`'s own doc comment
+(`rm.rs:653`): *"Nothing in this rung writes the guest's `GP_PUT` into our USERD, so the engine
+still has nothing to fetch. **Adopting the ring and advancing the cursor are two rungs, and this is
+the first.**"* And `guest_ring_adoption.md` §3 already said *"the host channel's birth has to
+move"*. Fifth instance of *check whether the question is already answered* — but the **good**
+shape: caught **before** the wrong thing was built.
+
+⚠ **HONOUR THE PRE-REGISTRATION.** With only leg C, `CUP2_RC` moves by **ZERO** steps.
+⊘ **That must NOT discharge §3's standing debt** (*"if the routed-doorbell boot also moves by one
+step, doubt the model"*). **A one-legged stool falling over is not evidence against stools.** The
+debt is discharged only by a boot with **A + B + C together.**
+
+★★★ **The new blocker under leg A is a CALLER gap, not a missing primitive.** `join_fb_leaf` is
+merged and proven on hardware, but it is driven by the **OPERAND** census — w260 joined FB phys
+`0x400000 / 0x600000 / 0x800000`, while **the ring sits at `0x1000000` and is never presented,
+because a ring is not an operand of the methods it carries.** ⇒ Give the join a **second source:
+the channel's own `ring_va`.** ⚠ The ring lives in the **emulated framebuffer**, so the owner's
+invariant — *no fake FB to a real GPU VA of an isolate except the scratchpad* — is directly in
+that path.
+
+**What leg C did buy, and it is not nothing**: the token question is **settled by code**. Guest→host
+translation is a **plain field read** (`Channel::host_token: Option<u64>`), not a map lookup, and
+**no hop reads the engine**. The C-era *"a guest token matching no host token"* is that `Option`
+being `None` — *not materialized yet* — and it is already `Some` before the first doorbell.
+⇒ *"Generalise the CE path to GR"* was **vacuous**: `SharedDevice::doorbell` was never
+copy-engine-specific, and the missing production wiring was **one arm in one `if`**.
+⚠ It **re-opens a path closed on evidence** at §16.65, hence armed, printed, controlled, default-off.
+
+---
+
 ## 2. WHAT LANDED TODAY — `master` moved `d55187a → e758778` (first time in days)
 
 | | |
@@ -99,14 +146,21 @@ counts as production. It reports only the **outermost** orphan. And a severance 
 
 ## 6. NEXT RUNGS, ORDERED
 
-1. ★★★ **Give `HostGr` a passthrough server** — the standing debt in §3 is discharged by this.
+1. ⊘ ~~Give `HostGr` a passthrough server~~ — **DONE `b734995`.** See §1's update: it is **leg C of
+   three**, and on its own it discharges nothing. Superseded by 1a/1b below.
+1a. ★★★ **LEG A — birth the GR host channel over the guest's ring.** Two halves: give the FB join a
+   **second source** (the channel's own `ring_va`, since the operand census can never present a
+   ring), then point the production birth path at `alloc_channel_over_guest_ring`.
+   ⚠ `guest_ring_census.rs:168` asserts that verb has exactly **one** caller — a deliberate
+   tripwire. Adding a production caller turns it red; update it **deliberately**.
    ⊘ Do **not** build a GR "handler"; the owner ruled that is the thing that should not exist.
    ⚠ Ring resolution / pushbuffer reads / method decode are **DEBUG**: flag-gated, non-fatal, and
    they must **never gate** whether the doorbell is forwarded. Follow `dump_gr_pushbuffer_once`'s
    shape (*"PRINT-ONLY: advances no cursor, writes no state"*).
-2. **USERD adoption AT CHANNEL CREATION** (#250) — hardware-confirmed possible;
+1b. ★★★ **LEG B — USERD adoption AT CHANNEL CREATION** (#250) — hardware-confirmed possible;
    ⚠ **RM ZEROES a caller-supplied USERD**, so adopting at first doorbell **wipes the cursor that
-   caused the doorbell**. Never lazily.
+   caused the doorbell**. Never lazily. May need a new `hUserdMemory` hand-in arm in
+   `alloc_channel_in`; if so that is a **primitive to build**, not a blocker.
 3. **Fault injection** for §4's three unknowns.
 4. The emulated arm must **schedule asynchronously**, not run on the vCPU thread (owner ruling);
    ⚠ measured today the trap **is** inline end to end: BQL → `regs_write` → `ring_doorbell` (RwLock
