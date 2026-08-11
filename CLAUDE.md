@@ -114,6 +114,21 @@ were not HEAD's.
 
 ## Design docs (`docs/design/`)
 
+★★★ **DOC HYGIENE — three rules, each paid for (2026-08-11).** This tree's most expensive recurring
+failure is **not** a missing document; it is **a correct document that stopped being true and did not
+say so**. Measured five times in two days, including a ruling superseded **the next day** that sent
+two bench lanes at work already proved unnecessary, and a doc committed **the day before** that
+already held the answer a rung then re-derived wrongly.
+- ★ **Every design doc opens with a dated `STATUS` block.** LIVE / SUPERSEDED-BY / ANSWERED /
+  DESIGN-ONLY. A doc with no status reads as current forever.
+- ★★ **A correction FOLDS INTO its parent, above the thing it corrects — never beside it.** A
+  correction living as its own file leaves the parent reading as current and requires the reader to
+  already know the correction exists. That is the exact shape that cost the two lanes.
+- ⊘ **Record supersession IN the superseded text, not only in the successor.** Nobody reads forward
+  from a stale doc. ⇒ **A ruling's DATE and its ARCHITECTURE are both part of the citation**: ask
+  *why* it decided that, and whether the why survives today's design.
+
+
 - **Forwarding model (read first for Mode-2):** `mode2_forwarding_model.md` — translate guest
   *intent* to unprivileged host userspace ops; never replay privileged GSP-internal controls;
   correctness = observable end-states only.
