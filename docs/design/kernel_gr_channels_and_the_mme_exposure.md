@@ -6,6 +6,13 @@ Q1 (kernel GR channels) is **new material**. Q2 (what the C did) is **NOT new** 
 answered on **2026-08-10** in `mode2_channel_ownership_split.md` §5b; this page adds two facts and
 otherwise **defers to that page**. Do not re-derive Q2 from here.
 
+★★★ **§1.7 added 2026-08-11 — READ IT BEFORE TREATING §1.5's QUALIFICATION 2 AS OPEN WORK.** §1.5.2
+says the watchdog's channel/object/pushbuffer *"are all built at `RmInitAdapter` regardless"*, which is
+true of the **guest** and reads as a residual for **us**. It is not one: `nvkvm-rs@425c450` serves the
+golden-image tree end to end and refuses the watchdog's three allocations **by name**, all measured on
+committed boots. §1.7 has the port-side audit, the one thing that IS missing (a class on
+`PushMethod::Opaque`), and the reason this was commissioned twice.
+
 Source of truth for Q1: `research_clones/ogkm-580.159.04` (`version.mk:1` → `NVIDIA_VERSION =
 580.159.04`; git HEAD `b81d58e`). ⚠ `research_clones/ogkm` is a **different** version, **610.43.02** —
 not read for this page. `ogkm` is versioned, not a spec.
@@ -154,8 +161,132 @@ two-axis split rests on. **The two-axis design survives Q1.**
   `GspRmAlloc failed: hClient=0xc1d00008; hParent=0x31415903; hObject=0x31415900; hClass=0x0000c36f`
   then `Assertion failed: status == NV_OK @ kernel_rc_watchdog.c:1198`. ⇒ Live boots, this month, of the
   guest kernel building the watchdog GR channel.
+  ⊘ **`[measured 2026-08-11]` the count is understated and the direction matters**: `grep -l 31415900`
+  over `../nvkvm-rs/docs/reference/bench_evidence/` returns **19** files, **12** of them `*_dmesg.log`.
+  Under-counting evidence is the benign direction, but the number was written from a sample, not a count.
 - Same logs `:17` — `kgraphicsCreateGoldenImageChannel(pGpu, pKernelGraphics) @ kernel_graphics.c:508`.
   ⇒ The golden-image path is live on a GSP client, as `IS_GSP_CLIENT` predicts.
+
+### 1.7 ★★★★★ THE PORT SIDE — what `kayfabe` actually does with both allocations `[measured 2026-08-11, nvkvm-rs@425c450]`
+
+⊘ **This section exists because §1.5's qualification 2 reads as an open residual and it is not one.**
+Everything below is read from the **consuming** crate (`kayfabe-rmrpc`, `kayfabe-fwd`) and corroborated
+against committed boot logs, never from a text search alone.
+
+#### ⊘⊘ (a) The golden-image channel `0xbaba0045` is SERVED, and its 3D object has been served since 2026-08-08
+
+`0xbaba0045` never failed. In the one boot log that names it at all
+(`run_pro1_423bf08_dmesg.log:11`) it appears **only as `hParent`** — i.e. the port had already accepted
+it as a live object — and the alloc that failed was its child `0xbaba0046`, `AMPERE_B` `0xc797`. The
+channel's own class is `AMPERE_CHANNEL_GPFIFO_A` `0xc56f`, which is permitted
+(`nvkvm-rs: crates/kayfabe-abi/src/capability.rs:1080`) **and** decoded
+(`crates/kayfabe-abi/src/versions.rs:1119` → `AllocParams::Channel`).
+
+`0xc797` was then admitted the same day (`capability.rs:1146` `Origin::Empirical`,
+`versions.rs:1176`), and `[measured 2026-08-08, boot amb1_ee1994b]` the whole 3D-object chain went
+**silent** — five dmesg lines removed, zero added, `run_amb1_ee1994b_dmesg.log` contains no `0xbaba…`
+line at all (`nvkvm-rs: docs/design/execution_plane_increments.md` §14.26).
+⇒ **The golden-image tree is fully served today. There is nothing to make explicit.**
+
+#### ⊘⊘ (b) The C's mislabel was **NOT** inherited into the Rust port
+
+`git grep -nE '0xbaba|0x3141' 425c450 -- crates` finds **no handle-value special case anywhere**. The
+only occurrences are prose: a doc comment in `crates/kayfabe-rmrpc/src/policy.rs:248` that quotes a
+measured refusal. The port has **no** analogue of `nvkvm_gpu_emul.c:7010-7012`'s
+`is_sentinel = ((hObject & 0xffff0000u) == 0xbaba0000u) || ((hObject & 0xffffff00u) == 0x31415900u)`.
+★ The mislabel was also caught independently on the Rust side — `execution_plane_increments.md:9323`:
+*"Only knowing that `0x31415900` is not a libcuda handle…"*.
+
+#### ★ (c) The watchdog's allocations are refused **BY NAME**, on three different gates, and counted
+
+Nothing silently defaults. `[measured 2026-08-08, boot amb1_ee1994b]`
+(`nvkvm-rs: docs/reference/bench_evidence/run_amb1_ee1994b_qemu.log:83-89`) the boot summary prints the
+whole refusal census, and it reconciles exactly with the three `GspRmAlloc failed` lines in the same
+boot's dmesg:
+
+| the watchdog asks for | our gate | named refusal | site |
+|---|---|---|---|
+| `0x0070` `NV01_MEMORY_VIRTUAL` (`kernel_rc_watchdog.c:669-676`) | permitted (`capability.rs:827`), **no decoder** | `BridgeRefusal::UnmappedAllocClass` | `crates/kayfabe-rmrpc/src/lib.rs:1276` |
+| `0xc36f` `VOLTA_CHANNEL_GPFIFO_A` (`:1096-1101`) | **not on the allowlist** | `BridgeRefusal::AllocClassNotPermitted{denial: NotOnAllowlist}` | `crates/kayfabe-rmrpc/src/lib.rs:1268-1272` |
+| its GR context promotion `0x2080012b` | client/object unknown to the graph | `PromoteFault::UnknownContextObject{client: 0xc1d00008, object: 0x31415900}` | `crates/kayfabe-rmrpc/src/policy.rs:248` |
+
+The same log's control census shows `control 0x2080012b result 0x00000000 x2` **beside**
+`result 0x00000056 x2 REFUSED` — the golden image's two promotions served, the watchdog's two refused.
+⇒ `PromoteFault::UnknownContextObject` is not a shrug; it is the discriminator that separates the two
+callers of one control id.
+
+★ **Its `ClientKind` is `Kernel` and its declared channel kind is NOTHING — because the alloc never
+reaches the object model.** `hClient=0xc1d00008` is a kernel-RM client, so it declares
+`processID == KERNEL_PID` and classifies `ClientKind::Kernel` on a Linux guest
+(`crates/kayfabe-abi/src/guest_os.rs:259,285`), which folds it into the one `SYSTEM_ANCHOR` component
+(`crates/kayfabe-core/src/project.rs:107,1160-1170`). **Had** the channel been admitted it would
+therefore be `GuestChannelKind::Emulated` (`project.rs:311-317` — the one derivation) and hence
+`HostChannelKind::Scratchpad` (`crates/kayfabe-core/src/channel_kind.rs:309`). ⊘ But it is refused at
+the bridge, so no `ChannelFacts` is ever materialised and **no kind is declared for it at all**. That
+is the honest answer, and it is not the same as "Emulated".
+
+#### ★★★ (d) `0xc36f` on GA106 is CORRECT stock behaviour, not an artefact of our device
+
+⊘ Worth stating because it looks like a bug and is not. GA106's own class list carries **three**
+`ENG_KERNEL_FIFO` GPFIFO classes — `AMPERE_CHANNEL_GPFIFO_A` (`g_gpu_class_list.c:1113`),
+`TURING_CHANNEL_GPFIFO_A` (`:1166`) and `VOLTA_CHANNEL_GPFIFO_A` (`:1168`) — and the watchdog's private
+`gpfifoMapping[]` is scanned **first-match-wins in ascending-arch order**
+(`kernel_rc_watchdog.c:622-652`), so it stops at **Volta** and never reaches Ampere. Real silicon does
+the same. ⇒ Admitting `0xc36f` would be admitting a class a real GA106 genuinely serves, not papering
+over a wrong class list. (`nvkvm-rs: execution_plane_increments.md` §14.22 records this and the
+contrasting `kfifoGetChannelClassId` numeric-maximum rule that gives the golden channel `0xc56f`.)
+
+#### ★★ (e) If the watchdog ever DID submit — there are TWO gates before a method, and only the third is silent
+
+The five `NV902D_*` methods cannot be reached today, and opening one gate alone changes nothing:
+
+1. **Channel alloc** `0xc36f` — refused, `NotOnAllowlist` (above).
+2. **`FERMI_TWOD_A` `0x902d` object alloc** — ⚠ **permitted** (`capability.rs:945`) but **undecoded**:
+   `alloc_params` has no arm and falls to `_ => None` (`versions.rs:1308`) ⇒
+   `BridgeRefusal::UnmappedAllocClass`. `capability.rs:2629` pins the decodable set at **16** classes
+   and `0x902d` is not among them. So `krcWatchdogInit`'s `RmAllocObject` at
+   `kernel_rc_watchdog.c:1089-1096` would fail even with gate 1 open.
+3. **The methods themselves — and this is the ONE place that is silent.** `[measured]` the production
+   decoder `Ga10xPushbuffer::decode_method` (`crates/kayfabe-chips/src/ga10x.rs:1486-1505`) dispatches
+   on `(method_offset, arg_words)` with **three** arms and **no class gate at all**:
+   - `NV902D_SET_OBJECT` (`0x0000`) collides with `NVC56F_SET_OBJECT` and decodes to
+     `PushMethod::SetObject{class: 0x902d}` — which the consumer **deliberately ignores**
+     (`crates/kayfabe-fwd/src/lib.rs:5636`, *"Routing confirmation only"*). The class value is carried
+     and never validated.
+   - `NO_OPERATION` `0x0100`, `SET_NOTIFY_A` `0x0104`, `SET_NOTIFY_B` `0x0108`, `NOTIFY` `0x0110` hit
+     `_ => None` (`ga10x.rs:1502`) ⇒ `PushMethod::Opaque` ⇒ `out.opaque += 1`
+     (`crates/kayfabe-fwd/src/lib.rs:5774`). **A counter. No name, no fault, no log.**
+   - The GR census is worse than silent — it is *class-gated with a bare `continue`*
+     (`crates/kayfabe-rt/src/completion_watch.rs:342-344`, `!= AMPERE_COMPUTE_B`), so a `0x902d`
+     subchannel reports `operands=0`, **indistinguishable from "the guest named no addresses"**. That
+     is this tree's own `no_counter_fired_is_not_no_record_exists` shape, one plane over.
+
+   ⊘ There is no submission-time class allowlist anywhere; `DENIED_CLASSES` (`capability.rs:1562`) is
+   the alloc-side list and `FwdFault::NotAnEngine` (`kayfabe-fwd/src/lib.rs:767`) is the
+   doorbell-routing one. Neither is consulted by the method decoder.
+
+#### ⇒ The smallest change that makes both allocations explicit
+
+- **Golden image: none.** Already served end to end.
+- **Watchdog: one line of intent, not one line of code.** The correct explicit answer today is a
+  **`Denial::Refused{name: "VOLTA_CHANNEL_GPFIFO_A", why: …}`** row on `DENIED_CLASSES` for `0xc36f`,
+  which upgrades `NotOnAllowlist` (*"nobody has ever seen this"*) to *"we saw it and decided"* — exactly
+  the distinction `crates/kayfabe-rmrpc/src/lib.rs:384-408` exists to preserve, and the same treatment
+  `0x402c` `NV40_I2C` already got (`4088589`). ⊘ **Do not admit it.** §14.20/§14.22/§16.24.1 each measured
+  the watchdog's refusals **non-fatal** (the adapter initialises and `nvidia-smi` enumerates with all
+  three refused), so admitting buys zero progress and costs a channel we would then have to execute.
+- **The one thing that is genuinely missing is a NAME on the method plane**, and it is missing whether
+  or not the watchdog ever runs: `PushMethod::Opaque` should carry the bound class so an unmodelled
+  engine class on a subchannel is distinguishable from an unmodelled method on a modelled one. That is
+  §1.4's invariant made checkable at runtime rather than by grep.
+
+⚠ **And the meta-finding, which is worth more than any of the above.** This section was commissioned as
+open work. `nvkvm-rs: docs/design/execution_plane_increments.md` §16.24.1 (dated **2026-08-09**) already
+closed it in writing — *"§14.26 already closed the question the brief was re-asking … it was answered on
+2026-08-08 and re-queued for a day afterwards because a `file:line` was read without its caller"* — and
+records it as the **third** instance of `read_the_caller_not_the_id`. This is the **fourth**, and the
+second in a *brief*. ⇒ The rule that would have caught it is this tree's own: **`git grep` the closing
+section, not the failing `file:line`, before commissioning a residual.**
 
 ---
 
@@ -286,6 +417,11 @@ independent with very different evidence strength, and never let the Mode-1 numb
 4. **Golden-image init is an ALLOCATION event, not a submission event.** Getting it right means the GR
    object allocation must produce a real golden context on the host; it does **not** mean decoding a
    pushbuffer. This is a materially easier problem than the brief assumed.
+5. ★ **Both allocations are already handled at `nvkvm-rs@425c450` — see §1.7 before opening any of this
+   as work.** Golden image: served end to end since 2026-08-08. Watchdog: refused by name on three
+   gates, measured non-fatal. The only genuinely open item §1.7 found is on the **method** plane, and it
+   is independent of the watchdog: `PushMethod::Opaque` carries no class, so an unmodelled *engine
+   class* on a subchannel is indistinguishable from an unmodelled *method*.
 
 ## See also
 
