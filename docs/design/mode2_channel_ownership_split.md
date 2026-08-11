@@ -12,6 +12,20 @@ that too — several of the corrections below are of the assistant, not of the o
 
 ## 1. The split, and the discriminator
 
+★★★ **QUALIFICATION, 2026-08-11 — read before §1's second bullet: SOME KERNEL CHANNELS ARE GR
+CHANNELS, and one of them PUSHES GRAPHICS METHODS.** Enumerated from `ogkm-580.159.04` in
+`kernel_gr_channels_and_the_mme_exposure.md`. Three kernel-side channels target `RM_ENGINE_TYPE_GR0`:
+golden-image context init (`kernel_graphics.c:2136`, GSP-client-**specific**), the Turing-only Bug
+4208224 WAR (`kgraphics_tu102.c:296`), and the **RC watchdog** (`kernel_rc_watchdog.c:437`), which puts
+a `FERMI_TWOD_A` object on it and emits `NV902D_*` methods from CPU kernel code (`:1246-1345`).
+⊘ The good news, and it is what keeps this page's split intact: **the kernel's ENTIRE GR method
+vocabulary is those five `NV902D_*` methods, and there is NO MME anywhere in kernel code** — both
+established by tree-wide grep. So the emulated axis is `{CE methods} ∪ {five NV902D_ methods}` and
+stays statefully decodable. ⚠ But *"kernel channel"* must no longer be read as *"copy engine"*: the
+emulated axis has to model a GR-engine notifier, and a `GR0` channel carrying a `3D`/`COMPUTE` object
+that never receives work. ⚠ Do not conclude otherwise from the GA106 bench — Bug 4208224 is
+TU102/104/106-only and is invisible there, inside the Turing+ support floor.
+
 > **Guest-userspace-managed channels are always passthrough.** No exception has been found that we
 > need to implement.
 >
