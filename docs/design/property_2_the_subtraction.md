@@ -64,6 +64,16 @@ so `RingOwner::HandedIn` maps *nothing of ours* into the guest's space. It is **
 **one caller — the R31 probe**. Promoting it to the doorbell path removes the residual **as a
 side effect of work the execution plane needs anyway**.
 
+★★★★★ **THE INVERSION, found 2026-08-11 by the rung-preparation pass — and it reverses an
+ORDERING, not just a claim.** Property 2's *entire* residual is the materialized channel's own
+64 KiB ring mapped into the guest's `host_vas`. `RingOwner::HandedIn` maps **nothing of ours**
+there. ⇒ **Property 2 is DISSOLVED BY the GR execution rung, not a PREREQUISITE of it.**
+
+⊘ This corrects `gr_execution_boundary.md` §4.1, which orders property 2 **before** opening the
+route. That ordering is backwards: the route's own mechanism is the subtraction.
+⚠ **Fold this into §4.1 above its ordering before any code cites that ordering** — otherwise §4.1
+reads as current and sends a lane at a prerequisite that the successor supplies.
+
 ### ⊘⊘ RETRACTED — "ruling 2 does not dissolve this" was MY BAD RELAY (owner, 2026-08-11)
 
 ★ **I wrote that ruling 2 was "refuted on two code facts". It was not, and the owner caught it.**
