@@ -1,8 +1,49 @@
 # The scratchpad address space — where OUR work lives
 
-**Status:** owner design, 2026-08-10, recorded because it existed only in conversation.
-Companion to `mode2_channel_ownership_split.md` (who owns which channel) and
-`s1_what_does_it_protect.md` (why the current placement is wrong).
+> ### STATUS — 2026-08-11
+> **LIVE, with one correction folded in below (§0).** Owner design, 2026-08-10; corrected
+> 2026-08-11 after I shelved it on a misreading. ⇒ **The scratchpad is NEEDED** — for throughput,
+> which is a product requirement — and it is **not next**: it is the kernel road, while the compute
+> road is stuck at `RING-VA-UNBOUND`.
+> Companions: `mode2_channel_ownership_split.md` (who owns which channel),
+> `s1_what_does_it_protect.md` (why the old placement was wrong).
+
+---
+
+## 0. ⊘ CORRECTION, folded in — I read a CORRECTNESS answer as a PERFORMANCE one
+
+`w232` found an owner design of **2026-08-07** (`ce_executor_tree.md`): *"★ It is **NOT** needed for
+the scrubber — the CPU branch **reaches** both operands."* ⇒ I read that as *"no customer"* and
+shelved the scratchpad. ⊘ **That line answers CORRECTNESS. The owner's question was PERFORMANCE:**
+
+> *"How do you do a kernel-initiated CE with one operand in physical RAM and one in real GPU RAM,
+> since most performant is doing real CE? Same for scrub in GPU space if the page is still
+> referenced. **There must be a channel with a VA on unprivileged to execute that.**"*
+
+★★★ **"Reaches" is not "reaches fast enough"**, and the standing bar is *a product ready for
+production, not a research paper.*
+
+**The C measured this exact cost and named this exact fix:** emulated CE **~95–107 MB/s** vs **~7 GB/s**
+real — **≈70×** — every byte through a 4-byte CPU loop (`nvkvm_gpu_emul.c:3755-3844`). Its stated fix:
+*"(B) forward the CE to the host GPU."* ★ And the sharper case — **scrubbing GPU memory that is still
+referenced** — cannot be discarded; zeros must be written through something that can reach it, and
+CPU-side means the aperture window: slow **and** size-limited.
+
+★★★ **And it does NOT violate the boundary — two different things were collapsed.** The rule
+(`ce_executor_tree.md`, `[measured]` E10) forbids a **CPU memcpy inside the isolate**, because that
+would pull guest bytes into the sandbox. ⊘ **It says nothing about a GPU channel in the isolate** —
+driving real GPU channels *is* the isolate's job, and under a real CE the bytes never enter its
+address space: **the GPU moves them.**
+
+| shape | verdict |
+|---|---|
+| scratchpad + **real CE** | ★ compatible with the boundary |
+| scratchpad + **CPU memcpy** in the isolate | ⊘ exactly what the boundary forbids |
+
+⚠ **Sequencing: right, needed, NOT next.** The compute road (`cuCtxCreate` → first arithmetic) is
+stuck at `RING-VA-UNBOUND`. This is the **kernel** road and a **throughput** requirement. ★ One
+falsifiable exception, cheap to measure from a boot we already take: **if the CPU-side scrubber is
+slow enough to stall init itself**, it becomes a blocker rather than a performance item.
 
 ---
 
