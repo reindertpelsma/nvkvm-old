@@ -68,12 +68,16 @@ This is a **subtraction**, and it composes with §2 to give the two defaults the
 
 ### ⇒ Three consequences, stated so they can be checked
 
-1. ★★ **It may DISSOLVE Property 2.** `property_2_the_subtraction.md` asks the owner to approve an
-   architecture change because *"there is exactly ONE host address space per guest address space,
-   holding … our own ring, cursor block and completion semaphore"* — measured exploitable. **If
-   kernel CE work needs no host VA space at all, our machinery is not in the guest's space, because
-   there is no shared space to be in.** ⚠ **`[NOT MEASURED]`** — this is a prediction that the
-   subtraction becomes *free* rather than *architectural*. It must be checked, not assumed.
+1. ⊘⊘ **ADJUDICATED 2026-08-11 — MY PREDICTION HERE WAS WRONG, AND SO WAS ITS PREMISE.**
+   I wrote that this *"may DISSOLVE Property 2"*. Measured at `b3ecda4`: **Property 2's named
+   object was already separated at `254cf38` (2026-08-10)** — the day before Property 2 was
+   written — and its exploit citation is a **pre-fix** measurement quoted without its revision.
+   Ruling 2 reaches only the **kernel half** of the *different* residual that survives, and its
+   premise fails on two code facts: **every CE copy this tree can issue is VIRTUAL by a standing
+   refusal**, so kernel CE needs *a* host VA space; and **no verb consumes the VMM translation**
+   the ruling invokes. ⚠ **Applied literally today, ruling 2 turns kernel-channel forwarding OFF**
+   (`FwdFault::NoVas` / `NoHostVas`) rather than rerouting it.
+   ⇒ Full adjudication folded into `property_2_the_subtraction.md` **§0**. Read that, not this.
 2. **It deletes work we currently do.** The doorbell materialization path calls `rm.alloc_vaspace()`
    before allocating a channel (`kayfabe-isolate/src/lib.rs:2385-2393`). Under this ruling that is
    **wrong for kernel channels** — not merely wasteful.
