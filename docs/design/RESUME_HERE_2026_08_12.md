@@ -28,6 +28,41 @@
 > `0x200200000` leaf. **Nothing joins them.** ⇒ The ring is reachable and *the work it points at
 > is not*. ★ Tractable: it is the **same mechanism as A1** — the join needs more sources.
 >
+> > ### ⊘⊘ CORRECTION, 2026-08-12 — **IT IS THE PIN THAT NEEDS MORE SOURCES, NOT THE JOIN.**
+> > Read this before acting on the sentence above; that sentence names the wrong plane and a
+> > rung built on it **cannot fire**.
+> >
+> > `[measured, traces/boots/w263/run_w263_ring_qemu.log, all 8 channels, BOTH arms]` the
+> > pushbuffer VAs resolve **`pb=S:0x3d45f000` … `S:0x3e25f000`** — and `CeResolve::tag`'s own
+> > doc is the authority on that letter: *"`V` = this device's framebuffer, **`S` = guest
+> > RAM**, `P` = peer"*. ⇒ **The pushbuffer pages are in GUEST RAM, not the framebuffer.**
+> > (The `Vidmem` that later readings attach to these addresses is the **ring's** aperture,
+> > `rng=V:0x1024000`, and the `FwdFault::PushbufferAperture{va:GpuVa(8592179200)}` beside it
+> > decodes to `0x200224000` — the ring's VA, not a pushbuffer's.)
+> >
+> > `kayfabe_rt::ceutils::resolve_leaf_of` answers `(Site::GuestRam, **None**)` for a sysmem
+> > resolution **by construction**, and says why in its own comment: *"it is not this source's
+> > to join: **the guest-RAM pin owns that plane**."* A third join source would have been
+> > handed eight guest-RAM addresses, printed eight refusals, and joined nothing.
+> >
+> > ★★★ **The mechanism was already built and had no source.**
+> > `SharedDoorbell::pin_ring_guest_ram` is the complete chain — VA → address table → GPA →
+> > aperture check → the hypervisor's stated layout → file offset → one `OS_DESCRIPTOR` per
+> > contiguous run, mapped **FIXED at the guest's own VA**. It is asked about exactly **one**
+> > address, the ring's, which is in Vidmem, so on `w263` it refused all eight `NOT IN GUEST
+> > RAM` — **by name and correctly**. ⇒ *The pin has never pinned one byte on a live guest,
+> > and not because it is broken.* The addresses in the aperture it serves are on the same log
+> > line, eight of them, and nothing presents them.
+> >
+> > ⇒ Leg 4 keeps its shape — *the primitive works, the source list is short* — and changes
+> > its verb: **give the PIN a second source.** Built on branch `leg-4-pushbuffer-pin`
+> > (`KAYFABE_GUEST_PUSHBUF=pin`); pre-registration `docs/design/w264_pushbuffer_pin_prereg.md`
+> > in the `nvkvm-rs` tree.
+> >
+> > ⚠ The *hardware* half of the w263 reading is untouched: the eight `Xid 31 FAULT_PDE
+> > ACCESS_TYPE_VIRT_READ` are real, and `FAULT_PDE` is exactly what a pin at those VAs would
+> > install a directory entry for. Only the named mechanism was wrong.
+>
 > **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
 > in ~127 logs.
 >
