@@ -360,10 +360,25 @@ NVKMS needs `AllocDevice` to have succeeded. §0. §8.
 
 ### 6.1 Why no differential oracle exists for display today — the reason, not the absence
 
-- **`nvdiff` cannot see it.** The `LD_PRELOAD` shim records `/dev/nvidia*` + `nvidia-uvm`. Display
-  traffic is `/dev/nvidia-modeset` (a *different* node, one wrapper ioctl with an inner `cmdType`
-  that a naive recorder cannot size) and `/dev/dri/card*`. **INFERRED** from the shim's design and
-  §2.1's cmdType structure; not re-verified line-by-line in this pass.
+- ★★ **`nvdiff` would record display traffic and capture NONE OF ITS CONTENT — which is worse than
+  not seeing it.** ⊘ *Corrected in this audit*: an earlier draft of this section said the shim
+  "cannot see" NVKMS. **MEASURED, `nvdiff_shim.c`:**
+  - `:115` matches on `strncmp(path, "/dev/nvidia", 11)`. `/dev/nvidia-modeset` **passes that
+    prefix** — the shim *does* record it, under the device name `nvidia-modeset`.
+  - `:196` (`arg_len`) then takes the `"ioc"` branch and returns `iocsize`. NVKMS's wrapper is
+    `_IOWR('m',0,{u32 cmdType; u32 size; u64 address;})` ⇒ `iocsize = 16`. **Sixteen bytes are
+    recorded: the wrapper. The payload at `address` is never followed — zero bytes, on both sides
+    of the call.**
+  - `/dev/dri/card*` and `/dev/dri/renderD*` fail the prefix entirely ⇒ genuinely invisible.
+
+  ⇒ ★★★ A display workload would produce a **well-aligned, plausible, green** nvdiff over records
+  that contain an opaque `cmdType` and nothing else. This is the tree's own objection to `strace`
+  (*"without a before/after pair you cannot tell 'RM wrote nothing' from 'we didn't capture the
+  reply'"*) — reproduced **inside our own instrument**, where it looks like coverage.
+  ★ **But this also makes the fix small and nameable**, which "no oracle" would have hidden: follow
+  the `address` pointer and size the inner payload by `cmdType` — those sizes are in `nvkms-api.h`,
+  which §1.1 establishes is **open** — and widen the prefix to `/dev/dri/`. That is an
+  oracle *extension*, not an oracle *invention*. ⊘ Scoped, not proposed: §8.4 does not need it.
 - **No capture contains display traffic, and it is UNMEASURED rather than empty.** Every committed
   capture was produced by a **compute** workload — `cup2`/`cup8`, `nvd_prog`, `nvidia-smi`
   (memory: *every oracle we own was made by nvidia-smi*). A compute workload cannot emit display
@@ -538,6 +553,7 @@ output file is a *state needing its own check*, not "not yet" — and `143` (the
 5. **Zero of the 22 measured apps and none of the LLM north star require display** (§8.1–8.2). It is
    separable **unless** §8.4 comes back "gated".
 6. ⚠ **The oracle is positively wrong on display**, and **16 truncated rows** hide in a
-   documented-as-safe majority (§6.2). Fold into `CLAUDE.md`.
+   documented-as-safe majority (§6.2). Fold into `CLAUDE.md`. And our own recorder would go
+   **green on empty display records** (§6.1) — a small, named fix, not a missing instrument.
 7. **Run §8.4 before scheduling anything here.** One boot. One bit. It moves the estimate between
    *days* and *weeks*.
