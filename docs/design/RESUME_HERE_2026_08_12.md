@@ -135,6 +135,57 @@
 > **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
 > in ~127 logs.
 >
+> > ### ⊘⊘⊘ CORRECTION, 2026-08-12 (LATEST) — **THE PAGE WAS READ. THE COPY ENGINE WROTE IT,
+> > AND IT IS THE WRONG ENGINE.** Read this before the `w266` block below: that block's *"top
+> > limit"* has been discharged, and its two worlds are no longer open.
+> > `../../../nvkvm-rs/traces/boots/w267/RESULT.md` (rev `b129770`, 2 arms, real GA106, branch
+> > `w267-read-the-page`; pre-registration `docs/design/w267_read_the_page_prereg.md` at
+> > `efbcaba`, before either instrument existed).
+> >
+> > ★★★★★ **WORLD (a) IS MEASURED, WORLD (b) IS REFUTED.** `[measured, `on` arm, t=+71169ms]`
+> > `nonzero=12/1024` — **four complete `RELEASE_FOUR_WORD_SEMAPHORE` reports**
+> > `[payload=1, 0, ts_lo, ts_hi]` at `+0xf40 +0xf50 +0xf60 +0xf70`. ⊘ The `off` arm reads
+> > `nonzero=0/1024` on **all twenty dumps over 174 s**. ★ **The timestamps are the proof of
+> > authorship** (`0x18cb063c_…`, distinct per channel): nothing in this VMM has that clock, so
+> > this is not *"the value we expected appeared"* — it is **a value we could not have
+> > fabricated**.
+> >
+> > ★★★★★ **AND THE `on` ARM ALONE IS A PER-CHANNEL CONTROL.** An ordering race — exactly the one
+> > `w266` §3.2 said *"did not materialise, **not** that it cannot"* — split the eight CE
+> > channels 4/4, and **every** fact partitions on that line with no exceptions:
+> > **4 pinned** (`SOURCE 8 declared`, targets `…ff70 …ff40`) → payload + timestamp, **no `Xid`**;
+> > **4 unpinned** (`NO PAGE TO PIN`, targets `…ff30 …ff00`) → slot **zero**, `Xid 31 VIRT_WRITE`.
+> > Same boot, same page, same engine class. ⇒ The prediction failing is what bought the evidence.
+> >
+> > ⊘⊘⊘ **THE PAGE HOLDS SIXTEEN SLOTS AND THEY BELONG TO TWO ENGINES.** This is the correction
+> > that matters for planning:
+> > ```
+> > +0xf00 … +0xf70   eight CE channels' NVC7B5 SET_SEMAPHORE      ← WRITTEN
+> > +0xf80 … +0xff0   eight GR channels' NVC7C0 SET_REPORT_SEMAPHORE ← ZERO on EVERY dump, BOTH arms
+> > ```
+> > The CE pushbuffer is 32 bytes and decodes (`ogkm-580: clc7b5.h:84-105`) as `LAUNCH_DMA 0x14` =
+> > `DATA_TRANSFER_TYPE = NONE` + `RELEASE_FOUR_WORD_SEMAPHORE` — **a pure semaphore release that
+> > moves no data**. ⇒ **The engine that stopped faulting is not the engine `cuCtxCreate` waits
+> > on.** Leg 5's supply side is real and it was never on the path to `CUP2_RC`.
+> > ⇒ ⊘ **Do NOT widen the completion watch to the CE slots.** An `OBSERVED` row there would mean
+> > nothing and read as everything.
+> >
+> > ⊘ **And the brief's follow-through was already built**: *"derive the right offset from the
+> > guest's `SET_REPORT_SEMAPHORE`"* is what `decode_report_semaphore` has done since `w226` —
+> > eight declares at eight distinct VAs, eight verdicts, nothing hardcoded. The address the rung
+> > needed was **already read and truncated at the print** (`push_headers` emitted `words[i+1]`
+> > and stopped, so a three-argument run rendered as `=0x2`). ★ **For a multi-word operand a
+> > one-argument dump is not a smaller dump, it is a wrong one** — the half it keeps carries the
+> > least information.
+> >
+> > ⚠ **Deviations, and they are the next rung**: the pin is triggered by a **CE doorbell** but
+> > sourced from a **GR declaration**, and nothing orders those (`NO PAGE TO PIN = 4`);
+> > `SemaPageReader::close` never runs because QEMU dies without `detach_ram`, so there is **no
+> > teardown dump** and the harness's own assertion caught it; first-pass `PT-DECODE bound` moved
+> > `19615 → 19618` identically on both arms — **bounded, not explained**, so `w266`↔`w267` is not
+> > byte-identical. `CUP2_RC = 124` both arms: **seventh** consecutive predicted zero, seventh
+> > measured zero, with the size pre-registered as **zero** rather than *"small"*.
+>
 > > ### ⊘⊘⊘ CORRECTION, 2026-08-12 (LATER) — **THE PAGE IS PINNED AND THE HOST GPU STOPPED
 > > FAULTING: 8 `Xid` → 0. THE WALL IS NO LONGER A FAULT — AND IT IS STILL A WALL.**
 > > Read this before the block below, which says leg 5 is *unbuilt*. It is built and it has run:
@@ -293,11 +344,17 @@ USERD**, so late adoption wipes the cursor that caused the doorbell.
 
 ## 6. NEXT RUNGS, ORDERED
 
-0. ★★★★★ **READ THE SEMAPHORE PAGE** — `w266` pinned it and the host GPU's eight `Xid` went to
-   **zero**, while `COMPLETION-WATCH` stayed `NOT-OBSERVED` on every channel. Nothing dumps the
-   page, so *"the write landed at a slot nobody watches"* and *"the engine never wrote"* are
-   still one fact. One 4 KiB dump separates them. ⚠ Do this **before** widening the watch: a
-   guess at slots without reading the page is the `dlen=0`-decoded-to-zeros class.
+0. ⊘⊘ **DONE at `w267` — DO NOT RE-RUN THIS.** ~~READ THE SEMAPHORE PAGE~~ The dump exists and
+   the answer is **(a)**: the copy engine wrote four `RELEASE_FOUR_WORD_SEMAPHORE` reports at
+   `+0xf40 … +0xf70` with hardware timestamps, while the eight **GR** slots at `+0xf80 … +0xff0`
+   stayed zero on every dump on both arms. See the LATEST correction in §1 and
+   `../../../nvkvm-rs/traces/boots/w267/RESULT.md`.
+   ⇒ ★ **The successor is ORDERING, not widening.** The pin is triggered by a **CE doorbell** and
+   sourced from a **GR declaration**, and nothing orders those, so 4 of 8 channels raced ahead of
+   their own pin and faulted (`NO PAGE TO PIN = 4`). ⚠ The fix must derive the page from
+   something the **guest** wrote — pinning a remembered `0x2_0440f000` is the `cap2b` class.
+   ⊘ **Do NOT widen the watch to the CE slots**: a different engine's semaphores, which the guest
+   does not wait on. An `OBSERVED` row there would mean nothing and read as everything.
 1. ◐ **Leg B** — in flight. The first three-legged boot.
 2. **Read `GP_GET`** — the difference between *adopted* and *fetched*. Nothing does today.
 3. **Fault injection** for §4's items 3 and 5 — a green boot cannot reach them **by construction**.
