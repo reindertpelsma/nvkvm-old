@@ -62,6 +62,28 @@
 > > ⚠ The *hardware* half of the w263 reading is untouched: the eight `Xid 31 FAULT_PDE
 > > ACCESS_TYPE_VIRT_READ` are real, and `FAULT_PDE` is exactly what a pin at those VAs would
 > > install a directory entry for. Only the named mechanism was wrong.
+> >
+> > ### ★★★★★ MEASURED, `w264` (4 arms, real GA106, rev `a4c46bb`) — **AND LEG 4 IS NEITHER**
+> > `traces/boots/w264/RESULT.md`. The pin was built, armed, and asked about **exactly the
+> > eight addresses hardware faults on**. The **address table answered `Miss` on all eight**,
+> > while the **descent on the same log line resolves each to guest RAM** (`pb=S:0x41539000
+> > …`), and `NOT-IN-GUEST-RAM = 0` on every row.
+> > ⇒ ★ **The two resolvers disagree about EXISTENCE, not about aperture.** Leg 4 is not *"join
+> > the pages"* and not *"pin the pages"* — it is **the address table's POPULATE side never
+> > learning the pushbuffer leaves**. The consumer is built and correct; the authority was
+> > never told. ⊘ `miss = fault` means it cannot be papered over at the consumer.
+> > **The next rung's address list:** `pdb 0x201000`, VAs `0x202400000 0x202600000 0x202800000
+> > 0x202a00000 0x202c00000 0x202e00000 0x203000000 0x203200000`. Open question to split
+> > first: *never learned* vs *learned and pruned before we asked* — a `Miss` does not
+> > separate them; start at `PT-DECODE`'s `bound=6275 unwitnessed=6275`.
+> > ⚠ `CUP2_RC = 124` on all four arms, **pre-registered at zero movement**, and `CE-SUBMIT →
+> > RETIRED` still `0` — leg 5 is unbuilt, so this rung could not have moved it.
+> > ★★ Second result: the four-arm ladder (one variable per step) **discharges `w263`'s own
+> > qualification** — `PushbufferAperture 0→9` belongs to legs **A2+B** (`join`→`ring`), not to
+> > the pushbuffer plane, and the FB join **alone** (`base`→`join`) moves no doorbell-level
+> > number at all. ⊘ Still unseparated: **leg B vs leg A2** — `ring` and `pin` both carry B, so
+> > this campaign cannot attribute the fetch, and doing so needs a boolean on
+> > `plan_engine_object`'s public signature (leg B's arming is inherited by construction).
 >
 > **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
 > in ~127 logs.
