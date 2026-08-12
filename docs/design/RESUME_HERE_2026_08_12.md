@@ -11,7 +11,69 @@
 
 **`cuCtxCreate` still hangs. `CUP2_RC = 124`.** `CE-SUBMIT → RETIRED` has never printed.
 
-> ### ⊘⊘⊘ CORRECTION, 2026-08-12 (**NEWEST — read this one first**) — **THE WAIT WAS SATISFIED
+> ### ★★★★★ w271 + ITS ANALYSIS, 2026-08-12 (**NEWEST — read THIS one first**) — **THE CE WALL
+> IS CLOSED, THE WALL MOVED TO THE GR ENGINE, AND THE HIGH ADDRESS IS NOT A HOST POINTER.**
+> `../../../nvkvm-rs/traces/boots/w271/RESULT.md`, branch `w271-the-extent-key`, boots at rev
+> `5feac90`, analysis at **`d5d5c38`**. The w270 correction below is not superseded — it is
+> **one rung further on**: its named defect (the pin's identity was the base, not the
+> `(base, extent)` pair) is FIXED, and this is what came next.
+>
+> ★★★ **THE EXTENT FIX WORKED AND THE OLD FAULT IS GONE.** w270's `off` arm faulted at
+> `CE2 @ 0x2_04420000`; w271's `pin` arm pins **exactly that address**
+> (`OPERAND-PIN va=0x204420000 GREW requested=131072 described=131072`) and has **zero CE
+> faults**. Same wall budget (254 s vs 256 s), doorbells **17 → 88**, token `0x0001000f`
+> **1 → 69**. ⊘ `CUP2_RC = 124` on both arms still (tenth consecutive) — but the counters all
+> moved, and the single remaining `Xid` is on a **different engine**.
+>
+> ★★★ **FIRST GR-ENGINE FAULT OF THE CAMPAIGN.** `ENGINE GRAPHICS HUBCLIENT_FE faulted @
+> `0x75b2_aee00000`, `FAULT_PDE`. Every fault before this one was `engine=Ce`. `HUBCLIENT_FE`
+> = front-end method fetch ⇒ **the GR engine is fetching methods**, which is the plane
+> `cuCtxCreate` actually waits on.
+>
+> ### ⊘⊘⊘ AND THE ALARM THAT SHAPE INVITES IS WRONG — do not re-raise it
+> `0x75b2_aee00000` is ~129 TB and looks **exactly like a host `mmap` return**. It is not one,
+> and reading it as a VA-identity violation costs a lane. Three refutations:
+> - The sibling `0x75b2b9000000` is written **by the guest, into the guest's own pushbuffer**,
+>   as `NVC7C0_SET_SHADER_SHARED_MEMORY_WINDOW_A/B` (`ogkm-580 clc7c0.h:424`; `_A`'s field is
+>   `16:0`, so `0x75b2` is legal and not a truncation).
+> - It tracks the **guest's** per-boot ASLR in **both** arms: `off` libcuda@`0x76b5dc200000` /
+>   window `0x76b5d1000000`; `pin` libcuda@`0x75b2c4e00000` / window `0x75b2b9000000` / fault
+>   `0x75b2aee00000`. Same 32 GiB slot within an arm, different across arms.
+> - ★★★★★ **Native, unvirtualised GA106 emits the same shape** — already committed here:
+>   `traces/native_dataplane_ga106/` decodes `cup2`'s pushbuffer as
+>   `OFFSET_OUT_UPPER=0x00007f4f` / `OFFSET_OUT=0x66200000` ⇒ GPU VA `0x7f4f_66200000`, while
+>   the same log's mmap census puts that process's `/dev/nvidiactl` maps at `0x7f4f70ddf000`.
+>   **On real hardware the GPU VA IS the process VA.** That is UVM unified addressing.
+>
+> ⇒ **A `0x7xxx_xxxxxxxx` GPU VA is the NORMAL CUDA regime, measured on bare metal.** The
+> `0x2_xxxxxxxx` family every earlier rung lived in is the *other*, RM-managed family. ⊘ **Shape
+> cannot discriminate origin**: guest CUDA and host CUDA draw from the same 47-bit space. What
+> discriminates is **who wrote it** and **what it correlates with**.
+>
+> ★★ **MISS vs FAILED DESCENT = FAILED DESCENT, and both walkers agree.** Our `kind="Fault"` is
+> `CeResolve::Fault(TranslateFault)` — *"MISS = FAULT, arriving from the guest's own page
+> tables"*, a **distinct variant** from `NoPublication`; hardware independently says `FAULT_PDE`
+> (a directory, not a leaf). **The address table is behaving** — the guest's own tables do not
+> describe that VA. ⇒ The next rung is **UVM's fault-driven population**, not the table. ⊘ Do
+> **not** add `0x75b2_…` to the address table: nothing says the guest asked us to map it, and
+> populating a VA the guest's own tables leave invalid is the `cap2b` class pointed inward.
+>
+> ⊘ **Two counting corrections.** (1) The `Xid`'s `channel` field is
+> `(runlistId << 24) | ChID` (`g_kernel_channel_nvoc.h:1493`) ⇒ `0x01000011` = runlist 1 ChID 17,
+> `0x00000009` = runlist 0 ChID 9. So *"engine changed"* and *"channel changed"* are **ONE
+> measurement reported twice**; the substitution is **four** independent facts, not five.
+> (2) Channel `0x9` is **ours** (runlist 0, our isolate) — but **we never log host chids**, so
+> *which* of our ten materialised host GR channels is unknown. ⚠ Our own `vchid=VChid(0x9)` is a
+> **different number space**; conflating them names the wrong channel.
+>
+> ⚠ `grep 'CUP2_RC=[0-9]*'` still matches `GCC_CUP2_RC=0` — it yields a spurious `CUP2_RC=0`
+> on both w271 arms. **Anchor it (`^CUP2_RC=`)**; anchored, both arms read `124`.
+>
+> ⊘ The w271 summary-line false negative (`placed_as_asked=false` with `memory=0x0` on grown
+> runs) **was already fixed** by `11b75a7`, which is *not* an ancestor of the boots' build rev
+> `5feac90` — which is exactly why the committed logs still show it. **Nothing to do.**
+
+> ### ⊘⊘⊘ CORRECTION, 2026-08-12 — **THE WAIT WAS SATISFIED
 > AND RE-ARMED. THE RELEASE WROTE `2`.** Everything below about *"the guest is blocked on a
 > second CE release"* is SUPERSEDED: it was written, the guest consumed it, and it now wants a
 > **third**. `../../../nvkvm-rs/traces/boots/w270/RESULT.md` (rev `1b64729`, 2 arms, real
