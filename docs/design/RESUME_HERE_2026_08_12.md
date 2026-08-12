@@ -19,6 +19,23 @@
 | **B — the CURSOR** | `GP_PUT` is a word the **guest** advances ⇒ the guest's USERD, handed to RM **at creation** | ◐ **IN FLIGHT**, branch `leg-b-userd-adoption-at-creation` |
 | **C — the DOORBELL** | trap, translate guest token → host token, ring | ✔ **BUILT** `b734995`, default-off behind `KAYFABE_GR_ROUTE` |
 
+> ### ⊘⊘ CORRECTION, same day — **THE STOOL HAS FIVE LEGS, NOT THREE.** My three-leg model was
+> useful and **incomplete**, and w262b's measurement is what found the rest. Four and five are
+> **UNBUILT**:
+>
+> **4 — the PUSHBUFFER PAGES.** The guest's GPFIFO entries name VAs *outside* the leaf we join.
+> `[measured, w262b]` `gp[0]` names `0x200400000`, `0x200800000` … while leg A1 joins the
+> `0x200200000` leaf. **Nothing joins them.** ⇒ The ring is reachable and *the work it points at
+> is not*. ★ Tractable: it is the **same mechanism as A1** — the join needs more sources.
+>
+> **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
+> in ~127 logs.
+>
+> ⇒ **`w263` is therefore pre-registered at ZERO movement, and that is a prediction against the
+> rung's own optimism** — necessary-not-sufficient, exactly the shape `w260` measured for the
+> supply side. ⚠ **A zero here still does not indict the passthrough model**; it indicts my
+> arithmetic about how many legs there were.
+
 **Why nothing has moved yet, and why that is expected**: a channel born `RingSource::Ours(None)`
 has its `gpFifoOffset` on **our** ring and its `GP_PUT` in **our** USERD, and `submit_entry`
 refuses a handed-in ring **by name**. ⇒ `GP_PUT == GP_GET` forever until **all three** legs are
