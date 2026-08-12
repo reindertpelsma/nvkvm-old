@@ -47,6 +47,19 @@ no amount of Rust-side testing can.
 > acceptance criteria** — and **no oracle at all** for engine execution, hardware completion,
 > or forwarding throughput. ⚠ Its perf figures (20→60 tok/s) are **CPU-copy** numbers; do not
 > read them as a forwarding baseline.
+>
+> ★★★ **PARTLY ANSWERED 2026-08-12 — there is now a DATA-PLANE oracle, and it is native.**
+> `docs/reference/native_dataplane_cup2_ga106.md` + `traces/native_dataplane_ga106/` record what a
+> real GA106 (`580.159.04`, no QEMU, no emulated GPU) actually does for `cup2`: the ring, the
+> pushbuffer method stream, USERD `GP_GET`/`GP_PUT`, and the report semaphore. Headlines: a 4-byte
+> `cuMemcpyHtoD` uses **no copy engine** — it is the compute class's I2M unit with the **payload as
+> a pushbuffer literal**; the semaphore is at **`0x2_0440_fff0`, page offset `+0xff0`, in host
+> RAM** — the **same address our guest uses**; and the GPU's authorship is proved by a report
+> timestamp that tracks CPU wall time to **43 ppm**, not by a watchpoint (a DMA write is invisible
+> to x86 debug registers — that instrument is a negative control only).
+> ⊘ It bounds one workload on one chip: it says nothing about our emulated path, cannot order the
+> release against the `GP_GET` advance, and the **guest's own `cuMemcpyHtoD` pushbuffer has never
+> been decoded by anyone**, so the native↔guest comparison has a hole. See §8 of that doc.
 
 **New, and load-bearing:**
 - ★ **`traces/mode2_c_reference/`** — the committed §6 replay captures (~11 MB zstd, dense,
