@@ -57,6 +57,11 @@ typedef struct CUstream_st *CUstream;
 #define cuMemFree        cuMemFree_v2
 #define cuMemcpyHtoD     cuMemcpyHtoD_v2
 #define cuMemcpyDtoH     cuMemcpyDtoH_v2
+/* ★ an EIGHTH, added for the fault stages: cuMemcpyDtoD is versioned too. The other
+ * fault-stage entry points (cuCtxSetCurrent, cuMemAddressReserve/Free) are NOT — they
+ * postdate the CUDA 3.2 renaming and carry no _v2 alias. Checked against libcuda's
+ * dynamic symbol table on the bench, not from memory. */
+#define cuMemcpyDtoD     cuMemcpyDtoD_v2
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +86,53 @@ CUresult cuModuleGetFunction(CUfunction *, CUmodule, const char *);
 CUresult cuLaunchKernel(CUfunction, unsigned, unsigned, unsigned,
                         unsigned, unsigned, unsigned, unsigned,
                         CUstream, void **, void **);
+/* fault stages */
+CUresult cuMemcpyDtoD(CUdeviceptr, CUdeviceptr, size_t);
+CUresult cuCtxSetCurrent(CUcontext);
+CUresult cuMemAddressReserve(CUdeviceptr *, size_t, size_t, CUdeviceptr,
+                             unsigned long long);
+CUresult cuMemAddressFree(CUdeviceptr, size_t);
+
+/* ★ The virtual-memory-management (VMM) API. It is the ONLY way found to hand CUDA a
+ * pointer it accepts as a device allocation while the GPU page tables hold no mapping
+ * for it — i.e. an "invalid CE address" that survives libcuda's own bounds check.
+ * ⚠ These structs are ABI, and getting them wrong is the silent-failure shape this
+ * header already exists to warn about. Layout is the CUDA 11+ definition; every call's
+ * return code is printed by the caller, so a mismatch shows up as a refusal at
+ * cuMemCreate rather than as a wrong measurement. */
+typedef unsigned long long CUmemGenericAllocationHandle;
+#define CU_MEM_ALLOCATION_TYPE_PINNED      0x1
+#define CU_MEM_HANDLE_TYPE_NONE            0x0
+#define CU_MEM_LOCATION_TYPE_DEVICE        0x1
+#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE 0x3
+#define CU_MEM_ALLOC_GRANULARITY_MINIMUM   0x0
+
+typedef struct CUmemLocation_st { int type; int id; } CUmemLocation;
+typedef struct CUmemAllocationProp_st {
+    int          type;                  /* CUmemAllocationType       */
+    int          requestedHandleTypes;  /* CUmemAllocationHandleType */
+    CUmemLocation location;
+    void        *win32HandleMetaData;
+    struct {
+        unsigned char  compressionType;
+        unsigned char  gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char  reserved[4];
+    } allocFlags;
+} CUmemAllocationProp;
+typedef struct CUmemAccessDesc_st {
+    CUmemLocation location;
+    int           flags;                /* CUmemAccess_flags */
+} CUmemAccessDesc;
+
+CUresult cuMemGetAllocationGranularity(size_t *, const CUmemAllocationProp *, int);
+CUresult cuMemCreate(CUmemGenericAllocationHandle *, size_t,
+                     const CUmemAllocationProp *, unsigned long long);
+CUresult cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
+                  unsigned long long);
+CUresult cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+CUresult cuMemUnmap(CUdeviceptr, size_t);
+CUresult cuMemRelease(CUmemGenericAllocationHandle);
 
 #ifdef __cplusplus
 }

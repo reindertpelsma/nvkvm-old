@@ -50,8 +50,10 @@ $CC -O0 $INCFLAG -o "$OUT/nvd_prog" "$HERE/nvd_prog.c" -lcuda $CFLAGS_CUDA || {
 # instead builds, links, runs, and emits a DIFFERENT ioctl stream — silently. Refuse.
 echo "== symbol-binding gate (the seven versioned entry points must bind _v2)"
 MISSING=
+# ⚠ cuMemcpyDtoD_v2 joined the list with the fault stages (2026-08-12). It is compiled
+#   unconditionally, so the gate applies to every build, not only to a fault capture.
 for sym in cuDeviceTotalMem_v2 cuCtxCreate_v2 cuCtxDestroy_v2 cuMemAlloc_v2 \
-           cuMemFree_v2 cuMemcpyHtoD_v2 cuMemcpyDtoH_v2; do
+           cuMemFree_v2 cuMemcpyHtoD_v2 cuMemcpyDtoH_v2 cuMemcpyDtoD_v2; do
     # ⚠ objdump prints `cuCtxCreate_v2@Base` (or `@LIBCUDA_1.0`), never a bare name — an
     #   end-anchored match fails on a CORRECTLY bound symbol. Measured: the first version of
     #   this gate refused a build in which all seven were bound. It failed SAFE, which is the
