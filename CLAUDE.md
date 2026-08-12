@@ -216,6 +216,22 @@ guest**, diffed. It replaces *"I infer the wall"* with *"we diverge at record N,
 | `cap2b_stalequeue_nofn47` | 862 940 | no | ★ **the real negative** — 378 GSP elements parsed from arbitrary guest RAM, answered `NV_OK` |
 | `cap3_matmul_forwarding` | 532 824 | no | decision planes; `cup8` at `bad=0 maxerr=0` |
 
+★★★★★ **CORRECTION 2026-08-12 — THE FIFTH LIMIT BELOW UNDERCOUNTS, AND THE UNDERCOUNTED ROWS ARE
+THE DANGEROUS ONES.** Re-derived from the header itself (`{cmd, status, psize, dlen, data}`, 56
+rows): **11 EMPTY (`dlen=0`), 16 TRUNCATED (`0 < dlen < psize`), 29 COMPLETE.** ⇒ The text below
+credits **45 rows** as *"carrying a body"* and matching byte for byte — **16 of those 45 are
+partial**, and a partial row is not a body. Only **29/56 (51.8 %)** are complete.
+⊘ **`dlen` is the CAPTURED length; `psize` is what RM would return. A short row decodes to
+whatever follows in the struct — usually zeros — with no marker distinguishing it from a real
+value.** Worst cases: `0x20800a22` missing **18 216 of 34 592** bytes, `0x20800a40` missing
+**8 196 of 24 580**, `0x20800b03` missing **8 160 of 16 352**.
+★ It has already bitten, **on display**: `0x20800a01` is `psize=36 dlen=32`, and
+`numDispChannels` lives in the **missing 4 bytes** — read as 0, producing a NULL
+`clientChannelTable`. And `0x20800a4b`, which **selects the whole display HAL**, is both an
+empty row *and* already contradicted by a real GA106.
+⇒ **The trustworthy set is `dlen >= psize`, not `dlen > 0`.** Refuse both empty *and* short rows
+as **unmeasured**; never let a short row's tail decode to zeros.
+
 ★★★ **FIFTH LIMIT, and it is different in kind — the oracle is POSITIVELY WRONG here, not blind**
 (measured 2026-08-01 against a real GA106, `../nvkvm-rs/traces/real_ga106/`). The captured control
 table `src/qemu/mode2_initctrl_ga106.h` has **56 rows, of which 11 (19.6%) carry `dlen = 0`** — the
@@ -230,8 +246,9 @@ empty row was a **buffer overrun with a hardware writer**, not merely a wrong nu
 a `C:` citation was **satisfied** by a row that cited the empty body *as corroboration* — **citing
 the oracle is not the oracle being right.** A citation gate checks a claim is *sourced*, never that
 the source says what the claim says.
-★ This **scopes** the oracle rather than devaluing it: the 45 rows with bodies matched exactly. The
-oracle is trustworthy precisely where it captured something.
+★ This **scopes** the oracle rather than devaluing it: the rows that were captured *in full* matched
+exactly. The oracle is trustworthy precisely where it captured something — but see the 2026-08-12
+correction above for what *"captured something"* actually means: **29 rows, not 45.**
 
 ★ **Four further measured limits before trusting any diff** (full text in
 `../nvkvm-rs/docs/design/c_rust_trace_differential.md`): the **completion plane has NO C
