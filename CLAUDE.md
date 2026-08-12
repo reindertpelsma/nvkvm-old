@@ -34,7 +34,16 @@ no amount of Rust-side testing can.
 > ### OVERDRAW MISDIRECTED A WHOLE DAY.** Read this first; the text below is true of the **CE
 > ### COPY plane** and **FALSE of the GR/COMPUTE plane**.
 > `cap3_matmul_forwarding` — *the passing run* — carries a **self-describing header**
-> (`docs/BENCH_REBUILD_NOTES.md:119`):
+> (`docs/design/kernel_gr_channels_and_the_mme_exposure.md:372`, the captured `props:` line; quoted
+> again at `docs/design/how_the_c_passed_the_gr_wall.md:119`):
+> ⊘ **CITATION CORRECTED 2026-08-12 (w275).** This block previously cited
+> `docs/BENCH_REBUILD_NOTES.md:119`. That file contains the string **zero times**
+> (`grep -c m2hostsem docs/BENCH_REBUILD_NOTES.md` → `0`); its line 119 is about `cap1b`'s
+> GSP-D6 continuation elements. The **flags are right and the reading is right** — only the
+> pointer was wrong, almost certainly by carrying `:119` across from the doc that does quote
+> them. ⚠ Same class this file already names: **citing the oracle is not the oracle being
+> right**, and a wrong pointer in the most-read file in the repo is checked by nobody because
+> it looks checked.
 > **`m2fwd=1  m2exec=1  m2hostsem=0  m2cefwd=0  m2cexec=0`**
 > ⇒ ⊘ **`m2cefwd=0`.** The claim below that it is *"the flag on every green run"* is **contradicted
 > by the trace's own header.**
