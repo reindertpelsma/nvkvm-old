@@ -77,6 +77,13 @@ echo "== environment"
 } | tee "$OUT/env_$STAGE.txt"
 
 rc_all=0
+# ⊘ runs=0 is BUILD-ONLY, and it exists because a caller that wants to control the run
+#   itself (detached, with its own timeout, extracting the trace mid-hang) would otherwise
+#   have to run the workload once just to get a binary — on a GPU that is a serial resource.
+if [ "$RUNS" -eq 0 ]; then
+    echo "== runs=0: BUILD ONLY, nothing was executed (this is not an empty capture)"
+    exit 0
+fi
 for i in $(seq 1 "$RUNS"); do
     f="$OUT/${STAGE}_r${i}.jsonl"
     rm -f "$f"
