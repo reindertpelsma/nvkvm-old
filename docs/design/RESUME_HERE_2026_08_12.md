@@ -135,7 +135,65 @@
 > **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
 > in ~127 logs.
 >
-> > ### ⊘⊘⊘ CORRECTION, 2026-08-12 (LATEST) — **THE PAGE WAS READ. THE COPY ENGINE WROTE IT,
+> > ### ⊘⊘⊘ CORRECTION, 2026-08-12 (**NEWEST — read this one first**) — **LEG 5 IS CLOSED.
+> > THE GR ENGINE FETCHED, THE GR WORK RAN, AND ALL EIGHT COMPLETIONS LANDED. `CUP2_RC` DID
+> > NOT MOVE.** Everything below this block about *"the completion is never written"* is
+> > SUPERSEDED. `../../../nvkvm-rs/traces/boots/w268/RESULT.md` (rev `70463ae`, 2 arms, real
+> > GA106, branch `w268-the-cursor-and-the-arm`; pre-registration
+> > `docs/design/w268_the_cursor_and_the_arm_prereg.md` at `87c0d0f`, before the instruments
+> > existed).
+> >
+> > ★★★★★ **THE OWNER'S `GP_GET` QUESTION, ANSWERED BOTH WAYS BY ONE VARIABLE**
+> > (`KAYFABE_GR_ROUTE`, `refuse` → `passthrough`; ⊘ the arm is **not** defaulted and stays
+> > `refuse`):
+> > - `refuse` (the shipping configuration): all eight `GrCompute` channels read
+> >   **`GET=0 PUT=1`** and `GET` **never** becomes non-zero — over **167 seconds**
+> >   (`t=+71006ms` → `t=+238095ms`, when the guest tears down and `PUT` returns to 0).
+> >   ⇒ **The guest submitted and the host engine NEVER FETCHED.**
+> >   ★★ The reading carries its own **known-positive**: the same reader, same arm, reads
+> >   `GET=1 PUT=1` on a **copy-engine** channel. The zero is about those channels, not the
+> >   instrument.
+> > - `passthrough`: **`GET` caught `PUT` on all eight, 32 ms after the doorbell.**
+> >
+> > ★★★★★ **AND THE THING `cuCtxCreate` POLLS WAS WRITTEN — the first time in this campaign.**
+> > All eight GR `SET_REPORT_SEMAPHORE` slots (`+0xf80…+0xff0`) carry `payload=1` and a
+> > **distinct GPU timestamp**; `COMPLETION-WATCH → OBSERVED` **= 8** against the control's
+> > `NOT-OBSERVED = 8`; the page fills in real time `24/1024 → 48/1024` over 430 ms.
+> >
+> > ⊘⊘⊘ **AND `CUP2_RC = 124` ON BOTH ARMS**, pre-registered at **zero** movement (eighth
+> > consecutive), with `cup2`'s own output **byte-identical** between arms. ★★★ **This is the
+> > most informative negative the campaign has produced, because it is the first one taken
+> > BEHIND a satisfied completion.** *"The guest is waiting for a semaphore nobody writes"* is
+> > **RETIRED as an explanation** — eight were written, at the guest's own declared addresses,
+> > with the guest's own payloads, and it did not proceed. **What it waits on now is a NEW and
+> > unmeasured question.**
+> >
+> > ★★★ **WHY THIS WAS REACHABLE AT ALL, and it is a doc-hygiene finding, not a code one:**
+> > `gr_doorbell_passthrough.md` §0.3 kept the route disarmed on two reasons — *"the ring is
+> > OURS"*, *"the cursor is OURS"* — measured **2026-08-11** and **both refuted by `w267`'s own
+> > log** (all 16 `GR-BIRTH iso2` lines read `adopt=GUEST-RING userd=GUEST-USERD`, eight of
+> > them `GrCompute`; legs A2 and B landed at `w261`/`w262`). Impeccably sourced, out of date,
+> > duplicated as a comment in **two** further places. ⇒ *A ruling's DATE is part of the
+> > citation.* All three copies corrected in place at `65fe5ca`.
+> >
+> > ⊘ Two further code readings that retire standing puzzles:
+> > **(a)** the three pin passes sit **below** `try_ce_submission`, which terminates a GR
+> > doorbell by `RefuseByRoute` — so the GR pushbuffer pages were never pinned, and **arming
+> > the route IS giving the pins their source** (`PB-PIN`/`SEMA-PIN` distinct tokens **8→16**);
+> > **(b)** `DOORBELL-REFUSED [PushbufferAperture]` is a **POST-HOC** refusal —
+> > `rm.schedule` + `rm.ring_doorbell` already ran inside `verb_op`, **before** `forward_ring`.
+> > That is why the hardware executed at `w266` while every doorbell read as refused.
+> >
+> > ★★★ **THE NEW WALL, and it is one address**: the `pass` arm's single `Xid 31` is
+> > `ENGINE CE2 HUBCLIENT_CE0 … VIRT_WRITE @ 0x2_04420000` — a page that appears **nowhere else
+> > in the boot**, arriving on the guest's **first substantive copy-engine work**
+> > (`methods=11 launches=3` over two GPFIFO entries) once GR context init completed.
+> > ⚠ And a prediction that FAILED: I expected the fetching GR engine to fault **reading** its
+> > own unjoined pushbuffer leaf. It did not, and that is unexplained.
+> > ⚠ New measured instrument limit: the observer thread's `stderr` interleaves with QEMU's own
+> > timestamped writer and splices whole log rows — 6 of 8 `why=first` rows on one arm.
+>
+> > ### ⊘⊘⊘ CORRECTION, 2026-08-12 — **THE PAGE WAS READ. THE COPY ENGINE WROTE IT,
 > > AND IT IS THE WRONG ENGINE.** Read this before the `w266` block below: that block's *"top
 > > limit"* has been discharged, and its two worlds are no longer open.
 > > `../../../nvkvm-rs/traces/boots/w267/RESULT.md` (rev `b129770`, 2 arms, real GA106, branch
