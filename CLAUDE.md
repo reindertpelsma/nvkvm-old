@@ -30,7 +30,38 @@ reproduced `cuCtxCreate → 2048² matmul` at **`bad=0 maxerr=0` on a STOCK, unp
 implementation a real NVIDIA driver has ever accepted end-to-end, so it can answer questions
 no amount of Rust-side testing can.
 
+> ### ⊘⊘⊘ CORRECTED HOURS LATER, 2026-08-12 — **THE BLOCK BELOW IS OVERDRAWN, AND THE
+> ### OVERDRAW MISDIRECTED A WHOLE DAY.** Read this first; the text below is true of the **CE
+> ### COPY plane** and **FALSE of the GR/COMPUTE plane**.
+> `cap3_matmul_forwarding` — *the passing run* — carries a **self-describing header**
+> (`docs/BENCH_REBUILD_NOTES.md:119`):
+> **`m2fwd=1  m2exec=1  m2hostsem=0  m2cefwd=0  m2cexec=0`**
+> ⇒ ⊘ **`m2cefwd=0`.** The claim below that it is *"the flag on every green run"* is **contradicted
+> by the trace's own header.**
+> ⇒ ★ **`m2exec=1`** — the execution plane was **ON**, and **`m2hostsem=0`** — the host-semaphore
+> forge was **OFF**. The C's `SET_REPORT_SEMAPHORE` CPU-forge exists (`:6544-6573`) and **wrote
+> nothing to the completion page in the green runs**. **The real host GR engine executed the
+> guest's ctx-init pushbuffer and wrote `0x2_0440fff0` itself.**
+> ⇒ ★★★ **So the C IS an oracle for GR engine execution** — precisely what the block below says it
+> is *"no oracle at all"* for. The `:4228` forge is real but is scoped to the **kernel CeUtils
+> scrubber channels** and explicitly excludes user GR/CE channels.
+>
+> ★★★★★ **AND HERE IS WHAT THE MIS-SCOPING COST:** reading the C as *"it forged everything"*
+> retired the only question that mattered — **how did the C's host GR get a COMPLETE VAS?** The
+> answer is stated in the C's own source at `src/qemu/nvkvm_gpu_emul.c:582`:
+> *"**Fault-safe: a mapping is always backed before the engine that uses it runs.**"*
+> Mechanism: a **doorbell-time sweep of the guest's GR page tables** (`m2_gr_pt_set`, re-swept
+> whenever a tracked PT page is written) plus **observed CE page-table writes decoded at the
+> completion-semaphore release** (`nvkvm_m2_cpt_sync_at_release`, `:592-604`).
+> ⇒ **The C mirrored the guest's page tables WHOLESALE and committed the mirror before any
+> completion became observable.** Every fault this campaign has chased one at a time — pushbuffer
+> VAs, the semaphore page, the CE operand, its extent, the GR write — is **one instance of that
+> single missing invariant.** ⚠ The C never met any of them because the sweep made them
+> **impossible as a class**, and it went green **without servicing or forwarding a single GPU
+> fault** (there is no fault-buffer emulation anywhere in the file).
+>
 > ### ⊘⊘ SCOPE THE ORACLE — 2026-08-12, measured from this tree's own source
+> ### ⚠ TRUE OF THE CE COPY PLANE ONLY — see the correction directly above.
 > **The green is a CONTROL-PLANE result. The data plane was CPU + emulator, not hardware.**
 > - `m2cefwd` — the flag on every green run — is defined at `src/qemu/nvkvm_gpu_emul.c:9931` as
 >   *"real-back the user-CE copy dst … (**completion/CPU-copy unchanged**)"*. ⇒ the **CPU** did
