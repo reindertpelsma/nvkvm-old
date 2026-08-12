@@ -563,6 +563,37 @@ static const char *gr_method(uint32_t m)
     case 0x0ad4: return "NVC7C0_SEND_SIGNALING_PCAS2_B";
     case 0x0268: return "NVC7C0_SET_INLINE_QMD_ADDRESS_A";
     case 0x026c: return "NVC7C0_SET_INLINE_QMD_ADDRESS_B";
+    /* ★ w274 -- the CONTEXT-INIT segment (gpe[0]) names these and nothing else did.
+     * ⚠ Note the field names in clc7c0.h, because they are the whole point:
+     *   SET_SHADER_LOCAL_MEMORY_A/B      -> ADDRESS_UPPER / ADDRESS_LOWER   (a POINTER)
+     *   SET_SHADER_LOCAL_MEMORY_WINDOW_* -> BASE_ADDRESS_UPPER / BASE_ADDRESS (an APERTURE)
+     *   SET_SHADER_SHARED_MEMORY_WINDOW_*-> BASE_ADDRESS_UPPER / BASE_ADDRESS (an APERTURE)
+     * and there is NO SET_SHADER_SHARED_MEMORY_A/B at all -- shared memory is on-chip
+     * SRAM, so there is nothing in memory for a pointer to point at. */
+    case 0x0114: return "NVC7C0_LOAD_MME_INSTRUCTION_RAM_POINTER";
+    case 0x0118: return "NVC7C0_LOAD_MME_INSTRUCTION_RAM <== MME MICROCODE";
+    case 0x011c: return "NVC7C0_LOAD_MME_START_ADDRESS_RAM_POINTER/RAM";
+    case 0x0200: return "NVC7C0_SET_VALID_SPAN_OVERFLOW_AREA_A";
+    case 0x0204: return "NVC7C0_SET_VALID_SPAN_OVERFLOW_AREA_B";
+    case 0x0208: return "NVC7C0_SET_VALID_SPAN_OVERFLOW_AREA_C(size)";
+    case 0x023c: return "NVC7C0_SET_SPA_VERSION/INVALIDATE";
+    case 0x0248: return "NVC7C0_(0x0248 -- repeated 64x in context init)";
+    case 0x02a0: return "NVC7C0_SET_SHADER_SHARED_MEMORY_WINDOW_A <== APERTURE BASE, NOT A POINTER";
+    case 0x02a4: return "NVC7C0_SET_SHADER_SHARED_MEMORY_WINDOW_B <== APERTURE BASE, NOT A POINTER";
+    case 0x02e4: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A(size)";
+    case 0x02e8: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_B(size)";
+    case 0x02ec: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_C(max_sm)";
+    case 0x0310: return "NVC7C0_(0x0310 -- context init)";
+    case 0x0790: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_A(ADDRESS_UPPER) <== a real POINTER";
+    case 0x0794: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_B(ADDRESS_LOWER) <== a real POINTER";
+    case 0x07b0: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A <== APERTURE BASE";
+    case 0x07b4: return "NVC7C0_SET_SHADER_LOCAL_MEMORY_WINDOW_B <== APERTURE BASE";
+    case 0x155c: return "NVC7C0_SET_TEX_SAMPLER_POOL_A";
+    case 0x1560: return "NVC7C0_SET_TEX_SAMPLER_POOL_B";
+    case 0x1564: return "NVC7C0_SET_TEX_SAMPLER_POOL_C(max_index)";
+    case 0x1574: return "NVC7C0_SET_TEX_HEADER_POOL_A";
+    case 0x1578: return "NVC7C0_SET_TEX_HEADER_POOL_B";
+    case 0x157c: return "NVC7C0_SET_TEX_HEADER_POOL_C(max_index)";
     default: return NULL;
     }
 }
@@ -583,6 +614,12 @@ struct pbfacts {
     uint32_t ce_sem_payload, host_sem_payload_lo, gr_sem_payload;
     uint64_t off_in, off_out;
     uint32_t line_len, launch_dma;
+    /* ★ w274 -- the context-init segment's own operands. `have_*` is separate from the
+     * value because 0 is a legal window base and "absent" must not decode to it. */
+    uint64_t shared_win, local_win, local_mem, tex_hdr, tex_smp, span_ovf;
+    int have_shared_win, have_local_win, have_local_mem, have_tex_hdr, have_tex_smp,
+        have_span_ovf;
+    int n_mme_dw;               /* dwords written to LOAD_MME_INSTRUCTION_RAM */
 };
 
 /* Decode a Pascal+/Ampere pushbuffer segment. dwords at cpu_va, n dwords. */
@@ -673,6 +710,22 @@ static void decode_pb(uint64_t cpu_va, uint32_t ndw, struct pbfacts *f, int verb
             if (a == 0x018c) f->i2m_off_out = (f->i2m_off_out & ~0xffffffffull) | v;
             if (a == 0x01b0) { f->n_i2m_launch++; f->i2m_launch = v; }
             if (a == 0x01b4) { if (!f->n_inline_data) f->inline_first = v; f->n_inline_data++; }
+            /* ★ w274 -- context-init operands. ⚠ the `_A` field width is NOT constant:
+             * these five are all `16:0` per clc7c0.h, unlike SET_REPORT_SEMAPHORE_A's
+             * `7:0`. Masking them all with 0xff reports 0 for a real address. */
+            if (a == 0x02a0) { f->shared_win = ((uint64_t)(v & 0x1ffff) << 32) | (f->shared_win & 0xffffffffu); f->have_shared_win = 1; }
+            if (a == 0x02a4)   f->shared_win = (f->shared_win & ~0xffffffffull) | v;
+            if (a == 0x07b0) { f->local_win  = ((uint64_t)(v & 0x1ffff) << 32) | (f->local_win  & 0xffffffffu); f->have_local_win = 1; }
+            if (a == 0x07b4)   f->local_win  = (f->local_win  & ~0xffffffffull) | v;
+            if (a == 0x0790) { f->local_mem  = ((uint64_t)(v & 0x1ffff) << 32) | (f->local_mem  & 0xffffffffu); f->have_local_mem = 1; }
+            if (a == 0x0794)   f->local_mem  = (f->local_mem  & ~0xffffffffull) | v;
+            if (a == 0x1574) { f->tex_hdr    = ((uint64_t)(v & 0x1ffff) << 32) | (f->tex_hdr    & 0xffffffffu); f->have_tex_hdr = 1; }
+            if (a == 0x1578)   f->tex_hdr    = (f->tex_hdr    & ~0xffffffffull) | v;
+            if (a == 0x155c) { f->tex_smp    = ((uint64_t)(v & 0x1ffff) << 32) | (f->tex_smp    & 0xffffffffu); f->have_tex_smp = 1; }
+            if (a == 0x1560)   f->tex_smp    = (f->tex_smp    & ~0xffffffffull) | v;
+            if (a == 0x0200) { f->span_ovf   = ((uint64_t)(v & 0xff)    << 32) | (f->span_ovf   & 0xffffffffu); f->have_span_ovf = 1; }
+            if (a == 0x0204)   f->span_ovf   = (f->span_ovf   & ~0xffffffffull) | v;
+            if (a == 0x0118)   f->n_mme_dw++;
         }
         i += 1 + cnt;
     }
@@ -1140,7 +1193,9 @@ int main(void)
     int armed_sem = 0, armed_gpput = 0;
     uint64_t pb_hit = 0, ring_va = 0, pb_va = 0;
     uint32_t ring_idx = 0, pb_len = 0;
+    uint64_t ring_base_seen = 0;               /* ★ w274 -- for ITEM 2c */
     struct pbfacts allf; memset(&allf, 0, sizeof allf);
+    struct pbfacts ctxf; memset(&ctxf, 0, sizeof ctxf);
 
     g_t0 = now_s();
     g_pid = getpid();
@@ -1329,6 +1384,7 @@ int main(void)
         if (g_userd_ch >= 0) ring_base = g_ch[g_userd_ch].gpFifoOffset;
         else                 ring_base = ring_va & ~0xfffull;
         hexdump_to("ring.bin", ring_base, 8192);
+        ring_base_seen = ring_base;
         for (e = 0; e < 1024; e++) {
             uint32_t e0, e1;
             if (!rd32(ring_base + 8ull * e, &e0) || !rd32(ring_base + 8ull * e + 4, &e1)) break;
@@ -1378,6 +1434,94 @@ int main(void)
         L("  I2M destination = 0x%016llx  line_len=%u line_count=%u launch=0x%08x  (dp=0x%llx, match=%d)",
           (unsigned long long)allf.i2m_off_out, allf.i2m_line_len, allf.i2m_line_cnt,
           allf.i2m_launch, (unsigned long long)dp, allf.i2m_off_out == dp);
+
+    /* ---- 2c: THE CONTEXT-INIT SEGMENT (gpe[0]) ------------------------------
+     * ★★★ w274. The guest's decoder only ever dumps ring index 0, so gpe[0] is the ONE
+     * segment a native<->guest byte comparison can be made over -- and it is also the only
+     * segment that names SET_SHADER_SHARED_MEMORY_WINDOW. ITEM 2/2b above decode the
+     * segment carrying the COPY (gpe[110] in the reference run), which is a different one.
+     *
+     * ⊘ For every 64-bit operand it names we print the CONTAINING /proc/self/maps record,
+     * not merely "is it in an nvidia mmap window". The distinction is the result: a device
+     * pointer has NO cpu mapping at all, an aperture base sits inside a PROT_NONE
+     * RESERVATION, and a real pool is mapped. Printing only "not in a window" would collapse
+     * all three into one answer. */
+    L("=== ITEM 2c: THE CONTEXT-INIT SEGMENT (gpe[0]) ===");
+    maps_reload();   /* ⚠ the census below is only as current as this */
+    if (!ring_base_seen) {
+        L("  ⊘ NO DUMP: no ring base was established. This is NOT 'the segment was empty'.");
+    } else {
+        uint32_t e0 = 0, e1 = 0;
+        if (!rd32(ring_base_seen, &e0) || !rd32(ring_base_seen + 4, &e1)) {
+            L("  ⊘ NO DUMP: gpe[0] at 0x%llx is not readable.",
+              (unsigned long long)ring_base_seen);
+        } else if (!e0 && !e1) {
+            L("  ⊘ gpe[0] IS ZERO -- measured, not assumed.");
+        } else {
+            uint64_t cva = gpe_addr(e0, e1);
+            uint32_t cdw = gpe_len(e1);
+            L("  gpe[0] = %08x %08x -> pbuf 0x%010llx len=%u dw (%u bytes)",
+              e0, e1, (unsigned long long)cva, cdw, cdw * 4);
+            hexdump_to("pushbuffer_ctxinit.bin", cva, (size_t)cdw * 4);
+            decode_pb(cva, cdw, &ctxf, 1);
+            L("  CTX-INIT FACTS: mme_dwords=%d i2m_launch=%d qmd=%d gr_report_sem=%d",
+              ctxf.n_mme_dw, ctxf.n_i2m_launch, ctxf.n_qmd, ctxf.n_report_sem);
+            {
+                struct { const char *k; uint64_t va; int have; } o[6] = {
+                    { "SET_SHADER_SHARED_MEMORY_WINDOW (aperture)", ctxf.shared_win, ctxf.have_shared_win },
+                    { "SET_SHADER_LOCAL_MEMORY_WINDOW  (aperture)", ctxf.local_win,  ctxf.have_local_win  },
+                    { "SET_SHADER_LOCAL_MEMORY         (pointer) ", ctxf.local_mem,  ctxf.have_local_mem  },
+                    { "SET_TEX_HEADER_POOL             (pointer) ", ctxf.tex_hdr,    ctxf.have_tex_hdr    },
+                    { "SET_TEX_SAMPLER_POOL            (pointer) ", ctxf.tex_smp,    ctxf.have_tex_smp    },
+                    { "SET_VALID_SPAN_OVERFLOW_AREA    (pointer) ", ctxf.span_ovf,   ctxf.have_span_ovf   } };
+                int k;
+                L("  --- every 64-bit operand gpe[0] names, against THIS process's own maps ---");
+                L("  ⊘ 'NOT PRESENT' below means the method was ABSENT from the stream. It is a");
+                L("     different fact from a value of 0, and neither is evidence of the other.");
+                for (k = 0; k < 6; k++) {
+                    char d[256];
+                    const struct maprec *m;
+                    if (!o[k].have) { L("    %-44s : NOT PRESENT in gpe[0]", o[k].k); continue; }
+                    m = map_of(o[k].va);
+                    L("    %-44s : 0x%016llx", o[k].k, (unsigned long long)o[k].va);
+                    L("        containing map      = %s", map_desc(o[k].va, d, sizeof d));
+                    L("        cpu-readable        = %d", readable(o[k].va));
+                    if (m) {
+                        L("        ★ the record        = 0x%llx-0x%llx perm=%s (%llu MiB), value at"
+                          " +0x%llx = %llu%% of the way in",
+                          (unsigned long long)m->lo, (unsigned long long)m->hi, m->perm,
+                          (unsigned long long)((m->hi - m->lo) >> 20),
+                          (unsigned long long)(o[k].va - m->lo),
+                          (unsigned long long)(m->hi > m->lo
+                              ? (100ull * (o[k].va - m->lo)) / (m->hi - m->lo) : 0));
+                    } else {
+                        L("        ★ NO /proc/self/maps RECORD CONTAINS IT — the VA is not in this");
+                        L("          process's address space at all (a GPU-only mapping).");
+                    }
+                }
+                L("  ⊘ CONTROL: dp = 0x%llx (a device pointer the GPU demonstrably writes) is",
+                  (unsigned long long)dp);
+                L("     itself %s. So 'no cpu mapping' can NEVER be read as 'no GPU backing'.",
+                  map_of(dp) ? "inside a map record" : "in NO map record at all");
+            }
+        }
+    }
+    /* The whole map, so the reservation structure above is checkable after the fact. */
+    {
+        FILE *mf = fopen("/proc/self/maps", "r");
+        char pth[512];
+        snprintf(pth, sizeof pth, "%s/maps.txt", g_rawdir);
+        if (mf) {
+            FILE *of = fopen(pth, "w");
+            if (of) {
+                char ln[512];
+                while (fgets(ln, sizeof ln, mf)) fputs(ln, of);
+                fclose(of);
+                L("  raw -> %s (the whole address space, for after-the-fact checking)", pth);
+            }
+            fclose(mf);
+        }
+    }
 
     /* ---- 3: the semaphore -------------------------------------------------- */
     L("=== ITEM 3: THE REPORT SEMAPHORE ===");
