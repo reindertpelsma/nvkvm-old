@@ -63,6 +63,53 @@
 > > ACCESS_TYPE_VIRT_READ` are real, and `FAULT_PDE` is exactly what a pin at those VAs would
 > > install a directory entry for. Only the named mechanism was wrong.
 > >
+> > ### ⊘⊘⊘ CORRECTION, 2026-08-12 — **LEG 4 IS DONE, AND THE WALL IS NOW ON THE COMPLETION
+> > PLANE.** Read this before acting on the `w264` block below; that block's *"the next rung"*
+> > has been RUN. `traces/boots/w265/RESULT.md` (rev `2f02621`, 2 arms, real GA106).
+> >
+> > ★★★★★ **NO CODE WAS WRITTEN. The populate source was ALREADY BUILT and `w264` ran with it
+> > OFF** — `KAYFABE_PT_WITNESS_EXEC`. `w261`/`w262` armed it; `w263_run.sh` and `w264_run.sh`
+> > silently dropped it, and all four `w264` arms say `EXEC-WITNESS DISARMED` in their own logs.
+> > ⇒ The ninth consecutive lane whose brief's premise was already answered — and the sharpest
+> > instance yet: `execution_plane_increments.md` §16.98.1 diagnosed **this exact class about
+> > this exact flag two rungs earlier** (*"a correct default is not a handoff … must be named in
+> > the CONSUMER's preconditions, not only in the producer's rationale"*) — and recorded it in
+> > the **producer's** doc, which is the failure mode the sentence describes.
+> >
+> > **One variable, `off`→`on`, measured:**
+> > - the table LEARNED the leaves — `pdb=0x201000` rows **5 → 13 348**, `wit` **0 → 37**,
+> >   `wit_sample` `[]` → **`[0x201000,0x202000,0x203000,0x204000]`** = *exactly* the four
+> >   page-table pages the descent calls `byEXEC#104…#107`;
+> > - `PB-PIN … MISS` **8 → 0**, resolved-in-guest-RAM **0 → 8**, **`PINNED` 0 → 8** — the
+> >   guest-RAM pin has placed bytes on a live guest **for the first time**;
+> > - `NOT-IN-GUEST-RAM = 0` ⇒ the **`miss = fault` invariant HELD**; the fix adds a *writer* to
+> >   the witness, never a lookup path, so residue still cannot bind.
+> >
+> > ★★★★★ **AND THE EIGHT `Xid` AT THE EIGHT PUSHBUFFER VAs ARE GONE:**
+> > ```
+> > off: ENGINE CE3_PBDMA0 HUBCLIENT_ESC @ 0x2_02c00000 (8 distinct VAs) ACCESS_TYPE_VIRT_READ
+> > on:  ENGINE CE3        HUBCLIENT_CE1 @ 0x2_0440f000 (ONE address)    ACCESS_TYPE_VIRT_WRITE
+> > ```
+> > Front-end → engine; method-fetch client → **data** client; the pinned pages → a new page;
+> > **READ → WRITE**. ⇒ **The PBDMA fetched the pushbuffer, parsed its methods, and the copy
+> > engine began EXECUTING them.**
+> > ★★★ **`0x2_0440f000` is the COMPLETION SEMAPHORE PAGE** — eight channels'
+> > `SET_REPORT_SEMAPHORE` targets, `0x20440ff80 … 0x20440fff0` at 16-byte stride, all
+> > `site=GuestRam`. **Leg 5 has arrived as a hardware fault at a named address, and the fix is
+> > isomorphic to the one just landed, on ONE page.**
+> > ⚠ `CUP2_RC = 124` on both arms, **pre-registered at zero movement** (fifth consecutive lane
+> > to predict zero and measure zero — still right: no table fix retires a semaphore nothing
+> > submits). `CE-SUBMIT → RETIRED` still `0`.
+> > ⊘ **Costs, unpaid:** `unwitnessed` rose **6275 → 19 874** beside `bound` **6275 → 19 615**
+> > (the gate opened *partway*); **255 `StraddlesLiveBinding` refusals** (0 on `off`).
+> > ⊘ **Not attributable to the PIN** — the arm changed 13 343 bindings, so the `Xid` move
+> > belongs to the **arm**.
+> > ⊘⊘ **AND THE INSTRUMENT LESSON, which cost the most:** `grep -c Xid` read **8 on both
+> > arms**. ★★★ **A COUNT CANNOT SEE A SUBSTITUTION** — five facts changed and a magnitude saw
+> > none of them. When a fix is expected to **move** a wall rather than remove it, the identity
+> > is the instrument. `w265_grade.sh` now carries `Xid` ENGINE/CLIENT/DISTINCT-ADDRS/ACCESS-TYPE
+> > as scorecard rows.
+> >
 > > ### ★★★★★ MEASURED, `w264` (4 arms, real GA106, rev `a4c46bb`) — **AND LEG 4 IS NEITHER**
 > > `traces/boots/w264/RESULT.md`. The pin was built, armed, and asked about **exactly the
 > > eight addresses hardware faults on**. The **address table answered `Miss` on all eight**,
@@ -87,6 +134,15 @@
 >
 > **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
 > in ~127 logs.
+>
+> > ### ⊘⊘ CORRECTION, 2026-08-12 — **LEG 5 NOW HAS AN ADDRESS, AND HARDWARE NAMED IT.**
+> > `w265`'s `on` arm faults `ENGINE CE3 HUBCLIENT_CE1 @ 0x2_0440f000 ACCESS_TYPE_VIRT_WRITE`,
+> > ×8. That page holds **eight channels' `SET_REPORT_SEMAPHORE` targets**
+> > (`0x20440ff80 … 0x20440fff0`, 16-byte stride, all `site=GuestRam`). ⇒ Leg 5 is still
+> > **unbuilt**, but it is no longer *unlocated*: the copy engine is now **trying to complete**
+> > and faulting on the write. ★ The primitive it needs is `pin_guest_ram` — the one that just
+> > placed 8 pushbuffer runs — pointed at **one** page. ⊘ `CE-SUBMIT → RETIRED` is still `0`;
+> > nothing here submits, and an attempted semaphore write is not a retirement.
 >
 > ⇒ **`w263` is therefore pre-registered at ZERO movement, and that is a prediction against the
 > rung's own optimism** — necessary-not-sufficient, exactly the shape `w260` measured for the
