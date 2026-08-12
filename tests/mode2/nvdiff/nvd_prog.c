@@ -14,7 +14,14 @@
  *
  * Build: cc -O0 -o nvd_prog nvd_prog.c -lcuda      (no nvcc, no cudart, no cuBLAS)
  */
+/* ⊘ -DNVD_NO_CUDA_H selects the bundled stand-in (nvd_capture.sh sets it when the box has
+ * libcuda but no toolkit). ⚠ It must be set on BOTH sides of a differential or neither:
+ * the two binaries are supposed to be the same program. */
+#ifdef NVD_NO_CUDA_H
+#include "nvd_cuda_min.h"
+#else
 #include <cuda.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

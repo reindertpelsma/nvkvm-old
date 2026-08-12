@@ -22,15 +22,47 @@ mkdir -p "$OUT"
 CC="${CC:-cc}"
 CFLAGS_CUDA="${CFLAGS_CUDA:-}"
 : "${CUDA_INC:=}"
-for d in /usr/local/cuda/include /usr/include /usr/local/include; do
-    [ -f "$d/cuda.h" ] && CUDA_INC="$d" && break
-done
-[ -n "$CUDA_INC" ] || { echo "FATAL: no cuda.h found"; exit 1; }
-
-echo "== build (cuda.h from $CUDA_INC)"
+# ⊘ NVD_MIN_CUDA=1 forces the bundled minimal header even where a real cuda.h exists.
+#   ★ USE IT ON BOTH SIDES OR NEITHER. The differential's whole validity is that host and
+#   guest run the SAME program; building one side against the toolkit header and the other
+#   against the stand-in makes the two binaries a variable, and it is the variable nobody
+#   would think to look at.
+if [ "${NVD_MIN_CUDA:-0}" != 1 ]; then
+    for d in /usr/local/cuda/include /usr/include /usr/local/include; do
+        # ⚠ a file named cuda.h is not cuda.h: the PowerMac ADB driver header has the same
+        #   name and is present on both the bench box and the guest. Check the content.
+        [ -f "$d/cuda.h" ] && grep -q 'CUDA_SUCCESS' "$d/cuda.h" 2>/dev/null && CUDA_INC="$d" && break
+    done
+fi
+if [ -n "$CUDA_INC" ]; then
+    echo "== build (REAL cuda.h from $CUDA_INC)"
+    INCFLAG="-I$CUDA_INC"
+else
+    echo "== build (⊘ no real cuda.h — using the bundled nvd_cuda_min.h stand-in)"
+    INCFLAG="-DNVD_NO_CUDA_H -I$HERE"
+fi
 $CC -shared -fPIC -O2 -o "$OUT/nvdiff_shim.so" "$HERE/nvdiff_shim.c" -ldl -lpthread || exit 1
-$CC -O0 -I"$CUDA_INC" -o "$OUT/nvd_prog" "$HERE/nvd_prog.c" -lcuda $CFLAGS_CUDA || {
+$CC -O0 $INCFLAG -o "$OUT/nvd_prog" "$HERE/nvd_prog.c" -lcuda $CFLAGS_CUDA || {
     echo "FATAL: could not link -lcuda (need libcuda.so dev symlink)"; exit 1; }
+
+# ★★★ SYMBOL-BINDING GATE. A header cannot check itself; the linker's output can.
+# Real cuda.h #defines seven entry points onto their _v2 symbols. Binding the v1 names
+# instead builds, links, runs, and emits a DIFFERENT ioctl stream — silently. Refuse.
+echo "== symbol-binding gate (the seven versioned entry points must bind _v2)"
+MISSING=
+for sym in cuDeviceTotalMem_v2 cuCtxCreate_v2 cuCtxDestroy_v2 cuMemAlloc_v2 \
+           cuMemFree_v2 cuMemcpyHtoD_v2 cuMemcpyDtoH_v2; do
+    # ⚠ objdump prints `cuCtxCreate_v2@Base` (or `@LIBCUDA_1.0`), never a bare name — an
+    #   end-anchored match fails on a CORRECTLY bound symbol. Measured: the first version of
+    #   this gate refused a build in which all seven were bound. It failed SAFE, which is the
+    #   only reason it cost minutes and not a wrong reference capture.
+    if objdump -R "$OUT/nvd_prog" 2>/dev/null | grep -qE "[[:space:]]$sym(@|$)"; then
+        echo "   ok   $sym"
+    else
+        echo "   ★★★ NOT BOUND: $sym"; MISSING="$MISSING $sym"
+    fi
+done
+[ -z "$MISSING" ] || { echo "FATAL: v1 symbols bound instead of _v2 —$MISSING"; exit 1; }
 
 echo "== environment"
 {
