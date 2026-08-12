@@ -26,7 +26,7 @@
  *
  * Env:
  *   NVDIFF_OUT     output path (default: ./nvdiff.jsonl)
- *   NVDIFF_MAXBUF  max parameter bytes captured per side (default 4096)
+ *   NVDIFF_MAXBUF  max parameter bytes captured per side (default 65536)
  *   NVDIFF_MMAP    1 = also record mmap/munmap of nvidia fds (default 1)
  *   NVDIFF_PROBE   bytes to read when the size is UNKNOWN (default 0 -- see below)
  *
@@ -69,7 +69,15 @@ static void *(*r_mmap)(void *, size_t, int, int, int, off_t);
 static int   (*r_munmap)(void *, size_t);
 
 static int      g_fd = -1;
-static unsigned g_maxbuf = 8192;
+/* ★★★ 65536, not 8192 — measured 2026-08-12, boot w274b_pin.
+ * At 8192 the recorder truncated 18/18 guest and 25/25 host
+ * UVM_MAP_EXTERNAL_ALLOCATION records — sizeof(PARAMS) = 9264, the LARGEST struct in
+ * uvm_sizes.h, so the cap cut exactly the call the divergence lands on and every value
+ * diff on it was computed over a partial buffer. Three orchestration scripts already
+ * pinned 65536 in their own env; the DEFAULT was the one that was wrong, so a caller
+ * driving nvd_capture.sh directly (as the w274 hook did) silently got the truncated
+ * answer. A correct value carried by every caller except the default is not a default. */
+static unsigned g_maxbuf = 65536;
 static unsigned g_probe  = 0;
 static int      g_mmap   = 1;
 static uint64_t g_seq    = 0;   /* atomic */
@@ -244,7 +252,13 @@ int ioctl(int fd, unsigned long req, ...)
 
     hlen = arg_len(dev, req, iocsize, &lensrc);
     uname_ = dev_is_uvm(dev) ? uvm_name(req) : NULL;
-    if (hlen > g_maxbuf) { hlen = g_maxbuf; trunc |= 1; }
+    /* ★ A "tbl" length is NOT externally derived: it is a compile-time sizeof(*_PARAMS)
+     * emitted from the open-driver headers by gen_uvm_sizes.sh, bounded by construction
+     * (max 9264 = MAP_EXTERNAL_ALLOCATION) and already trusted enough to be the ONLY
+     * reason this shim is not reading _IOC_SIZE garbage. Capping it can therefore only
+     * destroy known-good bytes, never bound an unknown read. "ioc" lengths and the RM
+     * `declared` params length below stay capped — those come from the caller. */
+    if (hlen > g_maxbuf && strcmp(lensrc, "tbl") != 0) { hlen = g_maxbuf; trunc |= 1; }
     if (hlen) {
         hdr_pre  = malloc(hlen);
         hdr_post = malloc(hlen);

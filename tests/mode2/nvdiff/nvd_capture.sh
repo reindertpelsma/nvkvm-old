@@ -88,7 +88,7 @@ for i in $(seq 1 "$RUNS"); do
     f="$OUT/${STAGE}_r${i}.jsonl"
     rm -f "$f"
     echo "== run $i -> $f"
-    NVDIFF_OUT="$f" NVDIFF_MAXBUF="${NVDIFF_MAXBUF:-8192}" \
+    NVDIFF_OUT="$f" NVDIFF_MAXBUF="${NVDIFF_MAXBUF:-65536}" \
         LD_PRELOAD="$OUT/nvdiff_shim.so" \
         timeout "${NVD_TIMEOUT:-300}" "$OUT/nvd_prog" "$STAGE" \
         > "$OUT/${STAGE}_r${i}.stdout" 2>&1
