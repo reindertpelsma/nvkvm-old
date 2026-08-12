@@ -135,6 +135,59 @@
 > **5 — the COMPLETION PATH.** `CE-SUBMIT → RETIRED` was **0 on both `w262` arms**, as it has been
 > in ~127 logs.
 >
+> > ### ⊘⊘⊘ CORRECTION, 2026-08-12 (LATER) — **THE PAGE IS PINNED AND THE HOST GPU STOPPED
+> > FAULTING: 8 `Xid` → 0. THE WALL IS NO LONGER A FAULT — AND IT IS STILL A WALL.**
+> > Read this before the block below, which says leg 5 is *unbuilt*. It is built and it has run:
+> > `../../../nvkvm-rs/traces/boots/w266/RESULT.md` (rev `f09aba2`, 2 arms, real GA106,
+> > branch `leg-5-completion-pin`).
+> >
+> > ★★★★★ **One variable — `KAYFABE_GUEST_SEMA` `off`→`pin` — one page, and three campaigns of
+> > MMU faults end.** `w263`/`w264`/`w265_off` faulted **reading** the pushbuffer; `w265_on`
+> > faulted **writing** the completion; `w266_on` **does not fault at all**.
+> > ```
+> > off: 8 × Xid 31  ENGINE CE3/CE2 HUBCLIENT_CE1/CE0 @ 0x2_0440f000  VIRT_WRITE
+> > on:  (nothing)
+> > ```
+> > ⊘ **And the zero is MEASURED, not an empty artefact** — checked first, because a zero-byte
+> > `hostdmesg` is exactly the shape that reads as benign. The watermark advanced **961 → 969**
+> > (the `off` arm's own 8), the `host dmesg delta:` line is printed **only** by the branch that
+> > successfully read `dmesg`, and the probe log carries `HOST_DMESG_XID=0` beside `off`'s `=8`.
+> >
+> > ★ Again **no new mechanism**: `pin_guest_ram` — the chain that placed eight pushbuffer runs
+> > at `w265` — pointed at one page. What did not exist was a **reader** for the addresses
+> > (`WatchList` had `declare`/`stats`/`live`/`sweep` and no accessor) and a **consumer**
+> > (`back_census_framebuffer_leaves` handles `Site::Framebuffer` only and calls the `GuestRam`
+> > rows *"this pass's standing negative controls"*). Eight declared targets → **one** page.
+> >
+> > ⊘⊘ **AND THE COMPLETION STILL DOES NOT LAND.** `COMPLETION-WATCH … NOT-OBSERVED samples=88
+> > last_seen=0x00000000`, byte-identical on both arms; `CUP2_RC = 124` on both — the **sixth**
+> > consecutive predicted zero and the sixth measured zero. The observer *is* watching the
+> > pinned page (declares resolve `gpa 0x2197eff0`; the pin placed `gpa 0x2197e000 len=4096`).
+> > ⇒ ★★★ **The page became writable and nothing observable was written to it — 0 faults AND 0
+> > completions.** *"Writable"* and *"the guest's wait was satisfied"* are different facts, and
+> > this is the campaign's cleanest demonstration of it.
+> >
+> > ⊘ **THE TOP LIMIT, and it is the next rung: nothing reads the page.** *"No fault"* is
+> > consistent with (a) the write landing at a slot nobody watches — the **CE**'s own
+> > `SET_SEMAPHORE` target is a different address in the same page than the **GR** channels'
+> > `SET_REPORT_SEMAPHORE` targets the observer watches — and (b) the engine never attempting
+> > it. The evidence leans hard on (a); leaning is not measuring. ⇒ **Dump the 4 KiB page**, and
+> > decode the CE's full `SET_SEMAPHORE_A/B/PAYLOAD` operand (the pushbuffer dump prints only
+> > the first of three arguments).
+> >
+> > ⊘⊘ **INSTRUMENT LESSON, and it cost the most here: ADDING A PRODUCER SILENTLY RE-SCOPES
+> > EVERY CONSUMER THAT WAS IMPLICITLY SCOPED BY BEING THE ONLY ONE.** Three grader rows read
+> > `16/16/20` against the control's `8/8/12` — *"leg 4 doubled"* — when leg 4 had not moved;
+> > they were counting leg 5's identically-shaped lines. Fixing it exposed that one of them was
+> > **already wrong before leg 5 existed** (its true value is 8, not 12; four came from
+> > `GR-RING-JOIN`/`GR-FB-JOIN`, a different plane), so at `w265` it was summing **three**
+> > producers and only a hand-done subtraction made it read right. ★ **A row that needs a
+> > subtraction to be read is a row that will be misread.** ⚠ And the obvious repair `TABLE:`
+> > does *not* work — `SEMA-TABLE:` contains it; the correct anchor is `[^-]TABLE:`.
+> >
+> > ⊘ **`CE-SUBMIT → RETIRED` is still `0`** and this rung does not submit. The `Xid` going to
+> > zero is a **supply-side** result.
+> >
 > > ### ⊘⊘ CORRECTION, 2026-08-12 — **LEG 5 NOW HAS AN ADDRESS, AND HARDWARE NAMED IT.**
 > > `w265`'s `on` arm faults `ENGINE CE3 HUBCLIENT_CE1 @ 0x2_0440f000 ACCESS_TYPE_VIRT_WRITE`,
 > > ×8. That page holds **eight channels' `SET_REPORT_SEMAPHORE` targets**
@@ -240,6 +293,11 @@ USERD**, so late adoption wipes the cursor that caused the doorbell.
 
 ## 6. NEXT RUNGS, ORDERED
 
+0. ★★★★★ **READ THE SEMAPHORE PAGE** — `w266` pinned it and the host GPU's eight `Xid` went to
+   **zero**, while `COMPLETION-WATCH` stayed `NOT-OBSERVED` on every channel. Nothing dumps the
+   page, so *"the write landed at a slot nobody watches"* and *"the engine never wrote"* are
+   still one fact. One 4 KiB dump separates them. ⚠ Do this **before** widening the watch: a
+   guess at slots without reading the page is the `dlen=0`-decoded-to-zeros class.
 1. ◐ **Leg B** — in flight. The first three-legged boot.
 2. **Read `GP_GET`** — the difference between *adopted* and *fetched*. Nothing does today.
 3. **Fault injection** for §4's items 3 and 5 — a green boot cannot reach them **by construction**.
