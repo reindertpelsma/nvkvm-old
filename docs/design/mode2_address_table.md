@@ -180,6 +180,56 @@ honoring it is how "atomic end-state after invalidate" is actually achieved.
 
 ## 6. Miss handling — a miss is a fault, never a walk, never a guess
 
+> ### ★★★★★ OWNER RULING 2026-08-12 — MIRROR THE WHOLE VAS. §6 stands; its SCOPE narrows.
+>
+> **What changed.** The Rust port (`kayfabe`, w276) now runs the C's whole-VAS sweep
+> (`enum_gr_sysmem`, `C: nvkvm_gpu_emul.c:583-591`) at the doorbell: a walk from each address
+> space's **own installed page-directory root**, whose every reached page is admitted and whose
+> leaves are forward-populated. The owner was shown the objection below **in full** and ruled for
+> the whole-VAS port anyway — this is *"port the C, don't redesign"* applied to the completeness
+> invariant.
+>
+> **⊘ What did NOT change, and must not be misread.** §6 below is about **`resolve`**, and it is
+> untouched: a lookup that misses is still a fault, still never walked, still never guessed. The
+> sweep is a **populate source** (§4), not a resolver. It runs **before** the consumer that reads
+> the table, never as a fallback **after** a miss. ⇒ *"we now walk on a miss"* is false; the port
+> has no such path and adding one is still refused.
+>
+> **★ Why the timing hazard below does not apply to the submission's own set.** A **doorbell is
+> the guest's own commit point** for the work it is submitting. The guest cannot be mid-update on
+> a VA that this submission will touch without racing its own GPU. So for that reachable set, the
+> *"uncommitted, possibly mid-update"* state §6 refuses to read is not the state we read.
+>
+> **⚠ THE ACCEPTED RESIDUAL, stated rather than papered over.** The argument above covers the
+> submission's own set and **not the rest of the address space**. A whole-VAS walk also reads
+> regions another guest thread may be rewriting right now, and there §6's hazard is intact: a torn
+> multi-level walk can resolve to the wrong physical page. **This is a knowingly accepted risk, not
+> a refuted one.** Two things bound it and neither is a proof of absence:
+> - ★★ **The dirty-driven re-sweep, which is why the sweep is HALF a design.** A page that was
+>   mid-update when it was swept was **by definition being written**, so it lands in the dirty set,
+>   so the next doorbell re-sweeps it. The torn window is **bounded and self-healing**. ⇒ **A
+>   one-shot sweep without dirty-driven re-sweep does NOT carry this argument.** Build both halves
+>   or neither. (`kayfabe_fwd::plan_pt_sweep` triggers = never-swept / truncated / dirty — the C's
+>   `chan_vas_n` / `m2_gr_pt_trunc` / `m2_gr_vas_dirty`.)
+> - The window is a wrong *guest-owned* mapping inside **the guest's own address space**, not a
+>   cross-VM one: every page still passes the aperture checks, the walk is depth- and
+>   budget-bounded, an unreadable page is still a loud fault and never zeros, and a truncated walk
+>   contributes **no** leaves rather than partial ones.
+>
+> **⊘ The residual is real and is not zero.** It is a fidelity/consistency risk taken to reach the
+> C's completeness. Anyone re-opening this must re-open it as *"is the self-healing bound good
+> enough"*, not as *"§6 was wrong."*
+>
+> ★ **Scope of the relaxation, exactly as implemented** (`kayfabe_mmu::reach::ReachShadow::witness_swept`):
+> a page is admitted **iff** a descent starting at that address space's own installed PDB reached
+> it. It is *not* "read whatever the guest points at" — that is the `cap2b` class this project
+> keeps as a fixture. The cost is hole 2's guarantee: residue reachable from the root can now bind,
+> where before it could only ever make an unwitnessed page reachable. `swept_binds` reports how
+> much of the published set exists **only** because of this.
+>
+> ⚠ **A ruling's date is part of its citation.** This one is 2026-08-12 and its architecture is a
+> doorbell-driven populate pass with a dirty-driven re-sweep. If either half goes, re-ask.
+
 A lookup that finds no binding means the guest never committed (invalidated) that
 VA → it is not relying on it yet → resolving it would mean reading **uncommitted,
 possibly mid-update** page-table state. That is a security hole (torn multi-level
