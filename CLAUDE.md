@@ -30,6 +30,24 @@ reproduced `cuCtxCreate → 2048² matmul` at **`bad=0 maxerr=0` on a STOCK, unp
 implementation a real NVIDIA driver has ever accepted end-to-end, so it can answer questions
 no amount of Rust-side testing can.
 
+> ### ⊘⊘ SCOPE THE ORACLE — 2026-08-12, measured from this tree's own source
+> **The green is a CONTROL-PLANE result. The data plane was CPU + emulator, not hardware.**
+> - `m2cefwd` — the flag on every green run — is defined at `src/qemu/nvkvm_gpu_emul.c:9931` as
+>   *"real-back the user-CE copy dst … (**completion/CPU-copy unchanged**)"*. ⇒ the **CPU** did
+>   the copies.
+> - Real host-CE execution is a **different** flag, `m2cexec` (`fwd_ce = s->m2cexec && …`,
+>   `:9052`), and it was **OFF in the only green run**; a verbatim forward measured
+>   **untranslatable** (`dst_phys=1`).
+> - Completions were **emulator-written**: `:4228` completes `finishPayload` for the kernel
+>   CeUtils channels because *"the scrub is a **no-op** for our backing … complete now if no
+>   real work"*.
+>
+> ⇒ **`bad=0 maxerr=0` means THE DATA WAS RIGHT, not that a hardware forwarding path worked.**
+> The C is a strong oracle for **RM semantics, control-plane ordering, and the driver's
+> acceptance criteria** — and **no oracle at all** for engine execution, hardware completion,
+> or forwarding throughput. ⚠ Its perf figures (20→60 tok/s) are **CPU-copy** numbers; do not
+> read them as a forwarding baseline.
+
 **New, and load-bearing:**
 - ★ **`traces/mode2_c_reference/`** — the committed §6 replay captures (~11 MB zstd, dense,
   `n_errors=0`). `cap1_coldboot_hermetic` (359 062 records) is the **only trace a replay can be
