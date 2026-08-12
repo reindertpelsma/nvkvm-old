@@ -1,6 +1,30 @@
 # USERD IS NOT THE RING — adjudicating guest-USERD passthrough
 
-**STATUS: LIVE, 2026-08-11.** Read-only investigation, no code written, no bench run. Answers
+> ### ⊘⊘ CORRECTION FOLDED IN, 2026-08-12 — §3 IS SUPERSEDED, §1 AND §4 STAND
+>
+> **§3 ("USERD IS NAMED PHYSICALLY, THE RING IS NAMED VIRTUALLY") is right about the naming and
+> wrong about the consequence.** It concludes USERD needs *"a **different** crossing … byte
+> identity between the guest's BAR1 view and a host-describable page"*, and that this is
+> "exactly and only R32's J1/J2". §2's *"there is no host page to hand RM"* is likewise
+> **overtaken**: the framebuffer memfd backing landed (`join_fb_leaf` /
+> `BackingBytes::JoinsGuestWindow`) and R32 **ran** at `nvkvm-rs@f58473f`, with J2 holding.
+>
+> ★★★ And the missing address was never missing. The guest's **own CPU-RM** resolves
+> `hUserdMemory[0]`/`userdOffset[0]` to a physical address before the GSP RPC — GSP has no
+> client handle namespace, which is §1's own GSP row read forwards instead of backwards — and
+> sends it as `NV_CHANNEL_ALLOC_PARAMS.userdMem` @ **+168 (580)**
+> (`ogkm-580: src/nvidia/src/kernel/gpu/fifo/kernel_channel.c:2747-2757`; the sub-memdesc at
+> `kernel_channel_gv100.c:234-237` means `userdOffset` is already folded in). ⇒ **§5's
+> dependency table collapses to items #3, #5, #7 and #8**; #1 and #2 landed and #4/#6 change
+> shape. Full argument: `nvkvm-rs/docs/design/userd_mem_is_on_the_wire.md`.
+>
+> ⊘ **What stands, unchanged and load-bearing:** §1 (RM permits it — no aperture, class or
+> allocation gate; 512 B / 512 B-aligned / non-VPR / < 2^40), §0.2 (`mem_phys` is irrelevant —
+> and this was the half the successor doc got right), §0.3, and **§4, which is now the live
+> cost**: a passthrough USERD cannot be CPU-mapped, so `GP_GET` stops being readable by us.
+> §6's demotion of G8 stands and hardens.
+
+**STATUS: LIVE, 2026-08-11, ⊘ §2/§3 SUPERSEDED 2026-08-12 — see the block above.** Read-only investigation, no code written, no bench run. Answers
 the question *"can the channel's USERD be the guest's own page rather than one we allocate?"*
 against the owner's passthrough item 5 (*"no ring/pushbuffer/semaphore/**userd** we inspect for
 prod code"*). Scope: `kayfabe` @ `carry-the-guests-engine-and-close-the-ring-gate` (`11cced9`),
