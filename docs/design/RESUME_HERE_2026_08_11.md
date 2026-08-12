@@ -1,6 +1,14 @@
 # RESUME HERE — cold-start state, 2026-08-11 end of session
 
-> ### STATUS — 2026-08-11 / **LIVE — THIS IS THE HANDOFF DOC.** Read before anything else.
+> # ⊘⊘ SUPERSEDED-BY `RESUME_HERE_2026_08_12.md` — GO THERE FIRST.
+> **2026-08-12.** The night-run cron prompts still name *this* file and cannot be edited from a
+> later session, so the redirect lives here. What changed: **the "next rung" below (give `HostGr`
+> a passthrough server) is DONE** — and it turned out to be **leg C of three**. Legs A1+A2 are now
+> built and hardware-witnessed (`w261`, `w262`); leg B is in flight. §3's standing debt is **still
+> not discharged**, and every zero-movement result since was **pre-registered as zero**.
+> Everything below remains true **as of 08-11** and is kept for its traps and its ledger.
+
+> ### STATUS — 2026-08-11 / **SUPERSEDED 2026-08-12** (was: LIVE — the handoff doc).
 > Written because the owner hit a usage limit; the next session starts with **no conversational
 > context**. Everything needed to continue is here or linked from here.
 
