@@ -11,6 +11,58 @@
 
 **`cuCtxCreate` still hangs. `CUP2_RC = 124`.** `CE-SUBMIT → RETIRED` has never printed.
 
+> ### ⊘⊘⊘ CORRECTION, 2026-08-12 (**NEWEST — read this one first**) — **THE WAIT WAS SATISFIED
+> AND RE-ARMED. THE RELEASE WROTE `2`.** Everything below about *"the guest is blocked on a
+> second CE release"* is SUPERSEDED: it was written, the guest consumed it, and it now wants a
+> **third**. `../../../nvkvm-rs/traces/boots/w270/RESULT.md` (rev `1b64729`, 2 arms, real
+> GA106, branch `w270-the-operand-pin`; pre-registration
+> `docs/design/w270_the_operand_pin_prereg.md` at `905f289`, before any of the code existed).
+>
+> ★★★★★ **THE PIN'S FOURTH SOURCE — the CE launch's own OPERANDS — and the decode AGREES WITH
+> HARDWARE TO THE BYTE.** Chan 8's `methods=11 launches=3` submission declares, in the guest's
+> own `OFFSET_OUT_UPPER`/`_LOWER`, **`W@0x204420000+0x8000`** — the exact address the host GPU
+> faults on, decoded by the chip's own codec out of a binary in which that address **does not
+> appear at all** (a negative content check enforces it). ⇒ The first end-to-end validation the
+> decode path has ever had against an independent authority: the host GPU's own MMU.
+>
+> **One variable, `KAYFABE_GUEST_OPERAND` `off`→`pin`, measured:**
+> - `Xid` **`0x2_04420000` → `0x2_04428000`**; polled slot `0x20440ff70` **`1` → `2`**; the wait
+>   **wants `2` → wants `3`**; chan-8 CE doorbells **2 → 3**; every counter strictly greater.
+> - ⊘ **`CUP2_RC = 124` on both arms** — ninth consecutive. But it was pre-registered at
+>   `p = .40` as **A10**, a *first-class* prediction that the pin would land, the fault would
+>   clear, and the number would not move — so the null could not be reported as "expected"
+>   without also reporting what was expected to change.
+>
+> ★★★★★ **AND THE REASON IS ONE NAMED DEFECT, one layer below this rung's code:**
+> ```
+> run va=0x204420000 len=32768 → PINNED         memory=0xcafe0055
+> run va=0x204420000 len=65536 → ALREADY PINNED memory=0xcafe0055
+> ```
+> **`pin_guest_ram`'s idempotence key is the VA; the EXTENT is not part of it.** 32 KiB were
+> never described to RM, and the row that should have said so said `ALREADY PINNED … 
+> placed_as_asked=true`. ⇒ *`already` is true of the ADDRESS and false of the RANGE* — a green
+> supply row holding a wall in place. ⊘ Latent since `w265` in the primitive **all four**
+> sources share; only surfaceable once a source produced a **growing** run at a repeated base.
+> **The next rung is that one predicate**, and the fault address is its falsifier.
+>
+> ⚠ **`grep -c Xid` reads `1` on BOTH arms.** *A count cannot see a substitution* — `w265`'s
+> lesson, reproduced verbatim, and the only reason it was caught is that the grader scores
+> engine / client / **distinct addresses** / access type.
+>
+> ⊘⊘ **Three instrument findings, all of one class — AN ABSENT ARTEFACT READING AS A
+> FAVOURABLE MEASUREMENT — in a single rung**, two of them costing no GPU time:
+> **(a)** the rung's own cap2b guard **refused the first boot** because the address was in two
+> printed *sentences*; it was right to, because a `strings` check cannot tell a literal in a
+> sentence from one in a decision, and allowlisting the prose would have certified nothing;
+> **(b)** ★★★ **`grep 'CUP2_RC=[0-9]*'` MATCHES `GCC_CUP2_RC=0`** — the guest **compiler's**
+> exit status — and so reported **`CUP2_RC=0`**, the campaign's headline success value, on an
+> arm that was hanging. `tail -1` does not save it: on any run where the hook aborts early the
+> `gcc` line is the *only* match. ⇒ **anchor to `(^|[^A-Z_])CUP2_RC=`**, and render an absent
+> line as *"THE MEASUREMENT DID NOT HAPPEN"*, never as empty;
+> **(c)** a **missing** `hostdmesg` file read as *"zero faults"* — `stat` prints empty and
+> `grep` matches nothing, byte-identical to a clean capture. The real file, once written, held
+> an `Xid`.
+
 ★★★ **But the wall is now decomposed into three legs, and two are built and hardware-witnessed.**
 
 | leg | what it is | state |
