@@ -59,7 +59,38 @@ no amount of Rust-side testing can.
 > retired the only question that mattered — **how did the C's host GR get a COMPLETE VAS?** The
 > answer is stated in the C's own source at `src/qemu/nvkvm_gpu_emul.c:582`:
 > *"**Fault-safe: a mapping is always backed before the engine that uses it runs.**"*
-> Mechanism: a **doorbell-time sweep of the guest's GR page tables** (`m2_gr_pt_set`, re-swept
+> ### ⊘⊘⊘ CORRECTED 2026-08-13 (w289) — **THE SOURCE LIST BELOW IS INCOMPLETE, AND THE MISSING
+> ### ONE IS THE RM CAPTURE THE OWNER KEEPS ASKING ABOUT.**
+> The two mechanisms named below are both **page-table-derived**, and this file therefore reads
+> as *"the C was PDB-only; no RM capture involved"* — while `docs/design/mode2_address_table.md`
+> says the co-equal sources are **(1) bind-time RPC/ioctl bindings** and (2) the observed CE
+> write. **Two docs in this tree, opposite answers, to the question the fix turns on.**
+> ★★★ **Settled from the C's source, 2026-08-13. `mode2_address_table.md` is RIGHT and THIS
+> FILE WAS WRONG.** There is a **third source and it is an RPC capture**:
+> `NV2080_CTRL_CMD_GPU_PROMOTE_CTX` (`0x2080012b`) is snooped in flight
+> (`nvkvm_snoop_promote_ctx`, `src/qemu/nvkvm_gpu_emul.c:2446-2472`), its
+> `{gpuPhysAddr, gpuVirtAddr, size, physAttr}` entries folded into a side table by
+> `nvkvm_record_va_map` (`:2417-2440`), and that table is what `nvkvm_chan_translate`
+> **consults FIRST** (`:305-309`, which cites `mode2_address_virtualization.md` *"capture path
+> #2"*). The rows are then backed by `nvkvm_m2_back_and_map` (`:3902`).
+> ⇒ **THREE sources, not two:** (1) the `GPU_PROMOTE_CTX` RPC capture, (2) the doorbell-time GR
+> page-table sweep, (3) the observed CE page-table write at the release.
+>
+> ★★★★★ **AND THE DIFFERENCE THAT IS LOAD-BEARING FOR THE FIX — a single line.** The C rounds
+> every promote-derived mapping **UP TO 64 KiB** before mapping it:
+> `uint64_t asize = (size + 0xffff) & ~0xffffull;` (`:7920`). This port binds at the
+> **declared length** (`kayfabe-core/src/promote.rs`; no rounding anywhere in it), which is what
+> produces w277's `0x8600`-long, non-page-aligned rows and the **sub-page hole** it recorded:
+> *"2 560 bytes our own `resolve` answers `Miss` for inside a page the guest has mapped"*, held
+> open by the `CrossesEnd` refusal. **The C could not have that hole; we do, by construction.**
+> ⚠ Not yet measured against a fault — stated as a mechanism with both sides cited, and it is
+> the first thing to test on the 82-ioctl CE repro.
+> ⊘ The C also treats `st == 0x51` (`NV_ERR_NO_MEMORY`) on a FIXED map as **success** —
+> *"the VA is ALREADY mapped in the host VASpace"* (`:7935-7938`) — a semantic our side must
+> match or it will refuse exactly the ctx buffers the host RM already placed.
+>
+> Mechanism (the two page-table-derived sources; **see the correction above for the third**):
+> a **doorbell-time sweep of the guest's GR page tables** (`m2_gr_pt_set`, re-swept
 > whenever a tracked PT page is written) plus **observed CE page-table writes decoded at the
 > completion-semaphore release** (`nvkvm_m2_cpt_sync_at_release`, `:592-604`).
 > ⇒ **The C mirrored the guest's page tables WHOLESALE and committed the mirror before any
