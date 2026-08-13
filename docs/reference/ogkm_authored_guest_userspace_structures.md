@@ -237,6 +237,12 @@ only by resolving the nvoc HAL dispatch, not by reading the C.
 **3 — Address / handle / ID?** **No.** `info32` = Xid/exception code, `info16` =
 `NV2080_ENGINE_TYPE`, `status` = completion code, plus a GPU timestamp. Consistent with w287's
 measurement.
+⚠ **Disambiguation — `info16` means two different things on two different surfaces, and the
+names do not warn you.** On **this** surface (the `NvNotification`) it is the engine type:
+`krcErrorWriteNotifier_CPU` passes `(NvU16)gpuGetNv2080EngineType(localRmEngineType)`
+(`kernel_rc_notification.c:172`). On the **`NvUnixEvent`** delivered by
+`NV_ESC_RM_GET_EVENT_DATA` (§10) it is `partitionAttributionId` — `rmEngineType` is explicitly
+`// unused` at `kernel_rc_notification.c:443`. Same field name, same RC event, different meaning.
 **4 — Does hardware read it?** No. `method_notification.c:176-179` states notifiers are not
 read by the GPU; nothing in the tree contradicts it. RM reads back only its **own** watchdog
 notifier, which is RM-internal and not user-mapped.
@@ -435,10 +441,34 @@ unrelated patches.
    `bIsRcPending` no-setter (§4.2) are exactly the kind of fact a driver revision can move.
    ★ Any claim built on them must carry the driver version, the way a bench claim carries a
    source revision.
+7. ★ **`NV906F_CTRL_CMD_GET_MMU_FAULT_INFO` (`0x906f0106`)** — unprivileged *and* per-channel,
+   which is exactly the identity the RC event lacks (§10.2). ⊘ `ROUTE_TO_PHYSICAL`, no
+   open-source body: the fill code is closed GSP firmware. **Must be measured, not read** — the
+   single empirical probe this question justifies.
+8. **Whether libcuda's own `cls=0xc56f` allocs set `hObjectError`.** Structurally unmeasurable in
+   `traces/host_reference_ga106/` (§9.4). ⊘ Does *not* block anything: §9.1 already establishes
+   UVM's channels always do, which is sufficient for the design. *Cheapest closure, no bench:*
+   decompress `traces/mode2_c_reference/cap3_matmul_forwarding.rec.zst` to scratch and run
+   `scripts/mode2_diag/rec_dump.py --payload`, filtering the `GSP_RM_ALLOC` RPC for
+   `hClass=0xc56f` — `kernel_channel.c:2654` puts `hObjectError` verbatim on the wire, and that
+   capture is a real-GA106 `cup8` run at `bad=0`.
+   ★ *Structural fix worth doing anyway:* `nvdiff_shim.c:178`, when `nr == 0x2B` and the declared
+   `paramsSize == 0`, fall back to a per-`hClass` size table — that un-blinds **every** alloc
+   class in the reference oracle, not just this field.
 
 ---
 
 ## 6. THE ONE-LINE ANSWER FOR THE OWNER
+
+★★★★★ **THE LOOP CLOSES, AND IT NEEDS NO NEW MECHANISM AND NO ROOT** (§10.6). Host side: the
+unprivileged isolate learns the Xid by **OS event** — no shared page, no shadow page, no
+privilege (§10). Guest side: **we author slot 0** at the guest-physical address the guest already
+handed us (§3.1), then send `RC_TRIGGERED` with the *guest's* ChID (§4.1). ⚠ **Both halves are
+mandatory** — per §9.2, UVM's only error exit is a non-zero `errorNotifier->status`, so without
+the guest-side write a faulted CUDA channel simply waits.
+⊘ **And the hoped-for simplification is dead:** the error notifier is **on the CUDA path** via
+nvidia-uvm (§9), so it cannot be split off as a raw-client-only job.
+
 
 > **Yes, ogkm writes structures into guest userspace VAs — but none of them contains an
 > address the GPU follows, so the passthrough design is NOT broken by this.** The thing to
@@ -554,8 +584,12 @@ spaces, one author each — **exactly the property the shadow page was designed 
 fake FB, no aliasing, and no VMM-side "read the host variant" step.
 ★★ And it dissolves §3.1's concern by construction: **the guest's `hObjectError` never needs to
 reach the host RM**, so the host RM is never a second author of a guest-owned structure.
-⇒ This is contingent on Q2 (§9) — if the isolate can also learn of the fault by *event*, it does
-not need to poll a notifier page at all.
+
+✅ **RESOLVED by §10 — the fallback is not needed at all.** The isolate can learn of the fault by
+**unprivileged OS event** (`NV_ESC_ALLOC_OS_EVENT` → `NV2080_NOTIFIERS_RC_ERROR` → `poll()` →
+`NV_ESC_RM_GET_EVENT_DATA`), so it need not poll *any* notifier page on the host side — its own
+or a shadow. ⇒ **the shadow page is retired as unnecessary, not merely as unneeded-for-this-
+structure.**
 
 **Where the shadow-page idea DOES have a natural target.** The two structures that are genuinely
 GPU-written — the SW-method `NvGpuSemaphore` (§2.2) and the UVM semaphore pool (§2.3) — are
@@ -656,7 +690,96 @@ that reads slot 1 directly — `nvidia-push-utils.h:108` reads exactly that slot
 
 ---
 
-## 10. SWEEP VALIDITY — the known-positive fired on every pass
+## 10. ★★★★★ Q2 — CAN THE UNPRIVILEGED HOST-SIDE ISOLATE LEARN OF A FAULT BY ioctl/event? **YES.**
+
+**No root, no `CAP_SYS_ADMIN`, no shared notifier page.** Every gate on the path is
+`RS_FLAGS_ALLOC_NON_PRIVILEGED` / `RS_ACCESS_NONE`. ⇒ **The sanctioned shadow-page fallback is
+not needed, and neither is polling a notifier on the host side.**
+
+### 10.1 The mechanism, end to end
+`NV_ESC_ALLOC_OS_EVENT` → `NV01_EVENT_OS_EVENT` (0x79) on a `NV20_SUBDEVICE_0` →
+`NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION(event=37, action=REPEAT)` → `poll()` →
+`NV_ESC_RM_GET_EVENT_DATA` (0x52).
+
+- **Payload store:** `kernel-open/nvidia/nv.c:4013-4017` — `nvet->event.info32 = info32;` etc.
+- **Copy-out:** `arch/nvalloc/unix/src/osapi.c:435-438` then `:440` `os_memcpy_to_user(...)`.
+- **Production:** `kernel_rc_notification.c:462-467` `gpuNotifySubDeviceEvent(pGpu,
+  NV2080_NOTIFIERS_RC_ERROR, NULL, 0, exceptType, partitionAttributionId)`, reached from
+  `_kgspRpcRCTriggered` (`kernel_gsp.c:669-676`).
+- **Reaches every client:** `gpu_rmapi.c:324-326` — `if (!IS_MIG_IN_USE(pGpu)) return NV_OK;`
+  short-circuits the filter. (MIG adds a `NV_RM_CAP_SYS_SMC_MONITOR` gate at `:337-345` — the
+  only privilege-ish check anywhere on this path, and MIG-only.)
+
+**What arrives:** `NotifyIndex = 37`; **`info32 = exceptType`** — the Xid-equivalent
+`ROBUST_CHANNEL_*` (`nverror.h:49` = 31 for `..._MMU_ERR_FLT`); `info16 =
+partitionAttributionId`; `hObject` = which of *our* registrations fired.
+
+**Privilege, registration vs delivery, answered separately as asked:**
+- *Registration:* `NV01_EVENT_OS_EVENT` `resource_list.h:2188-2199` and `NV20_SUBDEVICE_0`
+  `:429-438` are both `NON_PRIVILEGED`/`RS_ACCESS_NONE`; `alloc_free.c:649-671` rejects only
+  `ALLOC_PRIVILEGED`/`ALLOC_KERNEL_PRIVILEGED`. `EVENT_SET_NOTIFICATION` is `flags=0x10118u,
+  accessRight=0x0u` (`g_subdevice_nvoc.c:1600-1614`) and its `_IMPL` has no admin check.
+- *Delivery:* **no check at all.** `NV_ESC_ALLOC_OS_EVENT` / `NV_ESC_RM_GET_EVENT_DATA` are
+  handled in `rm_ioctl`'s **pre-RM switch** (`osapi.c:2779-2825`) — they never build a `secInfo`.
+
+### 10.2 ⊘ The real gap is INFORMATION, not privilege
+The RC event is **GPU-scoped**: `gpuNotifySubDeviceEvent_IMPL` (`gpu_rmapi.c:509-596`) iterates
+*all* subdevice back-references and never consults `pKernelChannel` or `RC_NOTIFIER_SCOPE`.
+⇒ we get the Xid but **not which channel**, and we are woken by other tenants' RC errors too.
+
+The channel-scoped event exists in the same callback —
+`krcErrorSendEventNotificationsCtxDma_FWCLIENT` `:409-426` `notifyEvents(..., 0, 0,
+RES_GET_HANDLE(pContextDma), ...)` — but carries `info32=0, info16=0`, i.e. identity and no
+detail. ⇒ **two unprivileged registrations, correlated by arrival.**
+⚠ That per-channel event fires **only if `hObjectError` resolves as a `NV01_CONTEXT_DMA`**
+(`ctxdmaGetByHandle`); a `Memory` handle silently never fires it. **Our isolate controls that
+choice** — this is the one place where the legacy ctxdma form is the useful one.
+
+### 10.3 ★★ Two traps this turned up
+- ⊘ **The NVOC flag table is not the authority on privilege.**
+  `NV2080_CTRL_CMD_RC_GET_ERROR_COUNT` (`0x20802205`) and `..._GET_ERROR_V2` (`0x20802213`) are
+  flagged `NON_PRIVILEGED` (`g_subdevice_nvoc.c:7146`, `:7311`) but are **admin-gated in the
+  function body** — `kernel_rc_ctrl.c:113` → `_KERNEL` HAL → `:88` `rmclientIsAdmin(...)` else
+  `:98` `NV_ERR_INSUFFICIENT_PERMISSIONS`. **Root only.** Same class as *a signature bounds what
+  can be returned; the call site says what is read.*
+- ⊘ **`NV01_EVENT_WITHOUT_EVENT_DATA` silently discards the Xid.** `nv.c:3997` guards the store
+  on `data_valid`; `event_notification.c:809-816` clears it for that flag. You get a wakeup with
+  **no payload**. Do not set it.
+
+### 10.4 Ruled out, with citations
+- `NV906F_CTRL_CMD_RESET_CHANNEL`'s `bIsRcPending` — unprivileged, and **always FALSE**
+  (independently re-derived; confirms §4.2).
+- `MMU_FAULT_BUFFER` (0xc369) — `RS_FLAGS_ALLOC_KERNEL_PRIVILEGED` (`resource_list.h:975-984`);
+  since `escape.c:304` caps any ioctl caller at `RS_PRIV_LEVEL_USER_ROOT`, it is **unreachable
+  from userspace even as root**. UVM-in-kernel only.
+- `NV2080_CTRL_CMD_GPU_GET_ENGINE_FAULT_INFO` — unprivileged but useless: a **static
+  engine→fault-ID table lookup** (`subdevice_ctrl_gpu_kernel.c:1749-1751`), no runtime state.
+- `NV0000_CTRL_CMD_NVD_GET_RCERR_RPT` — kernel-only for the useful owner (`kernel_rc_ctrl.c:312-316`).
+- ★ **`NV906F_CTRL_CMD_GET_MMU_FAULT_INFO` (`0x906f0106`) is the best untested lead:**
+  unprivileged **and per-channel** (`g_kernel_channel_nvoc.c:292-308`, `flags=0x10048u`), params
+  `addrHi/addrLo/faultType/...` (`ctrl906f.h:213-220`). ⊘ But it is `ROUTE_TO_PHYSICAL` with no
+  open-source body — the fill code is in **closed GSP firmware**. ⇒ **must be measured, not
+  read.** That is the one empirical probe this whole question justifies.
+
+### 10.5 gVisor is asymmetric — and it is NOT evidence against us
+nvproxy forwards `NV_ESC_ALLOC_OS_EVENT` (`version.go:180`), `NV01_EVENT_OS_EVENT`
+(`version.go:412`) and `EVENT_SET_NOTIFICATION` (`version.go:272`), but
+**`NV_ESC_RM_GET_EVENT_DATA` (0x52) is not defined anywhere in `pkg/abi/nvgpu/frontend.go`** —
+sandboxed clients get the **wakeup but not the payload**. That is a gVisor limitation, not an RM
+one; our isolate talks to the host driver directly and can issue `0x52` itself.
+
+### 10.6 ⇒ THE LOOP CLOSES, WITH NO NEW MECHANISM
+- **Host side:** isolate registers an OS event on the host subdevice → learns the Xid,
+  unprivileged, no shared page (§10.1). Optionally a second, per-channel ContextDma event for
+  identity (§10.2).
+- **Guest side:** we author slot 0 at the guest-physical address the guest handed us in
+  `errorNotifierMem.base` (§3.1), then send `RC_TRIGGERED` with the **guest's** ChID (§4.1).
+- **And per §9.2 the guest side is mandatory:** UVM's only error exit is a non-zero
+  `errorNotifier->status`, so without step 2 a faulted CUDA channel just waits.
+
+---
+
+## 11. SWEEP VALIDITY — the known-positive fired on every pass
 
 Per the brief's ★★★ trap, no "empty" claim below was reported without a control.
 
