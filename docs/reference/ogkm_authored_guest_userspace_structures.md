@@ -418,12 +418,9 @@ unrelated patches.
    `0x9074`/`0x9072`, or decode the guest pushbuffer for SW-object subchannel binds. The
    `nvdiff` host reference (`traces/host_reference_ga106/`) can answer the alloc half today
    without a boot.
-2. **Whether the token in `NvNotification[1]` is actually consumed by libcuda from the
-   notifier page, or only from the ioctl reply.** The kernel writes both. *Would determine it:*
-   a userspace read-watchpoint on the notifier page during `cuCtxCreate`, or disassembly of
-   libcuda's `GET_WORK_SUBMIT_TOKEN` caller. ⚠ Note the campaign's own lesson — a DMA write is
-   invisible to x86 debug registers, but a *CPU* read by libcuda is not, so a watchpoint is a
-   valid instrument here specifically.
+2. ✅ **ANSWERED by §9.5 — struck.** libcuda takes the work-submit token from the **ioctl reply**
+   (`0xc36f0108`, `ppost 08000000`, ×16), not from `NvNotification[1]`. Still open only for raw
+   clients and for `nvidia-push` (`nvidia-push-utils.h:108` reads slot 1 directly).
 3. **Whether `instancePtr` (§2.5) is hypervisor-translated before UVM sees it.** UVM performs
    no translation; the producer is the access-counter buffer parser in `src/nvidia`, which was
    not audited. *Would determine it:* trace `kaccessCntrBufferService`/`uvm_gv100.c` producers
@@ -569,7 +566,97 @@ question about our own code, not about ogkm.
 
 ---
 
-## 9. SWEEP VALIDITY — the known-positive fired on every pass
+## 9. ★★★★★ Q3 — DOES CUDA USE THE ERROR NOTIFIER? **YES. THE HOPED-FOR SPLIT DOES NOT EXIST.**
+
+**The question was:** if libcuda never allocates or polls an error notifier, the notifier serves
+only the raw-client requirement and is **irrelevant to `cup2`** ⇒ two separate jobs.
+
+⊘⊘ **It is not two jobs. The notifier is on the CUDA path, and the route is nvidia-uvm.**
+
+### 9.1 ALLOCATE — yes, unconditionally, in-kernel
+
+`src/nvidia/src/kernel/rmapi/nv_gpu_ops.c`, `nvGpuOpsChannelAllocate` (reached from
+`nvUvmInterfaceChannelAllocate`):
+```
+:5887  errorNotifierSize = sizeof(NvNotification) * NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1;
+:5891  nvGpuOpsGpuMalloc(..., &channel->errorNotifierOffset, /* bGetKernelVA */ ..., ...);
+:5933  channel->errorNotifier = (NvNotification*)pDmaMappingInfo->KernelVAddr[subdeviceInstance];
+:5941  pAllocInfo->gpFifoAllocParams.hObjectError = hErrorNotifier;
+```
+⇒ **every UVM channel carries `hObjectError != 0`**, and UVM channels are built inside `cuInit`
+(`UVM_REGISTER_GPU` builds a channel manager). ★ This never crosses the ioctl boundary, which is
+exactly why an ioctl-level search reads as *"libcuda doesn't do it"*.
+
+★ Corroborated on real GA106 by our own commit **`299b5d7`**: dropping the forwarded channel's
+`hObjectError` ref *"fixes `kchannelGetNotifierInfo` OBJECT_NOT_FOUND"*. That function is called
+**only when `hObjectError != 0`** — a zero field produces no such error to fix. ⇒ the forwarded
+CUDA-path channel alloc carried a non-zero `hObjectError`, measured.
+
+### 9.2 POLL — yes, on **every** channel progress update, and it is UVM's ONLY error exit
+
+`kernel-open/nvidia-uvm/uvm_channel.c:2058-2081`, `uvm_channel_get_status`:
+```c
+error_notifier = channel->channel_info.errorNotifier;   /* :2066 */
+if (error_notifier->status == 0)                        /* :2068 */
+    return NV_OK;
+...
+return NV_ERR_RC_ERROR;
+```
+called from `uvm_channel_update_progress_with_max` (`:2086`, `:2094`). Consistent with
+`docs/design/mode2_channel_ownership_split.md:150` — *"every UVM wait exits **solely** on a
+non-zero error notifier … UVM cannot originate a timeout."*
+
+⇒ ★★★ **If we never write slot 0, a faulted UVM channel never reports an error — it waits.**
+That makes §3.1 (author slot 0 as the GSP, from `errorNotifierMem.base`) **load-bearing for the
+CUDA path**, not a raw-client nicety.
+
+### 9.3 libcuda's own fault-time read is `0x83de030c`, not a notifier — w277 reproduced with the record
+
+`traces/fault_known_positive_ga106/arm1_native/faultgr.jsonl.zst`: `[367]` allocs `cls=0x83de`
+(GT200_DEBUGGER, `hObjectNew=0x5c000072`); `[707]` `RM_CONTROL 0x83de030c`, `paramsSize=4824`,
+**`pgot=4824` — fully captured**, `rc=0`. Decoding against `ctrl83dedebug.h:382-389`:
+`hTargetChannel=0x5c000019`, `numSMsToRead=28`, **`smErrorStateArray` all 4800 bytes zero on both
+sides**, and RM wrote **exactly 5 bytes** — `mmuFaultInfo=0x81010000`, `mmuFault.valid=1`,
+`mmuFault.faultInfo=0x81010000`. ⇒ the fault reached libcuda through the **MMU-fault tail** of
+that control, not the SM array and not a notifier.
+
+⚠ **Do not use `faultce` as the contrast.** `arm1_native/RESULT` records it as
+`VERDICT NOFAULT … delivered_on=NOTHING`. Its lack of `0x83de030c` is a **no-fault run**, not
+evidence that CE faults skip the debugger. `faultgr` is the only genuine CUDA fault capture we own.
+
+### 9.4 ⊘⊘⊘ A NEW, LOAD-BEARING LIMIT ON THE nvdiff ORACLE — it CANNOT see `hObjectError`
+
+**Every `NV_ESC_RM_ALLOC` in all 12 `traces/host_reference_ga106/` captures has an UNMEASURED
+parameter body** — `launch_r1` `nr=43`: **100/100** records at `psize=0, pgot=0, len(ppre)=0`.
+Cause: `tests/mode2/nvdiff/nvdiff_shim.c:178` sizes the out-of-line body from
+`NVOS64_PARAMETERS.paramsSize`, and **libcuda passes `paramsSize = 0`** (RM derives the size from
+`hClass`). Verified genuine, not a decode slip: record 161's raw `hpre` bytes 32-47 are zero.
+
+⇒ **"`hObjectError` is 0 in libcuda's channel allocs" is NOT readable from this oracle** — the one
+field the question turned on is the one field it structurally cannot capture. ★ Decoding that
+absent body to zeros would have produced exactly the false discovery the brief warns about
+(*an absent artefact reads as favourable*), and it would have "confirmed" the hoped-for split.
+⚠ This blinds **every** alloc class (`0xc56f`, `0xa06c`, `0xc7c0`, `0x003e`), and belongs beside
+the `dlen=0` lesson in `CLAUDE.md`. By contrast `RM_CONTROL` bodies **are** captured (197 records,
+`psize` 1…13344), so §9.3's control-command absences **are** measurements.
+
+★ Measured absences (real, from captured control headers) across `launch_r1/r2/faultce/faultgr`:
+`0xa06f0108` `NVA06F_CTRL_CMD_SET_ERROR_NOTIFIER` (`ctrla06fgpfifo.h:115`), `0xc36f010a`
+`SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX` (`ctrlc36f.h:132`), `0x20800303`
+`EVENT_SET_MEMORY_NOTIFIES`, and `RM_ALLOC cls=0x0005` (`NV01_EVENT`) — **all zero**.
+⇒ libcuda never *retro-fits* a notifier; if it has one it is named at channel-alloc time.
+
+### 9.5 ★ A correction to my own §2.1 caveat
+
+I flagged a risk that a stale guest-scoped token could persist in `NvNotification[1]`. Measured:
+`0xc36f0108` `GET_WORK_SUBMIT_TOKEN` appears ×16 with `ppre 00000000 → ppost 08000000` ⇒
+**libcuda takes the token from the ioctl reply**, not from the notifier page. The stale-copy risk
+is therefore **not** live for libcuda. ⊘ It is not retired for raw clients or for any consumer
+that reads slot 1 directly — `nvidia-push-utils.h:108` reads exactly that slot.
+
+---
+
+## 10. SWEEP VALIDITY — the known-positive fired on every pass
 
 Per the brief's ★★★ trap, no "empty" claim below was reported without a control.
 
