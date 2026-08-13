@@ -3,9 +3,13 @@
 > **STATUS — LIVE, 2026-08-13.** Measured read-only against
 > `research_clones/ogkm-580.159.04/` (**version-specific: 580.159.04**). All nvoc HAL bindings
 > resolved for **GA106 + GSP-client** from the generated dispatch tables, not from the `.c` alone.
-> Scope: **RM proper** (`src/nvidia/`). The **UVM plane** (`kernel-open/nvidia-uvm/`) and the
-> **GSP RPC surface census** were dispatched to parallel lanes; where their results are not folded
-> in below, §7 says so explicitly and marks the gap.
+> Scope: **RM proper** (`src/nvidia/`) **+ the UVM plane** (`kernel-open/nvidia-uvm/`, §5A)
+> **+ the GSP RPC surface** (§2.6). All three lanes folded in.
+> ⚠ **Configuration-scoped**: true of a **default bare-metal GA106 GSP client**. Two switches invert
+> it — see the box at the end of §7.
+> ⊘ **Contains two corrections to this document's own first draft**, both marked inline: §2.5 (RM's
+> PTE writes are **BAR2 CPU stores, not CE writes** — which changes what our source (2) can see) and
+> §0 (the flat *"zero GSP crossings"* was too strong; five UVM sites cross, four carrying no VA).
 >
 > Answers the owner's question of 2026-08-12: *"does ogkm issue rm ioctls and then automatically
 > insert mappings in its own bookkeeping, if so which ones. iterate them, all sites, so we also
@@ -22,16 +26,22 @@ But the count that matters is not the number of insert sites. It is this:
 
 | | count | |
 |---|---|---|
-| distinct bookkeeping structures | **4** in RM proper (+ UVM's own, separate) | §3 |
-| insert call sites across them | **~14** | §3 |
-| **PTE-writing choke points** | **exactly 2** | §2 |
-| **GSP-crossing insert sites on a GA106 GSP-client** | ⊘ **ZERO** | §2 |
-| CPU-RM-local (invisible to a GSP) insert sites | **all of them** | §2 |
+| distinct bookkeeping structures | **5 in RM proper + 1 in UVM** (28 UVM rows) | §3, §5A |
+| insert call sites across them | **~14 in RM, ~26 in UVM** | §3, §5A |
+| **PTE-writing choke points** | **exactly 2** — RM's walker, UVM's walker | §2.5 |
+| **insert sites whose GPU VA is visible to a GSP** | ⊘ **ZERO** | §2 |
+| GSP-crossing insert sites that carry **no VA** | 5 (UVM only) | §5A |
+| CPU-RM-local / UVM-local insert sites | **everything else** | §2 |
 
-★★★★★ **On a GA106 GSP client, the entire user-visible GPU-VA mapping plane is CPU-RM-local. Not
-one of these sites sends an RPC to the GSP.** The client RM owns the VA space, owns the mapping
-bookkeeping, and **writes the GMMU page tables itself**. The GSP is told the **page-directory base**
-and nothing else about what is mapped inside it.
+★★★★★ **On a GA106 GSP client, no site in this census publishes a GPU VA to the GSP.** The client
+RM owns the VA space, owns the mapping bookkeeping, and **writes the GMMU page tables itself**; UVM
+owns and writes its own. The GSP is told **where the page tables are** — never what is in them.
+
+⊘ **REFINED after the two sub-lanes returned (this is a correction to my own first draft's flat
+"ZERO GSP-crossing").** Five UVM sites *do* cross the wire — `SET_PAGE_DIRECTORY`, `PROMOTE_CTX`,
+`RetainChannel`, `DupMemory`→`DUP_OBJECT`, `MemoryAllocSys/FB` (§5A). **Four of the five carry no
+GPU VA at all**, and the fifth (`PROMOTE_CTX`) carries a VA **and has no un-promote** (§5A F2). So
+the headline holds for *mapping* purposes, but "zero RPCs" was too strong and is withdrawn.
 
 ⇒ **This is the structural answer to the owner's *"is it PDB or RM?"* fork: it is RM, and RM is on
 the guest side of our boundary.** A GSP emulator that watches only the wire will see **none** of
@@ -166,8 +176,34 @@ On a bare-metal GSP client `bSriovFull` is false, so **`bRpcAlloc = !TRUE = NV_F
 |---|---|---|---|
 | `virtual_mem.c:1421` | `if (!pMemory->bRpcAlloc \|\| gpuIsSplitVas...Enabled(pGpu))` (sysmem/EGM/fabric arm) | **TRUE** | `dmaAllocMap` runs **locally** (`:1426`); mapping registered locally (`:1430`) |
 | `virtual_mem.c:1463` | same predicate (`ADDR_FBMEM` arm) | **TRUE** | `dmaAllocMap` runs **locally** (`:1466`); registered at `:1472` |
-| `virtual_mem.c:1520` | `if (pMemory->bRpcAlloc)` — the **only** guard on `NV_RM_RPC_MAP_MEMORY_DMA` (`:1522`) | ⊘ **FALSE** | ★★★ **NO RPC IS SENT** |
-| `virtual_mem.c:1850` | `if (pMemory->bRpcAlloc && ...)` — the **only** guard on `NV_RM_RPC_UNMAP_MEMORY_DMA` (`:1863`) | ⊘ **FALSE** | ★★★ **NO RPC ON UNMAP EITHER** |
+| `virtual_mem.c:1520` | `if (pMemory->bRpcAlloc)` — call-site guard on `NV_RM_RPC_MAP_MEMORY_DMA` (`:1522`) | ⊘ **FALSE** | ★★★ **NO RPC IS SENT** |
+| `virtual_mem.c:1850` | `if (pMemory->bRpcAlloc && ...)` — call-site guard on `NV_RM_RPC_UNMAP_MEMORY_DMA` (`:1863`) | ⊘ **FALSE** | ★★★ **NO RPC ON UNMAP EITHER** |
+
+★★ **It is DOUBLE-blocked, and the second gate is inside the macro itself** — which a call-site-only
+sweep would miss. `inc/kernel/vgpu/rpc.h:154-167` (verbatim):
+
+```c
+#define NV_RM_RPC_MAP_MEMORY_DMA(pGpu, hclient, ... , status)                  \
+    do { OBJRPC *pRpc; pRpc = GPU_GET_RPC(pGpu); NV_ASSERT(pRpc != NULL);      \
+        if ((status == NV_OK) && (pRpc != NULL) &&                             \
+            !gpuIsSplitVasManagementServerClientRmEnabled(pGpu))               \   // ← second gate
+            status = rpcMapMemoryDma_HAL(...);                                 \
+        ...
+```
+
+Identical gate on `NV_RM_RPC_UNMAP_MEMORY_DMA` (`rpc.h:171-183`). ⇒ **Both the caller and the macro
+independently refuse.** The HAL binding *is* live (`rpcMapMemoryDma_v03_00`, installed by
+`rpc_iGrp_ipVersions_Wrapup` for ipVersion ≥ `0x03000000`, and GA106's is `0x2B130000`) — so this is
+a **runtime** refusal, not a missing implementation. Reading the HAL table alone would say "wired
+up"; reading the call site alone would find one gate; only both together give the answer.
+
+⊘ **And a whole family of RPC macros you might grep for are INERT — they expand to nothing.**
+`inc/kernel/vgpu/rpc_vgpu.h:36-59` defines `NV_RM_RPC_MAP_MEMORY` (`:40`), `NV_RM_RPC_UNMAP_MEMORY`
+(`:41`), `NV_RM_RPC_UPDATE_PDE_2` (`:51`), `NV_RM_RPC_UPDATE_GPU_PDES` (`:59`),
+`NV_RM_RPC_DMA_FILL_PTE_MEM` (`:42`), `NV_RM_RPC_ALLOC_VIRTMEM` (`:37`) and others as
+`static NV_INLINE void NAME(...) { }`. ⇒ **Finding a call site for one of these is not evidence of
+wire traffic.** ⚠ Same class as this campaign's *"a vocabulary presence is not a measured event"* —
+here the symbol exists, the call site exists, and **the function body is empty.**
 
 ⚠ Note the comments at `:1456` and `:1491` — `// !IS_VIRTUAL(pGpu) && !IS_GSP_CLIENT(pGpu)` —
 which annotate the local-mapping branch as *not* taken on a GSP client. **Those comments are stale
@@ -184,15 +220,52 @@ that runs"*, one layer up: **the comment you read is not the predicate that runs
 
 ```
 dmaAllocMapping_GM107      gpu/mem_mgr/arch/maxwell/virt_mem_allocator_gm107.c:317
-  └─ dmaUpdateVASpace_*  → gvaspaceMap                                        :2605
-      └─ gvaspaceMap_IMPL                        mem_mgr/gpu_vaspace.c:2190
-          ├─ _gvaspaceMappingInsert  :2230   ← the bookkeeping insert (§3, family D)
-          └─ mmuWalkMap              :2239   ← ★ the MMU walker runs HERE, in CLIENT RM
-              └─ memmgrMemWrite      gpu/mmu/gmmu_walk.c:813   ← the actual PTE store
+  └─ dmaUpdateVASpace_GF100                                                   :2175
+      └─ gvaspaceMap                                                          :2605
+          └─ gvaspaceMap_IMPL                    mem_mgr/gpu_vaspace.c:2190
+              ├─ _gvaspaceMappingInsert  :2230   ← the bookkeeping insert (§3, family D)
+              └─ mmuWalkMap              :2239   ← ★ the MMU walker runs HERE, in CLIENT RM
+                  └─ _gmmuWalkCBMapNextEntries_RmAperture   virt_mem_allocator_gm107.c:2034
+                      └─ memmgrMemBeginTransfer                               :2078
+                          └─ _gmmuWalkCBMapNextEntries_Direct  ← the actual PTE stores :2081
 ```
 
-★★★ **`mmuWalkMap` is called in client RM with no RPC anywhere in the path.** The PTEs are written
-by `memmgrMemWrite` from the CPU side. **The GSP never sees the mapping.**
+★★★ **`mmuWalkMap` is called in client RM with no RPC anywhere in the path. The GSP never sees the
+mapping.**
+
+### 2.5 ★★★★★ HOW the PTEs are written — and this CORRECTS my own first draft
+
+⊘ **My first draft said the PTE store is `memmgrMemWrite` (`gmmu_walk.c:813`). That is the
+fill/clear path, not the map path, and the distinction turns out to matter enormously.**
+
+The map path selects its transport through `memmgrGetMemTransferType` (`gpu/mem_mgr/mem_utils.c:59-124`).
+Verified independently, all three legs:
+
+1. The walker passes `transferFlags = TRANSFER_FLAGS_SHADOW_ALLOC | TRANSFER_FLAGS_SHADOW_INIT_MEM`
+   (`virt_mem_allocator_gm107.c:2051`) — ⊘ **`TRANSFER_FLAGS_PREFER_CE` is NOT among them.**
+2. `memmgrGetMemTransferType` defaults to `TRANSFER_TYPE_PROCESSOR` (`mem_utils.c:68`). The **CE**
+   arm is gated `else if (flags & TRANSFER_FLAGS_PREFER_CE)` (`:80`) — not taken. The **GSP_DMA**
+   arm is gated `else if (kbusIsBarAccessBlocked(pKernelBus) && ...)` (`:118-122`) — not taken
+   outside Confidential Compute.
+3. ⇒ **`TRANSFER_TYPE_PROCESSOR`.** For a vidmem page table that is a **CPU MMIO store through the
+   BAR2 window**, followed by `kbusFlush_HAL` + `gvaspaceInvalidateTlb`
+   (`virt_mem_allocator_gm107.c:2612-2616`).
+
+★★★★★ **THERE ARE TWO PTE WRITERS AND THEY USE DIFFERENT TRANSPORTS:**
+
+| writer | mechanism | citation | would a CE-write watcher see it? |
+|---|---|---|---|
+| **RM's walker** (RM-owned VAS) | **CPU stores through BAR2** | `mem_utils.c:68` + `virt_mem_allocator_gm107.c:2051` | ⊘ **NO** |
+| **UVM's walker** (externally-owned VAS) | **its own CE pushbuffer** — `uvm_push_begin_acquire(… UVM_CHANNEL_TYPE_MEMOPS …)` then `uvm_pte_batch_single_write_ptes` | `kernel-open/nvidia-uvm/uvm_map_external.c:230-241` | ★ **YES** |
+
+⇒ ★★★ **This is a live correction to how we read populate source (2).** `mode2_address_table.md`
+calls source (2) *"the observed CE page-table write"* — that instrument sees **UVM's** writes and is
+**structurally blind to RM's**. A mapping established by an RM path is invisible to *both* of our
+declared sources: not an RPC (§2.2), and not a CE write (here). ⊘ **If we have been treating "no CE
+page-table write observed" as "no mapping was established", that inference is unsound for every
+RM-established mapping.** ⚠ Two exceptions that would restore visibility, both narrow:
+Confidential Compute (`kbusIsBarAccessBlocked` ⇒ `TRANSFER_TYPE_GSP_DMA`, `mem_utils.c:122`, which
+*does* put page-table bytes on the wire), and an explicit `TRANSFER_FLAGS_PREFER_CE` caller.
 
 ⚠ **Scope this correctly.** `gvaspaceMap_IMPL:2219` guards the bookkeeping insert with
 `if (!flags.bRemap)`; the remap path (MODS compression release, Windows BAR1 clobber) skips the
@@ -210,10 +283,50 @@ would miss remaps.
 | **E** | VAS eheap reservations | ⊘ **CPU-RM-LOCAL** | `pGVAS->pHeap`, `gpu_vaspace.c:588-595` |
 | — | **UVM's own page-tree writes** | ⊘ **not even RM-local** | see §5 / §7 |
 
-★ **What DOES cross to the GSP** is the *page-directory base and the server's own reserved PDEs* —
-`NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES` (`ctrl90f1.h:268`, handled at
-`gpu_vaspace.c:4405 / :4431`), plus channel-allocation RPCs carrying the VAS. ⇒ **The GSP learns
-WHERE the page tables are. It never learns WHAT IS IN THEM.**
+### 2.6 What DOES cross — and ⊘ the flag sweep that would have missed it
+
+**The GSP learns WHERE the page tables are. It never learns WHAT IS IN THEM.** The messages that
+carry the "where":
+
+| control | crosses via | citation | enclosing condition |
+|---|---|---|---|
+| `NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES` | **hand-rolled `NV_RM_RPC_CONTROL` in the `_IMPL` body** | `gpu_vaspace.c:4459-4471` | `if (IS_GSP_CLIENT(pGpu) \|\| IS_VIRTUAL(pGpu)) { … NV_RM_RPC_CONTROL(…); return status; }` |
+| `NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY` | same | `gpu/mem_mgr/dma.c:508-520` | `if (IS_VIRTUAL_WITH_SRIOV(pGpu) \|\| IS_GSP_CLIENT(pGpu))` inside `SLI_LOOP_START(SLI_LOOP_FLAGS_BC_ONLY)` |
+| `NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY` | same | `dma.c:539-551` | revoke first, then `if (IS_GSP_CLIENT(pGpu) \|\| IS_VIRTUAL_WITH_SRIOV(pGpu))` |
+| `NV_RM_RPC_UPDATE_BAR_PDE` | direct macro | `gpu/bus/kern_bus.c:880` | comment: *"Provide the PDE3[0] value to GSP-RM so that GSP-RM can merge CPU-RM's page table to GSP-RM's page table"* |
+| `NV0080_CTRL_CMD_DMA_FLUSH` | ★ the **`ROUTE_TO_PHYSICAL` flag** (`0x50048`, bit `0x40` set) | `generated/g_device_nvoc.c:751` | routed by `rmresControl_Prologue_IMPL`, `rmapi/resource.c:252-296` |
+
+★★★ **METHODOLOGY FINDING, and it is the kind that silently produces a wrong census:** the first
+three cross the wire **while their `RMCTRL_FLAGS` do NOT contain `ROUTE_TO_PHYSICAL`** —
+`COPY_SERVER_RESERVED_PDES` and both `PAGE_DIRECTORY` controls carry flags `0x14004`, bit `0x40`
+**clear** (`generated/g_vaspace_api_nvoc.c:196`; `g_device_nvoc.c:886`, `:901`). They reach the GSP
+because their `_IMPL` bodies **hand-roll `NV_RM_RPC_CONTROL`**. ⇒ **A sweep keyed on
+`RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` would report that the single most important mapping-establishing
+control does not cross.** ⚠ Exactly the campaign's *"a guard/sweep is scoped to what it names"* —
+and the inverse error is available too: of the twelve `NV0080_CTRL_CMD_DMA_*` controls, **only
+`DMA_FLUSH` carries the flag**; `GET_PTE_INFO`, `GET_PDE_INFO`, `INVALIDATE_TLB`, `UPDATE_PDE_2`,
+`SET_VA_SPACE_SIZE`, `ADV_SCHED_GET_VA_CAPS`, `GET_CAPS`, `ENABLE_PRIVILEGED_RANGE`,
+`SET_DEFAULT_VASPACE` are all **CPU-RM-local**.
+
+★ **The routing dispatch itself**, for the record: `rmresControl_Prologue_IMPL`
+(`rmapi/resource.c:252-296`) — note the disjunction pairs **different flags with different worlds**:
+`IS_VIRTUAL(pGpu) && ROUTE_TO_VGPU_HOST` (vGPU guest) **vs** `IS_FW_CLIENT(pGpu) && ROUTE_TO_PHYSICAL`
+(us). Confusing the two inverts every row.
+
+★★ **Who owns which VA range** — `gpu_vaspace.c:4123-4128`, quoted because it is the contract:
+> *"RPC the details of these reserved PDEs to server RM so that server RM can mirror these PDEs in
+> its mmu walker state. Any lower level PDEs/PTEs allocated under these top level PDEs will be
+> modified exclusively by server RM. Client RM won't touch those."*
+
+⇒ `[vaStartServerRMOwned, vaLimitServerRMOwned]` is GSP-owned; **everything else is CPU-RM-owned**
+(split created at `gpu_vaspace.c:598-612`, gated on `gpuIsSplitVasManagementServerClientRmEnabled`
+and not BAR/FLA/PMU/HDA/HWPM/PERFMON). And CPU-RM explicitly does **not** program the PDB register:
+`gmmu_walk.c:663-668`, `_gmmuWalkCBUpdatePdb` —
+`else if (IS_VIRTUAL_WITH_SRIOV(pGpu) || IS_GSP_CLIENT(pGpu)) { /* Noop inside a guest or CPU RM. */ return NV_TRUE; }`.
+
+⚠ **`RMCFG_FEATURE_PLATFORM_GSP == 0` in this whole tree** (`generated/rmconfig.h:260`). Every
+`#if RMCFG_FEATURE_PLATFORM_GSP` body here is **dead** — GSP-RM's own source is not in this repo.
+⇒ This census tells you what CPU-RM **sends**; it cannot tell you what GSP-RM **does** on receipt.
 
 ---
 
@@ -374,12 +487,100 @@ that matter.**
 
 ⇒ **There are exactly TWO GMMU page-table writers on this system:**
 1. **RM's MMU walker** — `mmuWalkMap` via `gvaspaceMap_IMPL:2239`, for RM-owned VA spaces.
-2. **UVM's own page-tree code**, for externally-owned VA spaces — **which does not go through any
-   structure in §3 and does not appear in this census at all.**
+   **Transport: CPU stores through BAR2** (§2.5).
+2. **UVM's own page-tree code**, for externally-owned VA spaces. **Transport: UVM's own CE
+   pushbuffer** (`kernel-open/nvidia-uvm/uvm_map_external.c:230-241`).
 
-For a CUDA workload, writer (2) dominates. **That is the single most important scoping statement in
-this document**, and it is why the UVM lane's result (§7) is required before this census can be
-called complete.
+For a CUDA workload, writer (2) dominates. Family F below enumerates it.
+
+---
+
+## 5A. FAMILY F — the UVM plane (28 rows, summarised)
+
+Paths below are relative to `research_clones/ogkm-580.159.04/kernel-open/nvidia-uvm/`.
+Ioctl dispatch table: `uvm.c:996-1049`.
+
+### 5A.1 ★★★ The teardown answer — UVM is kernel-guaranteed, and guaranteed EARLIER than RM
+
+**This closes the highest-value gap from my first draft.** Two independent guaranteed routes:
+
+```
+close(fd) / SIGKILL → uvm.c:1079 (.release = uvm_release_entry) → uvm.c:250 uvm_release
+                    → uvm.c:202 uvm_release_va_space → uvm_va_space.c:463 uvm_va_space_destroy
+```
+`uvm_va_space_destroy` walks **every** VA range (`uvm_va_space.c:505-510`,
+`uvm_for_each_va_range_safe`), detaches all user channels (`:500`), unregisters every GPU (`:517`),
+and destroys HMM state (`:519`).
+
+★★ **And earlier still** — `uvm_va_space_mm_shutdown` (`uvm_va_space_mm.c:329`) runs at **mm
+teardown**, which under `SIGKILL` precedes fd release: it stops channels (`:352`), detaches them
+(`:360`), and calls `nvUvmInterfaceUnsetPageDirectory` for every GPU VA space (`:388-389`).
+
+⇒ **"Process dies without issuing ioctls" does not leak GPU VA mappings in UVM either.** Every
+user-visible UVM row is reachable from one of these. **Both RM and UVM give us a
+kernel-guaranteed unjoin point.**
+
+### 5A.2 The GSP-crossing rows — five, and four carry no VA
+
+| trigger | insert | what crosses | carries a GPU VA? |
+|---|---|---|---|
+| `UVM_REGISTER_GPU_VASPACE` (base 25) | `uvm_gpu_va_space_t` → `uvm_va_space.c:1606-1608`; page tree `uvm_mmu.c:1116` | `nvUvmInterfaceSetPageDirectory` `uvm_va_space.c:1394` → `NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY` (`rmapi/nv_gpu_ops.c:8870`) | ⊘ no — **the PDB root only** |
+| `UVM_REGISTER_CHANNEL` (base 27) | `uvm_user_channel_t` → `list_add` `uvm_user_channel.c:592` | `nvUvmInterfaceRetainChannel` `:141` → `nv_gpu_ops.c:10122` | ⊘ no |
+| `UVM_REGISTER_CHANNEL` | RM-side bind `uvm_user_channel.c:467` | **`NV2080_CTRL_CMD_GPU_PROMOTE_CTX`** with `promoteEntry[i].gpuVirtAddr = …resourceVa` (`nv_gpu_ops.c:10888-10891`) | ★★★ **YES — the one row that publishes a VA** |
+| `UVM_MAP_EXTERNAL_ALLOCATION` (base 33) | `uvm_ext_gpu_map_t` → `uvm_range_tree_add` `uvm_map_external.c:894` | `nvUvmInterfaceDupMemory` `:909` → `NV_RM_RPC_DUP_OBJECT` **iff** `pMemory->bRpcAlloc && (IS_VIRTUAL \|\| IS_FW_CLIENT)` (`mem_mgr/mem.c:1114-1116`) | ⊘ no — **a memory handle, not a VA** |
+| internal (pushbuffer, semaphores) | `uvm_rm_mem.c:223/233` | `nvUvmInterfaceMemoryAllocSys/AllocFB` — RM both allocates *and* maps; UVM never touches these page tables | ⊘ no (RM-side VA) |
+
+★ I verified the `DUP_OBJECT` row myself: `mem.c:1114` reads
+`if (pMemory->bRpcAlloc && (IS_VIRTUAL(pSrcGpu) || IS_FW_CLIENT(pSrcGpu)))`, and
+`IS_FW_CLIENT(pGpu) = IS_GSP_CLIENT(pGpu) || IS_DCE_CLIENT(pGpu)` (`generated/g_gpu_nvoc.h:5686`).
+⇒ **On a GSP client this DOES fire** for GSP-allocated memory.
+⇒ ★★ **So we DO get a wire-visible event per `UVM_MAP_EXTERNAL_ALLOCATION` — but it names the
+allocation, never the VA it is about to be mapped at.** *"This buffer was duped"* is a strictly
+weaker signal than *"this buffer is now at VA X"*, and treating the first as the second would
+mis-place every mapping.
+
+★ The **PTE values** are computed CPU-RM-side, not GSP-side:
+`nvGpuOpsGetExternalAllocPtesOrPhysAddrs` (`nv_gpu_ops.c:4535`) encodes them locally via
+`kgmmuEncodePhysAddrs` (`:4180`); its **only** RPC is `NV_RM_RPC_GET_PLCABLE_ADDRESS_KIND` (`:4216`),
+gated on `IS_VIRTUAL_WITH_SRIOV && gpuIsWarBug200577889SriovHeavyEnabled && isCompressedKind && …`
+(`:4185-4189`) — **not our path.**
+
+### 5A.3 UVM-local rows (the bulk) — a representative index
+
+`UVM_CREATE_EXTERNAL_RANGE` → `uvm_va_range.c:285` · `UVM_MAP_EXTERNAL_SPARSE` →
+`uvm_map_external.c:1138` · `UVM_MAP_DYNAMIC_PARALLELISM_REGION` → `uvm_va_range.c:364` ·
+`UVM_ALLOC_SEMAPHORE_POOL` → `uvm_va_range.c:415` / `:1122` / `:842` · channel VA ranges →
+`uvm_user_channel.c:364` · fault-routing rb-trees → `uvm_gpu.c:3431`, `:3279` · managed-block GPU
+state → `uvm_va_block.c:1425` · GPU PTE bits → `uvm_va_block.c:8560-8562` · chunk reverse map →
+`uvm_va_block.c:2979` · sysmem DMA records → `uvm_pmm_sysmem.c:269` · page-table range refcounts →
+`uvm_mmu.c:265`, `:574` · HMM blocks → `uvm_hmm.c:684`.
+**All paired**; teardowns cited in the lane's table. All invisible to a GSP.
+
+### 5A.4 ⚠ UVM asymmetries worth carrying into our design
+
+- ★★★ **F2 — `PROMOTE_CTX` has no un-promote.** The only VA-carrying GSP crossing in the whole
+  census is **inserted and never withdrawn**. `uvm_user_channel_stop` calls only
+  `nvUvmInterfaceStopChannel` (`uvm_user_channel.c:787`) and clears a local flag (`:792`); the
+  RM/GSP-side record dies only with `nvUvmInterfaceReleaseChannel` (`:857`). Meanwhile UVM clears
+  the actual PTEs first (`uvm_va_range.c:539`). ⇒ **A window exists in which the GSP still believes
+  a VA is promoted for a context whose PTEs are already gone.** ★ For us this is the one place a
+  mirror keyed on GSP traffic would hold a stale VA, and UVM's own mitigation is **ordering**
+  (stop, then detach — `uvm_user_channel.c:875-881`) plus a fault-buffer flush
+  (`uvm_va_space.c:1972-1977`). **If we mirror `PROMOTE_CTX`, we must expire it on channel
+  teardown ourselves — nothing on the wire will tell us to.**
+- **F3 — `UVM_FREE` on a semaphore pool silently does nothing** if userspace has not munmap'd:
+  `uvm_va_range.c:637-638` returns `NV_ERR_INVALID_ARGUMENT` and `uvm_free` propagates it
+  (`:708-709`) **without destroying the range**. Backstopped by `uvm_va_space.c:509`.
+- **F4 — `uvm_mmu_sysmem_map` (`uvm_mmu.c:2868`) has an insert with NO per-call teardown.** Grep
+  found no `uvm_mmu_sysmem_unmap`; removal is bulk-only at GPU deinit (`uvm_mmu.c:2790`, `:2944`).
+  Contrast its refcounted vidmem twin (`uvm_mmu.c:2669/2719`). ⊘ **SR-IOV-heavy only** — not our
+  configuration, but it is a genuine unpaired insert and is reported as one.
+- **F5 — two deliberate leaks on fatal error:** `uvm_mmu.c:1281-1285` (*"We can't perform the unmap,
+  so just leave things in place for debug"*) and `uvm_map_external.c:500-503`
+  (*"System-fatal error. Just leak."*). Both conditional on global fatal state.
+- **F8 — the highest-value line to audit** in external-mapping teardown: `uvm_va_range.c:508`,
+  `if (uvm_processor_mask_empty(&external_range->mapped_gpus)) goto out;`. If `mapped_gpus` ever
+  desyncs from the per-GPU trees, that `goto` **skips real mappings**.
 
 ---
 
@@ -409,28 +610,44 @@ it reports `0x1_20000000` **mapped**, then the fault is *not* a missing mapping,
 all wrong, and this section is void — while §1 (teardown) and §2 (the GSP-crossing structure) stand
 regardless.
 
-★ What survives either outcome: **populate source (1) — "bind-time RPC/ioctl bindings" — cannot be
-complete on a GSP-client architecture, because the bindings it names do not cross to the GSP.** Our
-only wire-visible signal for an RM-established mapping is **source (2), the observed page-table
-write itself** (`memmgrMemWrite`, `gmmu_walk.c:813`) — which is exactly what
-`mode2_address_table.md` §5 already measured as the surviving source when both invalidate transports
-read zero. ⇒ **This census independently corroborates that §5 correction from ogkm's source, by a
-different route.**
+★★★ **What survives either outcome — and it is now sharper than my first draft, and partly a
+correction of it:**
+
+**BOTH declared populate sources have a structural blind spot, and they are different blind spots.**
+
+| our source | covers | ⊘ blind to |
+|---|---|---|
+| **(1) bind-time RPC/ioctl bindings** | nothing on the RM mapping plane — it does not cross (§2.2). Sees UVM's `DUP_OBJECT`, which names an allocation, **not a VA** (§5A.2) | **every** GPU VA |
+| **(2) the observed CE page-table write** | **UVM's** writes — UVM uses its own CE pushbuffer (`uvm_map_external.c:230-241`) | ⊘ **all of RM's writes — they are CPU stores through BAR2** (§2.5) |
+
+⇒ ★★★ **An RM-established mapping is invisible to BOTH.** ⊘ **If we have anywhere treated "no CE
+page-table write observed" as "no mapping was established", that inference is unsound for the entire
+RM plane** — and that is a reading error our own instruments would never flag, because the absence
+looks exactly like the mapping not existing. ⚠ Precisely this campaign's *"an absent artefact reads
+as favourable"*, one level up: the **instrument** is absent, not the event.
+
+★ This still **corroborates** `mode2_address_table.md` §5's correction — source (2) really is the
+surviving source where it applies — while **narrowing its scope**: §5 was measured on the
+GSP-emulated compute path, where the writer is UVM. It does not generalise to RM-written mappings.
+⇒ *What would close it:* a BAR2-write watcher, or accept RM-plane mappings as unobservable and
+mirror `gvaspaceMap_IMPL` semantically instead.
 
 ---
 
 ## 7. ⊘ WHAT I COULD NOT DETERMINE, AND WHAT WOULD DETERMINE IT
 
-1. ⊘ **The UVM plane is not enumerated here.** `kernel-open/nvidia-uvm/` — `uvm_ext_gpu_map`,
-   `uvm_va_range`/`uvm_va_block`, `uvm_user_channel`, `uvm_mem_map_gpu_*`, page-tree ranges — was
-   dispatched to a parallel lane whose result had not returned when this document was written.
-   **§5 makes it the highest-value missing piece.** ⇒ *What would determine it:* that lane's table,
-   folded in as family F, with the same GSP-crossing and kernel-guarantee columns. Specifically
-   needed: **does `uvm_release` (file-release) tear down external mappings unconditionally**, making
-   UVM's teardown kernel-guaranteed like RM's?
-2. ⊘ **The full `NV_RM_RPC_*` / `ROUTE_TO_PHYSICAL` surface** was likewise dispatched and is not
-   folded in. §2 establishes the *negative* (no RPC on the mapping path) from the call-site guards,
-   which is the load-bearing direction; the *positive* inventory of what else crosses is not here.
+1. ✔ **CLOSED — the UVM plane is now §5A**, and the specific question ("is UVM's teardown
+   kernel-guaranteed like RM's?") is answered **yes, twice over**: `uvm_release` → `uvm_va_space_destroy`
+   (`uvm_va_space.c:463`), plus `uvm_va_space_mm_shutdown` (`uvm_va_space_mm.c:329`) at mm teardown,
+   which fires *earlier* under `SIGKILL`.
+2. ✔ **CLOSED — the RPC / `ROUTE_TO_PHYSICAL` surface is now §2.6**, including the methodology trap
+   (three key controls cross via hand-rolled `NV_RM_RPC_CONTROL` **without** the flag).
+   ⊘ **Residual:** the sub-lane states it did **not** exhaustively sweep all `_IMPL` control bodies
+   for embedded `NV_RM_RPC_CONTROL` — it found those three by name-directed grep. **There may be
+   more crossings than §2.6 lists.** ⇒ *What would determine it:* a grep for `NV_RM_RPC_CONTROL`
+   across every `*Ctrl*_IMPL` body.
+2b. ⊘ **GSP-RM's own source is not in this tree** (`RMCFG_FEATURE_PLATFORM_GSP == 0`,
+   `generated/rmconfig.h:260`). This census says what CPU-RM **sends**, never what GSP-RM **does**.
 3. ✔ **CLOSED during this pass** — `vaspaceIncAllocRefCnt`'s decrement is inline at
    `gpu_vaspace.c:1741-1745`, not a separate function. See §4 item 2.
 4. ⊘ **BAR1/BAR2 and `kbus` mapping bookkeeping** (`gpu/bus/arch/*/kern_bus_*.c`) is out of scope.
@@ -440,6 +657,24 @@ different route.**
    freed `:1596`, `:1711`) are noted as paired but not analysed. Not on a single-GPU GA106 path.
 6. ⊘ **Confidential-computing and MIG variants** were not resolved. Several sites carry
    `swizzId` / `KMIGMGR_SWIZZID_INVALID` parameters; MIG changes VAS ownership.
+
+### ★★★ TWO CONFIGURATION SWITCHES THAT INVERT THIS DOCUMENT
+
+⚠ **Both are single flags, and either one flips the central conclusion. A reader who assumes the
+default without checking will be exactly wrong.**
+
+1. **`RmSplitVasMgmtServerClientRm` set to DISABLED** (`gpu_registry.c:174-177`) ⇒
+   `bSplitVasManagementServerClientRm = NV_FALSE` ⇒ `bRpcAlloc` becomes **TRUE** ⇒
+   `NV_RM_RPC_MAP_MEMORY_DMA` **fires** at `virtual_mem.c:1522`, both macro gates open, and
+   `MAP_MEMORY_DMA` / `UNMAP_MEMORY_DMA` become **live wire opcodes**. ⇒ **§2's "no RPC" becomes
+   "every mapping is an RPC".** A mirror should probably handle both configurations.
+2. **Confidential Compute** ⇒ `kbusIsBarAccessBlocked()` true ⇒ `TRANSFER_TYPE_GSP_DMA`
+   (`mem_utils.c:118-122`) ⇒ **page-table bytes traverse the wire** and §2.5's "RM's PTE writes are
+   invisible" becomes false.
+
+⇒ ★ **The measured claims here are true of a DEFAULT bare-metal GA106 GSP client and are
+configuration-scoped, not architectural.** ⚠ Same class as this campaign's *"a ruling's DATE is
+part of the citation"* — here it is the **configuration** that is part of the citation.
 
 ### What this enumeration would MISS, stated plainly
 
@@ -471,7 +706,10 @@ different route.**
 
 ## 8. ONE-LINE SUMMARY FOR THE DESIGN
 
-**Mirror `gvaspaceMap_IMPL` / `gvaspaceUnmap_IMPL` (family D), key the unjoin on
-`clientFreeResource_IMPL` (T2b/T2c) with the `pMapTree` whole-block sweep (T4) as the backstop,
-and accept that on a GSP-client architecture NONE of it is visible to us as an RPC — so our only
-wire-side signal remains the observed page-table write.**
+**Mirror `gvaspaceMap_IMPL` / `gvaspaceUnmap_IMPL` (family D) for the RM plane and UVM's
+`uvm_ext_gpu_map` tree (family F) for the CUDA plane; key the unjoin on `clientFreeResource_IMPL`
+(T2b/T2c) and `uvm_va_space_destroy` — both kernel-guaranteed — with the `pMapTree` whole-block
+sweep (T4) as the backstop; expire any mirrored `PROMOTE_CTX` VA ourselves, because nothing on the
+wire withdraws it (§5A F2); and accept that on a default GSP-client configuration a GPU VA reaches
+us through NEITHER declared populate source — not as an RPC (§2.2), and, for the RM plane, not as a
+CE page-table write either (§2.5).**
