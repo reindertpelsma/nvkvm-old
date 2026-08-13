@@ -316,6 +316,12 @@ plus `_ERROR_NOTIFIER_TYPE` in `internalFlags` (`:589-592`). ⇒ the guest's ogk
 **guest-physical address and aperture of its own error notifier in the channel-alloc RPC**.
 Nothing needs to be reverse-resolved and nothing host-scoped needs to cross.
 
+★ The wire field is `NV_CHANNEL_ALLOC_PARAMS.errorNotifierMem`
+(`src/common/sdk/nvidia/inc/alloc/alloc_channel.h:330`), of type `NV_MEMORY_DESC_PARAMS`
+= `{ NvU64 base; NvU64 size; NvU32 addressSpace; NvU32 cacheAttrib; }` (`alloc_channel.h:37-42`).
+It is marked `// reserved` — i.e. it is a **kernel→GSP internal field, not client-facing**, which
+is exactly why the guest fills it only under `IS_GSP_CLIENT` and why it arrives at us for free.
+
 ⊘ **The prior reading — "forwarding `hObjectError` makes the host RM a writer" — is the thing
 to avoid, and it is avoidable without inventing anything:** do not hand `hObjectError` to the
 host RM at all. Author slot 0 ourselves from `errorNotifierMem.base`, exactly as the GSP does.
