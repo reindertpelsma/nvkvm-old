@@ -33,6 +33,9 @@ apt-get install -y \
     libglib2.0-dev \
     libpixman-1-dev \
     python3 \
+    `# QEMU 9.2 meson/configure needs these (rebuild fix 2026-07-04)` \
+    python3-venv \
+    python3-tomli \
     git \
     libslirp-dev \
     pkg-config \
@@ -41,7 +44,29 @@ apt-get install -y \
     libepoxy-dev \
     libgbm-dev \
     libegl-dev \
-    libdrm-dev
+    libdrm-dev \
+    `# the isolate stub is embedded via xxd -i (bench-rebuild fix 2026-07-29)` \
+    xxd
+
+# ── 1b. Build the isolate STUB and its embed header ───────────────────────
+# Bench-rebuild fix 2026-07-29: this step did not exist, and its absence is
+# SILENT. src/qemu/nvkvm_isolate.c embeds the stub behind
+#     #ifdef NVKVM_STUB_EMBEDDED
+#     #include "nvkvm_stub_bin.h"
+# so with neither the define nor the generated header the QEMU build SUCCEEDS
+# with stub_elf = NULL, stub_elf_len = 0, and silently falls back to
+# /usr/lib/nvkvm/nvkvm_stub at runtime. On a fresh box that path does not
+# exist, so fexecve fails and every isolate device-open returns -ENOENT:
+#     nvkvm-gpu[GA106] M5.1: open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF
+# i.e. Mode-2 comes up with forwarding OFF and NOTHING says why. The failure
+# looks like a missing /dev node (it is not — the nodes are present and
+# world-writable) and it reproduces identically with NVKVM_ISOLATE_NO_HARDEN=1,
+# which is what rules out the pivot_root / dev-dirfd path as the cause.
+echo "[1b/9] Building the isolate stub (nvkvm_stub + nvkvm_stub_bin.h)..."
+make -C "$REPO_ROOT/src/stub"
+install -d /usr/lib/nvkvm
+install -m 0755 "$REPO_ROOT/src/stub/nvkvm_stub" /usr/lib/nvkvm/nvkvm_stub
+echo "  stub installed at /usr/lib/nvkvm/nvkvm_stub (runtime fallback)"
 
 # ── 2. Clone QEMU 9.2 stable ──────────────────────────────────────────────
 if [ ! -d "$QEMU_SRC" ]; then
@@ -60,28 +85,32 @@ cp "$REPO_ROOT/src/qemu/"*.h "$QEMU_SRC/hw/misc/"
 # ── 4. Copy ABI / common headers into hw/misc/nvkvm_inc/ ──────────────────
 echo "[4/9] Copying ABI and common headers to $QEMU_SRC/hw/misc/nvkvm_inc/..."
 mkdir -p "$QEMU_SRC/hw/misc/nvkvm_inc"
-cp "$REPO_ROOT/src/abi/nvgpu.h"          "$QEMU_SRC/hw/misc/nvkvm_inc/"
-cp "$REPO_ROOT/src/abi/uvm.h"            "$QEMU_SRC/hw/misc/nvkvm_inc/"
-cp "$REPO_ROOT/src/common/nvkvm_proto.h" "$QEMU_SRC/hw/misc/nvkvm_inc/"
+# Rebuild fix 2026-07-04: the nvkvm .c/.h include SEVERAL headers from src/abi + src/common
+# (nvgpu.h, uvm.h, nvkvm_proto.h AND nvkvm_abi.h, nvkvm_isolate_proto.h, nvkvm_ring.h, ...),
+# not just the 3 hard-coded before — an incomplete copy fails the build.  Copy ALL of them.
+cp "$REPO_ROOT/src/abi/"*.h    "$QEMU_SRC/hw/misc/nvkvm_inc/" 2>/dev/null || true
+cp "$REPO_ROOT/src/common/"*.h "$QEMU_SRC/hw/misc/nvkvm_inc/" 2>/dev/null || true
 # Linux type shim: replaces <linux/types.h> in the QEMU user-space build
 # to avoid conflicts with QEMU's own type setup in qemu/osdep.h.
 cp "$REPO_ROOT/src/qemu/nvkvm_linux_types.h" \
    "$QEMU_SRC/hw/misc/nvkvm_inc/linux_types_compat.h"
+# The generated stub blob lives in src/stub/, NOT src/qemu/, so the *.h copy
+# above does not pick it up. nvkvm_isolate.c includes it by bare name, so it
+# must land in hw/misc/ alongside the sources (bench-rebuild fix 2026-07-29).
+cp "$REPO_ROOT/src/stub/nvkvm_stub_bin.h" "$QEMU_SRC/hw/misc/"
 
 # ── 5. Fix include paths in the copied files ──────────────────────────────
 echo "[5/9] Fixing include paths in copied files..."
-# virtio_nvgpu.h uses relative paths like ../../src/common/nvkvm_proto.h
-# that are correct relative to src/qemu/ but wrong inside hw/misc/.
-# Rewrite them to use the local nvkvm_inc/ sub-directory.
-sed -i \
-    's|"../../src/common/nvkvm_proto.h"|"nvkvm_inc/nvkvm_proto.h"|g' \
-    "$QEMU_SRC/hw/misc/virtio_nvgpu.h"
-sed -i \
-    's|"../../src/abi/nvgpu.h"|"nvkvm_inc/nvgpu.h"|g' \
-    "$QEMU_SRC/hw/misc/virtio_nvgpu.h"
-sed -i \
-    's|"../../src/abi/uvm.h"|"nvkvm_inc/uvm.h"|g' \
-    "$QEMU_SRC/hw/misc/virtio_nvgpu.h"
+# The nvkvm sources use relative paths like ../../src/common/foo.h and
+# ../../src/abi/bar.h that are correct relative to src/qemu/ but wrong inside
+# hw/misc/.  Rewrite EVERY such include (across all copied .c and .h) to the
+# local nvkvm_inc/ sub-directory — generalized so new headers don't break it.
+# Rebuild fix 2026-07-19: the previous sed used '|' as BOTH the s/// delimiter AND
+# inside the regex alternation (common|abi), so GNU sed parsed the alternation '|'
+# as end-of-command -> "unknown option to `s'".  Use '#' as the delimiter instead.
+sed -i -E \
+    's#"\.\./\.\./src/(common|abi)/([A-Za-z0-9_]+\.h)"#"nvkvm_inc/\2"#g' \
+    "$QEMU_SRC/hw/misc/"*.c "$QEMU_SRC/hw/misc/"*.h
 # Replace <linux/types.h> in nvkvm_inc headers with our QEMU-compatible shim
 # to avoid conflicts with QEMU's own qemu/osdep.h type setup.
 sed -i \
@@ -121,6 +150,7 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
   'nvkvm_isolate_handlers.c',
   'nvkvm_tables.c',
   'nvkvm_present_egl.c',
+  'nvkvm_gpu_emul.c',
 ))
 """
 
@@ -157,19 +187,23 @@ path = sys.argv[1]
 with open(path, 'r') as fh:
     text = fh.read()
 
-# Find the closing brace of virtio_device_names[] and insert before it.
-# The array ends with a line that is just "};" (possibly with leading spaces).
-insert_marker = '};\n'
-entry = '    [50] = "virtio-nvgpu",\n'
-# Only insert once; guard already checked above.
-idx = text.rfind(insert_marker)
-if idx == -1:
-    print("  ERROR: could not find end of virtio_device_names[]", file=sys.stderr)
+# Rebuild fix 2026-07-04: insert our entry RIGHT AFTER the [VIRTIO_ID_GPIO] line
+# inside virtio_device_names[].  The old code used text.rfind('};') which matched
+# the LAST '};' in the file — the virtio_device_info TypeInfo, NOT the names table —
+# corrupting an unrelated struct and breaking the build.  Anchor on the real entry.
+# Rebuild fix 2026-07-19: in QEMU 9.2.0 the [VIRTIO_ID_GPIO] entry is the LAST in the
+# initializer and has NO trailing comma ("virtio-gpio" then "};").  Make the trailing
+# comma optional in the match, and always emit our own entries WITH the needed comma.
+m = re.search(r'^([ \t]*)\[VIRTIO_ID_GPIO\][ \t]*=[ \t]*"virtio-gpio",?[ \t]*\n', text, re.M)
+if not m:
+    print("  ERROR: could not find [VIRTIO_ID_GPIO] entry in virtio_device_names[]", file=sys.stderr)
     sys.exit(1)
-text = text[:idx] + entry + text[idx:]
+indent = m.group(1)
+entry = '%s[VIRTIO_ID_GPIO] = "virtio-gpio",\n%s[50] = "virtio-nvgpu",\n' % (indent, indent)
+text = text[:m.start()] + entry + text[m.end():]
 with open(path, 'w') as fh:
     fh.write(text)
-print("  virtio.c patched successfully.")
+print("  virtio.c patched successfully (after VIRTIO_ID_GPIO).")
 PYEOF
 else
     echo "  virtio.c already contains virtio-nvgpu entry — skipping patch."
@@ -191,15 +225,23 @@ cd "$QEMU_SRC"
     `# it does not use virtio-gpu GL virgl.` \
     --disable-virglrenderer \
     --disable-vnc \
+    `# Bench-rebuild fix 2026-07-29: WITHOUT this define nvkvm_isolate.c takes` \
+    `# its #else branch (stub_elf = NULL) and the build still SUCCEEDS — the` \
+    `# breakage only shows at runtime as "open ctl/gpu FAILED r1=-2 r2=-2".` \
+    --extra-cflags=-DNVKVM_STUB_EMBEDDED \
     --prefix="$QEMU_PREFIX"
 
 # ── 8. Build ──────────────────────────────────────────────────────────────
+# Rebuild fix 2026-07-04: QEMU 9.2's ./configure creates the build tree in
+# ./build (out-of-tree); build.ninja is NOT in $QEMU_SRC.  Run ninja against it.
 echo "[8/9] Building QEMU with ninja -j$(nproc)..."
-ninja -j"$(nproc)"
+BUILD_DIR="$QEMU_SRC/build"
+[ -f "$BUILD_DIR/build.ninja" ] || BUILD_DIR="$QEMU_SRC"   # fallback for in-tree configs
+ninja -C "$BUILD_DIR" -j"$(nproc)"
 
 # ── 9. Install ────────────────────────────────────────────────────────────
 echo "[9/9] Installing to $QEMU_PREFIX..."
-ninja install
+ninja -C "$BUILD_DIR" install
 
 echo ""
 echo "=== Build complete ==="
