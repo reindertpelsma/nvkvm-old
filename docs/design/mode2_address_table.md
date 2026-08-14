@@ -113,6 +113,32 @@ invalidate" is trustworthy for *all* VAs. This is the #11-open item in §11.
 
 ## 5. The coherence event: TLB invalidate (two transports, both observed)
 
+> ### ⊘⊘⊘ CORRECTED 2026-08-14 (w324) — **"TWO TRANSPORTS" IS WRONG, AND SO IS THE ZERO BELOW.
+> ### ON GA106 THERE IS A THIRD, IT IS THE ONE RM ACTUALLY USES, AND WE HAVE NEVER DECODED IT.**
+> Full derivation with quotes: **`guest_invalidate_discipline_and_the_publish_boundary.md`**.
+> Headlines, each cited there:
+> - ★★★★★ **RM's invalidate is a BAR0 MMIO register write** —
+>   `GPU_VREG_WR32(pGpu, NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE, …)`
+>   (`ogkm: kern_gmmu_tu102.c:117`) at **`0xB80000 + 0x30B0 = 0xB830B0`**. Not an RPC, not a
+>   pushbuffer method. `grep -rn MMU_INVALIDATE src/qemu/ ../nvkvm-rs/crates/` = **zero hits in
+>   both trees** — the signal has been arriving at our BAR0 handler all along.
+> - ★★★★★ **The `INVALIDATE_TLB` RPC zero below is a known-negative, not a measurement.**
+>   `rpcInvalidateTlb` is **`_STUB` on GA106** (`ogkm: g_rpc_private.h:320`) and is reached only
+>   under vGPU with `VF_INVALIDATE_TLB_TRAP_ENABLED` (`kern_gmmu_gm107.c:151-159`). **It could
+>   never have been non-zero.** ⇒ *a census over a path that cannot execute*.
+> - ★★★★★ **MAP INVALIDATES TOO.** The GMMU negative-caches — *"the GPU TLBs may cache invalid
+>   entries using any page size they decide"* (`ogkm: uvm_mmu.c:1534-1536`). Map and unmap are
+>   symmetric in *whether* they invalidate; they differ only in the **membar**.
+> - ⊘ **And it is CLIENT-SUPPRESSIBLE**: `NVOS46/47_FLAGS_DEFER_TLB_INVALIDATION`
+>   (`ogkm: nvos.h:2150`, `:2191`) — *"can leave stale entries in the TLB, and allow access to
+>   memory no longer owned by the RM client"* (`nvos.h:2146-2148`). ⇒ **an invalidate-triggered
+>   UNPUBLISH is not safe against a hostile guest**; observe the write instead.
+>
+> ★ **WHAT SURVIVES BELOW, exactly:** the `MEM_OP` transport is real and is UVM's; the CE-write
+> capture feed is real and is source (2). What must **not** be repeated is *"the guest issues no
+> invalidate on the compute path"* — that reads the two-transport zero as a claim about all
+> transports, and it is false.
+
 > **★ CORRECTION (2026-07-22, audit S3 — #14 round-6, decisive).** The invalidate model in this
 > section governs the **kernel/UVM/RM paths** (where the two transports DO appear). It does **NOT**
 > fire on the **Mode-2 GSP-emulated compute path**: `mode2_14_concurrent_apps` round-6 measured
