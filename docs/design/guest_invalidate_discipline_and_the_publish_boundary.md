@@ -291,6 +291,39 @@ The address, derived from ogkm's own headers:
 (`_MMU_INVALIDATE_TRIGGER 31:31`, `ga100/dev_vm.h:122`). The scope bits `_ALL_VA` (0:0) and
 `_ALL_PDB` (1:1) are at `:64` and `:67`.
 
+> ### ⊘⊘ TWO CORRECTIONS FROM THE FIRST BOOT THAT DECODED THIS REGISTER — w326, 2026-08-14
+> Full working: `../nvkvm-rs/docs/design/the_publish_trigger_measured.md`.
+>
+> **(1) ⊘ "448 KiB below the doorbell" is WRONG — it is 180 KiB.**
+> `0x00BB_0090 − 0x00B8_30B0 = 0x2_CFE0 = 184 288 bytes`. The conclusion (same BAR, same
+> window, already trapped) is unaffected, but the number propagated from here into w326's
+> brief and is now pinned by a unit test in the Rust port
+> (`mmuinval::tests::the_distance_to_the_doorbell_is_180_kib_not_448`).
+>
+> **(2) ⊘⊘⊘ §8's OWN FALSIFIER FIRED, AND THE COST ARGUMENT DOES NOT MERELY COLLAPSE — IT
+> REVERSES.** §8 wrote: *"count `0xB830B0` writes per `cuLaunchKernel`. If that ratio is not
+> ≪ 1, the argument collapses."* Measured on GA106 with a decoder on the register, stock
+> guest, `CUP3_VAL=43`:
+>
+> | workload | triggers | `HUBTLB_ONLY` | GPU-VAS | doorbells | **triggers/doorbell** |
+> |---|---|---|---|---|---|
+> | `cup3` (×4 boots, identical) | 377 | 232 | 145 | 480 | **0.785** |
+> | `cup8` | 377 | 232 | 145 | 532 | **0.709** |
+> | `R33 arm 1` | 331 | 213 | 118 | **18** | **18.39** |
+>
+> ★★★ **The trigger count is nearly workload-INVARIANT (377 / 377 / 331) while the doorbell
+> count moves 30× (18 → 532)**, and `triggers_at_first_doorbell = 66` on all three. ⇒ the
+> guest's invalidates track **driver and context setup**; the doorbell tracks **submission**.
+> No single ratio describes them, and quoting one without its workload is how this doc's own
+> falsifier came to be answerable two ways.
+> ⇒ **Tier 1's case is SOUNDNESS and SCOPE (it names its PDB), never frequency** — and the
+> *stronger* form of the scope argument is that publication work is proportional to mappings
+> changing, which is what the invalidate counts and is **not** what the doorbell counts.
+>
+> ★ Everything else in §2.1 was confirmed exactly: `ALL_PDB = 0` on **all** 377,
+> `ALL_VA = 1` on all 377, and the completion poll is real —
+> `polls = 754 = 2 × 377`, the floor of one pre-check and one post-check per invalidate.
+
 ★ For orientation, the doorbell we already decode is the **same BAR0 window**:
 `NV_VIRTUAL_FUNCTION_DOORBELL = 0x30090` (`ga100/dev_vm.h:131`) ⇒ `0xBB0090`, which is exactly
 `NVKVM_VF_DOORBELL` in the C (`src/qemu/mode2_regs_ga10x.h:98`, *"CONFIRMED in trace"*).
