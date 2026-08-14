@@ -391,6 +391,21 @@ scope rule as §3.2 pointing the other way.
   this"* — ★ **a comment describing behaviour the open source does not implement.** Any design
   that plans to observe `bIsRcPending` flipping is planning around a field that never flips.
 - **Serve `0x83de030c` from guest-side state?** ⊘ **No.**
+  > ### ⊘ TRANSPORT CORRECTED 2026-08-14 (w289) — the conclusion holds, the route named below does NOT.
+  > The bullet's verdict (*"we must answer it as the GSP; no guest-side cache"*) is **right**.
+  > But `rpcCtrlDbgReadAllSmErrorStates_HAL` / `:7338` / the 80-SM chunking is the **vGPU-guest**
+  > transport, reached only from `rpcDmaControl_wrapper` (`vgpu/rpc.c:4513`), and **GA106 binds
+  > that interface to `rpcCtrlDbgReadAllSmErrorStates_STUB`** — `g_rpc_private.h:414` names GA106
+  > in the STUB's own chip list. ⚠ **Reading `:7338` as "what GA106 does" is reading a stub's body.**
+  > The real route on a bare-metal GSP client is the **generic** one: `ROUTE_TO_PHYSICAL` in the
+  > exported flags (`0x50048`) makes `rmresControl_Prologue_IMPL` (`rmapi/resource.c:266-297`)
+  > `NV_RM_RPC_CONTROL` the **whole 4824-byte struct** to GSP and return `NV_WARN_NOTHING_TO_DO`,
+  > so the `_IMPL` at `:731` is **skipped entirely** (`rs_resource.c:191-201`).
+  > ⇒ We must serve it as **one opaque control reply**, not as an 80-SM chunk stream — and every
+  > one of the 4800 output bytes must be initialised.
+  > ★ Full analysis, plus the scope/privilege answer:
+  > `docs/reference/sm_debugger_scope_and_sm_error_registers.md`.
+
   `0x83de030c` = `NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES`
   (`src/common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83dedebug.h:371`). Its kernel implementation is
   `ksmdbgssnCtrlCmdDebugReadAllSmErrorStates_IMPL`
