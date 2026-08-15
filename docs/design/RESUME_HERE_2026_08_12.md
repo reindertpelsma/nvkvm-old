@@ -1,6 +1,18 @@
 # RESUME HERE — cold-start state, 2026-08-12 (supersedes the 08-11 handoff)
 
-> ### STATUS — 2026-08-12 / **LIVE — THIS IS THE HANDOFF DOC.** Read before anything else.
+> ## ⊘⊘⊘ SUPERSEDED 2026-08-15 — **GO TO `../../../nvkvm-rs/docs/design/RESUME_HERE_2026_08_15.md`**
+> (in the **kayfabe** repo, `/workspace/nvkvm-rs`, at master `a7de8964`).
+> **Thirteen rungs landed on 2026-08-14/15** — 29 merges — and this file predates all of them.
+> ⚠ **Three of its framings are now actively wrong**, so do not read forward from here:
+> **(1)** four different things wear the word *"drain"* and `budget_hit=true` is the *disposal's*
+> and is true on **every** boot; **(2)** *"the guest emits zero TLB invalidates on the compute
+> path"* is **FALSE** — 377 per boot as BAR0 writes to `0xB830B0`, a transport no measured zero
+> covered; **(3)** `n = 1` is not a grade — a single-boot `43` is wrong **1 time in 5** on these
+> boxes.
+> ★ The 08-15 doc is the **ORDERING**; the **RECORD** is `git log --merges --since=2026-08-14` in
+> the kayfabe repo, where each merge carries its rung's findings and refutations in full.
+
+> ### STATUS — 2026-08-12 / ⊘ **SUPERSEDED — see the block above.** Formerly *"LIVE — THIS IS THE HANDOFF DOC."*
 > Supersedes `RESUME_HERE_2026_08_11.md`, which is marked SUPERSEDED-BY at its head. Everything
 > needed to continue is here or linked from here. ⚠ **The night-run cron prompts still name the
 > 08-11 doc**; they cannot be edited from a later session, so that doc's first line redirects here.
