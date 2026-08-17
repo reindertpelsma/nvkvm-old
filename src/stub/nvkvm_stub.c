@@ -809,6 +809,28 @@ static int dequeue_job(struct ioctl_job *out)
 	return 0;
 }
 
+/*
+ * U-2/U-4 helper: clear a pointer field inside the aux blob, fail-closed.
+ *
+ * Every per-command rewrite below is guarded by a count or size the GUEST
+ * supplied.  When such a guard does not fire the field must end up 0, never
+ * whatever the guest wrote — the driver walks these as user pointers
+ * (embedded_param_copy.c) and copies in AND out through them.  The write is
+ * bounded by aux_size so a short blob is partially cleared rather than
+ * overrun: a partly-guest-controlled pointer is still an attacker-influenced
+ * pointer, so clear whatever of it exists.
+ */
+static void aux_clear_ptr(void *aux_buf, uint32_t aux_size, uint32_t off)
+{
+	if (!aux_buf || off >= aux_size)
+		return;
+	uint32_t n = aux_size - off;
+	if (n > 8)
+		n = 8;
+	uint64_t zero = 0;
+	__builtin_memcpy((char *)aux_buf + off, &zero, n);
+}
+
 static void worker_thread(void *arg)
 {
 	/* arg = (void *)(uintptr_t)(slot_id + 1) — non-zero so we can
@@ -851,18 +873,51 @@ static void worker_thread(void *arg)
 		 * SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) and DRM
 		 * GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110) all carry
 		 * their single user ptr (nvkms_params_ptr) there. */
-		if (job.aux_size > 0 &&
-		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
-		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
-		     (job_type == 'd' && (job_nr == 0x54 || job_nr == 0x49) &&
-		      job.param_size >= 16))) {
-			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
-			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
-					 &aux_ptr, sizeof(uint64_t));
+		/*
+		 * U-2 (docs/internal/audit-guest-pointers.md) — FAIL CLOSED.
+		 *
+		 * Both rewrites below used to be gated on `job.aux_size > 0`, a
+		 * value that arrives straight off the virtqueue from the guest
+		 * (virtio_nvgpu.c:900-922).  A guest that sent aux_size == 0 fell
+		 * out of BOTH branches and nothing wrote the pointer field at
+		 * all — its own 8 bytes reached stub_ioctl() and the driver
+		 * verbatim.  Those fields are NVOS54.params (control.c:262
+		 * copy_from_user AND copy_to_user, paramsSize bytes),
+		 * NVOS21/NVOS64.pAllocParms, and NvKmsIoctlParams.address on the
+		 * host-global /dev/nvidia-modeset — i.e. an arbitrary read and
+		 * write at a guest-named address inside the isolate.
+		 * aux_size == 0 happens on the ordinary live path (measured: 11
+		 * RM_CONTROL and 24 RM_ALLOC calls in one CUDA run), so this was
+		 * not a theoretical corner.
+		 *
+		 * Decide the pointer's OFFSET from the cmd — which selects the
+		 * struct layout and which a guest cannot use to skip the write —
+		 * then write either the aux pointer or an explicit 0.  Never
+		 * leave the guest's bytes in a pointer field.  The offset-16
+		 * zeroing is scoped to the two NRs whose offset 16 is definitely
+		 * a pointer (RM_CONTROL 0x2a, RM_ALLOC 0x2b); other ioctls keep
+		 * real data there (e.g. NVOS33.offset) and are left alone.
+		 */
+		int ptr_off = -1;
+		if ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+		     job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
+		    (job_type == 'd' && (job_nr == 0x54 || job_nr == 0x49) &&
+		     job.param_size >= 16)) {
+			ptr_off = NVKVM_NVKMS_ADDR_OFF;
+		} else if (job_type == 'F' && (job_nr == 0x2a || job_nr == 0x2b) &&
+			   job.param_size >= 24) {
+			ptr_off = 16;
 		} else if (job.aux_size > 0 && job.param_size >= 24) {
-			uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
-			__builtin_memcpy((char *)job.param_buf + 16, &aux_ptr,
-					 sizeof(uint64_t));
+			/* Unchanged legacy generic case: some other cmd that
+			 * shipped an aux blob.  Only ever reached with
+			 * aux_size > 0, so behaviour here is exactly as before. */
+			ptr_off = 16;
+		}
+		if (ptr_off >= 0) {
+			uint64_t ptr_val = (job.aux_size > 0)
+				? (uint64_t)(uintptr_t)job.aux_buf : 0;
+			__builtin_memcpy((char *)job.param_buf + ptr_off,
+					 &ptr_val, sizeof(uint64_t));
 		}
 
 		/*
@@ -963,7 +1018,7 @@ static void worker_thread(void *arg)
 			 * writes into our own memory. After the ioctl we zero the
 			 * pointer again so we don't leak a host VA back to the guest. */
 			uint32_t list_esz = nvkvm_ctrl_list_entry_size(inner_cmd);
-			if (list_esz) {
+			if (list_esz && job.aux_size >= 4) {
 				/* GET_INFO family → 8-byte entries; GET_CAPS family
 				 * → 1-byte (the count is a byte length). Mirrors the
 				 * guest nvkvm_ctrl_list_entry_size(). */
@@ -971,6 +1026,7 @@ static void worker_thread(void *arg)
 				__builtin_memcpy(&ls, job.aux_buf, sizeof(uint32_t));
 				/* base_size is whatever the guest sent before the
 				 * extension; we recover it as aux_size - ls*esz. */
+				int wired = 0;
 				if (ls > 0 && (size_t)ls * list_esz < job.aux_size) {
 					uint32_t base = (uint32_t)(job.aux_size - (size_t)ls * list_esz);
 					if (base >= 16) {
@@ -981,8 +1037,25 @@ static void worker_thread(void *arg)
 								 &list_va, 8);
 						info_list_size = ls;
 						info_list_base = base;
+						wired = 1;
 					}
 				}
+				/*
+				 * U-4 — FAIL CLOSED.  `ls` is the count the GUEST
+				 * wrote at aux_buf+0 and job.aux_size is the length
+				 * the GUEST declared, so the guard above is a test
+				 * on guest-supplied values.  Choosing ls such that
+				 * ls*esz >= aux_size (or base < 16) used to skip the
+				 * rewrite and LEAVE the guest's own 8 bytes at
+				 * aux_buf+8 — which is exactly the pointer
+				 * embedded_param_copy.c walks: GR_GET_INFO copies
+				 * ls*8 bytes IN and OUT at that address with no
+				 * SKIP_COPYIN, i.e. an arbitrary read AND write in
+				 * the isolate.  Zero it instead: the driver then
+				 * gets a NULL list pointer and fails the call.
+				 */
+				if (!wired)
+					aux_clear_ptr(job.aux_buf, job.aux_size, 8);
 			}
 			if (inner_cmd == 0x00003d05U &&
 			    job.aux_size >= 20) {
@@ -1047,6 +1120,13 @@ static void worker_thread(void *arg)
 					/* flag: re-zero after ioctl */
 					info_list_size = nc;  /* repurpose flag */
 					info_list_base = 0xFFFFFFFFU; /* sentinel */
+				} else {
+					/* U-4 — FAIL CLOSED.  `nc` and aux_size are
+					 * both guest-chosen; on guard failure the
+					 * guest's own two pointers used to survive
+					 * at aux+8 / aux+16 and reach the driver. */
+					aux_clear_ptr(job.aux_buf, job.aux_size, 8);
+					aux_clear_ptr(job.aux_buf, job.aux_size, 16);
 				}
 			}
 			if (inner_cmd == 0x00000101U) {    /* GET_BUILD_VERSION */
@@ -1071,6 +1151,14 @@ static void worker_thread(void *arg)
 					__builtin_memcpy((char *)job.aux_buf +  8, &p1, 8);
 					__builtin_memcpy((char *)job.aux_buf + 16, &p2, 8);
 					__builtin_memcpy((char *)job.aux_buf + 24, &p3, 8);
+				} else {
+					/* U-4 — FAIL CLOSED.  `sz` and aux_size are
+					 * guest-chosen; on guard failure the guest's
+					 * three string pointers used to survive and
+					 * be written through by the driver. */
+					aux_clear_ptr(job.aux_buf, job.aux_size,  8);
+					aux_clear_ptr(job.aux_buf, job.aux_size, 16);
+					aux_clear_ptr(job.aux_buf, job.aux_size, 24);
 				}
 			}
 		}
@@ -1104,7 +1192,12 @@ static void worker_thread(void *arg)
 			case NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION:
 				/* #81: rm_ctrl_fd offset is version-variant — 9248 for
 				 * the V550 256-entry layout (550.54.14+, incl 575/580),
-				 * 68 for the pre-V550 1-entry layout (535). */
+				 * 1184 for the pre-V550 1-entry layout (535).
+				 * (This comment said "68" — a leftover from the
+				 * arithmetic-derived 535 row that commit 377bee5
+				 * replaced with MEASURED values.  Re-measured
+				 * 2026-08-17 with tools/abi_derive.sh against OGKM
+				 * 535.183.01: uvm_map_ext_fd_off = 1184.) */
 				uvm_embedded_fd_off =
 					nvkvm_abi_by_id(job.abi_profile)->uvm_map_ext_fd_off;
 				uvm_has_embedded_fd = 1;
@@ -2285,9 +2378,21 @@ static void ring_exec_one(const uint8_t *pay, uint32_t len)
 	/* Wire the inner-params pointer (nvos54.params at offset 16) to our local
 	 * aux copy so the driver dereferences valid stub memory; zero it on the
 	 * way back so we never leak a host VA to the guest. */
-	if (rq.aux_size) {
-		uint64_t aux_ptr = (uint64_t)(uintptr_t)aux;
-		__builtin_memcpy(param + 16, &aux_ptr, sizeof(aux_ptr));
+	/*
+	 * U-2/U-4 fail-closed idiom applied here too.  ring_ctrl_must_punt()
+	 * has already established that this record is a flat NV_ESC_RM_CONTROL
+	 * (nvos54, param_size >= 32), so offset 16 is NVOS54.params and nothing
+	 * else — writing 0 when there are no inner params is unambiguous.
+	 * Previously an aux_size == 0 record (which must_punt explicitly
+	 * ACCEPTS: "no inner params -> trivially flat") ran with the guest's own
+	 * 8 bytes still in params.  This does NOT address U-1 itself, which is
+	 * that this path has no allowlist at all; it only stops the pointer
+	 * field from being fail-open.
+	 */
+	{
+		uint64_t ptr_val = rq.aux_size
+			? (uint64_t)(uintptr_t)aux : 0;
+		__builtin_memcpy(param + 16, &ptr_val, sizeof(ptr_val));
 	}
 
 	clear_fault_addr();

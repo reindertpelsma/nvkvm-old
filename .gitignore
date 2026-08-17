@@ -1,50 +1,28 @@
-# Kernel module build artifacts
-*.ko
+# build artifacts
 *.o
+*.ko
 *.mod
 *.mod.c
 *.mod.o
+# ...but *.mod is a kernel build artifact rule (nvkvm-guest.mod) and it also
+# matches go.mod, which is how tests/abi_parity/go.mod got left behind when this
+# repo was extracted — the Go package then had no module file and `go test`
+# refused to run it at all.
+!go.mod
+!go.sum
 *.symvers
 *.order
 .tmp_versions/
 Module.symvers
 modules.builtin
 modules.order
-
-# Go test artifacts
-tests/abi_parity/vendor/
-# QEMU build artifacts
 *.so
-# Editor / IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-# Python
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-# gVisor reference (large, fetched separately)
-gvisor/
-# VM images
-*.qcow2
-*.iso
-*.img
-tools/diag/nvioctl_trace
+# generated: stub binary embedded for QEMU
 src/stub/nvkvm_stub
 src/stub/nvkvm_stub_bin.h
-# guest kernel-module build artifacts
-src/guest/.*.cmd
-src/guest/.*.o.d
-src/guest/*.o
-src/guest/*.ko
-src/guest/*.mod*
-src/guest/Module.symvers
-src/guest/modules.order
-# Claude Code session/memory (never commit — may hold secrets)
-.claude/
-host-libs-*/
-research_clones/
-docs/host_present_quad.png
+# editor
+.vscode/
+.idea/
+# local secrets — never commit
+*.key
+.env

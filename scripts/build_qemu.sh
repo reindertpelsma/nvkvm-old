@@ -58,7 +58,7 @@ apt-get install -y \
 # /usr/lib/nvkvm/nvkvm_stub at runtime. On a fresh box that path does not
 # exist, so fexecve fails and every isolate device-open returns -ENOENT:
 #     nvkvm-gpu[GA106] M5.1: open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF
-# i.e. Mode-2 comes up with forwarding OFF and NOTHING says why. The failure
+# i.e. the device comes up with forwarding OFF and NOTHING says why. The failure
 # looks like a missing /dev node (it is not — the nodes are present and
 # world-writable) and it reproduces identically with NVKVM_ISOLATE_NO_HARDEN=1,
 # which is what rules out the pivot_root / dev-dirfd path as the cause.
@@ -150,7 +150,6 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
   'nvkvm_isolate_handlers.c',
   'nvkvm_tables.c',
   'nvkvm_present_egl.c',
-  'nvkvm_gpu_emul.c',
 ))
 """
 

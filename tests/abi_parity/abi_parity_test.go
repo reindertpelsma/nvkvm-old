@@ -91,7 +91,11 @@ func TestFrontendStructSizes(t *testing.T) {
 		// Pad0 (+52). Earlier 48-byte def put FD at +44, overlapping Pad1
 		// and reading kernel zero as the user's fd field.
 		{"nv_ioctl_nvos02_parameters_with_fd (ALLOC_MEMORY)", Sizes.AllocMemFd, 56},
-		{"nv_ioctl_idle_channels", Sizes.IdleCh, 40},
+		// 56, not 40: the three NvP64 arrays end at +40, but flags/timeout/
+		// status follow (+52) and the NvP64 members force align-to-8 → 56.
+		// Confirmed against OGKM 580.159.04 nvos.h NVOS30_PARAMETERS and
+		// gvisor nvproxy frontend.go (explicit Pad0 [4]byte).
+		{"nv_ioctl_idle_channels", Sizes.IdleCh, 56},
 		{"nv_ioctl_alloc_context_dma2", Sizes.AllocCtx, 56},
 		{"nv_ioctl_export_to_dmabuf_fd", Sizes.ExportDma, 40},
 	})

@@ -678,6 +678,25 @@ struct nva0bc_alloc_parameters {
 	__u32 h_mem;         /* [IN] @16 */
 };
 
+/* ── NV503C_ALLOC_PARAMETERS — for NV50_THIRD_PARTY_P2P (0x503c) ──────────── */
+/*    4 bytes; from class/cl503c.h.  MEASURED with
+ *      gcc probe.c -I<ogkm>/src/common/sdk/nvidia/inc ... ; sizeof(...) == 4
+ *    against open-gpu-kernel-modules tag 575.51.03 (the exact host driver of
+ *    the Ada bring-up box).  Do NOT hand-derive this.
+ *
+ *    WHY IT MATTERS (Ada bring-up, 2026-08-17): libcuda allocates this object
+ *    during cuInit with alloc_parms_size=0, relying on the driver to size the
+ *    buffer by hClass — the same pattern as NV01_MEMORY_VIRTUAL (#84) and
+ *    NV01_CONTEXT_DMA (#99).  The class was in QEMU's alloc-class allowlist but
+ *    NOT in either of the guest's two size-by-hClass switches, so the forwarder
+ *    copied ZERO bytes of params and the host RM answered NV_ERR_NOT_SUPPORTED
+ *    (0x56).  libcuda turned that into cuInit -> CUDA_ERROR_NOT_SUPPORTED (801)
+ *    and the guest could not initialise CUDA at all. */
+#define NV50_THIRD_PARTY_P2P 0x0000503cU
+struct nv503c_alloc_parameters {
+	__u32 flags;         /* [IN] @0 — NV503C_ALLOC_PARAMETERS_FLAGS_TYPE */
+};
+
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */
 /*    several other generic memory classes. V545 layout (driver >= 545.23.06,
  *    matches our 575.51.03): adds numa_node + pad. */

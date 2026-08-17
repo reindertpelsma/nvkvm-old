@@ -364,7 +364,10 @@ void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
 /* nvkvm_dispatch.c */
 int  nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx,
 			  unsigned int cmd);
-size_t nvkvm_ioctl_expected_param_size(unsigned int cmd);
+/* #81: two UVM param sizes are driver-version-variant, so the expected size
+ * depends on the active ABI profile — pass it in. */
+size_t nvkvm_ioctl_expected_param_size(unsigned int cmd,
+                                       const struct nvkvm_abi_profile *prof);
 
 /* nvkvm_frontend.c */
 int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx);

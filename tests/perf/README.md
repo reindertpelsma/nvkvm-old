@@ -57,6 +57,21 @@ phantom "14x gap"; tok/s is the parity signal, not util.
 Methodology guards are enforced in code: in-run host baseline, RAM>=model assert,
 warm page cache, byte-exact correctness, threshold/regression gates.
 
+### LLM serving parity (2026-08-17) — `llm_parity.md`
+End-to-end vLLM 0.11.0 + Qwen2.5-32B-Instruct-AWQ, host vs guest, on an RTX
+6000 Ada: prefill 1.00x, decode 0.99x, 64-way concurrent batch 1.00x, and every
+temperature-0 token bit-identical across the boundary.  Runner
+`apps/llm_serving_bench.py`, comparator `compare_llm_parity.py`.
+Two caveats live in that doc and should be read before quoting the table:
+- the guest cannot allocate a pinned host buffer larger than **16 MiB**
+  (`nvkvm_cpu_pages_migrate_range()` -> -E2BIG, `NVKVM_MIG_MAXCHK == 8`), so
+  stock vLLM does not start; the run disables vLLM's pinned buffers on BOTH
+  sides.  `apps/pinned_host_probe.py` bisects the cap.
+- decode parity is contingent on CUDA graphs.  With `--enforce-eager` the guest
+  drops to **0.82x** decode — the per-launch control tax, which graph capture
+  removes 95% of.  The "control-RTT is only 1-2% of per-token time" comment is
+  confirmed for graph-using stacks and wrong for launch-per-kernel ones.
+
 ### Next: real-app matrix
 Point `cuda_api_prof.so` (LD_PRELOAD interposer) at real apps beyond llama.cpp:
 PyTorch (a small train/infer step), a CUDA sample, vLLM, Stable Diffusion. Compare

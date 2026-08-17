@@ -12,8 +12,17 @@
 #
 # Environment overrides:
 #   QEMU_BIN — path to qemu-system-x86_64 binary
+#   VM_MEM   — guest RAM   (default 16G).  For LLM parity runs this MUST be
+#              >= model size + overhead or model load is disk-bound (the old
+#              phantom "17x gap"); see tests/perf/README.md methodology #3.
+#   VM_SMP   — guest vCPUs (default 4).  Host and guest vCPU counts differing
+#              is a real confounder for CPU-side tokenisation/sampling; set
+#              this and pin the host side to the same count.
 
 set -euo pipefail
+
+VM_MEM="${VM_MEM:-16G}"
+VM_SMP="${VM_SMP:-4}"
 
 REPO_ROOT="$(realpath "$(dirname "$0")/..")"
 
@@ -57,8 +66,8 @@ echo ""
 
 exec "$QEMU" \
     -enable-kvm \
-    -m 16G \
-    -smp 4 \
+    -m "$VM_MEM" \
+    -smp "$VM_SMP" \
     -cpu host \
     \
     -drive file="$IMG",format=qcow2,if=virtio \

@@ -22,8 +22,11 @@
 
 /* ── Expected parameter sizes ─────────────────────────────────────────────── */
 
-size_t nvkvm_ioctl_expected_param_size(unsigned int cmd)
+size_t nvkvm_ioctl_expected_param_size(unsigned int cmd,
+                                       const struct nvkvm_abi_profile *prof)
 {
+	if (!prof)
+		prof = nvkvm_abi_by_id(NVKVM_ABI_570);
 	/* UVM full-word commands */
 	switch (cmd) {
 	case UVM_INITIALIZE:
@@ -51,7 +54,11 @@ size_t nvkvm_ioctl_expected_param_size(unsigned int cmd)
 	case UVM_SET_RANGE_GROUP:
 		return sizeof(struct uvm_set_range_group_params);
 	case UVM_MAP_EXTERNAL_ALLOCATION:
-		return sizeof(struct uvm_map_external_allocation_params);
+		/* #81: version-variant (9264 V550+, 1200 pre-V550). The C
+		 * struct hardcodes V550; take the size from the profile or a
+		 * 535 guest's legitimate 1200-byte call is rejected EINVAL by
+		 * the exact-size check in virtio_nvgpu.c. */
+		return prof->uvm_map_ext_size;
 	case UVM_FREE:
 		return sizeof(struct uvm_free_params);
 	case UVM_MIGRATE:
@@ -77,7 +84,8 @@ size_t nvkvm_ioctl_expected_param_size(unsigned int cmd)
 	case UVM_PAGEABLE_MEM_ACCESS_ON_GPU:
 		return sizeof(struct uvm_pageable_mem_access_on_gpu_params);
 	case UVM_ALLOC_SEMAPHORE_POOL:
-		return sizeof(struct uvm_alloc_semaphore_pool_params);
+		/* #81: version-variant (9248 V550+, 1184 pre-V550). */
+		return prof->uvm_sem_pool_size;
 	}
 
 	/* Frontend ioctls — IOC_NR dispatch */
@@ -257,14 +265,27 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 		return nvkvm_handle_simple_ioctl(ctx, cmd);
 
 	case UVM_MAP_EXTERNAL_ALLOCATION: {
-		struct uvm_map_external_allocation_params *p = ctx->params_buf;
-		struct nvkvm_handle *ctrl_h =
-			nvkvm_handle_get(&ctx->nv->handles, (uint32_t)p->rm_ctrl_fd);
+		/* #81: rm_ctrl_fd's OFFSET is version-variant (1184 pre-V550,
+		 * 9248 V550+); the C struct hardcodes V550, so p->rm_ctrl_fd
+		 * reads 9248 on every driver and lands past the end of a 535
+		 * guest's 1200-byte struct. Index by profile byte offset. */
+		const struct nvkvm_abi_profile *prof =
+			ctx->nv->abi ? ctx->nv->abi : nvkvm_abi_by_id(NVKVM_ABI_570);
+		unsigned off = prof->uvm_map_ext_fd_off;
+		nvhandle_t *fdp;
+		struct nvkvm_handle *ctrl_h;
+		nvhandle_t saved;
+		int ret;
+
+		if (off + sizeof(*fdp) > ctx->param_size)
+			return -EINVAL;
+		fdp = (nvhandle_t *)((char *)ctx->params_buf + off);
+		ctrl_h = nvkvm_handle_get(&ctx->nv->handles, (uint32_t)*fdp);
 		if (!ctrl_h || ctrl_h->fd < 0) return -EBADF;
-		nvhandle_t saved = p->rm_ctrl_fd;
-		p->rm_ctrl_fd = (nvhandle_t)ctrl_h->fd;
-		int ret = nvkvm_handle_simple_ioctl(ctx, cmd);
-		p->rm_ctrl_fd = saved;
+		saved = *fdp;
+		*fdp = (nvhandle_t)ctrl_h->fd;
+		ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		*fdp = saved;
 		return ret;
 	}
 	}

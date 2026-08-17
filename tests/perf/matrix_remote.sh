@@ -24,7 +24,7 @@ B=/tmp/mat_apps; mkdir -p "$B/bin"; cp "$SRC"/apps/*.cu "$B/" 2>/dev/null
     case $n in sgemm_cublas) ex="-lcublas";; fft_cufft) ex="-lcufft";; esac
     nvcc -O3 -arch=sm_86 -o bin/$n $f $ex 2>/tmp/$n.be || { echo "[$TAG] BUILD FAIL $n" >&2; }
   done )
-for b in stream_triad reduce nbody blackscholes mandelbrot conv2d sgemm_cublas fft_cufft sha256; do
+for b in stream_triad reduce nbody blackscholes mandelbrot conv2d sgemm_cublas fft_cufft sha256 memcpy2d; do
     [ -x "$B/bin/$b" ] || { log "missing $b"; continue; }
     out=$(timeout 90 "$B/bin/$b" 2>&1); echo "$out" | grep -E '^METRIC|^CHECK'
     log "$b: $(echo "$out"|tr '\n' ' ')"

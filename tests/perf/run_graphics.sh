@@ -29,8 +29,17 @@ while read -r t k v; do [ "$t" = METRIC ]&&gv[$k]="$v"; [ "$t" = CHECK ]&&gc[$k]
 echo ""; echo "============== nvkvm graphics / media parity =============="
 printf "%-24s %10s %10s %7s %5s %s\n" "workload" "host" "guest" "ratio" "ok" "verdict"
 echo "----------------------------------------------------------"
-PASS=0; FAIL=0
-row(){ local label="$1" k="$2" h="${hv[$2]:-}" g="${gv[$2]:-}"; [ -z "$h$g" ] && return
+PASS=0; FAIL=0; NORUN=0
+row(){ local label="$1" k="$2" h="${hv[$2]:-}" g="${gv[$2]:-}"
+    # Same fix as run_matrix.sh: a workload with no metric on EITHER side used to
+    # `return` and disappear from the table + the counts entirely.  For this
+    # runner that was especially misleading — with no Vulkan ICD staged in the
+    # guest, the vulkan rows simply were not printed and the table looked clean.
+    if [ -z "$h$g" ]; then
+        NORUN=$((NORUN+1))
+        printf "%-24s %10s %10s %7s %5s %s\n" "$label" "—" "—" "" "-" "DID-NOT-RUN"
+        return
+    fi
     local r="-" v="FAIL" gck="${gc[$2]:-na}"
     if [ -n "$h" ]&&[ -n "$g" ]; then r=$(awk -v h="$h" -v g="$g" 'BEGIN{if(h+0==0){print"-";exit}printf"%.2f",g/h}')
         local m; m=$(awk -v r="$r" -v t="$GATE" 'BEGIN{print(r>=t)?1:0}')
@@ -45,5 +54,7 @@ row "offscreen render"   egl_gl_Mtri_s
 echo "── Video engines ──"
 row "NVENC h264 encode"  nvenc_h264_fps
 echo "----------------------------------------------------------"
-echo "PASS: $PASS   FAIL: $FAIL   (gate guest/host >= $GATE; correctness must pass)"
+echo "PASS: $PASS   FAIL: $FAIL   DID-NOT-RUN: $NORUN   (gate guest/host >= $GATE; correctness must pass)"
+[ "$NORUN" != 0 ] && echo "RESULT: INCOMPLETE — $NORUN workload(s) produced no metric on either side"
 echo "=========================================================="
+[ "$FAIL" = 0 ] && [ "$NORUN" = 0 ]

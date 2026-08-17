@@ -1,7 +1,9 @@
 #!/bin/bash
 # Run integration tests on the remote vast.ai host's VM.
 # Assumes:
-#   - SSH host config alias `vasthost` resolved here as ssh -p 44850 root@77.104.167.149
+#   - a remote GPU host you can ssh to, given by NVKVM_REMOTE
+#         export NVKVM_REMOTE='ssh -p 22 root@your-gpu-host'
+#         export NVKVM_REMOTE_DIR=/root/nvkvm      # where the tree lives there
 #   - VM SSH at port 2222 on the vast.ai host
 #   - 9p mount tag `nvkvm_src` exposing the repo root to the guest
 #
@@ -14,7 +16,10 @@
 #   scripts/run_remote_test.sh log <pattern>  # grep /tmp/qemu.log on the host
 set -e
 
-HOST_SSH="ssh -p 44850 root@77.104.167.149"
+HOST_SSH="${NVKVM_REMOTE:?set NVKVM_REMOTE, e.g. 'ssh -p 22 root@gpu-host'}"
+REMOTE_DIR="${NVKVM_REMOTE_DIR:-/root/nvkvm}"
+LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RSYNC_TARGET="${NVKVM_RSYNC_TARGET:?set NVKVM_RSYNC_TARGET, e.g. 'root@gpu-host:/root/nvkvm/'}"
 GUEST_SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o ConnectTimeout=5 ubuntu@localhost"
 
 cmd="${1:-both}"
@@ -30,7 +35,7 @@ case "$cmd" in
     restart)
         $HOST_SSH 'kill -9 $(pgrep qemu-system) $(pgrep nvkvm_stub) 2>/dev/null; sleep 3
                    rm -f /tmp/qemu.log
-                   nohup bash /workspace/nvkvm/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!'
+                   nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!'
         echo "Waiting for VM..."
         wait_for_vm
         echo "VM ready."
@@ -38,22 +43,22 @@ case "$cmd" in
 
     rebuild)
         echo "Syncing source to remote..."
-        rsync -avz -e "ssh -p 44850" --exclude '.git' --exclude 'host-libs' \
-            /workspace/nvidia-gpu-passthrough/ root@77.104.167.149:/workspace/nvkvm/ > /dev/null
+        rsync -avz -e "${NVKVM_RSYNC_SSH:-ssh}" --exclude '.git' --exclude 'host-libs' \
+            "$LOCAL_DIR"/ "$RSYNC_TARGET" > /dev/null
         echo "Rebuilding QEMU + stub..."
         $HOST_SSH '
-            cp /workspace/nvkvm/src/qemu/*.c /workspace/nvkvm/src/qemu/*.h /opt/qemu-src/hw/misc/ 2>/dev/null
+            cp $REMOTE_DIR/src/qemu/*.c $REMOTE_DIR/src/qemu/*.h /opt/qemu-src/hw/misc/ 2>/dev/null
             cd /opt/qemu-src/build && ninja qemu-system-x86_64 2>&1 | tail -3
             # Canonical stub is freestanding (no libc); build via its Makefile so
             # stub_clone3.S links (resolves fs_clone3_run).  Plain "gcc nvkvm_stub.c"
             # fails to link since the C7 freestanding migration.
-            make -C /workspace/nvkvm/src/stub nvkvm_stub 2>&1 | tail -3
+            make -C $REMOTE_DIR/src/stub nvkvm_stub 2>&1 | tail -3
             kill -9 $(pgrep qemu-system) $(pgrep nvkvm_stub) 2>/dev/null
             sleep 2
             cp /opt/qemu-src/build/qemu-system-x86_64 /opt/qemu-nvkvm/bin/qemu-system-x86_64
-            [ -x /workspace/nvkvm/src/stub/nvkvm_stub ] && cp /workspace/nvkvm/src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
+            [ -x $REMOTE_DIR/src/stub/nvkvm_stub ] && cp $REMOTE_DIR/src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
             rm -f /tmp/qemu.log
-            nohup bash /workspace/nvkvm/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!
+            nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!
         '
         echo "Waiting for VM..."
         wait_for_vm

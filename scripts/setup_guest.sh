@@ -41,10 +41,15 @@ else
 fi
 
 # ── 3. Convert to qcow2 and resize ───────────────────────────────────────
+# GUEST_DISK_GROW: extra GB to add to the cloud image.  20G is fine for the
+# microbenchmarks, but an LLM parity run needs the model weights AND a serving
+# stack (vLLM/torch wheels are ~15 GB) on guest-local disk — a 9p read of a
+# multi-GB weight file hits EIO, so the model cannot live on /mnt/nvkvm.
+GUEST_DISK_GROW="${GUEST_DISK_GROW:-20G}"
 if [ ! -f "$QCOW2_IMG" ]; then
-    echo "[3/6] Converting to qcow2 and adding 20 GB..."
+    echo "[3/6] Converting to qcow2 and adding $GUEST_DISK_GROW..."
     qemu-img convert -f qcow2 -O qcow2 "$CLOUD_IMG_RAW" "$QCOW2_IMG"
-    qemu-img resize "$QCOW2_IMG" +20G
+    qemu-img resize "$QCOW2_IMG" "+$GUEST_DISK_GROW"
 else
     echo "[3/6] qcow2 image already exists — skipping conversion."
 fi
@@ -58,9 +63,19 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: false
-    # password: ubuntu  (mkpasswd -m sha-512 ubuntu)
-    passwd: "$6$rounds=4096$saltsaltsalt$OqjRcMoTCT3F30Gdi5W.nA7hF0CzWYGFsTIBKRq0HpVtY6JaxQlSSA3C5eGJV/hcLEFRhfQoG/4n95k3L1kkV."
-    ssh_pwauth: true
+
+# ssh_pwauth is a TOP-LEVEL cloud-config key. Nested under the users: entry it is
+# silently ignored, sshd keeps PasswordAuthentication no, and the documented
+# "password: ubuntu" login fails with 'Permission denied (publickey)'.
+ssh_pwauth: true
+
+# chpasswd, not a users: passwd hash. cloud-init's users module will not reset
+# the password of a user that already exists in the image, so a hash there only
+# works on a genuinely first boot. chpasswd applies every boot.
+chpasswd:
+  expire: false
+  list: |
+    ubuntu:ubuntu
 
 package_update: true
 packages:
@@ -68,11 +83,27 @@ packages:
   - git
   - python3
   - linux-headers-virtual
+  # Vendor-neutral loaders only, so tests/validate.sh can exercise the
+  # graphics rungs. These are the ICD/vendor dispatch layers (libglvnd, the
+  # Vulkan loader); the actual drivers behind them are the NVIDIA libraries
+  # that stage_guest_libs.sh installs, together with the ICD/vendor JSON it
+  # writes. Deliberately NOT installing mesa-vulkan-drivers or libgl1-mesa-dri:
+  # a software rasteriser in the guest would give validate.sh something to
+  # succeed against that is not the GPU.
+  - libvulkan1
+  - libegl1
+  - libgles2
 
 runcmd:
   # Mount the shared 9p virtfs (nvkvm repo root).
+  # Also record it in fstab: cloud-init runcmd runs ONCE per instance, so on
+  # any later boot of the same image (e.g. re-running the VM after changing
+  # the host driver) the mount would otherwise be missing and everything
+  # under /mnt/nvkvm -- the module source, stage_guest_libs.sh, the test
+  # suite -- would silently not be there.
   - mkdir -p /mnt/nvkvm
   - mount -t 9p -o trans=virtio,version=9p2000.L nvkvm_src /mnt/nvkvm
+  - grep -q nvkvm_src /etc/fstab || echo 'nvkvm_src /mnt/nvkvm 9p trans=virtio,version=9p2000.L,nofail 0 0' >> /etc/fstab
   # Build the guest kernel module against the running guest kernel.
   - cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build
   # Load the module.

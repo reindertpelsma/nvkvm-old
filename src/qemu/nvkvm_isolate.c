@@ -248,7 +248,10 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 #ifdef NVKVM_STUB_EMBEDDED
 #include "nvkvm_stub_bin.h"
 static const unsigned char *stub_elf     = nvkvm_stub;
-static unsigned int         stub_elf_len = nvkvm_stub_len;
+/* xxd -i emits `unsigned int nvkvm_stub_len = N;` — a mutable object, not a
+ * constant expression, so it cannot initialise a static. sizeof on the array
+ * is a constant expression and is independent of the xxd version. */
+static unsigned int         stub_elf_len = sizeof(nvkvm_stub);
 #else
 static const unsigned char *stub_elf     = NULL;
 static unsigned int         stub_elf_len = 0;
@@ -396,6 +399,24 @@ static void reader_signal_present(struct nvkvm_isolate *iso, int err, int fd)
 	iso->present_done = true;
 	pthread_cond_signal(&iso->present_cond);
 	pthread_mutex_unlock(&iso->present_sync_lock);
+}
+
+/*
+ * XISO_IMPORT (#110): dedicated slot, mirrors the present one.  Factored out of
+ * the response arm so the reader-exit path can wake a stranded waiter too — a
+ * stub that dies mid-broker otherwise leaves nvkvm_isolate_xiso_import blocked
+ * on xiso_cond forever while it still holds xiso_lock, and because the broker
+ * runs inline on the virtio TX thread that wedges the whole guest's GPU I/O,
+ * not just this isolate.  Same failure the sync/present slots already guard.
+ */
+static void reader_signal_xiso(struct nvkvm_isolate *iso, int err, uint32_t gem)
+{
+	pthread_mutex_lock(&iso->xiso_sync_lock);
+	iso->xiso_err  = err;
+	iso->xiso_gem  = gem;
+	iso->xiso_done = true;
+	pthread_cond_signal(&iso->xiso_cond);
+	pthread_mutex_unlock(&iso->xiso_sync_lock);
 }
 
 static void *isolate_reader_fn(void *arg)
@@ -634,12 +655,8 @@ static void *isolate_reader_fn(void *arg)
 		}
 
 		case ISOLATE_RESP_XISO_IMPORT: {
-			pthread_mutex_lock(&iso->xiso_sync_lock);
-			iso->xiso_err  = u.xiso_import.retval;
-			iso->xiso_gem  = u.xiso_import.gem_handle;
-			iso->xiso_done = true;
-			pthread_cond_signal(&iso->xiso_cond);
-			pthread_mutex_unlock(&iso->xiso_sync_lock);
+			reader_signal_xiso(iso, u.xiso_import.retval,
+					   u.xiso_import.gem_handle);
 			break;
 		}
 
@@ -667,6 +684,8 @@ reader_exit:
 	reader_signal_sync(iso, -ECONNRESET, 0);
 	/* …and any pending present-export waiter (dedicated slot, #106). */
 	reader_signal_present(iso, -ECONNRESET, -1);
+	/* …and any pending cross-isolate import waiter (dedicated slot, #110). */
+	reader_signal_xiso(iso, -ECONNRESET, 0);
 
 	return NULL;
 }

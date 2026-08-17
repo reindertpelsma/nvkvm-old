@@ -95,6 +95,10 @@ static bool iso_mmap_free(uint32_t token, struct nvkvm_iso_mmap_entry *out)
  * entries (defined below, after the munmap helper it mirrors). */
 static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id);
 
+/* U-6 (audit-guest-pointers): forget every UVM VA range recorded for a handle.
+ * Defined with the UVM schema below; declared here for the close handlers. */
+void nvkvm_uvm_va_purge_handle(uint32_t handle_id);
+
 /* ── Device enumeration ──────────────────────────────────────────────────── */
 
 int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
@@ -154,6 +158,35 @@ static uint32_t session_first_isolate(VirtIONvgpu *nv, uint32_t session_id)
 	}
 	pthread_mutex_unlock(&nv->sessions_lock);
 	return iso_id;
+}
+
+/*
+ * Does `session_id` actually own `isolate_id`?  The guest names an (isolate,
+ * handle) PAIR in XISO_IMPORT, and those are two independent assertions — the
+ * boundary must not take the pairing on faith just because each half is
+ * individually well-formed.  Sessions record their isolates, and handles record
+ * their session, so QEMU can check the guest's claim against its own bookkeeping
+ * rather than relying on the target stub's handle_lookup to fail with -EBADF
+ * (which it does, but that is the stub catching what the boundary should have).
+ */
+static bool session_has_isolate(VirtIONvgpu *nv, uint32_t session_id,
+				uint32_t isolate_id)
+{
+	bool found = false;
+	pthread_mutex_lock(&nv->sessions_lock);
+	struct nvkvm_session *s = nvkvm_session_find(nv, session_id);
+	if (s) {
+		pthread_mutex_lock(&s->lock);
+		for (int i = 0; i < s->nisolates; i++) {
+			if (s->isolate_ids[i] == isolate_id) {
+				found = true;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&s->lock);
+	}
+	pthread_mutex_unlock(&nv->sessions_lock);
+	return found;
 }
 
 int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
@@ -292,6 +325,9 @@ int nvkvm_req_close_handle(VirtIONvgpu *nv,
 			    struct nvkvm_req_close_handle *req,
 			    struct nvkvm_resp_close_handle *resp)
 {
+	/* U-6: the va_space dies with the fd — drop its VA-range ownership
+	 * records so a recycled handle_id cannot inherit them. */
+	nvkvm_uvm_va_purge_handle(req->handle_id);
 	int ret = nvkvm_handle_close(&nv->handles, req->handle_id);
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
 	return 0;
@@ -469,6 +505,8 @@ int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
 				       struct nvkvm_req_close_handle_on_isolate *req,
 				       struct nvkvm_resp_close_handle_on_isolate *resp)
 {
+	/* U-6: see nvkvm_req_close_handle. */
+	nvkvm_uvm_va_purge_handle(req->handle_id);
 	int ret = nvkvm_isolate_close_handle(&nv->isolates, &nv->handles,
 					     req->isolate_id, req->handle_id);
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
@@ -498,10 +536,55 @@ int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
  * fd-field read is additionally guarded against the actual param_size.
  */
 enum { NVKVM_UVM_FD_FIELD = 1 };
+
+/*
+ * ── U-6 (docs/internal/audit-guest-pointers.md): guest-supplied UVM VA ranges
+ *
+ * 15 of the rows below carry a (base, length) or (requestedBase, length) pair.
+ * These are virtual addresses in the CALLING TASK'S mm — and the calling task
+ * is QEMU (see the UVM branch of nvkvm_req_ioctl_on_isolate: UVM ioctls run in
+ * QEMU's own process, not the isolate).  Nothing used to look at them.
+ *
+ * What an attacker could otherwise do: name any address in QEMU's address
+ * space — the process that holds the KVM fd, every memslot, every isolate's
+ * socket and the per-VM handle table.  The sharpest case is UVM_MIGRATE: when
+ * UVM finds NO va_range covering the named range it falls through to the
+ * pageable-memory path and migrates the CALLER'S OWN anonymous pages (i.e.
+ * QEMU's heap, the 128 GiB sparse window that backs guest RAM-visible GPU
+ * mappings), and UVM_MIGRATE_PARAMS.semaphoreAddress is an address the driver
+ * WRITES semaphorePayload to on async completion.  This is the one finding in
+ * that audit the Phase 0 isolate does not contain.
+ *
+ * The control: a host-side ownership table.  A UVM VA range is only usable if
+ * it is one nvkvm itself established for THAT UVM handle — recorded when a
+ * range-CREATING command (73 CREATE_EXTERNAL_RANGE, 68 ALLOC_SEMAPHORE_POOL,
+ * 65 MAP_DYNAMIC_PARALLELISM_REGION, 27 REGISTER_CHANNEL) is accepted BY THE
+ * DRIVER.  Every range-USING command must be fully contained in a recorded
+ * range for the same handle; anything unresolvable is rejected with
+ * NV_ERR_INVALID_ADDRESS and never reaches the driver.  Default-deny: a row
+ * with no va_mode gets no VA treatment, and a cmd that is not in the table at
+ * all was already refused above.
+ *
+ * Per-HANDLE, deliberately: each guest UVM fd gets its own QEMU-side
+ * /dev/nvidia-uvm fd and therefore its own uvm_va_space, and two guest
+ * processes legitimately pick the SAME base (measured: isolates 8 and 10 both
+ * create 0x200000000).  A per-VM or process-wide VA reservation would break
+ * that; range ownership is only meaningful inside one va_space.
+ */
+enum {
+	NVKVM_UVM_VA_NONE   = 0, /* no guest VA range in this struct        */
+	NVKVM_UVM_VA_CREATE = 1, /* establishes a range; record on success  */
+	NVKVM_UVM_VA_USE    = 2, /* must be contained in a recorded range   */
+	NVKVM_UVM_VA_FREE   = 3, /* must be contained; drops it on success  */
+};
+
 struct nvkvm_uvm_desc {
 	uint32_t cmd;
 	uint16_t min_size;
 	uint16_t fd_off[2];   /* frontend-fd field byte offsets; 0xffff = none */
+	uint16_t va_off;      /* byte offset of the u64 base (length at +8);
+			       * 0xffff = this cmd carries no VA range      */
+	uint8_t  va_mode;     /* NVKVM_UVM_VA_*                             */
 };
 /*
  * min_size is the EXACT struct size from our ABI (src/abi/uvm.h, driver
@@ -524,37 +607,37 @@ static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
 	 * already mis-denied REGISTER_GPU once; the kernel validates its own
 	 * struct against the fixed shm slot regardless.  fd-field translation
 	 * stays limited to the two cmds the pre-schema code translated. */
-	{ 0x30000001 /* UVM_INITIALIZE          */,  16, { 0xffff, 0xffff } },
-	{ 0x30000002 /* UVM_DEINITIALIZE        */,   8, { 0xffff, 0xffff } },
-	{ 23 /* UVM_CREATE_RANGE_GROUP          */,  16, { 0xffff, 0xffff } },
-	{ 24 /* UVM_DESTROY_RANGE_GROUP         */,  16, { 0xffff, 0xffff } },
-	{ 25 /* UVM_REGISTER_GPU_VASPACE        */,  32, { 16,     0xffff } },
-	{ 26 /* UVM_UNREGISTER_GPU_VASPACE      */,  20, { 0xffff, 0xffff } },
-	{ 27 /* UVM_REGISTER_CHANNEL            */,  48, { 0xffff, 0xffff } },
-	{ 28 /* UVM_UNREGISTER_CHANNEL          */,  28, { 0xffff, 0xffff } },
-	{ 29 /* UVM_ENABLE_PEER_ACCESS          */,  40, { 0xffff, 0xffff } },
-	{ 30 /* UVM_DISABLE_PEER_ACCESS         */,  40, { 0xffff, 0xffff } },
-	{ 31 /* UVM_SET_RANGE_GROUP             */,  32, { 0xffff, 0xffff } },
-	{ 33 /* UVM_MAP_EXTERNAL_ALLOCATION     */, 9264, { 0xffff, 0xffff } },
-	{ 34 /* UVM_FREE                        */,  24, { 0xffff, 0xffff } },
-	{ 37 /* UVM_REGISTER_GPU                */,  32, { 0xffff, 0xffff } },
-	{ 38 /* UVM_UNREGISTER_GPU              */,  24, { 0xffff, 0xffff } },
-	{ 39 /* UVM_PAGEABLE_MEM_ACCESS         */,   8, { 0xffff, 0xffff } },
-	{ 42 /* UVM_SET_PREFERRED_LOCATION      */,  40, { 0xffff, 0xffff } },
-	{ 43 /* UVM_UNSET_PREFERRED_LOCATION    */,  24, { 0xffff, 0xffff } },
-	{ 44 /* UVM_ENABLE_READ_DUPLICATION     */,   0, { 0xffff, 0xffff } },
-	{ 45 /* UVM_DISABLE_READ_DUPLICATION    */,   0, { 0xffff, 0xffff } },
-	{ 46 /* UVM_SET_ACCESSED_BY             */,  40, { 0xffff, 0xffff } },
-	{ 47 /* UVM_UNSET_ACCESSED_BY           */,  40, { 0xffff, 0xffff } },
-	{ 51 /* UVM_MIGRATE                     */,  48, { 0xffff, 0xffff } },
-	{ 53 /* UVM_MIGRATE_RANGE_GROUP         */,   0, { 0xffff, 0xffff } },
-	{ 65 /* UVM_MAP_DYNAMIC_PARALLELISM_REGION */, 0, { 0xffff, 0xffff } },
-	{ 66 /* UVM_UNMAP_EXTERNAL              */,   0, { 0xffff, 0xffff } },
-	{ 68 /* UVM_ALLOC_SEMAPHORE_POOL        */, 9248, { 0xffff, 0xffff } },
-	{ 70 /* UVM_PAGEABLE_MEM_ACCESS_ON_GPU  */,  24, { 0xffff, 0xffff } },
-	{ 72 /* UVM_VALIDATE_VA_RANGE           */,  24, { 0xffff, 0xffff } },
-	{ 73 /* UVM_CREATE_EXTERNAL_RANGE       */,  24, { 0xffff, 0xffff } },
-	{ 75 /* UVM_MM_INITIALIZE               */,   8, { 0,      0xffff } },
+	{ 0x30000001 /* UVM_INITIALIZE          */,  16, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 0x30000002 /* UVM_DEINITIALIZE        */,   8, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 23 /* UVM_CREATE_RANGE_GROUP          */,  16, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 24 /* UVM_DESTROY_RANGE_GROUP         */,  16, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 25 /* UVM_REGISTER_GPU_VASPACE        */,  32, { 16, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 26 /* UVM_UNREGISTER_GPU_VASPACE      */,  20, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 27 /* UVM_REGISTER_CHANNEL            */,  48, { 0xffff, 0xffff }, 32, NVKVM_UVM_VA_CREATE },
+	{ 28 /* UVM_UNREGISTER_CHANNEL          */,  28, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 29 /* UVM_ENABLE_PEER_ACCESS          */,  40, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 30 /* UVM_DISABLE_PEER_ACCESS         */,  40, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 31 /* UVM_SET_RANGE_GROUP             */,  32, { 0xffff, 0xffff }, 8, NVKVM_UVM_VA_USE },
+	{ 33 /* UVM_MAP_EXTERNAL_ALLOCATION     */, 9264, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 34 /* UVM_FREE                        */,  24, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_FREE },
+	{ 37 /* UVM_REGISTER_GPU                */,  32, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 38 /* UVM_UNREGISTER_GPU              */,  24, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 39 /* UVM_PAGEABLE_MEM_ACCESS         */,   8, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 42 /* UVM_SET_PREFERRED_LOCATION      */,  40, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 43 /* UVM_UNSET_PREFERRED_LOCATION    */,  24, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 44 /* UVM_ENABLE_READ_DUPLICATION     */,   0, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 45 /* UVM_DISABLE_READ_DUPLICATION    */,   0, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 46 /* UVM_SET_ACCESSED_BY             */,  40, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 47 /* UVM_UNSET_ACCESSED_BY           */,  40, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 51 /* UVM_MIGRATE                     */,  48, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 53 /* UVM_MIGRATE_RANGE_GROUP         */,   0, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 65 /* UVM_MAP_DYNAMIC_PARALLELISM_REGION */, 0, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_CREATE },
+	{ 66 /* UVM_UNMAP_EXTERNAL              */,   0, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 68 /* UVM_ALLOC_SEMAPHORE_POOL        */, 9248, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_CREATE },
+	{ 70 /* UVM_PAGEABLE_MEM_ACCESS_ON_GPU  */,  24, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 72 /* UVM_VALIDATE_VA_RANGE           */,  24, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
+	{ 73 /* UVM_CREATE_EXTERNAL_RANGE       */,  24, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_CREATE },
+	{ 75 /* UVM_MM_INITIALIZE               */,   8, { 0, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	/* Default-denied by omission: UVM_TOOLS_READ_PROCESS_MEMORY (62) and
 	 * UVM_TOOLS_WRITE_PROCESS_MEMORY (63) — a cross-process memory
 	 * peek/poke primitive with no place in our isolation model — plus any
@@ -569,6 +652,144 @@ static const struct nvkvm_uvm_desc *nvkvm_uvm_lookup(uint32_t cmd)
 			return &nvkvm_uvm_schema[i];
 	}
 	return NULL;
+}
+
+/* ── U-6: the UVM VA-range ownership table ──────────────────────────────────
+ *
+ * One flat array, keyed by the UVM handle_id (== one QEMU-side /dev/nvidia-uvm
+ * fd == one uvm_va_space).  Entries are added ONLY after the driver itself has
+ * accepted a range-creating ioctl, so the table can never contain a range the
+ * driver would have refused; it is a *narrowing* of the driver's own state,
+ * never a widening.  Bounded and fail-closed: if the table is full a CREATE is
+ * refused rather than silently untracked.
+ */
+#define NVKVM_UVM_VA_MAX 16384
+
+/*
+ * U-6 — floor for the bounce buffer the UVM ioctl actually runs on.  Must be
+ * >= the largest UVM_*_PARAMS the driver copies: 9264 bytes
+ * (UVM_MAP_EXTERNAL_ALLOCATION_PARAMS, V550 256-entry perGpuAttributes).
+ * 16 KiB leaves headroom for a future driver growing a struct, on a path that
+ * runs a few hundred times per process.
+ */
+#define NVKVM_UVM_BOUNCE_MIN 16384u
+
+struct nvkvm_uvm_va_ent {
+	uint32_t handle_id;   /* 0 = free slot */
+	uint64_t base;
+	uint64_t length;
+};
+
+static struct nvkvm_uvm_va_ent uvm_va_tbl[NVKVM_UVM_VA_MAX];
+static uint32_t                uvm_va_used;
+static pthread_mutex_t         uvm_va_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* [base, base+length) with no wrap.  length == 0 is never a valid range. */
+static bool uvm_va_sane(uint64_t base, uint64_t length)
+{
+	if (length == 0)
+		return false;
+	if (base + length < base)          /* u64 overflow */
+		return false;
+	if ((base | length) & 0xfffULL)    /* UVM works in pages */
+		return false;
+	return true;
+}
+
+/* Is there room to record one more range?  Checked BEFORE a range-creating
+ * ioctl runs, so we never leave the driver holding a range the table cannot
+ * describe (which would fail closed on every later use of it). */
+static bool uvm_va_have_room(void)
+{
+	bool room;
+	pthread_mutex_lock(&uvm_va_lock);
+	room = uvm_va_used < NVKVM_UVM_VA_MAX;
+	pthread_mutex_unlock(&uvm_va_lock);
+	return room;
+}
+
+static bool uvm_va_add(uint32_t handle_id, uint64_t base, uint64_t length)
+{
+	bool ok = false;
+	pthread_mutex_lock(&uvm_va_lock);
+	/* Idempotent: the guest may legitimately re-create an identical range
+	 * after freeing it, and the driver arbitrates that. */
+	for (uint32_t i = 0; i < NVKVM_UVM_VA_MAX; i++) {
+		if (uvm_va_tbl[i].handle_id == handle_id &&
+		    uvm_va_tbl[i].base == base &&
+		    uvm_va_tbl[i].length == length) {
+			pthread_mutex_unlock(&uvm_va_lock);
+			return true;
+		}
+	}
+	for (uint32_t i = 0; i < NVKVM_UVM_VA_MAX; i++) {
+		if (uvm_va_tbl[i].handle_id == 0) {
+			uvm_va_tbl[i].handle_id = handle_id;
+			uvm_va_tbl[i].base      = base;
+			uvm_va_tbl[i].length    = length;
+			uvm_va_used++;
+			ok = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&uvm_va_lock);
+	return ok;
+}
+
+/* True iff [base, base+length) is fully inside ONE range recorded for this
+ * handle.  Deliberately not a union-of-ranges test: UVM operations act on a
+ * single va_range, and stitching adjacent entries together would let a guest
+ * address across a boundary it never actually owns as one object. */
+static bool uvm_va_covers(uint32_t handle_id, uint64_t base, uint64_t length)
+{
+	bool found = false;
+	pthread_mutex_lock(&uvm_va_lock);
+	for (uint32_t i = 0; i < NVKVM_UVM_VA_MAX; i++) {
+		if (uvm_va_tbl[i].handle_id != handle_id)
+			continue;
+		if (base >= uvm_va_tbl[i].base &&
+		    base + length <= uvm_va_tbl[i].base + uvm_va_tbl[i].length) {
+			found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&uvm_va_lock);
+	return found;
+}
+
+/* Drop every entry of this handle fully inside the freed range. */
+static void uvm_va_drop(uint32_t handle_id, uint64_t base, uint64_t length)
+{
+	pthread_mutex_lock(&uvm_va_lock);
+	for (uint32_t i = 0; i < NVKVM_UVM_VA_MAX; i++) {
+		if (uvm_va_tbl[i].handle_id != handle_id)
+			continue;
+		if (uvm_va_tbl[i].base >= base &&
+		    uvm_va_tbl[i].base + uvm_va_tbl[i].length <= base + length) {
+			uvm_va_tbl[i].handle_id = 0;
+			if (uvm_va_used)
+				uvm_va_used--;
+		}
+	}
+	pthread_mutex_unlock(&uvm_va_lock);
+}
+
+/* Forget everything about a handle: its va_space is gone (UVM_INITIALIZE on a
+ * recycled handle_id, UVM_DEINITIALIZE, or the fd being closed).  Also called
+ * from the close-handle handlers so a long-lived VM cannot leak the table. */
+void nvkvm_uvm_va_purge_handle(uint32_t handle_id)
+{
+	if (handle_id == 0)
+		return;
+	pthread_mutex_lock(&uvm_va_lock);
+	for (uint32_t i = 0; i < NVKVM_UVM_VA_MAX; i++) {
+		if (uvm_va_tbl[i].handle_id == handle_id) {
+			uvm_va_tbl[i].handle_id = 0;
+			if (uvm_va_used)
+				uvm_va_used--;
+		}
+	}
+	pthread_mutex_unlock(&uvm_va_lock);
 }
 
 /* ── Phase 4: per-VM RM client-handle allowlist ─────────────────────────────
@@ -946,6 +1167,28 @@ int nvkvm_req_xiso_import(VirtIONvgpu *nv,
 		return 0;
 	}
 
+	/*
+	 * The guest asserts two (isolate, handle) pairings; verify both against
+	 * QEMU's own session bookkeeping.  A guest that names isolate X together
+	 * with a handle belonging to some other session is either buggy or
+	 * probing, and must not reach a stub either way.  Note this deliberately
+	 * does NOT require owner and importer to share a session — differing
+	 * sessions is the entire point of a cross-isolate share; what is checked
+	 * is that each isolate genuinely belongs to the session owning the handle
+	 * presented with it.  Cross-VM is already impossible: nv->handles and
+	 * nv->sessions are this VM's alone.
+	 */
+	if (!session_has_isolate(nv, oh->session_id, req->owner_isolate_id) ||
+	    !session_has_isolate(nv, ih->session_id, req->importer_isolate_id)) {
+		NVKVM_DBG("nvkvm xiso: isolate/handle session mismatch "
+			  "(owner iso=%u h=%u sess=%u; imp iso=%u h=%u sess=%u)\n",
+			  req->owner_isolate_id, req->owner_handle_id, oh->session_id,
+			  req->importer_isolate_id, req->importer_handle_id,
+			  ih->session_id);
+		resp->status = EPERM;
+		return 0;
+	}
+
 	/* 1. Owner stub exports the bo as a host dma-buf (PRIME_HANDLE_TO_FD). */
 	int dmabuf_fd = -1;
 	int r = nvkvm_isolate_present_export(&nv->isolates, req->owner_isolate_id,
@@ -1023,18 +1266,129 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				resp->fault_addr = 0;
 				return 0;
 			}
-			if (req->param_size < d->min_size ||
-			    (d->min_size > 0 && !param_buf)) {
+			/* #81: two of the schema's min_sizes are version-variant.
+			 * The table carries the V550 (256 per-GPU-attribute)
+			 * sizes — 9264 / 9248 — but on a driver <= 545 the guest
+			 * legitimately sends the pre-V550 1200 / 1184.  Taking
+			 * the floor from the table would DENY every valid
+			 * MAP_EXTERNAL_ALLOCATION on a 535 host. Override from
+			 * the active profile for exactly those two cmds. */
+			uint32_t min_size = d->min_size;
+			const struct nvkvm_abi_profile *prof =
+				nv->abi ? nv->abi : nvkvm_abi_by_id(NVKVM_ABI_570);
+			if (req->cmd == 33 /* UVM_MAP_EXTERNAL_ALLOCATION */)
+				min_size = prof->uvm_map_ext_size;
+			else if (req->cmd == 68 /* UVM_ALLOC_SEMAPHORE_POOL */)
+				min_size = prof->uvm_sem_pool_size;
+
+			if (req->param_size < min_size ||
+			    (min_size > 0 && !param_buf)) {
 				NVKVM_DBG(
 					"nvkvm: DENY UVM cmd=0x%x short param_size=%u "
 					"(<%u)\n", req->cmd, req->param_size,
-					d->min_size);
+					min_size);
 				resp->retval     = (uint64_t)(int64_t)(-EINVAL);
 				resp->status     = 0;
 				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
 				resp->fault_addr = 0;
 				return 0;
 			}
+			/*
+			 * ── U-6 — validate the guest-supplied VA range ─────
+			 *
+			 * These are addresses in QEMU'S mm (this ioctl runs in
+			 * QEMU's process).  Unvalidated, a guest names any
+			 * address in the process that holds the KVM fd, the
+			 * memslots and every isolate's socket — and for
+			 * UVM_MIGRATE a range UVM does not own falls through to
+			 * the pageable path, which migrates QEMU's OWN
+			 * anonymous pages.  Require every range-USING command
+			 * to name a range nvkvm recorded for THIS UVM handle
+			 * when the driver accepted the corresponding
+			 * range-CREATING command.  Anything unresolvable is
+			 * refused here and never reaches the driver.
+			 */
+			uint64_t va_base = 0, va_len = 0;
+			bool va_checked = false;
+			if (d->va_off != 0xffff &&
+			    d->va_mode != NVKVM_UVM_VA_NONE) {
+				uint32_t off = d->va_off;
+				if (!param_buf ||
+				    req->param_size < (uint64_t)off + 16) {
+					/* Cannot even read the pair → deny. */
+					NVKVM_DBG("nvkvm: DENY UVM cmd=0x%x "
+						  "param_size=%u too short for "
+						  "VA range at +%u (U-6)\n",
+						  req->cmd, req->param_size, off);
+					resp->retval   = (uint64_t)(int64_t)(-EINVAL);
+					resp->status   = 0;
+					resp->nvstatus = 0x1f; /* INVALID_ARGUMENT */
+					resp->fault_addr = 0;
+					return 0;
+				}
+				memcpy(&va_base, (char *)param_buf + off, 8);
+				memcpy(&va_len,  (char *)param_buf + off + 8, 8);
+				/*
+				 * (0,0) is the "no VA range" form — measured on
+				 * UVM_REGISTER_CHANNEL, which libcuda issues both
+				 * with and without a channel VA range.  Pass it
+				 * through untracked; there is no address to abuse.
+				 */
+				if (va_base != 0 || va_len != 0) {
+					va_checked = true;
+					if (!uvm_va_sane(va_base, va_len)) {
+						fprintf(stderr,
+							"nvkvm: DENY UVM cmd=0x%x "
+							"malformed VA range "
+							"0x%llx+0x%llx (U-6)\n",
+							req->cmd,
+							(unsigned long long)va_base,
+							(unsigned long long)va_len);
+						resp->retval   = (uint64_t)(int64_t)(-EINVAL);
+						resp->status   = 0;
+						resp->nvstatus = 0x1e; /* NV_ERR_INVALID_ADDRESS */
+						resp->fault_addr = 0;
+						return 0;
+					}
+					if (d->va_mode == NVKVM_UVM_VA_CREATE &&
+					    !uvm_va_have_room()) {
+						fprintf(stderr,
+							"nvkvm: DENY UVM cmd=0x%x "
+							"VA ownership table full "
+							"(U-6)\n", req->cmd);
+						resp->retval   = (uint64_t)(int64_t)(-ENOMEM);
+						resp->status   = 0;
+						resp->nvstatus = 0x1a; /* NV_ERR_INSUFFICIENT_RESOURCES */
+						resp->fault_addr = 0;
+						return 0;
+					}
+					if ((d->va_mode == NVKVM_UVM_VA_USE ||
+					     d->va_mode == NVKVM_UVM_VA_FREE) &&
+					    !uvm_va_covers(req->handle_id,
+							   va_base, va_len)) {
+						fprintf(stderr,
+							"nvkvm: DENY UVM cmd=0x%x "
+							"VA range 0x%llx+0x%llx not "
+							"owned by handle %u (U-6)\n",
+							req->cmd,
+							(unsigned long long)va_base,
+							(unsigned long long)va_len,
+							req->handle_id);
+						resp->retval   = (uint64_t)(int64_t)(-EINVAL);
+						resp->status   = 0;
+						resp->nvstatus = 0x1e; /* NV_ERR_INVALID_ADDRESS */
+						resp->fault_addr = 0;
+						return 0;
+					}
+				}
+			}
+
+			/* A fresh UVM_INITIALIZE means a fresh va_space: drop
+			 * anything a previous incarnation of this handle_id
+			 * recorded, so a recycled id never inherits ownership. */
+			if (req->cmd == 0x30000001 /* UVM_INITIALIZE */)
+				nvkvm_uvm_va_purge_handle(req->handle_id);
+
 			/* Translate each embedded frontend-fd field: the guest
 			 * sanitizer rewrote the fd into a handle_id; swap to
 			 * QEMU's local fd for the kernel, then restore the
@@ -1074,9 +1428,79 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				resp->fault_addr = 0;
 				return 0;
 			}
-			int r = ioctl(tfd, (unsigned long)req->cmd, param_buf);
+			/*
+			 * ── U-6 — bounce buffer ───────────────────────────
+			 *
+			 * param_buf is a g_malloc of EXACTLY req->param_size
+			 * (nvkvm_ioctl_work_fn), and req->param_size is the
+			 * GUEST's idea of the struct size.  The UVM driver
+			 * copies sizeof(ITS OWN struct) in and out.  Those
+			 * disagree on the live path — measured: the guest sends
+			 * 48 bytes for UVM_REGISTER_CHANNEL where the driver's
+			 * UVM_REGISTER_CHANNEL_PARAMS is 56 and writes rmStatus
+			 * at +48, i.e. 4 bytes past the allocation; UVM_MIGRATE
+			 * is 48 vs the driver's 80, so the driver would read 32
+			 * bytes of adjacent QEMU heap — including 8 bytes it
+			 * would treat as semaphoreAddress, an address it WRITES
+			 * to.  Run the ioctl on an over-sized ZEROED buffer so
+			 * every byte the guest did not send is deterministically
+			 * 0 and no driver access lands in QEMU's heap, then copy
+			 * back only what the guest asked for.
+			 */
+			size_t bsz = req->param_size;
+			if (bsz < NVKVM_UVM_BOUNCE_MIN)
+				bsz = NVKVM_UVM_BOUNCE_MIN;
+			void *bounce = g_malloc0(bsz);
+			if (param_buf && req->param_size)
+				memcpy(bounce, param_buf, req->param_size);
+			/*
+			 * U-6 — UVM_MIGRATE.semaphoreAddress is the ONE UVM
+			 * field the driver dereferences for a WRITE (it stores
+			 * semaphorePayload there on async completion).  Zero it
+			 * unconditionally: the gate cannot be skipped by any
+			 * guest-chosen value, which is what "enforced" means
+			 * here.  This is invisible to a legitimate guest — the
+			 * guest module's own UVM_MIGRATE struct is 48 bytes
+			 * (src/abi/uvm.h) and stops before semaphoreAddress@40,
+			 * so those bytes are its rmStatus/reserved being
+			 * MISREAD as an address by the driver.  Async-semaphore
+			 * migration completion is not part of the nvkvm path.
+			 */
+			if (req->cmd == 51 /* UVM_MIGRATE */ && bsz >= 52)
+				memset((char *)bounce + 40, 0, 12);
+			int r = ioctl(tfd, (unsigned long)req->cmd, bounce);
 			int saved_errno = errno;
 			close(tfd);
+			/*
+			 * U-6 — the driver's real verdict for the ownership
+			 * table.  The `st` computed further down is read from
+			 * param_size-4, which is only the rmStatus field for
+			 * SOME UVM structs (for UVM_REGISTER_CHANNEL our 48-byte
+			 * ABI struct ends in the high half of `length`).  Read
+			 * rmStatus at the offset the DRIVER's struct puts it
+			 * (ogkm 575.51.03 kernel-open/nvidia-uvm/uvm_ioctl.h),
+			 * out of the bounce buffer that is guaranteed long
+			 * enough to hold it.  0xffffffff = "unknown" and is
+			 * treated as failure, so an unrecognised cmd can never
+			 * add ownership.
+			 */
+			uint32_t va_rmstatus = 0xffffffffu;
+			if (va_checked) {
+				uint32_t so = 0xffffffffu;
+				switch (req->cmd) {
+				case 27: so = 48;   break; /* REGISTER_CHANNEL      */
+				case 34: so = 16;   break; /* FREE                  */
+				case 65: so = 36;   break; /* MAP_DYNAMIC_PARALLEL. */
+				case 68: so = 9240; break; /* ALLOC_SEMAPHORE_POOL  */
+				case 73: so = 16;   break; /* CREATE_EXTERNAL_RANGE */
+				default: break;
+				}
+				if (so != 0xffffffffu && (size_t)so + 4 <= bsz)
+					memcpy(&va_rmstatus, (char *)bounce + so, 4);
+			}
+			if (param_buf && req->param_size)
+				memcpy(param_buf, bounce, req->param_size);
+			g_free(bounce);
 			for (int k = 0; k < nsaved; k++)
 				memcpy((char *)param_buf + saved_off[k],
 				       &saved_val[k], 4);
@@ -1087,6 +1511,30 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				memcpy(&st, (char *)param_buf + req->param_size - 4,
 				       sizeof(st));
 			}
+			/*
+			 * U-6 — maintain the ownership table from the DRIVER's
+			 * own verdict, never from the guest's request.  A range
+			 * is only recorded once the driver has accepted the
+			 * ioctl that creates it, so the table is a narrowing of
+			 * driver state and can never admit a range the driver
+			 * would have refused.
+			 */
+			if (r == 0 && va_rmstatus == 0 && va_checked) {
+				if (d->va_mode == NVKVM_UVM_VA_CREATE &&
+				    !uvm_va_add(req->handle_id, va_base, va_len))
+					fprintf(stderr,
+						"nvkvm: WARN UVM VA table full — "
+						"handle %u range 0x%llx+0x%llx "
+						"untracked (U-6)\n",
+						req->handle_id,
+						(unsigned long long)va_base,
+						(unsigned long long)va_len);
+				else if (d->va_mode == NVKVM_UVM_VA_FREE)
+					uvm_va_drop(req->handle_id, va_base, va_len);
+			}
+			if (req->cmd == 0x30000002 /* UVM_DEINITIALIZE */ && r == 0)
+				nvkvm_uvm_va_purge_handle(req->handle_id);
+
 			resp->retval     = (r < 0) ? (uint64_t)(int64_t)(-saved_errno) : 0;
 			resp->status     = 0;
 			resp->nvstatus   = st;
@@ -1218,6 +1666,72 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			resp->fault_addr = 0;
 			return 0;
 		}
+		/*
+		 * ── U-3 (docs/internal/audit-guest-pointers.md) ────────────
+		 * NV_ESC_RM_VID_HEAP_CONTROL (nr 0x4a) carries NVOS32_PARAMETERS:
+		 * a fixed prefix plus a 144-byte union selected by `function`
+		 * (NvU32 at offset 8, verified against ogkm 575.51.03 nvos.h).
+		 * nvkvm forwards the union opaquely.
+		 *
+		 * What an attacker could otherwise do: send
+		 * function == NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR (27).  The
+		 * driver then reads data.AllocOsDesc.descriptor (an NvP64 inside
+		 * that union) and hands it straight to os_lock_user_pages()
+		 * i.e. pin_user_pages(), with data.AllocOsDesc.limit as the
+		 * length — pinning an arbitrary attacker-named address range in
+		 * the isolate's address space, with the driver's only checks
+		 * being page alignment and a limit+1 overflow test
+		 * (escape.c:162, :142-150).  function == 19 (HW_ALLOC) likewise
+		 * exposes data.HwAlloc.bindResultFunc and .pHandle, two further
+		 * NvP64s (nvos.h:832-833).
+		 *
+		 * The guest declines to sanitise NVOS32 (src/guest/nvkvm_ioctl.c
+		 * :456-460) on the premise that "the ALLOC_SIZE path has no
+		 * embedded input pointer".  That premise is true only for
+		 * function == 2, and the guest is untrusted anyway — so the
+		 * constraint has to be enforced here.  gVisor's nvproxy takes
+		 * exactly this position (rmVidHeapControl rejects every NVOS32
+		 * whose Function != NVOS32_FUNCTION_ALLOC_SIZE).
+		 *
+		 * Default-deny, matching the frontend-NR / alloc-class /
+		 * control-cmd allowlists around it.  Allowed:
+		 *   2  NVOS32_FUNCTION_ALLOC_SIZE — the only NVOS32 function the
+		 *      working stack uses.  It is the legacy heap allocation
+		 *      libGLX_nvidia issues (src/abi/nvgpu.h:299-312); its union
+		 *      arm (data.AllocSize) contains no input pointer at all —
+		 *      `address` is [OUT] only.  Measured on this tree: a full
+		 *      compute run (nvidia-smi + cuInit/cuCtxCreate + 8 MiB
+		 *      HtoD/DtoH + a kernel launch) issues ZERO nr-0x4a ioctls,
+		 *      so this allowance is the graphics path's, kept because
+		 *      removing it would silently regress libGLX.
+		 * Everything else — 3 FREE, 5 INFO, 6, 14, 15, 16, 18, 19
+		 * HW_ALLOC, 20 HW_FREE, 27 ALLOC_OS_DESCRIPTOR and any value
+		 * the driver may add — is refused.
+		 *
+		 * NOT affected: U-14's deliberate OS-descriptor path.  That one
+		 * is NV_ESC_RM_ALLOC_MEMORY (nr 0x27) with
+		 * hClass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (0x71), where the
+		 * guest migrates the range onto memfds the stub MAP_FIXEDs at
+		 * the same VA.  Different ioctl, different struct, untouched by
+		 * this gate.
+		 */
+		if (nr == 0x4a) {
+			uint32_t fn = 0xffffffffu;
+			if (param_buf && req->param_size >= 12)
+				memcpy(&fn, (char *)param_buf + 8, 4);
+			if (fn != 2 /* NVOS32_FUNCTION_ALLOC_SIZE */) {
+				fprintf(stderr,
+					"nvkvm: DENY RM_VID_HEAP_CONTROL "
+					"function=%u (only ALLOC_SIZE=2 "
+					"allowed, U-3)\n", fn);
+				resp->retval     = (uint64_t)(int64_t)(-EACCES);
+				resp->status     = 0;
+				resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+				resp->fault_addr = 0;
+				return 0;
+			}
+		}
+
 		/* RM_ALLOC (nvos21/nvos64): hClass at param+12 (shared prefix). */
 		if (nr == 0x2b && param_buf && req->param_size >= 16) {
 			uint32_t cls = 0;

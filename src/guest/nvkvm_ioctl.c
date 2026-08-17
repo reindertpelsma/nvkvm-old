@@ -78,7 +78,11 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 	case UVM_SET_RANGE_GROUP:
 		return sizeof(struct uvm_set_range_group_params);
 	case UVM_MAP_EXTERNAL_ALLOCATION:
-		return sizeof(struct uvm_map_external_allocation_params);
+		/* #81: version-variant. struct uvm_map_external_allocation_params
+		 * hardcodes the V550 256-entry layout (9264B); the pre-V550
+		 * layout (driver <= 545) is 1200B. Take the size from the
+		 * profile, not from sizeof. */
+		return nvkvm_prof()->uvm_map_ext_size;
 	case UVM_FREE:
 		return sizeof(struct uvm_free_params);
 	case UVM_MIGRATE:
@@ -104,7 +108,9 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 	case UVM_PAGEABLE_MEM_ACCESS_ON_GPU:
 		return sizeof(struct uvm_pageable_mem_access_on_gpu_params);
 	case UVM_ALLOC_SEMAPHORE_POOL:
-		return sizeof(struct uvm_alloc_semaphore_pool_params);
+		/* #81: version-variant, same per-GPU-attributes growth as
+		 * UVM_MAP_EXTERNAL_ALLOCATION (1184B pre-V550, 9248B V550+). */
+		return nvkvm_prof()->uvm_sem_pool_size;
 	}
 
 	/* Frontend ioctls — dispatch on IOC_NR only */
@@ -293,13 +299,31 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		return 0;
 	}
 	case UVM_MAP_EXTERNAL_ALLOCATION: {
-		struct uvm_map_external_allocation_params *p = buf;
+		/* #81: rm_ctrl_fd's OFFSET is version-variant — 1184 in the
+		 * pre-V550 1-entry layout (driver <= 545), 9248 in the V550
+		 * 256-entry layout.  `struct uvm_map_external_allocation_params`
+		 * hardcodes V550, so dereferencing p->rm_ctrl_fd reads offset
+		 * 9248 on EVERY driver.  On a 535 host libcuda's struct is only
+		 * 1200 bytes, so that read lands 8 KiB past the real field, the
+		 * garbage fails guest_fd_to_handle_id(), and the ioctl returns
+		 * -EBADF from inside the guest — nothing ever reaches QEMU, so
+		 * the QEMU debug log shows no error at all.  Observed on
+		 * GTX 1660 SUPER / 535.309.01 as cuCtxCreate -> 999. Index by
+		 * byte offset from the profile instead. */
+		unsigned off = nvkvm_prof()->uvm_map_ext_fd_off;
+		__s32 *fdp;
+
+		/* uvm_param_size() sized this buffer from the same profile, so
+		 * off+4 is in range; assert rather than trust. */
+		if (off + sizeof(*fdp) > nvkvm_prof()->uvm_map_ext_size)
+			return -EINVAL;
+		fdp = (__s32 *)((char *)buf + off);
 		/* libcuda passes -1 as the "no ctrl fd specified" sentinel. */
-		if (p->rm_ctrl_fd >= 0) {
-			__s32 hid = guest_fd_to_handle_id(p->rm_ctrl_fd);
+		if (*fdp >= 0) {
+			__s32 hid = guest_fd_to_handle_id(*fdp);
 			if (hid < 0)
 				return -EBADF;
-			p->rm_ctrl_fd = hid;
+			*fdp = hid;
 		}
 		return 0;
 	}

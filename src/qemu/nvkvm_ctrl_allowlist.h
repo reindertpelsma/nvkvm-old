@@ -215,6 +215,28 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x90960107u,
 	0xa06f0104u, /* channel (GPFIFO) controls */
 	0xc36f010au,
+	/* #81 / 535 bring-up 2026-08-17: NVC36F_CTRL_GET_CLASS_ENGINEID.
+	 * libcuda on driver 535.309.01 issues this during cuCtxCreate; libcuda
+	 * on 575.51.03 does not, so it was missing from a table generated
+	 * against the 575 ABI plus empirically-observed 575 traffic. Without it
+	 * the ctrl was denied EACCES and cuCtxCreate failed
+	 * CUDA_ERROR_OPERATING_SYSTEM (304):
+	 *     nvkvm: DENY ctrl cmd 0xc36f0101 (not in allowlist / oversize)
+	 *
+	 * Safe by the same standard as the rest of the table, checked against
+	 * open-gpu-kernel-modules 535.309.01 rather than assumed:
+	 *   - ctrlc36f.h: NVC36F_CTRL_GET_CLASS_ENGINEID (0xc36f0101), a
+	 *     read-only "which engine does this class run on" query.
+	 *   - its params are NV906F_CTRL_GET_CLASS_ENGINEID_PARAMS: 16 bytes,
+	 *     { NvHandle hObject; NvU32 classEngineID, classID, engineID; } —
+	 *     one RM object handle in, three u32 out, NO embedded pointers and
+	 *     no host resource named.
+	 *   - the identical command is ALREADY allowed under its older class
+	 *     id 0x906f0101 (NV906F_CTRL_GET_CLASS_ENGINEID, two rows above),
+	 *     and two siblings on this same GPFIFO interface (0xc36f0108,
+	 *     0xc36f010a) are already allowed. This grants no new capability.
+	 * No reg-ops/HWPM/debug/fabric surface is opened. */
+	0xc36f0101u,
 };
 #define NVKVM_CTRL_ALLOWLIST_N \
 	(sizeof(nvkvm_ctrl_allowlist) / sizeof(nvkvm_ctrl_allowlist[0]))

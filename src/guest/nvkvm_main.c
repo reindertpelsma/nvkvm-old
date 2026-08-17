@@ -1688,6 +1688,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * Same pattern as NV01_CONTEXT_DMA (#99). */
 				ap_size = sizeof(struct nva0bc_alloc_parameters);
 				break;
+			case NV50_THIRD_PARTY_P2P:
+				/* 0x503c: 4B; libcuda allocs this during cuInit with
+				 * alloc_parms_size=0. Without this case we copy 0 bytes
+				 * -> host RM returns NV_ERR_NOT_SUPPORTED (0x56) and
+				 * cuInit fails CUDA_ERROR_NOT_SUPPORTED (801). */
+				ap_size = sizeof(struct nv503c_alloc_parameters);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -1805,6 +1812,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						/* 0xa0bc: 20B; NVENC session-tracking object, size=0.
 						 * Same pattern as NV01_CONTEXT_DMA (#99). */
 						ap_size = sizeof(struct nva0bc_alloc_parameters);
+						break;
+					case NV50_THIRD_PARTY_P2P:
+						/* 0x503c: 4B; libcuda allocs this during cuInit with
+						 * alloc_parms_size=0. Without this case we copy 0 bytes
+						 * -> host RM returns NV_ERR_NOT_SUPPORTED (0x56) and
+						 * cuInit fails CUDA_ERROR_NOT_SUPPORTED (801). */
+						ap_size = sizeof(struct nv503c_alloc_parameters);
 						break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:

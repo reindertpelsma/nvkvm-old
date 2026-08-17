@@ -43,10 +43,20 @@ while read -r t k v; do [ "$t" = METRIC ]&&gv[$k]="$v"; [ "$t" = CHECK ]&&gc[$k]
 echo ""; echo "================= nvkvm real-app parity matrix ================="
 printf "%-26s %12s %12s %7s %6s %s\n" "workload" "host" "guest" "ratio" "ok" "verdict"
 echo "----------------------------------------------------------------------"
-PASS=0; FAIL=0; N=0
+PASS=0; FAIL=0; N=0; NORUN=0
 row(){ # $1 label  $2 key  $3 unit
     local label="$1" k="$2" u="$3" h="${hv[$2]:-}" g="${gv[$2]:-}"
-    [ -z "$h$g" ] && return
+    # A workload that produced no metric on EITHER side used to `return` here —
+    # so it vanished from the table AND from the N/PASS/FAIL counts, and the run
+    # still ended in "RESULT: PASS".  A missing nvcc, a build failure on both
+    # sides, or a typo'd metric key were all indistinguishable from a clean
+    # sweep: the report simply got shorter.  Print it as DID-NOT-RUN instead and
+    # count it, so "did not run" can never again read as "passed".
+    if [ -z "$h$g" ]; then
+        NORUN=$((NORUN+1))
+        printf "%-26s %12s %12s %7s %6s %s\n" "$label" "—" "—" "" "-" "DID-NOT-RUN"
+        return
+    fi
     N=$((N+1))
     local ratio="-" v="FAIL" okc="-"
     local hck="${hc[$2]:-na}" gck="${gc[$2]:-na}"
@@ -69,6 +79,7 @@ row "2D convolution"       conv2d_GFLOPs           GFLOP/s
 row "SGEMM (cuBLAS)"       sgemm_cublas_TFLOPs     TFLOP/s
 row "FFT (cuFFT)"          fft_cufft_GFLOPs        GFLOP/s
 row "SHA-256 (crypto)"     sha256_MHs              MH/s
+row "cudaMemcpy2D (pitched)" memcpy2d_GBs          GB/s
 row "gpu-burn (sustained)" gpu_burn_GFLOPs         GFLOP/s
 echo "── PyTorch AI ──"
 row "matmul fp32"          torch_matmul_fp32_TFLOPs TFLOP/s
@@ -82,6 +93,11 @@ row "BERT enc infer"       bert_infer_seqs          seq/s
 row "Qwen2.5-7B decode"    llm_decode_tok_s         tok/s
 row "Qwen2.5-7B prefill"   llm_prefill_tok_s        tok/s; }
 echo "----------------------------------------------------------------------"
-echo "apps compared: $N   PASS: $PASS   FAIL: $FAIL   (parity gate guest/host >= $GATE)"
+echo "apps compared: $N   PASS: $PASS   FAIL: $FAIL   DID-NOT-RUN: $NORUN   (parity gate guest/host >= $GATE)"
 echo "================================================================"
-[ "$FAIL" = 0 ] && echo "RESULT: PASS" || echo "RESULT: $FAIL below gate (see FAIL rows)"
+if [ "$FAIL" != 0 ]; then echo "RESULT: $FAIL below gate (see FAIL rows)"
+elif [ "$NORUN" != 0 ]; then echo "RESULT: INCOMPLETE — $NORUN workload(s) produced no metric on either side"
+else echo "RESULT: PASS"; fi
+# Non-zero for both "below gate" and "did not run": an incomplete matrix is not
+# a passing matrix.
+[ "$FAIL" = 0 ] && [ "$NORUN" = 0 ]

@@ -399,7 +399,7 @@ static void handle_ioctl(VirtIONvgpu *nv, VirtQueue *vq,
 	}
 
 	/* Validate param_size against the known ABI size for this command */
-	expected_size = nvkvm_ioctl_expected_param_size(cmd);
+	expected_size = nvkvm_ioctl_expected_param_size(cmd, nv->abi);
 	if (expected_size == (size_t)-1) {
 		resp_msg.resp.status = cpu_to_le32(ENOTTY);
 		goto send;

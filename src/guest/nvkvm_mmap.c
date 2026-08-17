@@ -770,14 +770,55 @@ bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len)
 /*
  * Bulk migration chunk size.  Each chunk = ONE memfd + ONE mmap_on_isolate +
  * ONE remap_pfn_range (vs the old per-4KB-page path: ~5 forwarded round-trips
- * EACH — measured 2.44s for a 16MB OS_DESCRIPTOR).  Chunking (rather than one
- * memfd for the whole range) bounds the transient memory: during migration the
- * data lives in BOTH the pinned guest pages AND the memfd, so a multi-GB single
- * memfd would need ~2x the RAM.  2MB amortizes the ~4 fixed per-chunk forwards
- * over 512 pages (negligible) while keeping the in-flight memfd small.
+ * EACH — measured 2.44s for a 16MB OS_DESCRIPTOR).  2MB amortizes the ~4 fixed
+ * per-chunk forwards over 512 pages (negligible).
+ *
+ * Migration is strictly PER CHUNK: copy the chunk into its memfd, swap that
+ * chunk's PTEs onto the memfd's GPA, release that chunk's pinned guest pages —
+ * and only then start the next chunk.  That ordering is what bounds the
+ * duplicated data, and it is worth being precise about what is and is not
+ * transient here:
+ *
+ *   - The memfd is NOT transient.  It is the backing store the guest VMA
+ *     points at for the lifetime of the registration (the mapping has to be
+ *     genuine passthrough), so total memfd bytes necessarily equal the
+ *     registered size.  That is the data in its final home, not overhead, and
+ *     it scales with the request because it must.
+ *   - The pinned guest pages are the data's OLD home.  They are what we
+ *     release as migration proceeds.
+ *   - The DUPLICATE is only the window in which one chunk exists in both
+ *     places at once — between copying it into its memfd and dropping its
+ *     pins.  Per-chunk ordering pins that window at exactly ONE chunk, 2 MiB,
+ *     whether the caller registers 16 MiB or 2 GiB.
+ *
+ * This function used to run Phase 1 (create and fill every chunk's memfd)
+ * across the whole range before Phase 2 (one VMA swap) touched anything.  That
+ * keeps every memfd alive simultaneously, so the duplicate scaled with the
+ * request, and a fixed 8-entry chunk array plus a 16 MiB -E2BIG check were
+ * added to bound it.  The ceiling was a side effect of that batching rather
+ * than a cost anyone chose: the chunk SIZE had already made per-iteration
+ * overhead negligible, so batching chunks on top of it bought nothing.
+ * Restoring the per-chunk order removes the array, removes the per-call
+ * ceiling, and tightens the duplicate from 16 MiB to 2 MiB.
  */
 #define NVKVM_MIG_CHUNK   (2UL << 20)
-#define NVKVM_MIG_MAXCHK  8          /* 16MB cap / 2MB = 8 chunks max */
+
+/*
+ * Largest range a single call will migrate.  This is no longer structural —
+ * the loop is O(1) in memory — but a guest process should not be able to make
+ * the guest kernel pin an unbounded amount in one ioctl, so the sanity check
+ * stays.  2 GiB is derived from the host-side table this path actually
+ * consumes: every chunk takes one entry in QEMU's fixed
+ * NVKVM_ISO_MMAP_MAX = 8192 mmap-token table
+ * (src/qemu/nvkvm_isolate_handlers.c), and that table is shared by every
+ * isolate in the VM.  2 GiB / 2 MiB = 1024 tokens = 1/8 of it, so even eight
+ * concurrent maximal registrations fit.  The same number keeps the
+ * struct page * array at 4 MiB (kvmalloc, vmalloc-backed) and sits at 1/64 of
+ * the 128 GiB sparse GPA window, so neither of those is the binding
+ * constraint.  Measured: the host driver itself accepts >= 4 GiB, so this is a
+ * guest-side policy limit, not a hardware one.
+ */
+#define NVKVM_MIG_MAX_RANGE   (2ULL << 30)
 
 int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 				  __u64 gva, __u64 len, unsigned long prot)
@@ -786,6 +827,8 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	unsigned long end   = ((unsigned long)gva + len + PAGE_SIZE - 1) &
 			      PAGE_MASK;
 	unsigned long range_len, npages, coff;
+	unsigned long done_pages = 0;   /* pages already unpinned (migrated) */
+	unsigned long dup_peak = 0;     /* max bytes duplicated at any instant */
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
 	struct page **pages = NULL;
@@ -793,16 +836,15 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	size_t slot_bytes = nvkvm.slot_size;
 	struct nvkvm_cpu_page *cpdup;
 	long got = 0;
-	int ret = 0, nck = 0, i;
-	struct { unsigned long base, clen; __u64 gpa; __u32 handle, token; }
-		ck[NVKVM_MIG_MAXCHK];
+	unsigned long i;
+	int ret = 0, nck = 0;
 	ktime_t _t0 = ktime_get();   /* DIAG */
 
 	if (!len)
 		return 0;
 	if (end < start)                  /* overflow */
 		return -EINVAL;
-	if (end - start > (16ULL << 20))  /* sanity: 16 MB max per call */
+	if (end - start > NVKVM_MIG_MAX_RANGE)   /* sanity, see the #define */
 		return -E2BIG;
 	if (!isolate_id)
 		return -ENOENT;
@@ -827,8 +869,16 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	if (!pages)
 		return -ENOMEM;
 
-	/* Pin every page up front — BEFORE any VMA mutation, so a later
-	 * VM_PFNMAP toggle can't break gup_fast on the remainder. */
+	/*
+	 * Pin every page up front — BEFORE any VMA mutation, so a later
+	 * VM_PFNMAP toggle can't break gup_fast on the remainder.
+	 *
+	 * That constraint is about ACQUIRING the pins, not about holding them
+	 * to the end: once we hold a reference on a page we can reach it with
+	 * kmap_local_page() forever, with no further page-table or VMA lookup.
+	 * So each chunk's pins are dropped as soon as that chunk is remapped,
+	 * which is what keeps the duplicated data down to one chunk.
+	 */
 	while (got < npages) {
 		long n = get_user_pages_fast(start + (got << PAGE_SHIFT),
 					     npages - got, FOLL_WRITE, pages + got);
@@ -836,21 +886,83 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		got += n;
 	}
 
-	/* Phase 1: one memfd + batched upload + copy + mmap per chunk.  No VMA
-	 * mutation yet. */
+	/*
+	 * ONE VMA conversion for the whole range, up front.  It moves no data,
+	 * and it does not split the VMA: vm_flags_set()/vm_flags_clear() take
+	 * no address range — they OR/AND bits on the vm_area_struct itself.
+	 * Splitting is an mprotect()/madvise() behaviour (__split_vma()), which
+	 * this path never invokes.
+	 *
+	 * Doing the conversion here rather than per chunk also means the
+	 * per-chunk loop below only ever touches PTEs.
+	 */
+	mmap_write_lock(mm);
+	vma = find_vma(mm, start);
+	if (!vma || vma->vm_start > start || vma->vm_end < end) {
+		mmap_write_unlock(mm);
+		ret = -EFAULT; goto err_unpin;
+	}
+	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	/*
+	 * remap_pfn_range() refuses ANY sub-VMA remap on a copy-on-write
+	 * mapping: is_cow_mapping() is (VM_SHARED|VM_MAYWRITE) == VM_MAYWRITE,
+	 * and for such a VMA it returns -EINVAL unless the remap covers the
+	 * whole VMA exactly.  Ordinary user memory — malloc(), or a
+	 * MAP_PRIVATE|MAP_ANONYMOUS mmap — is exactly that, so before this
+	 * every multi-chunk registration, and every single-chunk registration
+	 * that did not happen to span its VMA exactly, failed with -EINVAL.
+	 * That surfaced to userspace as CUDA_ERROR_INVALID_VALUE and was a
+	 * second, undocumented cap sitting UNDER the 16 MiB one: measured on a
+	 * 575.51.03 guest, a MAP_SHARED buffer registered fine at 4/8/16 MiB
+	 * while a MAP_PRIVATE buffer of the identical size did not.
+	 *
+	 * We are converting this VMA into a straight passthrough mapping of
+	 * host memfd pages; there is no copy-on-write left to perform, so drop
+	 * VM_MAYWRITE.  VM_WRITE is untouched, so userspace keeps write access
+	 * — only a later mprotect() trying to re-add PROT_WRITE is refused.
+	 */
+	if (is_cow_mapping(vma->vm_flags))
+		vm_flags_clear(vma, VM_MAYWRITE);
+	/*
+	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
+	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
+	 * On x86 the guest's WB view, the stub's WB view of the same memfd, and
+	 * the GPU's DMA are all cache-coherent (DMA snoops), so WB is correct.
+	 * Mapping it UC made the guest's post-DtoH read of the result a stream of
+	 * uncached, unprefetched loads — measured 0.07 GB/s vs 9.6 GB/s on the
+	 * host (130x).  HtoD was unaffected because the guest fills the buffer
+	 * while it is still cached anon memory (before the swap) and the stub
+	 * then reads the memfd as host RAM — the guest never reads through the
+	 * window on HtoD.  Leaving vm_page_prot at its default keeps it WB.
+	 *
+	 * NB: requesting WB here is necessary but NOT sufficient — because the GPA
+	 * window is a PCI-BAR (non-RAM) region, remap_pfn_range silently downgrades
+	 * the PTEs to UC-.  On Intel the EPT IPAT bit hid this; on AMD it does not,
+	 * so we rewrite the PTEs to WB with nvkvm_force_range_wb() after each
+	 * chunk's remap.
+	 */
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	mmap_write_unlock(mm);
+
+	/*
+	 * Per chunk, strictly in order: move the data, register it, release its
+	 * old home.  A partially migrated range is a legal intermediate state —
+	 * nothing in it is usable from CUDA until the call returns — so this
+	 * does not need to be atomic across the range, only across each chunk.
+	 */
 	for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
 		unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
 					 range_len - coff);
+		unsigned long cbase = start + coff;
 		__u32 handle = 0, token = 0;
 		__u64 gpa = 0;
 		unsigned long uoff;
-
-		if (nck >= NVKVM_MIG_MAXCHK) { ret = -E2BIG; goto err_handles; }
+		struct nvkvm_cpu_page *cp;
 
 		ret = nvkvm_virtio_open_memory_handle(
 			(unsigned int)ctx->session->id, clen, &handle);
 		if (ret)
-			goto err_handles;
+			goto err_unpin;
 
 		/* Upload clen bytes in slot-sized batches (one forward per slot,
 		 * vs one per 4KB page in the old path). */
@@ -861,9 +973,9 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			int slot = nvkvm_slot_alloc(&nvkvm);
 			void *sp;
 
-			if (slot < 0) { ret = -ENOSPC; goto chunk_fail; }
+			if (slot < 0) { ret = -ENOSPC; goto chunk_fail_h; }
 			sp = nvkvm_slot_addr(&nvkvm, slot);
-			if (!sp) { nvkvm_slot_free(&nvkvm, slot); ret = -ENOMEM; goto chunk_fail; }
+			if (!sp) { nvkvm_slot_free(&nvkvm, slot); ret = -ENOMEM; goto chunk_fail_h; }
 			for (p = 0; p < this; p += PAGE_SIZE) {
 				unsigned long pidx = (coff + uoff + p) >> PAGE_SHIFT;
 				void *ka = kmap_local_page(pages[pidx]);
@@ -874,112 +986,153 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			ret = nvkvm_virtio_write_memory_handle(handle, uoff, slot,
 							       (__u32)this);
 			nvkvm_slot_free(&nvkvm, slot);
-			if (ret) goto chunk_fail;
+			if (ret) goto chunk_fail_h;
 			continue;
-chunk_fail:
+chunk_fail_h:
 			nvkvm_virtio_close_handle(handle);
-			goto err_handles;
+			goto err_unpin;
 		}
 
+		/*
+		 * From here until this chunk's pins are dropped, this chunk's
+		 * data exists in two places: the pinned guest pages and the
+		 * memfd.  That window is one chunk wide and never widens.
+		 */
+		if (clen > dup_peak)
+			dup_peak = clen;
+
 		ret = nvkvm_virtio_copy_handle_to_isolate(handle, isolate_id);
-		if (ret) { nvkvm_virtio_close_handle(handle); goto err_handles; }
+		if (ret) { nvkvm_virtio_close_handle(handle); goto err_unpin; }
 
 		ret = nvkvm_virtio_mmap_on_isolate(isolate_id, handle,
-						   start + coff, 0, clen,
+						   cbase, 0, clen,
 						   (__u32)prot, MAP_SHARED,
 						   (unsigned int)ctx->session->id,
 						   &gpa, &token);
 		if (ret) {
 			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
 			nvkvm_virtio_close_handle(handle);
-			goto err_handles;
+			goto err_unpin;
 		}
 		if (!nvkvm_gpa_in_mmap_window(gpa, clen)) {
-			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
-			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
-			nvkvm_virtio_close_handle(handle);
-			ret = -EIO; goto err_handles;
+			ret = -EIO;
+			goto chunk_fail_mapped;
 		}
-		ck[nck].base = start + coff; ck[nck].clen = clen;
-		ck[nck].gpa = gpa; ck[nck].handle = handle; ck[nck].token = token;
-		nck++;
-	}
 
-	/* Phase 2: ONE VMA swap — zap the whole range, mark PFNMAP, remap each
-	 * chunk's contiguous GPA.  After this libcuda reads/writes the memfd via
-	 * the GPA window directly (the stub maps the same memfd) — no per-page
-	 * writeback needed. */
-	mmap_write_lock(mm);
-	vma = find_vma(mm, start);
-	if (!vma || vma->vm_start > start || vma->vm_end < end) {
+		/*
+		 * Swap THIS chunk's PTEs onto the memfd's GPA.  zap and remap
+		 * happen inside one mmap_write_lock section, so there is never
+		 * an instant in which a page of the range is unmapped: the
+		 * chunks behind us point at their memfds, the chunks ahead of
+		 * us still have their original anon PTEs, and userspace can
+		 * touch either without faulting into a hole.
+		 */
+		mmap_write_lock(mm);
+		vma = find_vma(mm, cbase);
+		if (!vma || vma->vm_start > cbase || vma->vm_end < cbase + clen) {
+			mmap_write_unlock(mm);
+			ret = -EFAULT;
+			goto chunk_fail_mapped;
+		}
+		/*
+		 * Take the per-VMA write lock before touching PTEs.  mmap_lock
+		 * alone does not exclude a fault that took only the per-VMA read
+		 * lock (CONFIG_PER_VMA_LOCK, on by default since 6.4); such a
+		 * fault could install an anon page between the zap and the
+		 * remap, and remap_pte_range() BUG_ON()s a non-empty PTE.
+		 * vm_flags_set() got us this implicitly on the whole-range
+		 * conversion above; here we ask for it directly.
+		 */
+		vma_start_write(vma);
+		/*
+		 * Zapping ordinary anon PTEs in a VMA that is already VM_PFNMAP
+		 * is safe on x86_64: CONFIG_ARCH_HAS_PTE_SPECIAL is set, so
+		 * vm_normal_page() short-circuits on !pte_special(pte) BEFORE it
+		 * consults vm_flags, and anon PTEs still resolve to their struct
+		 * page and get refcounted and rmap-removed correctly.  VM_PFNMAP
+		 * only changes the outcome for pte_special() entries, which is
+		 * exactly what remap_pfn_range() installs (pte_mkspecial) for the
+		 * chunks already migrated.  unmap_single_vma()'s untrack_pfn()
+		 * is gated on VM_PAT, which track_pfn_remap() only sets for a
+		 * remap covering the entire VMA — never the case for a chunk of
+		 * a larger range.
+		 */
+		zap_page_range_single(vma, cbase, clen, NULL);
+		ret = remap_pfn_range(vma, cbase,
+				      (unsigned long)(gpa >> PAGE_SHIFT),
+				      clen, vma->vm_page_prot);
+		if (!ret)
+			nvkvm_force_range_wb(mm, cbase, cbase + clen);
 		mmap_write_unlock(mm);
-		ret = -EFAULT; goto err_handles;
-	}
-	zap_page_range_single(vma, start, range_len, NULL);
-	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
-	/*
-	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
-	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
-	 * On x86 the guest's WB view, the stub's WB view of the same memfd, and
-	 * the GPU's DMA are all cache-coherent (DMA snoops), so WB is correct.
-	 * Mapping it UC made the guest's post-DtoH read of the result a stream of
-	 * uncached, unprefetched loads — measured 0.07 GB/s vs 9.6 GB/s on the
-	 * host (130x).  HtoD was unaffected because the guest fills the buffer
-	 * while it is still cached anon memory (before this swap) and the stub
-	 * then reads the memfd as host RAM — the guest never reads through the
-	 * window on HtoD.  Leaving vm_page_prot at its default keeps it WB.
-	 *
-	 * NB: requesting WB here is necessary but NOT sufficient — because the GPA
-	 * window is a PCI-BAR (non-RAM) region, remap_pfn_range silently downgrades
-	 * the PTEs to UC-.  On Intel the EPT IPAT bit hid this; on AMD it does not,
-	 * so we rewrite the PTEs to WB with nvkvm_force_range_wb() after the remap.
-	 */
-	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
-	for (i = 0; i < nck; i++) {
-		ret = remap_pfn_range(vma, ck[i].base,
-				      (unsigned long)(ck[i].gpa >> PAGE_SHIFT),
-				      ck[i].clen, vma->vm_page_prot);
-		if (ret) { mmap_write_unlock(mm); goto err_handles; }
-	}
-	nvkvm_force_range_wb(mm, start, end);
-	mmap_write_unlock(mm);
+		if (ret)
+			goto chunk_fail_mapped;
 
-	/* The VMA now points at the GPAs (memfds); release the original anon
-	 * page pins. */
-	for (i = 0; i < got; i++)
-		put_page(pages[i]);
+		/*
+		 * The chunk is live and the VMA points at it.  Record it BEFORE
+		 * dropping the pins, so cleanup at fd close can never miss a
+		 * mapping we have already installed.  page==NULL marks a range
+		 * entry: no writeback and no put_page at cleanup, because the
+		 * guest reads the GPU's writes straight out of the memfd.
+		 */
+		cp = kzalloc(sizeof(*cp), GFP_KERNEL);
+		if (cp) {
+			cp->page       = NULL;
+			cp->gva        = cbase;
+			cp->gpa        = gpa;
+			cp->handle_id  = handle;
+			cp->mmap_token = token;
+			cp->prot       = (__u32)prot;
+			mutex_lock(&ctx->cpu_pages_lock);
+			list_add_tail(&cp->list, &ctx->cpu_pages);
+			mutex_unlock(&ctx->cpu_pages_lock);
+		}   /* else: mapping is live; accept the tracking leak */
+
+		/*
+		 * Release this chunk's pinned pages.  The data's only home is
+		 * now the memfd, so the guest gets these page frames back
+		 * immediately instead of at the end of the whole registration.
+		 * This is the half of the per-chunk order that actually bounds
+		 * the duplicate.
+		 */
+		for (i = coff >> PAGE_SHIFT;
+		     i < (coff + clen) >> PAGE_SHIFT; i++)
+			put_page(pages[i]);
+		done_pages = (coff + clen) >> PAGE_SHIFT;
+		nck++;
+		continue;
+
+chunk_fail_mapped:
+		nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+		nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+		nvkvm_virtio_close_handle(handle);
+		goto err_unpin;
+	}
+
+	/* Every chunk is migrated, recorded and unpinned.  Nothing is left to
+	 * do but free the descriptor array. */
 	kvfree(pages);
-
-	/* Track one range entry per chunk (page==NULL → no writeback, no
-	 * put_page at cleanup; munmap_on_isolate(token)+close_handle suffice). */
-	for (i = 0; i < nck; i++) {
-		struct nvkvm_cpu_page *cp = kzalloc(sizeof(*cp), GFP_KERNEL);
-		if (!cp)
-			continue;   /* mapping live; accept tracking leak */
-		cp->page       = NULL;
-		cp->gva        = ck[i].base;
-		cp->gpa        = ck[i].gpa;
-		cp->handle_id  = ck[i].handle;
-		cp->mmap_token = ck[i].token;
-		cp->prot       = (__u32)prot;
-		mutex_lock(&ctx->cpu_pages_lock);
-		list_add_tail(&cp->list, &ctx->cpu_pages);
-		mutex_unlock(&ctx->cpu_pages_lock);
-	}
-	pr_info("nvkvm DIAG: migrate_range(bulk) %lu pages, %d chunks in %lld us\n",
-		npages, nck, ktime_to_us(ktime_sub(ktime_get(), _t0)));
+	pr_info("nvkvm DIAG: migrate_range(bulk) %lu pages, %d chunks, dup_peak=%lu B in %lld us\n",
+		npages, nck, dup_peak,
+		ktime_to_us(ktime_sub(ktime_get(), _t0)));
 	return 0;
 
-err_handles:
-	for (i = 0; i < nck; i++) {
-		nvkvm_virtio_munmap_on_isolate(isolate_id, ck[i].token);
-		nvkvm_virtio_close_handle_on_isolate(ck[i].handle, isolate_id);
-		nvkvm_virtio_close_handle(ck[i].handle);
-	}
 err_unpin:
-	for (i = 0; i < got; i++)
+	/*
+	 * Drop only the pins we still hold.  Pages below done_pages belong to
+	 * chunks that are already migrated: their pins were released at the end
+	 * of their own iteration and their mappings are recorded in
+	 * ctx->cpu_pages, so nvkvm_cpu_pages_free() will tear them down at fd
+	 * close.  Unpinning them again here would be a double put_page().
+	 *
+	 * Those already-migrated chunks stay mapped.  A partially migrated range
+	 * is a legal intermediate state, and there is no clean way to undo one:
+	 * the original anon pages are gone.  The caller gets the error and the
+	 * registration fails, which is the same thing userspace saw before.
+	 */
+	for (i = done_pages; i < (unsigned long)got; i++)
 		put_page(pages[i]);
 	kvfree(pages);
-	pr_warn("nvkvm: migrate_range(bulk) failed ret=%d at chunk %d\n", ret, nck);
+	pr_warn("nvkvm: migrate_range(bulk) failed ret=%d at chunk %d (%d chunk(s) already migrated and left mapped)\n",
+		ret, nck, nck);
 	return ret;
 }
