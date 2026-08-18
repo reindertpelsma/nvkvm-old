@@ -132,6 +132,51 @@ platform present is in the same paragraph of the matrix:
 Under investigation. Do not assume a screenshot proves anything here — check the
 client's `GL_RENDERER`.
 
+### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
+
+Kept here because the diagnosis is the useful part, and because the shape of
+this bug will recur.
+
+For a while, creating an offscreen framebuffer inside a guest failed on
+595.84 and 610.43.02. Every colour attachment format returned
+`GL_FRAMEBUFFER_UNSUPPORTED` (`0x8CDD`) from `glCheckFramebufferStatus`, with
+`glGetError()` clean at every step. Context creation and `GL_RENDERER` were
+healthy (`GL_VENDOR='NVIDIA Corporation'`,
+`GL_VERSION='OpenGL ES 3.2 NVIDIA 610.43.02'`), so any check that stopped at
+the renderer string reported these drivers as fully working. It tracked the
+driver version and not the ABI profile row — 595.84 and 580.95.05 take the
+same profile row on the same box and disagree — which made "NVIDIA regressed
+it in 595" the natural conclusion.
+
+**It was ours.** The test that settled it took half an hour: install 610.43.02
+on a host and run `tests/validate.sh` on bare metal, no VM. It passes —
+`gl_draw_pixel_check PASS`, and a five-format probe reports
+`0/5 configurations incomplete`. 595.84 on bare metal passes too. Booting a
+guest on that *same box, same GPU, same driver* gives `5/5 incomplete`.
+
+The cause is `src/qemu/nvkvm_nvkms_allowlist.h`. Its allowed set was captured
+live from a 575-era Vulkan/EGL session, and branches 595+ issue an NVKMS inner
+`cmdType=60` that the capture never saw. Default-deny returned `-EACCES` /
+`NV_ERR_NOT_SUPPORTED`; the ICD's response was to unregister the surface and
+declare every format unrenderable. Allowing `60` takes the 610.43.02 guest from
+27/28 to **28/28**, and fixes 595.84 identically. Full trace, including the
+`0/1440 → 17/152 → 60/32 → 18/16` NVKMS sequence and why cmdType 60 cannot be
+named from any shipped header, is in
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md).
+
+Three things to carry forward:
+
+- **An allowlist captured on one driver branch expires on the next.** This one
+  was three branches stale. `61`/`62`, the entries it was built around, are not
+  even issued by the 610 ICD any more.
+- **A denied ioctl does not necessarily surface as a denial.** This one surfaced
+  four layers up as a GL enum, with no GL error set and nothing in guest
+  `dmesg`. The only evidence was one line in the QEMU log.
+- **"Works on bare metal?" is the cheapest question in this project.** It costs
+  one box and separates *our* bugs from the driver's, and `tests/validate.sh`
+  runs unmodified on bare hardware (`guest_module` FAILs, which is the correct
+  answer there, and `abi_profile` SKIPs).
+
 ### PRIME-imported buffers are backed by guest pages, not host memory
 
 `nvkvm_gem_get_sg_table()` (`src/guest/nvkvm_drm.c:132-155`) lazily allocates
@@ -188,6 +233,16 @@ The NVKMS allowlist calls itself interim:
 `/dev/nvidia-modeset` is host-global and privileged. If you do not need
 Vulkan/EGL, run compute-only (`graphics=off` on the QEMU device, `make
 NVKVM_GRAPHICS=0` for the guest module) and the device never opens.
+
+The allowlist now carries a third unnamed entry, `cmdType=60`, added
+2026-08-17 because branches 595+ need it for any offscreen render target (see
+the fixed entry above). Like 61/62 it is required in practice and unaudited in
+principle: the `NvKmsIoctlCommand` enum that would name it is not in any
+shipped header — the DKMS tree ships only the wrapper struct in
+`nvidia-modeset/nvkms-ioctl.h`. That makes the interim status *more* pressing,
+not less: the allowlist is now three commands wide on evidence that amounts to
+"a real ICD issued it", and it has already been shown to break silently and
+non-locally when a driver branch moves.
 
 ---
 
@@ -261,12 +316,12 @@ Specific things a reader should weigh:
   This is forced by the driver: UVM binds its file's `nvfp` to the calling task's
   `mm` during `UVM_INITIALIZE`, and the matching `mmap` must come from the same
   `mm` — which is QEMU, because QEMU is what installs the KVM memory region
-  (`src/qemu/nvkvm_isolate_handlers.c:985-995`). The schema allowlist
-  (`src/qemu/nvkvm_isolate_handlers.c:516-562`) is the mitigation.
+  (`src/qemu/nvkvm_isolate_handlers.c:1229-1237`). The schema allowlist
+  (`src/qemu/nvkvm_isolate_handlers.c:599-645`) is the mitigation.
 - **Intra-VM access control is the guest kernel's job, by design.** QEMU does
   not check which guest process may touch which object; it checks cross-VM and
   host-process boundaries only
-  (`src/qemu/nvkvm_isolate_handlers.c:997-1007`). A malicious guest *kernel* is
+  (`src/qemu/nvkvm_isolate_handlers.c:1240-1252`). A malicious guest *kernel* is
   outside the model that check would defend.
 - **The guest does not defend against the host.** `src/guest/nvkvm_mmap.c:18-20`:
   "A malicious host could abuse this, but we are not defending against the
@@ -287,7 +342,7 @@ Do not put untrusted tenants behind this.
 The multi-channel form carries three guest-userspace pointers to handle arrays,
 which the single-aux-slot path cannot marshal. The guest zeroes them *and*
 `num_channels` (`src/guest/nvkvm_ioctl.c:462-479`), and the stub re-zeroes the
-same 28 bytes at the boundary (`src/stub/nvkvm_stub.c:1192-1196`).
+same 28 bytes at the boundary (`src/stub/nvkvm_stub.c:1280-1283`).
 
 > multi-channel idle degrades to a best-effort single-channel drain, which is
 > fine for the pre-teardown use libcuda makes of this call.
@@ -329,7 +384,7 @@ The guest synthesises an opaque per-fd id instead
   (`src/qemu/nvkvm_mmap_host.c:296-300`).
 - **Isolate mmap table**: 8192 entries; on overflow the mapping is torn down and
   the request fails rather than leaking
-  (`src/qemu/nvkvm_isolate_handlers.c:1939-1972`).
+  (`src/qemu/nvkvm_isolate_handlers.c:2434-2470`).
 - **Guest RAM ≥ 1 TB is refused.** The GPA windows sit at fixed addresses (1 TB
   shm, 1.5 TB mmap, 2 TB sparse); a VM with ≥1 TB RAM would overlap and silently
   corrupt, so realize fails loudly instead
@@ -354,11 +409,19 @@ The legacy `NVKVM_REQ_OPEN` / `_CLOSE` / `_IOCTL` / `_MMAP` / `_MUNMAP`
 handlers in `src/qemu/virtio_nvgpu.c` are under `#if 0` as tombstones
 (`src/qemu/virtio_nvgpu.c:230-236`).
 
-Two comments in the graphics layer are stale in the other direction: the
-`src/guest/nvkvm_drm.c:23-25` header note and the `Audit G-3` block in
-`src/qemu/nvkvm_drm_allowlist.h` both describe a smaller guest DRM ioctl table
-than the code now has — `0x09`, `0x0b`, `0x0e` and `0x18` were added later
-(`src/guest/nvkvm_drm.c:688-720`).
+One comment in the graphics layer was stale in the other direction, and has been
+corrected: the `Audit G-3` block in `src/qemu/nvkvm_drm_allowlist.h` justified
+its four exclusions by asserting the guest DRM proxy "wires only GET_DEV_INFO /
+DMABUF_SUPPORTED / SEMSURF_FENCE_* + GEM_CLOSE". `nvkvm_drm_ioctls[]`
+(`src/guest/nvkvm_drm.c:688-720`) also wires `0x09`, `0x0b`, `0x0e` and `0x18`.
+The conclusion survives — `0x02`/`0x0a`/`0x0d` are genuinely absent from the
+guest table, and `0x0e` is wired but answered entirely guest-side
+(`src/guest/nvkvm_drm.c:391-405`) and never forwarded — but the stated reason
+did not, and a reason that no longer holds is worse than no reason.
+
+The `src/guest/nvkvm_drm.c:23-25` header note is *not* stale: the three ioctls
+it defers (`IMPORT_USERSPACE_MEMORY`, `MAP_OFFSET`, `EXPORT_DMABUF`) are still
+absent from the guest table.
 
 ### Pinned host memory
 
