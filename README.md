@@ -6,7 +6,7 @@
 > Read-only discontinued archived research artifact.
 > Nothing here is built, tested, maintained, or intended to run.
 > This repo got continued into nvkvm-pv and kayfabe
-> [https://github.com/reindertpelsma/nvkvm-pv](nvkvm-pv) is the mature repository to use, forked from this artifact
+> [https://github.com/reindertpelsma/nvkvm-pv](https://github.com/reindertpelsma/nvkvm-pv) is the mature repository to use, forked from this artifact
 > No issues or pull requests are read on this repo.
 > Published to show a transperant git history for nvkvm-pv
 
