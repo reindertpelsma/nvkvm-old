@@ -2,7 +2,7 @@
 
 ## Archived repository
 
-> *Do not run this repo*
+> **Do not use this repo**
 > Read-only discontinued archived research artifact.
 > Nothing here is built, tested, maintained, or intended to run.
 > This repo got continued into nvkvm-pv and kayfabe
