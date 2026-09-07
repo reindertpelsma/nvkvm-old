@@ -1,5 +1,24 @@
 # nvkvm
 
+## Archived repository
+| *Do not run this repo*
+| Read-only discontinued archived research artifact.
+| Nothing here is built, tested, maintained, or intended to run.
+| This repo got continued into nvkvm-pv and kayfabe
+| [https://github.com/reindertpelsma/nvkvm-pv](nvkvm-pv) is the mature repository to use, forked from this artifact
+| No issues or pull requests are read on this repo.
+
+The original nvkvm C research prototype, snapshotted at commit bac00b6 and imported as a single squashed commit (its own history was not carried over).
+
+It is kept because kayfabe's design references its Mode-2 work directly — the differential oracle, the address table, the forwarding model, and lessons #11–#14. When a kayfabe design doc says "the C artifact does X", this is the code it means.
+
+Two things it is not:
+
+* Not a supported project. It does not build here, is not covered by CI, and will not be fixed.
+* Not the maintained descendant. That is nvkvm-pv, which was forked from this prototype and deliberately excludes Mode 2 — Mode 2 is a research artifact, and nvkvm-pv ships only the paths that are tested.
+
+## Original README
+
 Run CUDA, PyTorch and Vulkan inside a KVM guest — on the same GPU your host is
 still using.
 
