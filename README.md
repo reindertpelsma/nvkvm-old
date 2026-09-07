@@ -1,12 +1,14 @@
-# nvkvm
+# nvkvm-old - Archived
 
 ## Archived repository
-| *Do not run this repo*
-| Read-only discontinued archived research artifact.
-| Nothing here is built, tested, maintained, or intended to run.
-| This repo got continued into nvkvm-pv and kayfabe
-| [https://github.com/reindertpelsma/nvkvm-pv](nvkvm-pv) is the mature repository to use, forked from this artifact
-| No issues or pull requests are read on this repo.
+
+> *Do not run this repo*
+> Read-only discontinued archived research artifact.
+> Nothing here is built, tested, maintained, or intended to run.
+> This repo got continued into nvkvm-pv and kayfabe
+> [https://github.com/reindertpelsma/nvkvm-pv](nvkvm-pv) is the mature repository to use, forked from this artifact
+> No issues or pull requests are read on this repo.
+> Published to show a transperant git history for nvkvm-pv
 
 The original nvkvm C research prototype, snapshotted at commit bac00b6 and imported as a single squashed commit (its own history was not carried over).
 
