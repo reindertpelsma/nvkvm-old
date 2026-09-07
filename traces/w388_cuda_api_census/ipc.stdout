@@ -1,0 +1,20 @@
+STAGE ipc
+pid=1777 nvdiff_out=/root/nvd_apis_run/ipc.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+  TRY alloc                    cuMemAlloc(&da, SZ)                            rc=0 no error
+  TRY htod_magic               cuMemcpyHtoD(da, &magic, 4)                    rc=0 no error
+  TRY sync                     cuCtxSynchronize()                             rc=0 no error
+  exporter da=0x7f3068200000 size=2097152 magic=0xc0ffee42
+  TRY ipcgetmemhandle          cuIpcGetMemHandle(&ih, da)                     rc=0 no error
+  IPC handle = 50bb8f4394550000f10600000000000000002000000000000002000000000000000d0000000000002a000000000000003f38d5c17c00005c0000000000000000
+  -- negative probe: open our OWN handle in the exporting process --
+  TRY selfopen                 cuIpcOpenMemHandle_v2(&dsame, ih, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS) rc=201 invalid device context
+  IPC_CHILD_TRACE=/root/nvd_apis_run/ipc_child.jsonl
+  IPC_CHILD_STDOUT=/root/nvd_apis_run/ipc_child.stdout
+  IPC_CHILD rc=0 (⚠ read the child's own OK/FAIL line, not this rc)
+  TRY free                     cuMemFree(da)                                  rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK ipc get-handle here + open/read/close in a second process (child trace is the .child file)
+DONE

@@ -88,6 +88,22 @@ LAYOUT = {
            ("hObjectNew", 8, U32, "h"), ("hClass", 12, U32, "k"),
            ("flags", 16, U32, ""), ("pMemory", 24, U64, "p"),
            ("limit", 32, U64, ""), ("status", 40, U32, "s")],                # NVOS02 :293
+    # ★ 0x57 / 0x58 added 2026-09-07 with tests/mode2/nvdiff/nvd_apis.c. They decode as
+    # w0,w1,... without this, which is enough to COUNT but not enough to say WHAT was
+    # mapped. ⊘ Adding them cannot perturb any committed result: both escapes appear
+    # ZERO times in all twelve captures under traces/host_reference_ga106/ — which is
+    # precisely the absence nvd_apis.c exists to test.
+    # ⚠ dmaOffset is NV_ALIGN_BYTES(8) after three NvV32s, so it is at 48, not 44.
+    0x57: [("hClient", 0, U32, "h"), ("hDevice", 4, U32, "h"),
+           ("hDma", 8, U32, "h"), ("hMemory", 12, U32, "h"),
+           ("offset", 16, U64, ""), ("length", 24, U64, ""),
+           ("flags", 32, U32, ""), ("flags2", 36, U32, ""),
+           ("kindOverride", 40, U32, ""), ("dmaOffset", 48, U64, "p"),
+           ("status", 56, U32, "s")],                                        # NVOS46 :2167
+    0x58: [("hClient", 0, U32, "h"), ("hDevice", 4, U32, "h"),
+           ("hDma", 8, U32, "h"), ("hMemory", 12, U32, "h"),
+           ("flags", 16, U32, ""), ("dmaOffset", 24, U64, "p"),
+           ("size", 32, U64, ""), ("status", 40, U32, "s")],                 # NVOS47 :2195
     0x4A: [("hRoot", 0, U32, "h"), ("hObjectParent", 4, U32, "h"),
            ("function", 8, U32, "f"), ("hVASpace", 12, U32, "h"),
            ("ivcHeapNumber", 16, "h", ""), ("status", 20, U32, "s"),

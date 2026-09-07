@@ -1,0 +1,13 @@
+STAGE ipcimport
+pid=1781 nvdiff_out=/root/nvd_apis_run/ipc_child.jsonl
+MARKFD 4
+  child pid=1781 importing a handle exported by pid=1777
+  TRY ipcopenmemhandle         cuIpcOpenMemHandle_v2(&dp, ih, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS) rc=0 no error
+  IMPORTED dptr=0x7f7cec200000 in a foreign process
+  TRY dtoh_from_imported       cuMemcpyDtoH(&v, dp, 4)                        rc=0 no error
+  TRY sync                     cuCtxSynchronize()                             rc=0 no error
+  IMPORT-READ got=0xc0ffee42 want=0xc0ffee42 -> PASS
+  TRY ipcclosememhandle        cuIpcCloseMemHandle(dp)                        rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK ipcimport open/read/close of a foreign process's allocation
+DONE

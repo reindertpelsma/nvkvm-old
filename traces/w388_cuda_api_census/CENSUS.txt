@@ -1,0 +1,19 @@
+NV_ESC_RM_MAP_MEMORY_DMA CENSUS  (nr 0x57=87 map, 0x58=88 unmap)
+============================================================================================================
+stage                   records   ioctls  marks    0x57   0x58    0x4E   0x4F  verdict
+------------------------------------------------------------------------------------------------------------
+arrays                      595      587      7       0      0      24     23  OK arrays create/2D-copy-both-ways/mipmap/texobj array+linea
+base                        586      583      2       0      0      24     23  OK base cuMemAlloc+HtoD+DtoH+cuMemFree (the KNOWN-NEGATIVE c
+hostreg                     609      600      8       0      0      25     24  OK hostreg register/getdevptr/allochost/hostalloc, GPU wrote
+ipc                         590      583      6       0      0      24     23  OK ipc get-handle here + open/read/close in a second process
+ipc_child                   586      581      4       0      0      24     23  OK ipcimport open/read/close of a foreign process's allocati
+mapped                      599      589      8       0      0      24     23  OK mapped allocManaged/advise x3/prefetch to device and back
+peer                        106      104      2       0      0       1      0  UNMEASURED <- SKIPPED peer: n_devices=1 (needs 2)
+vmm                         615      606      8       0      0      24     23  OK vmm reserve/create/map/setaccess/alias/unmap/release
+------------------------------------------------------------------------------------------------------------
+CONTROL  base: 0x57=0 0x58=0  (the nvd_prog `ce` shape; the twelve committed reference captures measure 0 here)
+KNOWN-POSITIVE  0x4E RM_MAP_MEMORY total across all rows = 170
+------------------------------------------------------------------------------------------------------------
+VERDICT  7 stage(s) ran to an OK verdict and NONE of them issued NV_ESC_RM_MAP_MEMORY_DMA. That is a measurement, bounded by the stage list actually run — not a statement about CUDA as a whole.
+
+(no 0x57/0x58 records to decode)

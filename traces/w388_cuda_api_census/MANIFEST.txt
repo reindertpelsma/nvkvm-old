@@ -1,0 +1,67 @@
+w388 — WHICH CUDA APIs ISSUE NV_ESC_RM_MAP_MEMORY_DMA?  ANSWER: NONE OF THE SEVEN TESTED
+=========================================================================================
+Captured 2026-09-07 on a REAL, unvirtualised host. Bare metal, no guest, no QEMU.
+
+THE QUESTION
+  w387 §15.1 measured NV_ESC_RM_MAP_MEMORY_DMA (nr 0x57 = 87) at ZERO across all twelve
+  traces/host_reference_ga106 captures. But those run only nvd_prog.c — a narrow shape:
+  context + plain cuMemAlloc + one CE copy + one launch.
+  Owner, 2026-09-07: "the only library issuing ogkm ioctl calls on bare metal is libcuda,
+  so if the ioctl exists, there is probably a path in cuda to invoke it/trigger it."
+  ⇒ That prior is correct as a default. This capture tests it.
+
+PROVENANCE (a bench claim without its revision is not a claim)
+  host          vast.ai contract 50160885, label kayfabe-w388-ioctl-census
+                container nvidia/cuda:12.6.2-devel-ubuntu22.04
+  GPU           NVIDIA GeForce RTX 3060 (GA106) — same die as the C oracle's bench
+  host driver   560.35.03  (OPEN kernel module; /proc/driver/nvidia/version)
+  ⚠ DIFFERENT DRIVER from host_reference_ga106, which is 580.173.02. That is deliberate
+    and is why every comparison here is WITHIN-BOX against the `base` control, never
+    cross-version against the committed traces.
+  CUDA          12.6.77 (nvcc 12.6.r12.6)
+  capture opts  NVDIFF_MAXBUF=65536 (the default 8192 truncates 27 records)
+  instrument    tests/mode2/nvdiff/nvdiff_shim.c   md5 f4bbadc8a0a072c859990a162e4bde87
+  workload      tests/mode2/nvdiff/nvd_apis.c      (new; nvd_prog.c deliberately untouched)
+
+  ⚠⚠ PROVENANCE DRIFT FOUND IN THE PARENT CAPTURE, and nothing checks it.
+     host_reference_ga106/MANIFEST.txt pins nvd_prog.c at md5 7af4c3ec2b70... and the shim
+     at 480e45c41de9... The tree TODAY has 326fb0bac2d5... and f4bbadc8a0a0... BOTH have
+     changed since 2026-08-10. The MANIFEST states the rule and does not enforce it.
+     ⇒ Here that CUTS IN OUR FAVOUR: two program versions, two shim versions, two driver
+       versions, same answer. But it is a live hole in the oracle's provenance.
+
+THE RESULT — seven CUDA API families, each doing real work, all ZERO
+
+  stage      records   0x57   0x58   0x4E  what it exercised
+  --------------------------------------------------------------------------------------
+  vmm            615      0      0     24  cuMemAddressReserve/Create/Map/SetAccess/alias
+  hostreg        609      0      0     25  cuMemHostRegister/GetDevicePointer/AllocHost
+  ipc            590      0      0     24  cuIpcGetMemHandle + a REAL second process
+  ipc_child      586      0      0     24  the child's own open/read/close
+  mapped         599      0      0     24  cuMemAllocManaged + cuMemAdvise x3 + prefetch
+  arrays         595      0      0     24  cuArrayCreate/2D copies/mipmap/texobj
+  base           586      0      0     24  cuMemAlloc+HtoD+DtoH   <- KNOWN-NEGATIVE control
+  peer           106      -      -      1  UNMEASURED: n_devices=1, needs 2
+
+  ★ KNOWN-POSITIVE: 0x4E NV_ESC_RM_MAP_MEMORY = 170 across these rows. The counter fires
+    and the decode works, so the zeros are REAL ZEROS and not a broken probe.
+    (`a_census_zero_needs_a_known_positive`, satisfied.)
+
+  ★ ALSO ZERO for NVML: nvidia-smi (109 records), -q (194), --query-gpu (66).
+
+WHAT THIS ESTABLISHES
+  NVOS46_FLAGS_DEFER_TLB_INVALIDATION is a flag on an ioctl that CUDA never issues.
+  ⇒ The DEFER half of w387's silent conjunction is NOT on the application path. It is a
+    hostile-guest / raw-client concern and gates neither phase 1 nor phase 2.
+  ⇒ libcuda maps through UVM. The coverage question moves to UVM, which is uncovered for
+    ENTIRELY DIFFERENT reasons (own page tables, PTE writes by CPU store or CE copy,
+    invalidates as pushbuffer methods).
+
+⊘ WHAT IT DOES NOT ESTABLISH — stated, not buried
+  - `peer` is UNMEASURED, not zero. It needs a 2-GPU rental.
+  - GRAPHICS (libGL/EGL) and NVENC/NVDEC are NOT covered. They do not go through UVM and
+    are the classic RM DMA-mapping clients — plausibly the reason this escape exists.
+  - One arch (GA106), two drivers (560, 580). Not a statement about all hardware.
+  - ⊘ A PREDICTION OF MINE DIED HERE: I ranked the CUDA VMM API as most likely to issue
+    0x57, on the reasoning that client-managed explicit mapping is exactly what
+    NV04_MAP_MEMORY_DMA provides. It issues ZERO. cuMemMap goes through UVM like the rest.

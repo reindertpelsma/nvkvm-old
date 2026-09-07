@@ -1,0 +1,62 @@
+START 2026-09-07T13:30:23Z host=4d5a50fb304f uid=0
+BUILD using REAL cuda.h from /usr/local/cuda/include
+GATE checking the versioned entry points bind their _v2 symbols
+   ok   cuCtxCreate_v2
+   ok   cuCtxDestroy_v2
+   ok   cuMemAlloc_v2
+   ok   cuMemFree_v2
+   ok   cuMemcpyHtoD_v2
+   ok   cuMemcpyDtoH_v2
+   ok   cuMemcpyDtoD_v2
+   ok   cuDeviceTotalMem_v2
+   ok   cuMemHostRegister_v2
+   ok   cuMemHostGetDevicePointer_v2
+   ok   cuMemAllocHost_v2
+   ok   cuIpcOpenMemHandle_v2
+   ok   cuArrayCreate_v2
+   ok   cuMemcpy2D_v2
+   ok   cuMemsetD32_v2
+   ok   cuMemGetInfo_v2
+---- stage vmm ----
+PROG vmm rc=0 records=615
+GRADE vmm OK vmm reserve/create/map/setaccess/alias/unmap/release
+---- stage hostreg ----
+PROG hostreg rc=0 records=609
+GRADE hostreg OK hostreg register/getdevptr/allochost/hostalloc, GPU wrote host pages
+---- stage ipc ----
+PROG ipc rc=0 records=590
+GRADE ipc OK ipc get-handle here + open/read/close in a second process (child trace is the .child file)
+CHILD ipc records=586 grade=OK ipcimport open/read/close of a foreign process's allocation
+---- stage peer ----
+PROG peer rc=0 records=106
+GRADE peer SKIPPED peer: n_devices=1 (needs 2)
+---- stage mapped ----
+PROG mapped rc=0 records=599
+GRADE mapped OK mapped allocManaged/advise x3/prefetch to device and back
+---- stage arrays ----
+PROG arrays rc=0 records=595
+GRADE arrays OK arrays create/2D-copy-both-ways/mipmap/texobj array+linear
+---- stage base ----
+PROG base rc=0 records=586
+GRADE base OK base cuMemAlloc+HtoD+DtoH+cuMemFree (the KNOWN-NEGATIVE control)
+---- census ----
+   NV_ESC_RM_MAP_MEMORY_DMA CENSUS  (nr 0x57=87 map, 0x58=88 unmap)
+   ============================================================================================================
+   stage                   records   ioctls  marks    0x57   0x58    0x4E   0x4F  verdict
+   ------------------------------------------------------------------------------------------------------------
+   arrays                      595      587      7       0      0      24     23  OK arrays create/2D-copy-both-ways/mipmap/texobj array+linea
+   base                        586      583      2       0      0      24     23  OK base cuMemAlloc+HtoD+DtoH+cuMemFree (the KNOWN-NEGATIVE c
+   hostreg                     609      600      8       0      0      25     24  OK hostreg register/getdevptr/allochost/hostalloc, GPU wrote
+   ipc                         590      583      6       0      0      24     23  OK ipc get-handle here + open/read/close in a second process
+   ipc_child                   586      581      4       0      0      24     23  OK ipcimport open/read/close of a foreign process's allocati
+   mapped                      599      589      8       0      0      24     23  OK mapped allocManaged/advise x3/prefetch to device and back
+   peer                        106      104      2       0      0       1      0  UNMEASURED <- SKIPPED peer: n_devices=1 (needs 2)
+   vmm                         615      606      8       0      0      24     23  OK vmm reserve/create/map/setaccess/alias/unmap/release
+   ------------------------------------------------------------------------------------------------------------
+   CONTROL  base: 0x57=0 0x58=0  (the nvd_prog `ce` shape; the twelve committed reference captures measure 0 here)
+   KNOWN-POSITIVE  0x4E RM_MAP_MEMORY total across all rows = 170
+   ------------------------------------------------------------------------------------------------------------
+   VERDICT  7 stage(s) ran to an OK verdict and NONE of them issued NV_ESC_RM_MAP_MEMORY_DMA. That is a measurement, bounded by the stage list actually run — not a statement about CUDA as a whole.
+   
+   (no 0x57/0x58 records to decode)
+EXIT rc=0

@@ -1,0 +1,7 @@
+STAGE peer
+pid=1804 nvdiff_out=/root/nvd_apis_run/peer.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+SKIPPED peer: n_devices=1 (needs 2)
+DONE

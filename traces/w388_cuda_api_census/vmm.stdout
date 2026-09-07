@@ -1,0 +1,39 @@
+STAGE vmm
+pid=1743 nvdiff_out=/root/nvd_apis_run/vmm.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+  vmm_supported=1 posix_fd_handle_supported=1
+  TRY granularity              cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) rc=0 no error
+  granularity=2097152  size=4194304
+  TRY addressreserve           cuMemAddressReserve(&va, sz * 2, 0, 0, 0)      rc=0 no error
+  reserved va=0x7fecc6200000 va2=0x7fecc6600000 span=8388608
+  TRY memcreate                cuMemCreate(&h, sz, &prop, 0)                  rc=0 no error
+  handle=0x5630b19b9f70 (physical backing, NO virtual address yet)
+  TRY memmap                   cuMemMap(va, sz, 0, h, 0)                      rc=0 no error
+  TRY setaccess                cuMemSetAccess(va, sz, &acc, 1)                rc=0 no error
+  ROUNDTRIP vmm_mapped     dptr=0x7fecc6200000 bytes=65536 rc=0/0/0 bad=0 first=0xa5c30000 -> PASS
+  TRY memmap_alias             cuMemMap(va2, sz, 0, h, 0)                     rc=0 no error
+  TRY setaccess_alias          cuMemSetAccess(va2, sz, &acc, 1)               rc=0 no error
+  TRY alias_htod               cuMemcpyHtoD(va, &magic, 4)                    rc=0 no error
+  TRY alias_dtoh               cuMemcpyDtoH(&probe, va2, 4)                   rc=0 no error
+  ALIAS write@va read@va2 got=0x5eed5eed want=0x5eed5eed -> PASS
+  TRY unmap_alias              cuMemUnmap(va2, sz)                            rc=0 no error
+  TRY memcreate_exp            cuMemCreate(&he, sz, &ep, 0)                   rc=0 no error
+  TRY export_to_fd             cuMemExportToShareableHandle(&exp_fd, he, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0) rc=0 no error
+  exported fd=36
+  TRY import_from_fd           cuMemImportFromShareableHandle(&himp, (void *)(long)exp_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) rc=0 no error
+  TRY memaddrreserve_exp       cuMemAddressReserve(&vae, sz, 0, 0, 0)         rc=0 no error
+  TRY memmap_exp               cuMemMap(vae, sz, 0, himp, 0)                  rc=0 no error
+  TRY setaccess_exp            cuMemSetAccess(vae, sz, &acc, 1)               rc=0 no error
+  ROUNDTRIP vmm_imported   dptr=0x7fecc6a00000 bytes=4096 rc=0/0/0 bad=0 first=0xa5c30000 -> PASS
+  TRY unmap_exp                cuMemUnmap(vae, sz)                            rc=0 no error
+  TRY addrfree_exp             cuMemAddressFree(vae, sz)                      rc=0 no error
+  TRY release_imported         cuMemRelease(himp)                             rc=0 no error
+  TRY release_exportable       cuMemRelease(he)                               rc=0 no error
+  TRY unmap                    cuMemUnmap(va, sz)                             rc=0 no error
+  TRY release                  cuMemRelease(h)                                rc=0 no error
+  TRY addressfree              cuMemAddressFree(va, sz * 2)                   rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK vmm reserve/create/map/setaccess/alias/unmap/release
+DONE

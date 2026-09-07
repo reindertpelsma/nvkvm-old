@@ -1,0 +1,31 @@
+STAGE arrays
+pid=1836 nvdiff_out=/root/nvd_apis_run/arrays.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+  TRY arraycreate              cuArrayCreate_v2(&arr, &ad)                    rc=0 no error
+  array=0x5641c1a9cd90 256x256 fmt=U32 ch=1 bytes=262144
+  TRY memcpy2d_HtoA            cuMemcpy2D_v2(&cp)                             rc=0 no error
+  TRY memcpy2d_AtoH            cuMemcpy2D_v2(&cp)                             rc=0 no error
+  TRY sync                     cuCtxSynchronize()                             rc=0 no error
+  ARRAY-ROUNDTRIP words=65536 bad=0 dst[0]=0x30000000 dst[last]=0x3000ffff -> PASS
+  TRY mipmappedarraycreate     cuMipmappedArrayCreate(&mip, &a3, 4)           rc=0 no error
+  mipmapped array=0x5641c1a9e090 levels=4
+  TRY mipmapgetlevel           cuMipmappedArrayGetLevel(&lvl0, mip, 0)        rc=0 no error
+  level0 array=0x5641c1a9e560
+  TRY memcpy2d_HtoMip0         cuMemcpy2D_v2(&cp)                             rc=0 no error
+  TRY sync_mip                 cuCtxSynchronize()                             rc=0 no error
+  TRY texobjcreate_array       cuTexObjectCreate(&tex_arr, &rd, &td, NULL)    rc=0 no error
+  texobj(array) = 0x1
+  TRY alloc_linear             cuMemAlloc(&lin, bytes)                        rc=0 no error
+  TRY htod_linear              cuMemcpyHtoD(lin, src, bytes)                  rc=0 no error
+  TRY texobjcreate_linear      cuTexObjectCreate(&tex_lin, &rd, &td, NULL)    rc=0 no error
+  texobj(linear over 0x7f291e400000) = 0x2
+  TRY texobjdestroy_linear     cuTexObjectDestroy(tex_lin)                    rc=0 no error
+  TRY texobjdestroy_array      cuTexObjectDestroy(tex_arr)                    rc=0 no error
+  TRY free_linear              cuMemFree(lin)                                 rc=0 no error
+  TRY mipmappedarraydestroy    cuMipmappedArrayDestroy(mip)                   rc=0 no error
+  TRY arraydestroy             cuArrayDestroy(arr)                            rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK arrays create/2D-copy-both-ways/mipmap/texobj array+linear
+DONE

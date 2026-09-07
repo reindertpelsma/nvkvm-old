@@ -1,0 +1,14 @@
+STAGE base
+pid=1853 nvdiff_out=/root/nvd_apis_run/base.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+  TRY meminfo                  cuMemGetInfo_v2(&free_b, &total_b)             rc=0 no error
+  fb free=11829 MiB total=11940 MiB
+  TRY alloc_1MiB               cuMemAlloc(&da, 1 << 20)                       rc=0 no error
+  da=0x7f8012200000 size=1048576
+  ROUNDTRIP base           dptr=0x7f8012200000 bytes=1048576 rc=0/0/0 bad=0 first=0xa5c30000 -> PASS
+  TRY free                     cuMemFree(da)                                  rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK base cuMemAlloc+HtoD+DtoH+cuMemFree (the KNOWN-NEGATIVE control)
+DONE

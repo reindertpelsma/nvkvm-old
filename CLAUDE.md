@@ -185,6 +185,13 @@ no amount of Rust-side testing can.
   `/proc/PID/cmdline`. Twice it made a **finished** boot read as still-running for minutes.
   `boot_capture.sh` documents this *inside* the script; it applies just as much to anyone
   driving the bench from outside it. Fix = the bracket trick: `pgrep -f '[b]uild_qom_shim'`.
+  ⊘⊘ **AND THE BRACKET TRICK IS NOT SUFFICIENT — measured in `nvkvm-pv`, 2026-08-17.** It hides
+  the *pattern* from itself, and nothing else. If **any later word on the same command line**
+  names the binary — e.g. the `cp /opt/qemu-src/build/qemu-system-x86_64 ...` that usually
+  follows — `pkill -f '[q]emu-system-x86_64'` matches its **own remote shell**, kills it, and
+  **everything after the pkill silently never runs**. ⇒ Put the kill on a line of its own, in
+  its own ssh invocation. ⚠ Same failure signature as the trap above it: the step reports
+  nothing wrong and the experiment measures the OLD binary.
   ⚠ Note the two failures are opposite: one **never** fires, one **always** does — so a waiter
   and a "nothing is running" check need different fixes, and neither is safe by default.
 - ★★ ⊘ **CORRECTED 2026-08-08 — this trap is HARNESS-SPECIFIC and does NOT apply to the Rust

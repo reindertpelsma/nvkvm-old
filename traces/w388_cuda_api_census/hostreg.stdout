@@ -1,0 +1,35 @@
+STAGE hostreg
+pid=1760 nvdiff_out=/root/nvd_apis_run/hostreg.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+  can_map_host_memory=1
+  hbuf=0x562aeb21f000 size=1048576 (anonymous, page-aligned, pre-existing)
+  TRY hostregister             cuMemHostRegister_v2(hbuf, SZ, CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_PORTABLE) rc=0 no error
+  TRY getdevicepointer         cuMemHostGetDevicePointer_v2(&dp, hbuf, 0)     rc=0 no error
+  DEVICE POINTER for host page = 0x562aeb21f000 (host 0x562aeb21f000)  same_va=1
+  TRY hostgetflags             cuMemHostGetFlags(&flags, hbuf)                rc=0 no error
+  host flags=0x3
+  TRY memsetD32_via_devptr     cuMemsetD32_v2(dp, 0x1234beefu, 4096)          rc=0 no error
+  TRY sync                     cuCtxSynchronize()                             rc=0 no error
+  GPU-WROTE-HOST-PAGES words=4096 bad=0 w[0]=0x1234beef -> PASS
+  TRY hostunregister           cuMemHostUnregister(hbuf)                      rc=0 no error
+  TRY memallochost             cuMemAllocHost_v2(&halloc, SZ)                 rc=0 no error
+  cuMemAllocHost -> 0x7f7c7a200000
+  TRY alloc_dev                cuMemAlloc(&da, SZ)                            rc=0 no error
+  TRY htod_from_pinned         cuMemcpyHtoD(da, halloc, SZ)                   rc=0 no error
+  TRY dtoh_to_stack            cuMemcpyDtoH(&v, da, 4)                        rc=0 no error
+  PINNED-HtoD got=0xfeed0001 want=0xfeed0001 -> PASS
+  TRY free_dev                 cuMemFree(da)                                  rc=0 no error
+  TRY memfreehost              cuMemFreeHost(halloc)                          rc=0 no error
+  TRY memhostalloc             cuMemHostAlloc(&hpin, SZ, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_WRITECOMBINED) rc=0 no error
+  cuMemHostAlloc(DEVICEMAP|WC) -> 0x7f7c7a200000
+  TRY getdevptr_hostalloc      cuMemHostGetDevicePointer_v2(&dp2, hpin, 0)    rc=0 no error
+  device pointer = 0x7f7c7a200000
+  TRY memsetD32_wc             cuMemsetD32_v2(dp2, 0x0badf00du, 1024)         rc=0 no error
+  TRY sync2                    cuCtxSynchronize()                             rc=0 no error
+  GPU-WROTE-HOSTALLOC words=1024 bad=0 -> PASS
+  TRY memfreehost2             cuMemFreeHost(hpin)                            rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK hostreg register/getdevptr/allochost/hostalloc, GPU wrote host pages
+DONE

@@ -1,0 +1,24 @@
+STAGE mapped
+pid=1819 nvdiff_out=/root/nvd_apis_run/mapped.jsonl
+MARKFD 3
+devices=1
+name=NVIDIA GeForce RTX 3060 compute=8.6 totalMem=11940 MiB
+  managed_memory=1 concurrent_managed_access=1
+  dlsym cuMemAdvise=resolved cuMemPrefetchAsync=resolved (v1 ABI, by bare name)
+  TRY allocmanaged             cuMemAllocManaged(&um, SZ, CU_MEM_ATTACH_GLOBAL) rc=0 no error
+  managed ptr=0x7fab88000000 size=4194304 (addressable from BOTH sides)
+  CPU wrote 1048576 words; w[0]=0x11110000
+  TRY advise_preferred         p_memAdvise(um, SZ, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, d) rc=0 no error
+  TRY advise_accessedby        p_memAdvise(um, SZ, CU_MEM_ADVISE_SET_ACCESSED_BY, d) rc=0 no error
+  TRY advise_readmostly        p_memAdvise(um, SZ, CU_MEM_ADVISE_SET_READ_MOSTLY, d) rc=0 no error
+  TRY prefetch_to_dev          p_memPrefetch(um, SZ, d, 0)                    rc=0 no error
+  TRY sync                     cuCtxSynchronize()                             rc=0 no error
+  TRY memsetD32_managed        cuMemsetD32_v2(um, 0x77770000u, 1024)          rc=0 no error
+  TRY sync2                    cuCtxSynchronize()                             rc=0 no error
+  TRY prefetch_to_host         p_memPrefetch(um, SZ, CU_DEVICE_CPU, 0)        rc=0 no error
+  TRY sync3                    cuCtxSynchronize()                             rc=0 no error
+  MANAGED-ROUNDTRIP bad=0 w[0]=0x77770000 w[2048]=0x11110800 -> PASS
+  TRY free                     cuMemFree(um)                                  rc=0 no error
+  TRY ctxdestroy               cuCtxDestroy(ctx)                              rc=0 no error
+OK mapped allocManaged/advise x3/prefetch to device and back
+DONE
